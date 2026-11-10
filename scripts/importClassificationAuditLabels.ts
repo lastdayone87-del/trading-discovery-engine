@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createClassificationAuditItem, labelClassificationAuditItem, type ClassificationAuditEvidence } from '../server/classificationAudit';
+import { buildAuditEvidenceInput } from '../server/classificationAuditWorklist';
 
 const dataDir = process.env.CLASSIFICATION_AUDIT_DIR || '/tmp/opencode/classification-audit-data';
 const cohortKey = process.env.CLASSIFICATION_AUDIT_COHORT || 'audit-2026-11-10-v1';
@@ -13,10 +14,9 @@ for (const label of labels) {
   const item = work.get(label.itemId);
   if (!item) continue;
   const source = manifest.get(label.itemId) || {};
-  const videos = Array.isArray(item.videos) ? item.videos : [];
   const evidence: ClassificationAuditEvidence = {
     channel: { channelId: item.channelId, channelName: item.channelName, country: item.country || null, sourceCohort: source.sourceCohort },
-    input: { description: item.description || '', videos: videos.slice(0, 15), external_links: item.links || [] },
+    input: buildAuditEvidenceInput(item),
   };
   const createdItem = await createClassificationAuditItem({ cohortKey, channelId: item.channelId, evidence });
   if (createdItem.inserted) created += 1;

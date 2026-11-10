@@ -49,6 +49,21 @@ export interface ClassificationAuditItem {
   updatedAt: string;
 }
 
+export interface ClassificationAuditLabelRow {
+  id: string;
+  auditItemId: string;
+  channelId: string;
+  cohortKey: string;
+  label: ClassificationAuditLabel;
+  provenance: string;
+  reviewer: string;
+  notes: string | null;
+  reasonCodes: string[];
+  labelPolicyVersion: string;
+  evidenceSnapshot: Record<string, unknown>;
+  labeledAt: string;
+}
+
 function auditCacheKey(evidence: ClassificationAuditEvidence): string {
   return createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
 }
@@ -75,6 +90,25 @@ function mapItem(row: any): ClassificationAuditItem {
     latestLabeledAt: row.latest_labeled_at ? new Date(row.latest_labeled_at).toISOString() : null,
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function mapLabel(row: any): ClassificationAuditLabelRow {
+  return {
+    id: String(row.id),
+    auditItemId: String(row.audit_item_id),
+    channelId: String(row.channel_id),
+    cohortKey: String(row.cohort_key),
+    label: row.label,
+    provenance: String(row.provenance),
+    reviewer: String(row.reviewer),
+    notes: row.notes || null,
+    reasonCodes: Array.isArray(row.reason_codes) ? row.reason_codes.map(String) : [],
+    labelPolicyVersion: String(row.label_policy_version),
+    evidenceSnapshot: typeof row.evidence_snapshot === 'string'
+      ? JSON.parse(row.evidence_snapshot)
+      : row.evidence_snapshot,
+    labeledAt: new Date(row.labeled_at).toISOString(),
   };
 }
 
@@ -129,9 +163,8 @@ export async function listClassificationAuditItems(filters: {
        JOIN channels c ON c.channel_id=a.channel_id
        LEFT JOIN LATERAL (
          SELECT x.label,x.provenance,x.labeled_at
-           FROM evaluation_ground_truth_labels x
-          WHERE x.channel_id=a.channel_id
-            AND x.evidence_snapshot->>'auditItemId'=a.id::text
+           FROM classification_audit_labels x
+          WHERE x.audit_item_id=a.id
           ORDER BY x.labeled_at DESC,x.id DESC
           LIMIT 1
        ) l ON true
@@ -157,9 +190,8 @@ export async function getClassificationAuditItem(id: string): Promise<Classifica
        JOIN channels c ON c.channel_id=a.channel_id
        LEFT JOIN LATERAL (
          SELECT x.label,x.provenance,x.labeled_at
-           FROM evaluation_ground_truth_labels x
-          WHERE x.channel_id=a.channel_id
-            AND x.evidence_snapshot->>'auditItemId'=a.id::text
+           FROM classification_audit_labels x
+          WHERE x.audit_item_id=a.id
           ORDER BY x.labeled_at DESC,x.id DESC
           LIMIT 1
        ) l ON true
@@ -170,13 +202,26 @@ export async function getClassificationAuditItem(id: string): Promise<Classifica
   return result.rows[0] ? mapItem(result.rows[0]) : null;
 }
 
+export async function listClassificationAuditLabelHistory(auditItemId: string): Promise<ClassificationAuditLabelRow[]> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT l.*,a.cohort_key
+       FROM classification_audit_labels l
+       JOIN classification_audit_items a ON a.id=l.audit_item_id
+      WHERE l.audit_item_id=$1
+      ORDER BY l.labeled_at DESC,l.id DESC`,
+    [auditItemId],
+  );
+  return result.rows.map(mapLabel);
+}
+
 export async function labelClassificationAuditItem(input: {
   auditItemId: string;
   label: ClassificationAuditLabel;
   reviewer: string;
   notes?: string;
   reasonCodes?: string[];
-  provenance?: 'HUMAN_REVIEW' | 'AI_ASSISTED_AUDIT' | 'ADJUDICATION';
+  provenance?: 'OPERATOR_AUDIT' | 'AI_ASSISTED_AUDIT' | 'ADJUDICATION';
   idempotencyKey?: string;
 }): Promise<{ item: ClassificationAuditItem; labelId: string; idempotent: boolean }> {
   if (!['TRADING_CONFIRMED', 'NON_TRADING', 'UNCERTAIN'].includes(input.label)) {
@@ -190,19 +235,23 @@ export async function labelClassificationAuditItem(input: {
     const itemResult = await client.query(`SELECT * FROM classification_audit_items WHERE id=$1 FOR UPDATE`, [input.auditItemId]);
     if (!itemResult.rowCount) throw new Error('CLASSIFICATION_AUDIT_ITEM_NOT_FOUND');
     const item = itemResult.rows[0];
-    const provenance = input.provenance || 'HUMAN_REVIEW';
+    const provenance = input.provenance || 'OPERATOR_AUDIT';
     const existing = await client.query(
-      `SELECT id,label,provenance,evidence_snapshot,labeled_at FROM evaluation_ground_truth_labels
-        WHERE channel_id=$1 AND evidence_snapshot->>'auditItemId'=$2
+      `SELECT id,label,provenance,idempotency_key,labeled_at
+         FROM classification_audit_labels
+        WHERE audit_item_id=$1
         ORDER BY labeled_at DESC,id DESC`,
-      [item.channel_id, input.auditItemId],
+      [input.auditItemId],
     );
     const latest = existing.rows[0] || null;
-    const latestKey = latest?.evidence_snapshot?.idempotencyKey;
     if (latest && latest.label === input.label && latest.provenance === provenance
-      && input.idempotencyKey && latestKey === input.idempotencyKey) {
+      && input.idempotencyKey && latest.idempotency_key === input.idempotencyKey) {
       await client.query('COMMIT');
-      return { item: mapItem({ ...item, latest_label: latest.label, latest_provenance: latest.provenance, latest_labeled_at: latest.labeled_at }), labelId: String(latest.id), idempotent: true };
+      return {
+        item: mapItem({ ...item, latest_label: latest.label, latest_provenance: latest.provenance, latest_labeled_at: latest.labeled_at }),
+        labelId: String(latest.id),
+        idempotent: true,
+      };
     }
     const version = Number(existing.rowCount || 0) + 1;
     const labelKey = `classification-audit:${item.cohort_key}:${item.channel_id}:v${version}`;
@@ -219,10 +268,16 @@ export async function labelClassificationAuditItem(input: {
       labeledAt: new Date().toISOString(),
     };
     const labelResult = await client.query(
-      `INSERT INTO evaluation_ground_truth_labels(label_key,channel_id,review_decision_id,label,provenance,reviewer_count,disagreement,label_policy_version,evidence_snapshot)
-       VALUES($1,$2,NULL,$3,$4,1,false,$5,$6)
-       RETURNING id`,
-      [labelKey, item.channel_id, input.label, provenance, CLASSIFICATION_AUDIT_LABEL_POLICY, JSON.stringify(evidenceSnapshot)],
+      `INSERT INTO classification_audit_labels(
+         label_key,audit_item_id,channel_id,label,provenance,reviewer,notes,reason_codes,
+         label_policy_version,evidence_snapshot,idempotency_key
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING id,labeled_at`,
+      [
+        labelKey, input.auditItemId, item.channel_id, input.label, provenance,
+        input.reviewer.trim(), input.notes?.trim() || null, input.reasonCodes || [],
+        CLASSIFICATION_AUDIT_LABEL_POLICY, JSON.stringify(evidenceSnapshot), input.idempotencyKey || null,
+      ],
     );
     await client.query(`UPDATE classification_audit_items SET status='LABELED',updated_at=now() WHERE id=$1`, [input.auditItemId]);
     const updated = await client.query(
@@ -233,7 +288,12 @@ export async function labelClassificationAuditItem(input: {
     );
     await client.query('COMMIT');
     return {
-      item: mapItem({ ...updated.rows[0], latest_label: input.label, latest_provenance: provenance, latest_labeled_at: new Date().toISOString() }),
+      item: mapItem({
+        ...updated.rows[0],
+        latest_label: input.label,
+        latest_provenance: provenance,
+        latest_labeled_at: labelResult.rows[0].labeled_at,
+      }),
       labelId: String(labelResult.rows[0].id),
       idempotent: false,
     };
@@ -249,13 +309,13 @@ export async function exportClassificationAuditLabels(filters: { cohortKey?: str
   const db = await getDb();
   const limit = Math.min(1000, Math.max(1, filters.limit ?? 500));
   const result = await db.query(
-    `SELECT l.id,l.channel_id,l.label,l.provenance,l.reviewer_count,l.disagreement,
-            l.label_policy_version,l.evidence_snapshot,l.labeled_at,c.channel_name,c.country
-       FROM evaluation_ground_truth_labels l
-       JOIN classification_audit_items a ON a.id::text=l.evidence_snapshot->>'auditItemId'
+    `SELECT l.id,l.audit_item_id,l.channel_id,l.label,l.provenance,l.reviewer,l.notes,
+            l.reason_codes,l.label_policy_version,l.evidence_snapshot,l.labeled_at,
+            a.cohort_key,c.channel_name,c.country
+       FROM classification_audit_labels l
+       JOIN classification_audit_items a ON a.id=l.audit_item_id
        JOIN channels c ON c.channel_id=l.channel_id
-      WHERE l.evidence_snapshot->>'auditItemId' IS NOT NULL
-        AND ($1::text IS NULL OR a.cohort_key=$1)
+      WHERE ($1::text IS NULL OR a.cohort_key=$1)
       ORDER BY l.labeled_at DESC,l.id DESC
       LIMIT $2`,
     [filters.cohortKey || null, limit],

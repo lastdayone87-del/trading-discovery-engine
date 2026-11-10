@@ -10,6 +10,7 @@ import { DiscordProvider } from '../server/evidenceEngine/providers/DiscordProvi
 import type { RawChannelInput } from '../server/evidenceEngine/types';
 import { resolveClassificationRouting } from '../server/classificationRouting/deterministicFirst';
 import { detectScripts } from '../server/globalLanguageModel';
+import { buildAuditChannelInput, normalizeAuditVideos } from '../server/classificationAuditWorklist';
 
 const dataDir = process.env.CLASSIFICATION_AUDIT_DIR || '/tmp/opencode/classification-audit-data';
 const worklistPath = path.join(dataDir, 'worklist.jsonl');
@@ -30,28 +31,15 @@ function loadJsonl<T>(file: string): T[] {
 }
 
 function inputFor(item: WorkItem): RawChannelInput {
-  const videos = (item.videos || []).map((video, index) => ({
-    id: `${item.channelId}:${index}`,
-    title: String(video.title || ''),
-    description: String(video.description || ''),
-    published_at: video.published_at,
-  })).filter(video => video.title);
-  return {
-    channel_id: item.channelId,
-    channel_name: item.channelName,
-    description: item.description || '',
-    country: item.country || undefined,
-    video_titles: videos.map(video => video.title),
-    video_descriptions: videos.map(video => video.description).filter(Boolean),
-    videos,
-    external_links: item.links || [],
-    enrichment_stage: 0,
-    search_match_context: { type: 'CHANNEL', title: item.channelName, description: item.description || '' },
-  };
+  return buildAuditChannelInput(item);
 }
 
 function pct(value: number, total: number): number {
   return total ? Math.round((value / total) * 1000) / 10 : 0;
+}
+
+function ratio(value: number, total: number): number | null {
+  return total ? pct(value, total) : null;
 }
 
 function scriptFor(item: WorkItem): string {
@@ -87,9 +75,9 @@ async function main() {
     const item = work.get(label.itemId);
     if (!item) continue;
     const decision = await engine.evaluateChannel(inputFor(item));
-    const videoTexts = [...new Set((item.videos || [])
+    const videoTexts = normalizeAuditVideos(item)
       .map(video => [video.title, video.description].filter(Boolean).join(' ').trim())
-      .filter(Boolean))];
+      .filter(Boolean);
     const routing = resolveClassificationRouting(decision, {
       independentEvidence: decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition === 'PASS',
       videoTexts,
@@ -168,9 +156,9 @@ async function main() {
       const gfn = groupResolved.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.predictedStatus === 'NON_TRADING').length;
       return {
         name, total: group.length, resolved: groupResolved.length,
-        precision: pct(gtp, gtp + gfp), recall: pct(gtp, group.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length),
-        falsePositiveRate: pct(gfp, group.filter(row => row.humanLabel === 'NON_TRADING').length),
-        falseNegativeRate: pct(gfn, group.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length),
+        precision: ratio(gtp, gtp + gfp), recall: ratio(gtp, group.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length),
+        falsePositiveRate: ratio(gfp, group.filter(row => row.humanLabel === 'NON_TRADING').length),
+        falseNegativeRate: ratio(gfn, group.filter(row => row.humanLabel === 'TRADING_CONFIRMED').length),
       };
     }).sort((a, b) => b.total - a.total);
   }

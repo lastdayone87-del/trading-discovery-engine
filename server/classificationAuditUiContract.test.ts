@@ -22,3 +22,17 @@ test('audit UI shows raw evidence before the classifier suggestion and records i
   assert.match(ui, /UNCERTAIN/);
   assert.match(ui, /Record label/);
 });
+
+test('audit console supports corrections, filters, pagination, history and stale-response guards', () => {
+  assert.match(ui, /Audit status filter/);
+  assert.match(ui, /LABELED/);
+  assert.match(ui, /Previous/);
+  assert.match(ui, /Next/);
+  assert.match(ui, /\/labels/);
+  assert.match(ui, /Label history/);
+  assert.match(ui, /Corrections create a new append-only label version/);
+  assert.match(ui, /queueRequest/);
+  assert.match(ui, /itemRequest/);
+  assert.match(ui, /requestId !== queueRequest\.current/);
+  assert.match(ui, /requestId !== itemRequest\.current/);
+});

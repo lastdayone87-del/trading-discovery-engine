@@ -12,6 +12,7 @@
 - **Prediction-blind worklist:** each row contained only the channel id/name, country, bio, video titles/descriptions, and links. Production status and classifier suggestions were excluded from the labeling file.
 - **Independent audit:** six batches of 50 channels were audited from the raw evidence. Every decisive label required supporting quotes; every quote was checked as an exact substring of the cited field.
 - **Labels:** `TRADING_CONFIRMED` (165), `NON_TRADING` (56), `UNCERTAIN` (79). The labels do not use production classifications as ground truth.
+- **Label isolation:** audit labels live in the append-only `classification_audit_labels` ledger. They are never written into `evaluation_ground_truth_labels`, so they cannot enter the sealed evaluation dataset or production review decisions.
 - **Diagnostic coverage:** 250 of the 300 audited channels had a production classification diagnostic suitable for full-engine replay.
 
 ## Results
@@ -25,8 +26,21 @@ For the 221 decisive human labels:
 | Deterministic-only engine | **100.0%** | 64.8% | **0.0%** | **0.0%** | 49.3% |
 
 - Confusion matrix for the routing + guard: TP 114, FP 0, TN 44, FN 0.
-- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample.
+- The deterministic-only engine resolves obvious trading channels without semantic spend and without false positives in this sample. It routes 3 cases to human review rather than auto-confirming them.
 - The new routing guard escalates confirmed channels to human review when the video sample repeatedly contradicts the bio. It never rejects.
+
+### Cohort breakdown
+
+The sample is stratified by production cohort, so the headline figures are sample-weighted. The per-cohort figures below are the unbiased view for each cohort.
+
+| Source cohort | Decisive labels | Routing resolved | Coverage | Precision | Recall | FPR |
+|---|---:|---:|---:|---:|---:|---:|
+| `TRADING_CONFIRMED` | 93 | 88 | 94.6% | 100% | 100% | 0% |
+| `NEEDS_REVIEW` | 70 | 21 | 30.0% | 100% | 32.3% | 0% |
+| `NON_TRADING` | 44 | 44 | 100% | N/A (no positives) | N/A | 0% |
+| `UNCERTAIN` | 14 | 5 | 35.7% | 100% | 41.7% | 0% |
+
+`NON_TRADING` precision/recall are undefined because that cohort contains no trading labels; all 44 resolved non-trading labels were correct.
 
 ### Country breakdown (stored engine → routing)
 
@@ -76,7 +90,8 @@ These cases require more evidence or operator judgment; they are not counted as 
 
 ## Limitations
 
-- Labels are an independent **AI-assisted evidence audit** with exact quotes, not operator-entered human labels. The classification audit console lets operators inspect and correct every label.
+- Labels are an independent **AI-assisted evidence audit** with exact quotes, not operator-entered human labels. The classification audit console lets operators inspect, filter, and correct every label with an append-only history.
+- Audit labels are isolated from the sealed evaluation dataset. The audit ledger does not widen or write to `evaluation_ground_truth_labels`.
 - Negative sample size is 56; FPR estimates have wide uncertainty.
 - 50 audited channels had no production diagnostic and are excluded from the full-engine comparison.
 - The sample is stratified by production cohort; it is not a uniform random sample of all channels.
@@ -91,4 +106,4 @@ npm run classification:evaluate-audit
 npx tsx scripts/evaluateClassificationAuditFull.ts
 ```
 
-The worklist, labels, diagnostics export, and full evaluation JSON are generated under the configured audit data directory. The commands are read-only with respect to production classification decisions; the seed/import commands write only audit items and labels.
+The worklist, labels, diagnostics export, and full evaluation JSON are generated under the configured audit data directory. The commands are read-only with respect to production classification decisions; the seed/import commands write only to the isolated audit items and labels ledgers.

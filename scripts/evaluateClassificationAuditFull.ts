@@ -14,6 +14,7 @@ const deterministicRows = fs.existsSync(path.join(dataDir, 'evaluation.json'))
   : new Map<string, any>();
 
 const pct = (n: number, d: number) => d ? Math.round((n / d) * 1000) / 10 : 0;
+const ratio = (n: number, d: number) => d ? pct(n, d) : null;
 const scriptFor = (item: any) => {
   const text = [item.channelName, item.description, ...(item.videos || []).flatMap((video: any) => [video.title, video.description])].filter(Boolean).join(' ');
   try { const scripts = detectScripts(text); return scripts.length === 1 ? scripts[0] : scripts.length ? 'MULTI' : 'LATIN_OR_UNKNOWN'; } catch { return 'UNKNOWN'; }
@@ -35,9 +36,9 @@ function metrics(rows: any[], predictor: (row: any) => string | null) {
     humanDecisive: labeled.length, resolved: resolved.length, abstained: labeled.length - resolved.length,
     coveragePct: pct(resolved.length, labeled.length),
     tp, fp, tn, fn, positives: pos, negatives: neg,
-    precision: pct(tp, tp + fp), recall: pct(tp, pos),
-    falsePositiveRate: pct(fp, neg), falseNegativeRate: pct(fn, pos),
-    accuracyOnResolved: pct(tp + tn, resolved.length),
+    precision: ratio(tp, tp + fp), recall: ratio(tp, pos),
+    falsePositiveRate: ratio(fp, neg), falseNegativeRate: ratio(fn, pos),
+    accuracyOnResolved: ratio(tp + tn, resolved.length),
   };
 }
 
@@ -117,6 +118,13 @@ const report = {
     stored: metrics(withDiagnostic.filter(row => row.script === script), row => row.storedPrediction),
     routing: metrics(withDiagnostic.filter(row => row.script === script), row => row.routePrediction),
   })).sort((a, b) => b.stored.humanDecisive - a.stored.humanDecisive),
+  // The audit sample is stratified, so the headline metrics are sample-weighted
+  // and must be read alongside these cohort-level figures.
+  bySourceCohort: [...new Set(withDiagnostic.map(row => row.sourceCohort))].map(cohort => ({
+    cohort,
+    stored: metrics(withDiagnostic.filter(row => row.sourceCohort === cohort), row => row.storedPrediction),
+    routing: metrics(withDiagnostic.filter(row => row.sourceCohort === cohort), row => row.routePrediction),
+  })).sort((a, b) => b.stored.humanDecisive - a.stored.humanDecisive),
   examples: {
     storedFalsePositives: withDiagnostic.filter(row => row.humanLabel === 'NON_TRADING' && row.storedPrediction === 'TRADING_CONFIRMED').slice(0, 20),
     storedFalseNegatives: withDiagnostic.filter(row => row.humanLabel === 'TRADING_CONFIRMED' && row.storedPrediction === 'NON_TRADING').slice(0, 20),
@@ -132,4 +140,5 @@ console.log(JSON.stringify({
   deterministicOnlyEngine: report.deterministicOnlyEngine,
   byCountry: report.byCountry,
   byScript: report.byScript,
+  bySourceCohort: report.bySourceCohort,
 }, null, 2));

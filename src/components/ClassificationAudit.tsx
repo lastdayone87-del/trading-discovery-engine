@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, CheckCircle2, ChevronRight, ExternalLink, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, ExternalLink, Loader2, RefreshCw, ShieldCheck } from 'lucide-react';
 import { apiFetch, newRequestId } from '../apiClient';
 
 interface AuditItem {
@@ -23,6 +23,20 @@ interface AuditItem {
   latestProvenance?: string | null;
   latestLabeledAt?: string | null;
 }
+
+interface AuditLabel {
+  id: string;
+  label: string;
+  provenance: string;
+  reviewer: string;
+  notes: string | null;
+  reasonCodes: string[];
+  labeledAt: string;
+}
+
+type AuditStatusFilter = 'PENDING' | 'ALL' | 'LABELED' | 'DISPUTED' | 'SKIPPED';
+
+const PAGE_SIZE = 50;
 
 const date = (value?: string | null) => (value ? new Date(value).toLocaleString() : '—');
 
@@ -50,11 +64,17 @@ const LABELS = [
   { value: 'UNCERTAIN', label: 'Unresolved', className: 'bg-amber-600 text-white' },
 ] as const;
 
+const isAuditLabel = (value: string | null | undefined): value is typeof LABELS[number]['value'] =>
+  value === 'TRADING_CONFIRMED' || value === 'NON_TRADING' || value === 'UNCERTAIN';
+
 export const ClassificationAudit: React.FC = () => {
   const [items, setItems] = useState<AuditItem[]>([]);
   const [total, setTotal] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [item, setItem] = useState<AuditItem | null>(null);
+  const [history, setHistory] = useState<AuditLabel[]>([]);
+  const [status, setStatus] = useState<AuditStatusFilter>('PENDING');
+  const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingItem, setLoadingItem] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,48 +83,73 @@ export const ClassificationAudit: React.FC = () => {
   const [notes, setNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showSuggestion, setShowSuggestion] = useState(false);
+  const queueRequest = useRef(0);
+  const itemRequest = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++queueRequest.current;
     setLoading(true);
     setError(null);
     try {
-      const response = await apiFetch('/api/classification-audit?status=PENDING&limit=50');
+      const params = new URLSearchParams({ status, limit: String(PAGE_SIZE), offset: String(offset) });
+      const response = await apiFetch(`/api/classification-audit?${params.toString()}`);
       if (!response.ok) throw new Error(await response.text() || 'Could not load the audit queue.');
       const data = await response.json() as { items: AuditItem[]; total: number };
+      if (requestId !== queueRequest.current) return;
       setItems(data.items || []);
       setTotal(Number(data.total || 0));
-      if (!selected && data.items?.length) setSelected(data.items[0].id);
-      if (selected && !data.items?.some(row => row.id === selected)) {
-        setSelected(data.items?.[0]?.id || null);
-        setItem(null);
-      }
+      setSelected(previous => {
+        if (previous && data.items?.some(row => row.id === previous)) return previous;
+        return data.items?.[0]?.id || null;
+      });
     } catch (err) {
+      if (requestId !== queueRequest.current) return;
       setError(err instanceof Error ? err.message : 'Could not load the audit queue.');
     } finally {
-      setLoading(false);
+      if (requestId === queueRequest.current) setLoading(false);
     }
-  }, [selected]);
+  }, [status, offset]);
 
   const loadItem = useCallback(async (id: string) => {
+    const requestId = ++itemRequest.current;
     setLoadingItem(true);
+    setItem(null);
+    setHistory([]);
     setError(null);
     try {
-      const response = await apiFetch(`/api/classification-audit/${encodeURIComponent(id)}`);
-      if (!response.ok) throw new Error(await response.text() || 'Could not load the audit item.');
-      setItem(await response.json() as AuditItem);
-      setLabel('TRADING_CONFIRMED');
+      const [itemResponse, historyResponse] = await Promise.all([
+        apiFetch(`/api/classification-audit/${encodeURIComponent(id)}`),
+        apiFetch(`/api/classification-audit/${encodeURIComponent(id)}/labels`),
+      ]);
+      if (!itemResponse.ok) throw new Error(await itemResponse.text() || 'Could not load the audit item.');
+      const loaded = await itemResponse.json() as AuditItem;
+      if (requestId !== itemRequest.current) return;
+      const labels = historyResponse.ok ? await historyResponse.json() as AuditLabel[] : [];
+      if (requestId !== itemRequest.current) return;
+      setItem(loaded);
+      setHistory(labels);
+      setLabel(isAuditLabel(loaded.latestLabel) ? loaded.latestLabel : 'TRADING_CONFIRMED');
       setNotes('');
       setShowSuggestion(false);
     } catch (err) {
+      if (requestId !== itemRequest.current) return;
       setError(err instanceof Error ? err.message : 'Could not load the audit item.');
       setItem(null);
+      setHistory([]);
     } finally {
-      setLoadingItem(false);
+      if (requestId === itemRequest.current) setLoadingItem(false);
     }
   }, []);
 
   useEffect(() => { void load(); }, [load]);
-  useEffect(() => { if (selected) void loadItem(selected); }, [selected, loadItem]);
+  useEffect(() => {
+    if (!selected) {
+      setItem(null);
+      setHistory([]);
+      return;
+    }
+    void loadItem(selected);
+  }, [selected, loadItem]);
 
   const submit = async () => {
     if (!item) return;
@@ -115,12 +160,14 @@ export const ClassificationAudit: React.FC = () => {
       const response = await apiFetch(`/api/classification-audit/${encodeURIComponent(item.id)}/label`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': newRequestId() },
-        body: JSON.stringify({ label, notes, reasonCodes: [] }),
+        body: JSON.stringify({ label, notes, reasonCodes: ['INDEPENDENT_EVIDENCE_AUDIT'] }),
       });
       if (!response.ok) throw new Error(await response.text() || 'Could not record the audit label.');
-      setNotice(`Recorded ${label} for ${item.channelName || item.channelId}.`);
+      setNotice(`Recorded ${label} for ${item.channelName || item.channelId}. The prior label, if any, remains in history.`);
       setItem(null);
+      setHistory([]);
       setSelected(null);
+      setOffset(0);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not record the audit label.');
@@ -129,9 +176,23 @@ export const ClassificationAudit: React.FC = () => {
     }
   };
 
+  const changeStatus = (next: AuditStatusFilter) => {
+    setStatus(next);
+    setOffset(0);
+    setSelected(null);
+    setItem(null);
+    setHistory([]);
+  };
+
   const input = item?.evidence?.input || {};
-  const videos = Array.isArray(input.videos) ? input.videos : Array.isArray(input.video_titles) ? input.video_titles.map((title: string) => ({ title })) : [];
+  const videos = Array.isArray(input.videos)
+    ? input.videos
+    : Array.isArray(input.video_titles)
+      ? input.video_titles.map((title: string) => ({ title }))
+      : [];
   const classifier = item?.evidence?.classifier;
+  const page = Math.floor(offset / PAGE_SIZE) + 1;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(280px,380px)_1fr]">
@@ -140,24 +201,52 @@ export const ClassificationAudit: React.FC = () => {
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-5 h-5 text-indigo-600" />
             <h2 className="text-sm font-bold">Independent audit</h2>
-            <button onClick={() => void load()} className="ml-auto p-1.5 rounded border border-slate-200 dark:border-slate-700" title="Refresh queue">
+            <button onClick={() => void load()} aria-label="Refresh audit queue" className="ml-auto p-1.5 rounded border border-slate-200 dark:border-slate-700" title="Refresh queue">
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
           </div>
-          <div className="mt-2 text-[11px] text-slate-500">{total} pending audit items · labels are independent of production status.</div>
+          <div className="mt-2 flex items-center gap-2">
+            <select
+              aria-label="Audit status filter"
+              value={status}
+              onChange={event => changeStatus(event.target.value as AuditStatusFilter)}
+              className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2 py-1.5 text-[11px]"
+            >
+              <option value="PENDING">Pending</option>
+              <option value="ALL">All</option>
+              <option value="LABELED">Labeled</option>
+              <option value="DISPUTED">Disputed</option>
+              <option value="SKIPPED">Skipped</option>
+            </select>
+            <span className="text-[11px] text-slate-500">{total} items · labels are independent of production status.</span>
+          </div>
         </div>
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
-          <div className="max-h-[68vh] overflow-auto divide-y divide-slate-100 dark:divide-slate-800">
-            {items.length === 0 && !loading && <div className="p-4 text-xs text-slate-500">No pending audit items.</div>}
+          <div className="max-h-[62vh] overflow-auto divide-y divide-slate-100 dark:divide-slate-800">
+            {items.length === 0 && !loading && <div className="p-4 text-xs text-slate-500">No audit items for this filter.</div>}
             {items.map(row => (
               <button key={row.id} onClick={() => setSelected(row.id)} className={`w-full text-left p-3 hover:bg-slate-50 dark:hover:bg-slate-800/60 ${selected === row.id ? 'bg-indigo-50 dark:bg-indigo-950/30' : ''}`}>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold truncate">{row.channelName || row.channelId}</span>
                   <ChevronRight className="w-3.5 h-3.5 ml-auto text-slate-400" />
                 </div>
-                <div className="mt-1 text-[10px] text-slate-500">{row.country || 'Unknown country'} · {row.evidence?.channel?.sourceCohort || row.cohortKey}</div>
+                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">
+                  <span>{row.country || 'Unknown country'}</span>
+                  <span>· {row.evidence?.channel?.sourceCohort || row.cohortKey}</span>
+                  <span>· {row.status}</span>
+                  {row.latestLabel && <span>· {row.latestLabel}</span>}
+                </div>
               </button>
             ))}
+          </div>
+          <div className="flex items-center justify-between border-t border-slate-100 dark:border-slate-800 px-3 py-2 text-[11px]">
+            <button disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
+              <ChevronLeft className="w-3 h-3" /> Previous
+            </button>
+            <span className="text-slate-500">Page {page} of {pageCount}</span>
+            <button disabled={offset + PAGE_SIZE >= total || loading} onClick={() => setOffset(offset + PAGE_SIZE)} className="inline-flex items-center gap-1 rounded border border-slate-200 dark:border-slate-700 px-2 py-1 disabled:opacity-40">
+              Next <ChevronRight className="w-3 h-3" />
+            </button>
           </div>
         </div>
       </div>
@@ -176,7 +265,11 @@ export const ClassificationAudit: React.FC = () => {
                   <div className="text-xs text-slate-500 mt-1">{item.country || 'Unknown country'} · {item.evidence?.channel?.sourceCohort || item.cohortKey}</div>
                   {item.youtubeUrl && <a href={item.youtubeUrl} target="_blank" rel="noreferrer" className="text-xs text-indigo-600 inline-flex items-center gap-1 mt-1">Open channel <ExternalLink className="w-3 h-3" /></a>}
                 </div>
-                <div className="ml-auto text-[11px] text-slate-400">Audit {item.id.slice(0, 8)} · {date(item.latestLabeledAt)}</div>
+                <div className="ml-auto text-right text-[11px] text-slate-400">
+                  <div>Audit {item.id.slice(0, 8)}</div>
+                  <div>{item.status}{item.latestLabel ? ` · latest ${item.latestLabel}` : ''}</div>
+                  <div>{date(item.latestLabeledAt)}</div>
+                </div>
               </div>
             </Section>
 
@@ -208,6 +301,23 @@ export const ClassificationAudit: React.FC = () => {
               <div className="text-[10px] text-slate-400 mt-2">This is a suggestion only. Do not treat it as the label; decide from the evidence above.</div>
             </Section>
 
+            <Section title="Label history">
+              {history.length === 0 && <div className="text-xs text-slate-400">No labels recorded yet.</div>}
+              <div className="space-y-2">
+                {history.map(entry => (
+                  <div key={entry.id} className="rounded-lg border border-slate-100 dark:border-slate-800 p-2 text-[11px]">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold">{entry.label}</span>
+                      <span className="text-slate-400">{entry.provenance}</span>
+                      <span className="text-slate-400 ml-auto">{date(entry.labeledAt)}</span>
+                    </div>
+                    <div className="text-slate-500 mt-1">{entry.reviewer}{entry.reasonCodes.length ? ` · ${entry.reasonCodes.join(', ')}` : ''}</div>
+                    {entry.notes && <div className="text-slate-600 dark:text-slate-300 mt-1 whitespace-pre-wrap">{entry.notes}</div>}
+                  </div>
+                ))}
+              </div>
+            </Section>
+
             <Section title="Your independent label">
               <div className="flex flex-wrap gap-2">
                 {LABELS.map(option => (
@@ -215,12 +325,13 @@ export const ClassificationAudit: React.FC = () => {
                 ))}
               </div>
               <div className="mt-3 grid gap-2 md:grid-cols-[1fr_auto]">
-                <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Evidence note (what in the bio/videos supports this label?)" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
-                <button disabled={submitting} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
+                <input value={notes} onChange={event => setNotes(event.target.value)} placeholder="Evidence note (what in the bio/videos supports this label?)" className="rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent px-2.5 py-2 text-xs" />
+                <button disabled={submitting || !label} onClick={() => void submit()} className="rounded-lg bg-indigo-600 text-white px-4 py-2 text-xs font-semibold disabled:opacity-40 inline-flex items-center justify-center gap-2">
                   {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
                   Record label
                 </button>
               </div>
+              <div className="text-[10px] text-slate-400 mt-2">Corrections create a new append-only label version; the earlier label remains in history.</div>
             </Section>
           </>
         )}
