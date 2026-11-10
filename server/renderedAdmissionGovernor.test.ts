@@ -129,6 +129,36 @@ test('governor allows the 48/hour emergency allowance only with queued demand', 
   assert.equal(governor.snapshot().admissionsInWindow, 48);
 });
 
+test('rate-limit retry time uses the expiry that frees the selected limit', () => {
+  const clock = { now: 0 };
+  const governor = makeGovernor({}, clock);
+  const none = new Set<never>();
+  const queued = new Set(['RETRY'] as const);
+
+  for (let index = 0; index < 26; index++) {
+    governor.admit('RETRY', none, false);
+    clock.now += 1_000;
+  }
+  for (let index = 0; index < 14; index++) {
+    governor.admit('DISCOVERY', none, false);
+    clock.now += 1_000;
+  }
+  // Fill the emergency window with discovery so the final retry sees the
+  // nominal 40 limit again.
+  for (let index = 0; index < 8; index++) {
+    governor.admit('DISCOVERY', queued, true);
+    clock.now += 1_000;
+  }
+
+  const denied = governor.admit('RETRY', none, false);
+  assert.equal(denied.admitted, false);
+  assert.equal(denied.reason, 'RATE_LIMIT');
+  assert.equal(denied.limit, 40);
+  // 48 admissions, nominal 40 -> the ninth-oldest (index 8, admitted at 8s)
+  // must expire: 8s + 60s = 68s, not the oldest admission at 60s.
+  assert.equal(denied.retryAtMs, 68_000);
+});
+
 test('governor strictly reserves 35% of the window for DISCOVERY', () => {
   const governor = makeGovernor();
   const none = new Set<never>();
@@ -229,4 +259,5 @@ test('inspection lane is wired into every rendered fallback call', () => {
   );
   const fallback = readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
   assert.match(fallback, /limits\.admissionLane \|\| 'UNKNOWN'/);
+  assert.match(fallback, /retryAt,telemetry/, 'saturation result must carry the governor retry hint');
 });
