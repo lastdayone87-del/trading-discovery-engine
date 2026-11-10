@@ -146,8 +146,10 @@ export async function listClassificationAuditItems(filters: {
   offset?: number;
 } = {}): Promise<{ items: ClassificationAuditItem[]; total: number }> {
   const db = await getDb();
-  const limit = Math.min(100, Math.max(1, filters.limit ?? 50));
-  const offset = Math.max(0, filters.offset ?? 0);
+  const boundedInt = (value: number | undefined, fallback: number, min: number, max: number) =>
+    Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value as number))) : fallback;
+  const limit = boundedInt(filters.limit, 50, 1, 100);
+  const offset = boundedInt(filters.offset, 0, 0, Number.MAX_SAFE_INTEGER);
   const params = [
     filters.status && filters.status !== 'ALL' ? filters.status : null,
     filters.cohortKey || null,

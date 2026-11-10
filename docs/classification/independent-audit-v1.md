@@ -57,6 +57,8 @@ The sample is stratified by production cohort, so the headline figures are sampl
 | Australia | 5 | 100% | 60.0% | 100% | 40.0% |
 | Canada | 5 | n/a (all abstained) | n/a | n/a | n/a |
 
+The country table shows the eight largest groups. The remaining 15 decisive labels are distributed across other countries.
+
 ### Script breakdown
 
 | Script | Decisive labels | Stored precision | Stored recall | Routing precision | Routing recall |

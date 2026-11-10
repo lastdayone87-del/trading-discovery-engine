@@ -110,7 +110,7 @@ export interface TradingRelevanceBreakdown {
   ai_raw_response?: string;
   ai_model?: string;
   /** Integrated deterministic-first routing metadata. */
-  classification_route?: string;
+  classification_route?: 'DETERMINISTIC_TRADING' | 'SEMANTIC_TRADING' | 'DETERMINISTIC_NON_TRADING' | 'SEMANTIC_NON_TRADING' | 'HUMAN_REVIEW' | 'ENRICH' | 'UNCERTAIN';
   deterministic_fast_track?: boolean;
   semantic_used?: boolean;
   human_review_candidate?: boolean;

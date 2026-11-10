@@ -88,3 +88,12 @@ test('the importer validates the whole file before the first write', () => {
   assert.ok(firstWrite >= 0);
   assert.ok(validation < firstWrite);
 });
+
+test('audit routes reject malformed ids and normalize non-numeric pagination', () => {
+  const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+  const audit = readFileSync(new URL('./classificationAudit.ts', import.meta.url), 'utf8');
+  assert.match(server, /CLASSIFICATION_AUDIT_INVALID_ID/);
+  assert.match(server, /\[0-9a-f\]\{8\}/);
+  assert.match(audit, /Number\.isFinite\(value\)/);
+  assert.match(audit, /Math\.trunc\(value as number\)/);
+});
