@@ -35,7 +35,7 @@ test('review console guards stale responses and supports the OTHER reason contra
 
 test('review console never submits a stale bundle for a newly selected channel',()=>{
   assert.match(ui, /setBundle\(null\);/);
-  assert.match(ui, /bundle\.review\.channelId !== current\.channelId/);
-  assert.match(ui, /bundle\.review\.state !== 'PENDING'/);
+  assert.match(ui, /canSubmitReviewForSelection/);
+  assert.match(ui, /loadingBundle/);
   assert.match(ui, /aria-label="Other reason"/);
 });

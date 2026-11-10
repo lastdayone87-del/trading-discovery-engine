@@ -151,6 +151,7 @@ export async function getReviewEvidence(
   const db = await getDb();
 
   let eligibilityRow: any = null;
+  let eligibilityWarning: string | null = null;
   if (eligibilityDecisionId) {
     const result = await db.query(
       `SELECT d.*,p.status AS projection_status,p.version AS projection_version,
@@ -164,6 +165,7 @@ export async function getReviewEvidence(
       [eligibilityDecisionId, channelId],
     );
     eligibilityRow = result.rows[0] || null;
+    if (!eligibilityRow) eligibilityWarning = 'ELIGIBILITY_DECISION_NOT_FOUND';
   }
   if (!eligibilityRow) {
     const result = await db.query(
@@ -181,6 +183,7 @@ export async function getReviewEvidence(
   }
 
   let diagnosticRow: any = null;
+  let diagnosticWarning: string | null = null;
   const diagnosticId = eligibilityRow?.classification_diagnostic_id;
   if (diagnosticId) {
     const result = await db.query(
@@ -193,6 +196,7 @@ export async function getReviewEvidence(
       [diagnosticId, channelId],
     );
     diagnosticRow = result.rows[0] || null;
+    if (!diagnosticRow) diagnosticWarning = 'CLASSIFICATION_DIAGNOSTIC_NOT_FOUND';
   }
   if (!diagnosticRow) {
     const result = await db.query(
@@ -206,6 +210,7 @@ export async function getReviewEvidence(
       [channelId],
     );
     diagnosticRow = result.rows[0] || null;
+    if (!diagnosticWarning && !diagnosticId) diagnosticWarning = 'CLASSIFICATION_DIAGNOSTIC_ID_MISSING';
   }
 
   const cutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
@@ -237,6 +242,8 @@ export async function getReviewEvidence(
     evidenceCoverage,
     creatorFocusRow: creatorFocus,
   });
+  if (eligibilityWarning) bundle.warnings.push(eligibilityWarning);
+  if (diagnosticWarning) bundle.warnings.push(diagnosticWarning);
   if (documentsUnavailable) bundle.warnings.push('EVIDENCE_DOCUMENTS_UNAVAILABLE');
   if (assertionsUnavailable) bundle.warnings.push('EVIDENCE_ASSERTIONS_UNAVAILABLE');
   if (coverageUnavailable) bundle.warnings.push('EVIDENCE_COVERAGE_UNAVAILABLE');
