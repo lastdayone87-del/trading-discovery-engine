@@ -268,9 +268,11 @@ export async function getReviewEvidence(
   const snapshotScope = Boolean(creatorFocusRow);
   const exactDocumentScope = snapshotScope && documentScope.present && !documentScope.malformed;
   const exactAssertionScope = snapshotScope && assertionScope.present && !assertionScope.malformed;
+  const uniqueDocumentKeys = [...new Set(documentScope.keys)];
+  const uniqueAssertionKeys = [...new Set(assertionScope.keys)];
   const fallbackCutoff = options.cutoff || (diagnosticRow ? new Date(diagnosticRow.created_at).toISOString() : undefined);
-  const shouldQueryDocuments = !exactDocumentScope || documentScope.keys.length > 0;
-  const shouldQueryAssertions = !exactAssertionScope || assertionScope.keys.length > 0;
+  const shouldQueryDocuments = !exactDocumentScope || uniqueDocumentKeys.length > 0;
+  const shouldQueryAssertions = !exactAssertionScope || uniqueAssertionKeys.length > 0;
 
   let documentsUnavailable = false;
   let assertionsUnavailable = false;
@@ -278,14 +280,14 @@ export async function getReviewEvidence(
   const [evidenceDocuments, evidenceAssertions, evidenceCoverage] = await Promise.all([
     !shouldQueryDocuments ? Promise.resolve([]) : listEvidenceDocuments({
       channelId,
-      documentKeys: exactDocumentScope ? documentScope.keys : undefined,
-      limit: Math.min(250, Math.max(1, options.documentLimit || 50, documentScope.keys.length)),
+      documentKeys: exactDocumentScope ? uniqueDocumentKeys : undefined,
+      limit: Math.min(250, Math.max(1, options.documentLimit || 50, uniqueDocumentKeys.length)),
       cutoff: exactDocumentScope ? undefined : fallbackCutoff,
     }).catch(() => { documentsUnavailable = true; return []; }),
     !shouldQueryAssertions ? Promise.resolve([]) : listEvidenceAssertions({
       channelId,
-      assertionKeys: exactAssertionScope ? assertionScope.keys : undefined,
-      limit: Math.min(250, Math.max(1, options.assertionLimit || 100, assertionScope.keys.length)),
+      assertionKeys: exactAssertionScope ? uniqueAssertionKeys : undefined,
+      limit: Math.min(250, Math.max(1, options.assertionLimit || 100, uniqueAssertionKeys.length)),
       cutoff: exactAssertionScope ? undefined : fallbackCutoff,
     }).catch(() => { assertionsUnavailable = true; return []; }),
     listEvidenceCoverage({
@@ -313,8 +315,8 @@ export async function getReviewEvidence(
   if (assertionScope.malformed) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_MALFORMED');
   if (exactDocumentScope && documentScope.keys.length === 0) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_EMPTY');
   if (exactAssertionScope && assertionScope.keys.length === 0) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_EMPTY');
-  if (exactDocumentScope && evidenceDocuments.length < documentScope.keys.length) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
-  if (exactAssertionScope && evidenceAssertions.length < assertionScope.keys.length) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
+  if (exactDocumentScope && evidenceDocuments.length < uniqueDocumentKeys.length) bundle.warnings.push('EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE');
+  if (exactAssertionScope && evidenceAssertions.length < uniqueAssertionKeys.length) bundle.warnings.push('EVIDENCE_ASSERTION_SCOPE_INCOMPLETE');
   if (diagnosticRow && !coverageUnavailable && evidenceCoverage.length === 0) bundle.warnings.push('EVIDENCE_COVERAGE_NOT_FOUND');
   if (documentsUnavailable) bundle.warnings.push('EVIDENCE_DOCUMENTS_UNAVAILABLE');
   if (assertionsUnavailable) bundle.warnings.push('EVIDENCE_ASSERTIONS_UNAVAILABLE');

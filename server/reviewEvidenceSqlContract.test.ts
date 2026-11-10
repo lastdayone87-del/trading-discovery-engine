@@ -21,8 +21,8 @@ test('review evidence selects explicit diagnostic columns and bounded evidence r
 test('review evidence is scoped to the exact Creator Focus document and assertion keys', () => {
   assert.match(source, /document_keys/);
   assert.match(source, /assertion_keys/);
-  assert.match(source, /documentKeys: exactDocumentScope \? documentScope\.keys : undefined/);
-  assert.match(source, /assertionKeys: exactAssertionScope \? assertionScope\.keys : undefined/);
+  assert.match(source, /documentKeys: exactDocumentScope \? uniqueDocumentKeys : undefined/);
+  assert.match(source, /assertionKeys: exactAssertionScope \? uniqueAssertionKeys : undefined/);
   assert.match(source, /classificationDiagnosticId: diagnosticRow\?\.id/);
   assert.match(source, /EVIDENCE_SCOPE_TEMPORAL_FALLBACK/);
   assert.match(source, /EVIDENCE_DOCUMENT_SCOPE_INCOMPLETE/);
@@ -35,6 +35,8 @@ test('review evidence is scoped to the exact Creator Focus document and assertio
   assert.match(source, /documentScope\.present/);
   assert.match(source, /assertionScope\.present/);
   assert.match(source, /blockingReviewEvidenceWarnings/);
+  assert.match(source, /new Set\(documentScope\.keys\)/);
+  assert.match(source, /new Set\(assertionScope\.keys\)/);
   assert.match(source, /EVIDENCE_ASSERTION_SCOPE_EMPTY/);
 });
 
@@ -68,4 +70,5 @@ test('the authoritative decision route revalidates blocking evidence scope', () 
   assert.match(server, /blockingReviewEvidenceWarnings\(req\.params\.channelId\)/);
   assert.match(server, /REVIEW_EVIDENCE_INCOMPLETE/);
   assert.match(server, /action!=='FORCE_RESCAN'/);
+  assert.match(server, /hasReviewDecisionIdempotencyKey/);
 });

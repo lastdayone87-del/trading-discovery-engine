@@ -54,6 +54,14 @@ export async function getReviewDetails(channelId:string) {
   return {...map(item.rows[0]),history:history.rows};
 }
 
+/** A retry of an already-committed decision must not be re-blocked by a new guard. */
+export async function hasReviewDecisionIdempotencyKey(idempotencyKey: string): Promise<boolean> {
+  if (!idempotencyKey.trim()) return false;
+  const db = await getDb();
+  const result = await db.query('SELECT 1 FROM channel_review_decisions WHERE idempotency_key=$1 LIMIT 1', [idempotencyKey]);
+  return (result.rowCount || 0) > 0;
+}
+
 export interface DecideInput { channelId:string; action:ReviewAction; expectedVersion:number; reviewer:string; reason?:string; reviewReasonCode?:string; reviewReasonVersion?:string; reviewReasonOther?:string; notes?:string; idempotencyKey:string; creatorType?:CreatorType; reasonCodes?:string[]; }
 export async function decideReview(input:DecideInput) {
   if(!Number.isInteger(input.expectedVersion)||input.expectedVersion<1) throw new Error('reviewVersion must be a positive integer.');
