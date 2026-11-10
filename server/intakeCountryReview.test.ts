@@ -124,5 +124,7 @@ test('existing confirmed rows keep their trading decision but persist fresh defe
   assert.match(section, /reviewableCountry/);
   assert.match(section, /existing\.country_status = deferredCountry\.status/);
   assert.doesNotMatch(section, /existing\.trading_status\s*=(?!=)/);
-  assert.match(section, /channelRecord: existing/);
+  assert.match(section, /upsertChannelWithResult/);
+  assert.match(section, /requireStatusSnapshot/);
+  assert.match(section, /channelRecord: current/);
 });

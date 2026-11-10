@@ -482,6 +482,12 @@ async function processChannelThroughPipelineInContext(
 
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
+  const existingStatusSnapshot = existing ? {
+    country: existing.country,
+    country_status: existing.country_status,
+    scan_status: existing.scan_status,
+    trading_status: existing.trading_status,
+  } : undefined;
   if (existing) {
     if (existing.scan_status === 'FAILED_PERMANENT') {
       const trigger = shouldReactivateCommunityRecovery(existing, candidate, isManualScan);
@@ -724,20 +730,21 @@ async function processChannelThroughPipelineInContext(
           details: deferredCountry.decisionLogs,
           timestamp: now,
         }];
-        await upsertChannel(existing);
+        await upsertChannelWithResult(existing, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
       }
+      const current = await getChannelById(candidate.channelId) || existing;
       return {
         channelId: candidate.channelId,
         channelName: candidate.channelName,
         isNew: false,
         wasKnown: true,
         persisted: true,
-        countryStatus: reviewableCountry ? deferredCountry.status : existing.country_status as IngestionPipelineOutcome['countryStatus'],
-        detectedCountry: reviewableCountry ? deferredCreatorCountry : (existing.country || null),
-        tradingStatus: existing.trading_status || 'UNCERTAIN',
-        discordStatus: existing.discord_status,
-        discordInvite: existing.discord_invite || null,
-        channelRecord: existing,
+        countryStatus: current.country_status as IngestionPipelineOutcome['countryStatus'],
+        detectedCountry: current.country || null,
+        tradingStatus: current.trading_status || 'UNCERTAIN',
+        discordStatus: current.discord_status,
+        discordInvite: current.discord_invite || null,
+        channelRecord: current,
       };
     }
     const intakeChannel = buildDeferredTradingIntakeChannel(
@@ -779,35 +786,37 @@ async function processChannelThroughPipelineInContext(
         },
         now,
       }, candidate);
-      await upsertChannel(intakeChannel);
+      const rejectionWrite = await upsertChannelWithResult(intakeChannel, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
+      const rejected = rejectionWrite ? intakeChannel : (await getChannelById(candidate.channelId) || intakeChannel);
       return {
         channelId: candidate.channelId,
         channelName: candidate.channelName,
         isNew: !existing,
         wasKnown: !!existing,
         persisted: true,
-        countryStatus: 'REJECTED',
-        detectedCountry: deferredCreatorCountry,
-        rejectionReason: deferredCountry.rejectionReason,
-        tradingStatus: intakeChannel.trading_status || 'UNCERTAIN',
-        discordStatus: intakeChannel.discord_status,
-        discordInvite: intakeChannel.discord_invite || null,
-        channelRecord: intakeChannel,
+        countryStatus: rejected.country_status as IngestionPipelineOutcome['countryStatus'],
+        detectedCountry: rejected.country || null,
+        rejectionReason: rejected.country_status === 'REJECTED' ? deferredCountry.rejectionReason : undefined,
+        tradingStatus: rejected.trading_status || 'UNCERTAIN',
+        discordStatus: rejected.discord_status,
+        discordInvite: rejected.discord_invite || null,
+        channelRecord: rejected,
       };
     }
-    await upsertChannel(intakeChannel);
+    const deferredWrite = await upsertChannelWithResult(intakeChannel, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
+    const deferred = deferredWrite ? intakeChannel : (await getChannelById(candidate.channelId) || intakeChannel);
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
       isNew: !existing,
       wasKnown: !!existing,
       persisted: true,
-      countryStatus: intakeChannel.country_status as IngestionPipelineOutcome['countryStatus'],
-      detectedCountry: intakeChannel.country || null,
-      tradingStatus: 'UNCERTAIN',
-      discordStatus: intakeChannel.discord_status || 'UNCERTAIN',
-      discordInvite: intakeChannel.discord_invite || null,
-      channelRecord: intakeChannel,
+      countryStatus: deferred.country_status as IngestionPipelineOutcome['countryStatus'],
+      detectedCountry: deferred.country || null,
+      tradingStatus: deferred.trading_status || 'UNCERTAIN',
+      discordStatus: deferred.discord_status || 'UNCERTAIN',
+      discordInvite: deferred.discord_invite || null,
+      channelRecord: deferred,
     };
   }
 
