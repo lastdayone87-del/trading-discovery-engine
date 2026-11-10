@@ -1,8 +1,9 @@
 # Phase 2 Option C — crawl throughput telemetry
 
-**Status:** Units 1–2 implemented (telemetry activation, rendered-crawl
-counting, read-only report, and the admission governor documented in
-`docs/phase-2-admission-governor.md`).
+**Status:** Units 1–3 implemented (telemetry activation, rendered-crawl
+counting, read-only report, the admission governor documented in
+`docs/phase-2-admission-governor.md`, and the bounded wait documented in
+`docs/phase-2-crawl-deadline.md`).
 **Tracking:** #616.
 **Program constraints:** no new infrastructure, no server upgrade, exactly one
 browser slot, **40 browser crawls/hour nominal**, **48 browser crawls/hour
@@ -145,6 +146,5 @@ admission itself, so the two measurements can be cross-checked.
 
 ## Non-goals
 
-- No crawl deadline/fairness change yet (Unit 3).
 - No retry-backlog mutation (Unit 4).
 - No new browser slot, worker pool, migration, or server upgrade.

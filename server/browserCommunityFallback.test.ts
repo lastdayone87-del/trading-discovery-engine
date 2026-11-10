@@ -539,6 +539,33 @@ test('rendered gate refunds a zero-work startup failure', async () => {
   assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
 });
 
+test('rendered gate bounds a queued wait as capacity', async () => {
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 100,
+    emergencyPerHour: 100,
+    discoveryFloorPct: 0,
+    windowMs: 60_000,
+  }, () => 0);
+  const gate = new RenderedFallbackGate(1, 2, governor, 25);
+  let releaseFirst!: () => void;
+  const blocker = new Promise<void>(resolve => { releaseFirst = resolve; });
+
+  const first = gate.run(async () => { await blocker; }, 'RETRY');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await assert.rejects(
+    gate.run(async () => undefined, 'RETRY'),
+    (error: any) => error?.message === 'RENDERED_FALLBACK_SATURATED'
+      && typeof error.retryAt === 'number',
+  );
+  assert.equal(gate.snapshot().pending, 0, 'the timed-out waiter is removed');
+
+  const third = gate.run(async () => 'third', 'RETRY');
+  releaseFirst();
+  await first;
+  assert.equal(await third, 'third');
+});
+
 test('rendered gate exposes the admission id on a rejected startup', async () => {
   const governor = new RenderedAdmissionGovernor({
     enabled: true,

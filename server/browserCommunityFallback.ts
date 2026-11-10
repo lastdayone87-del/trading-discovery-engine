@@ -3781,17 +3781,26 @@ function boundedEnvInt(value: string | undefined, fallback: number, min: number,
 interface RenderedGateWaiter {
   lane: AcquisitionLane;
   grant: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+  granted: boolean;
 }
 
 export class RenderedFallbackGate {
   private active = 0;
   private readonly waiters: RenderedGateWaiter[] = [];
   private lastDeniedLogAtMs = 0;
+  private lastWaitTimeoutLogAtMs = 0;
 
   constructor(
     readonly concurrency: number,
     readonly maxPending: number,
     private readonly admissionGovernor: RenderedAdmissionGovernorLike = renderedAdmissionGovernor,
+    readonly maxWaitMs: number = boundedEnvInt(
+      process.env.RENDERED_FALLBACK_MAX_WAIT_MS,
+      90_000,
+      1_000,
+      300_000,
+    ),
   ) {}
 
   private pendingLanes(): Set<AcquisitionLane> {
@@ -3802,6 +3811,12 @@ export class RenderedFallbackGate {
     return Math.max(1, Math.ceil(this.maxPending * 0.35));
   }
 
+  private saturationError(): Error {
+    return Object.assign(new Error('RENDERED_FALLBACK_SATURATED'), {
+      retryAt: Date.now() + this.maxWaitMs,
+    });
+  }
+
   private acquire(lane: AcquisitionLane): Promise<() => void> {
     if (this.active >= this.concurrency) {
       // Discovery may use a small extra queue reserve so a full non-discovery
@@ -3809,10 +3824,18 @@ export class RenderedFallbackGate {
       const pendingLimit = lane === 'DISCOVERY'
         ? this.maxPending + this.discoveryQueueReserve()
         : this.maxPending;
-      if (this.waiters.length >= pendingLimit) return Promise.reject(new Error('RENDERED_FALLBACK_SATURATED'));
+      if (this.waiters.length >= pendingLimit) return Promise.reject(this.saturationError());
     }
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
+      const waiter: RenderedGateWaiter = {
+        lane,
+        granted: false,
+        grant: () => undefined,
+      };
       const grant = () => {
+        if (waiter.granted) return;
+        waiter.granted = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
         this.active++;
         let released = false;
         resolve(() => {
@@ -3822,7 +3845,23 @@ export class RenderedFallbackGate {
           this.grantNextWaiter();
         });
       };
-      if (this.active < this.concurrency) grant(); else this.waiters.push({ lane, grant });
+      waiter.grant = grant;
+      if (this.active < this.concurrency) {
+        grant();
+        return;
+      }
+      // A queued crawl must not hold a worker for an unbounded gate wait. The
+      // timeout is a capacity deferral, never an acquisition failure; the
+      // existing saturation class keeps retry accounting attempt-free.
+      waiter.timer = setTimeout(() => {
+        const index = this.waiters.indexOf(waiter);
+        if (index < 0) return; // granted concurrently; grant() cleared the timer
+        this.waiters.splice(index, 1);
+        this.logWaitTimeout(lane);
+        reject(this.saturationError());
+      }, this.maxWaitMs);
+      waiter.timer.unref?.();
+      this.waiters.push(waiter);
     });
   }
 
@@ -3854,6 +3893,19 @@ export class RenderedFallbackGate {
       limit: decision.limit,
       emergency: decision.emergency,
       retryAt: decision.retryAtMs ? new Date(decision.retryAtMs).toISOString() : null,
+      timestamp: new Date(now).toISOString(),
+    }));
+  }
+
+  private logWaitTimeout(lane: AcquisitionLane): void {
+    const now = Date.now();
+    if (now - this.lastWaitTimeoutLogAtMs < 60_000) return;
+    this.lastWaitTimeoutLogAtMs = now;
+    console.warn(JSON.stringify({
+      event: 'rendered_fallback_wait_timeout',
+      lane,
+      waitMs: this.maxWaitMs,
+      pending: this.waiters.length,
       timestamp: new Date(now).toISOString(),
     }));
   }

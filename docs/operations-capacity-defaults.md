@@ -16,6 +16,7 @@ dated 2026-07-29 and must keep its original values.
 | `RENDERED_ADMISSION_NOMINAL_PER_HOUR` | `40` | `server/renderedAdmissionGovernor.ts`, `.env.example` | Rolling 60-minute rendered-crawl admissions; clamped to [1, 1000]. |
 | `RENDERED_ADMISSION_EMERGENCY_PER_HOUR` | `48` | `server/renderedAdmissionGovernor.ts`, `.env.example` | Emergency allowance used only when the nominal window is full and another rendered request is queued; clamped to [nominal, 1000]. |
 | `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT` | `35` | `server/renderedAdmissionGovernor.ts`, `.env.example` | DISCOVERY share reserved whenever discovery work is queued; clamped to [0, 100], evaluated at 0.01% precision. |
+| `RENDERED_FALLBACK_MAX_WAIT_MS` | `90000` | `server/browserCommunityFallback.ts`, `.env.example` | Maximum gate-queue wait for one rendered request; clamped to [1s, 300s]. A timed-out waiter is removed and deferred as `RENDERED_FALLBACK_SATURATED` capacity. The admitted crawl's own total budget remains 60s. |
 
 Basis: previously authorized production capacity change (October 2026);
 `SEARCH_WORKER_CONCURRENCY=4` restores that change in code after it was lost
@@ -31,8 +32,9 @@ database value (verified read-only).
 - The same env output must show `ACQUISITION_LANE_TELEMETRY_ENABLED=true` and
   the admission budget: `RENDERED_ADMISSION_GOVERNOR_ENABLED=true`,
   `RENDERED_ADMISSION_NOMINAL_PER_HOUR=40`,
-  `RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48`, and
-  `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35` (or an explicitly approved
-  override). If the governor is disabled, the 40/48/35 budget is not enforced.
+  `RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48`,
+  `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35`, and
+  `RENDERED_FALLBACK_MAX_WAIT_MS=90000` (or an explicitly approved override).
+  If the governor is disabled, the 40/48/35 budget is not enforced.
 - Read-only database `SELECT setting_value FROM app_settings WHERE
   setting_key='discovery_target_queue_depth'` still returns `30`.
