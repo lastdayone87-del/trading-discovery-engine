@@ -633,7 +633,8 @@ export type ProfilerRedirectFailure =
   | 'DNS_RESOLUTION_FAILED'
   | 'DNS_TIMEOUT'
   | 'REDIRECT_LOOP'
-  | 'REDIRECT_LIMIT';
+  | 'REDIRECT_LIMIT'
+  | 'CROSS_ORIGIN_REDIRECT';
 
 export interface ProfilerTransportFailure {
   name: string;
@@ -661,6 +662,9 @@ export interface ProfilerFetchOptions {
   terminalNotFoundBodyMaxChars?: number;
   /** Deadline for the 404/410 body probe. Defaults to 1500ms. */
   terminalNotFoundBodyTimeoutMs?: number;
+  /** When set, reject a redirect before contacting it if its resolved origin
+   * differs. Used by same-origin iframe traversal. */
+  allowedRedirectOrigin?: string;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -938,6 +942,24 @@ export async function fetchProfilerUrl(
           rejectedRedirect: location,
           redirectFailure: 'MALFORMED_LOCATION',
         };
+      }
+      if (options.allowedRedirectOrigin) {
+        let sameOrigin = false;
+        try { sameOrigin = new URL(nextUrl).origin === options.allowedRedirectOrigin; } catch { sameOrigin = false; }
+        if (!sameOrigin) {
+          await cancelRedirectBody(response);
+          return {
+            status: response.status,
+            contentType: response.headers.get('content-type') || '',
+            text: '',
+            truncated: false,
+            finalUrl: response.url || currentUrl,
+            redirectsFollowed,
+            redirectRejected: true,
+            rejectedRedirect: nextUrl,
+            redirectFailure: 'CROSS_ORIGIN_REDIRECT',
+          };
+        }
       }
       if (visited.has(nextUrl)) {
         // Loop: stop at the last safe URL instead of burning the hop budget.

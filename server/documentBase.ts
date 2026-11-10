@@ -65,15 +65,20 @@ function firstHtmlBaseHref($: cheerio.CheerioAPI): string {
  * Use this when the caller already loaded the HTML: it avoids parsing the same
  * page a second time just to find the first base href.
  */
-export function resolveDocumentBaseUrlFromRoot($: cheerio.CheerioAPI, finalUrl: string): string {
+export function resolveDocumentBaseUrlFromRoot(
+  $: cheerio.CheerioAPI,
+  finalUrl: string,
+  fallbackBase: string = finalUrl,
+): string {
+  const fallback = fallbackBase || finalUrl;
   try {
     const href = firstHtmlBaseHref($);
-    if (!href) return finalUrl;
-    const resolved = new URL(href, finalUrl);
-    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return finalUrl;
+    if (!href) return fallback;
+    const resolved = new URL(href, fallback);
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return fallback;
     return resolved.toString();
   } catch {
-    return finalUrl;
+    return fallback;
   }
 }
 
@@ -96,11 +101,11 @@ export function resolveDocumentBaseUrlFromRoot($: cheerio.CheerioAPI, finalUrl: 
  *
  * Pure and fail-closed: malformed HTML or URLs never throw.
  */
-export function resolveDocumentBaseUrl(html: string, finalUrl: string): string {
+export function resolveDocumentBaseUrl(html: string, finalUrl: string, fallbackBase?: string): string {
   try {
-    return resolveDocumentBaseUrlFromRoot(cheerio.load(String(html || '')), finalUrl);
+    return resolveDocumentBaseUrlFromRoot(cheerio.load(String(html || '')), finalUrl, fallbackBase);
   } catch {
-    return finalUrl;
+    return fallbackBase || finalUrl;
   }
 }
 

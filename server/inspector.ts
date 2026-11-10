@@ -405,7 +405,7 @@ function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): 
   return resolveHost ?? defaultDnsResolve;
 }
 
-async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>}> {
+async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
   // The end-to-end budget starts before the admission lookup. The lookup gets
   // only the remaining slice, and the following fetch gets what is left after
@@ -450,6 +450,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
     CRAWLER_FETCH_HEADERS,
     {
     maxHops:CRAWLER_MAX_REDIRECT_HOPS,
+    ...(allowedRedirectOrigin?{allowedRedirectOrigin}:{}),
     onTransportError:failure=>{transportFailure=failure;},
     // Preserve the pre-refactor acquisition contract: only read a final body
     // when it can be page content, or for the bounded 401/403 block-marker
@@ -503,6 +504,8 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
         // The hop budget is fixed and the same URL deterministically exhausts
         // it, so an identical refetch cannot complete. Never own retry work.
         return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:fetched.status,failureClass:'REDIRECT_LIMIT',detail:`Redirect hop limit reached (fixed ${CRAWLER_MAX_REDIRECT_HOPS}-hop budget; identical retry cannot complete)${target}`}};
+      case 'CROSS_ORIGIN_REDIRECT':
+        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:fetched.status,failureClass:'INVALID_REDIRECT',detail:`Blocked cross-origin redirect before contact${target}`}};
     }
   }
   if(fetched.redirectRejected){
@@ -538,7 +541,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
   return {page:{html:fetched.text,finalUrl:fetched.finalUrl,truncated:fetched.truncated}};
 }
 
-export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[];candidates:DiscordCandidate[];domainWeightShadows?:DomainWeightShadowEvaluation[];/** Terminal-success page URLs (finals) in visit order for the shared-evidence registry. Additive; absent on early failure paths. */visitedUrls?:string[];/** Root-page scored navigation targets (single-seed calls) for lender inventory. Additive. */rootNavigation?:Array<{url:string;score:number}>;/** P4 platform-community evidence observed while crawling (Whop/Skool/Circle/Patreon). Never an invite; absent means no evidence. */communityIntent?:CommunityIntentEvidence[]}
+export interface ExternalDiscordCrawlResult {foundInvite:string|null;foundLocation?:string;details:string;outcome:ExternalAcquisitionStatus;observations:ExternalAcquisitionObservation[];candidates:DiscordCandidate[];domainWeightShadows?:DomainWeightShadowEvaluation[];/** Terminal-success page URLs (finals) in visit order for the shared-evidence registry. Additive; absent on early failure paths. */visitedUrls?:string[];/** Root-page scored navigation targets (single-seed calls) for lender inventory. Additive. */rootNavigation?:Array<{url:string;score:number}>;/** P4 platform-community evidence observed while crawling (Whop/Skool/Circle/Patreon). Never an invite; absent means no evidence. */communityIntent?:CommunityIntentEvidence[];/** True when this seed contained same-origin/srcdoc frame content; shared-root reuse is refused so a borrower never skips an iframe-only invite. */hasIframeContent?:boolean}
 
 /**
  * Shared static lender inventory (v2 L1): terminal-success root inspections
@@ -578,8 +581,12 @@ export function isReusableStaticRootLender(result: {
   outcome: unknown;
   visitedUrls?: unknown;
   rootNavigation?: unknown;
+  hasIframeContent?: unknown;
 }): boolean {
   if (result.outcome !== 'INSPECTED_NO_MATCH' && result.outcome !== 'FOUND') return false;
+  // Frame traversal is not carried in the shared record; a borrower must fetch
+  // the root itself rather than inherit a potentially iframe-only miss.
+  if (result.hasIframeContent === true) return false;
   if (!Array.isArray(result.visitedUrls) || result.visitedUrls.length === 0) return false;
   return Array.isArray(result.rootNavigation);
 }
@@ -596,6 +603,7 @@ export function buildSharedStaticRootRecord(
     visitedUrls?: unknown;
     rootNavigation?: unknown;
     communityIntent?: CommunityIntentEvidence[];
+    hasIframeContent?: unknown;
   },
 ): SharedStaticRootRecord | null {
   if (!isReusableStaticRootLender(result)) return null;
@@ -638,7 +646,8 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
   const sharedKey=(u:string):string|null=>normalizeVisitUrl(u);
   const crawledUrls:string[]=[];
   let rootNavigation: Array<{ url: string; score: number }> | undefined;
-  const discordIframeSurfaces=new Map<string,{surface:DiscordPublicSurfaceRef;parentUrl:string}>();
+  const discordIframeSurfaces=new Map<string,{surface:DiscordPublicSurfaceRef;parentUrls:Set<string>}>();
+  let anyIframeContent=false;
   for(const rawUrl of links){
     if(!rawUrl||typeof rawUrl!=='string')continue;let url=rawUrl.trim();if(!url.startsWith('http://')&&!url.startsWith('https://'))url=`https://${url}`;
     // R6 admission boundary (shared): rejected candidates never reach scoring
@@ -753,7 +762,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     }
     crawledUrls.push(page.finalUrl);
 
-    const inspectPage=async (current:{html:string;finalUrl:string},depth:number,truncated=false,iframeDepth=0):Promise<Array<{url:string;score:number}>>=>{
+    const inspectPage=async (current:{html:string;finalUrl:string},depth:number,truncated=false,iframeDepth=0,inheritedBase?:string):Promise<Array<{url:string;score:number}>>=>{
       pagesInspected++;logDetails.push(`Successfully loaded ${current.finalUrl} (${current.html.length} bytes, depth ${depth})`);
       const pageCandidates=extractDiscordCandidates(`${current.finalUrl}\n${current.html}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);
       if(pageCandidates.length)seedFound=true;discovered.push(...pageCandidates);
@@ -768,7 +777,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       // Static navigation resolves against the document's <base href>, not
       // just the response URL, so a page served at /guide with
       // <base href="/community/"> and <a href="join"> visits /community/join.
-      const documentBase=resolveDocumentBaseUrlFromRoot($,current.finalUrl);
+      const documentBase=resolveDocumentBaseUrlFromRoot($,current.finalUrl,inheritedBase);
       $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;let absolute:URL|null=null;try{absolute=new URL(href,documentBase);}catch{/* keep the raw href for candidate extraction and reject below */}const anchorCandidates=extractDiscordCandidates(`${absolute?absolute.toString():href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){seedFound=true;for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}if(!absolute){drops.countUnique('invalid-protocol',href);return;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());return;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});});
       // The dynamic-target scanner also matches href values inside <base>
       // elements. Those values are resolution rules, not navigation targets;
@@ -802,42 +811,51 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         const rawSrc=node.attr('src');
         if(srcdoc===undefined&&!rawSrc)continue;
         const sandbox=node.attr('sandbox');
-        const sandboxedOpaque=sandbox!==undefined&&!/allow-same-origin/i.test(sandbox);
+        const sandboxTokens=(sandbox??'').trim().toLowerCase().split(/\s+/).filter(Boolean);
+        const sandboxedOpaque=sandbox!==undefined&&!sandboxTokens.includes('allow-same-origin');
         if(srcdoc!==undefined){
           if(sandboxedOpaque){logDetails.push('[iframe] skipped sandboxed srcdoc frame');continue;}
+          anyIframeContent=true;
           if(iframeDepth>=MAX_IFRAME_DEPTH){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push('[iframe] srcdoc depth cap reached');continue;}
-          if(iframeDocumentsInspected>=MAX_IFRAME_DOCUMENTS){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push('[iframe] srcdoc count cap reached');break;}
+          if(iframeDocumentsInspected>=MAX_IFRAME_DOCUMENTS){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push('[iframe] srcdoc count cap reached');continue;}
           iframeDocumentsInspected++;
-          const srcdocHtml=srcdoc.length>MAX_IFRAME_SRCDOC_CHARS?srcdoc.slice(0,MAX_IFRAME_SRCDOC_CHARS):srcdoc;
-          if(srcdoc.length>MAX_IFRAME_SRCDOC_CHARS){seedCeiling??='frame-slice';drops.count('frame-slice');}
-          const childNavigation=await inspectPage({html:srcdocHtml,finalUrl:`${current.finalUrl}#iframe-srcdoc-${frameIndex}`},depth,false,iframeDepth+1);
+          const srcdocTruncated=srcdoc.length>MAX_IFRAME_SRCDOC_CHARS;
+          const srcdocHtml=srcdocTruncated?srcdoc.slice(0,MAX_IFRAME_SRCDOC_CHARS):srcdoc;
+          if(srcdocTruncated){seedCeiling??='frame-slice';drops.count('frame-slice');truncatedResponse=true;}
+          const childNavigation=await inspectPage({html:srcdocHtml,finalUrl:`${current.finalUrl}#iframe-srcdoc-${frameIndex}`},depth,srcdocTruncated,iframeDepth+1,documentBase);
           navigation.push(...childNavigation);
           continue;
         }
         let absolute:string;
-        try{absolute=new URL(String(rawSrc),documentBase).toString();}catch{drops.countUnique('invalid-protocol',String(rawSrc));continue;}
+        try{absolute=new URL(String(rawSrc),documentBase).toString();}catch{seedCeiling??='frame-slice';drops.count('frame-slice');drops.countUnique('invalid-protocol',String(rawSrc));continue;}
         const discordSurface=discordPublicSurfaceFor(absolute);
         if(discordSurface){
-          if(discordIframeSurfaces.size<MAX_DISCORD_IFRAME_SURFACES&&!discordIframeSurfaces.has(discordSurface.canonicalUrl)){
-            discordIframeSurfaces.set(discordSurface.canonicalUrl,{surface:discordSurface,parentUrl:current.finalUrl});
-          }
+          anyIframeContent=true;
+          const existing=discordIframeSurfaces.get(discordSurface.canonicalUrl);
+          if(existing){existing.parentUrls.add(current.finalUrl);}
+          else if(discordIframeSurfaces.size<MAX_DISCORD_IFRAME_SURFACES){discordIframeSurfaces.set(discordSurface.canonicalUrl,{surface:discordSurface,parentUrls:new Set([current.finalUrl])});}
+          else{seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] Discord surface cap reached at ${absolute}`);}
           continue;
         }
         if(sandboxedOpaque){logDetails.push(`[iframe] skipped sandboxed same-origin candidate ${absolute}`);continue;}
         let frameOrigin='';let currentOrigin='';
-        try{frameOrigin=new URL(absolute).origin;currentOrigin=new URL(current.finalUrl).origin;}catch{drops.countUnique('invalid-protocol',absolute);continue;}
+        try{frameOrigin=new URL(absolute).origin;currentOrigin=new URL(current.finalUrl).origin;}catch{seedCeiling??='frame-slice';drops.count('frame-slice');drops.countUnique('invalid-protocol',absolute);continue;}
         if(frameOrigin!==currentOrigin){logDetails.push(`[iframe] skipped cross-origin frame ${absolute}`);continue;}
-        if(iframeDepth>=MAX_IFRAME_DEPTH){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] depth cap reached at ${absolute}`);continue;}
-        if(iframeDocumentsInspected>=MAX_IFRAME_DOCUMENTS){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] count cap reached at ${absolute}`);break;}
+        anyIframeContent=true;
         const normalized=normalizeVisitUrl(absolute)||absolute;
         if(visitedFrameUrls.has(normalized)){drops.count('already-visited');continue;}
+        if(iframeDepth>=MAX_IFRAME_DEPTH){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] depth cap reached at ${absolute}`);continue;}
+        if(iframeDocumentsInspected>=MAX_IFRAME_DOCUMENTS){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] count cap reached at ${absolute}`);continue;}
+        const frameAdmission=assessCrawlAdmission(absolute);
+        if(!frameAdmission.eligible){drops.countUnique('admission-rejected',absolute);continue;}
         visitedFrameUrls.add(normalized);
         iframeDocumentsInspected++;
-        const iframeAcquired=await fetchExternalPage(absolute,fetchImpl,resolveHost);
+        const iframeAcquired=await fetchExternalPage(absolute,fetchImpl,resolveHost,false,currentOrigin);
         if(!iframeAcquired.page){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] same-origin frame unavailable: ${absolute}`);continue;}
         let finalOrigin='';try{finalOrigin=new URL(iframeAcquired.page.finalUrl).origin;}catch{finalOrigin='';}
         if(finalOrigin!==currentOrigin){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] cross-origin redirect rejected: ${absolute} -> ${iframeAcquired.page.finalUrl}`);continue;}
-        if(iframeAcquired.page.truncated){seedCeiling??='response-cap';drops.count('response-cap');}
+        if(!assessCrawlAdmission(iframeAcquired.page.finalUrl).eligible){drops.countUnique('admission-rejected',iframeAcquired.page.finalUrl);continue;}
+        if(iframeAcquired.page.truncated){seedCeiling??='response-cap';drops.count('response-cap');truncatedResponse=true;}
         logDetails.push(`[iframe] inspected same-origin frame ${iframeAcquired.page.finalUrl} (${iframeAcquired.page.html.length} bytes, depth ${iframeDepth+1})`);
         crawledUrls.push(iframeAcquired.page.finalUrl);
         const childNavigation=await inspectPage({html:iframeAcquired.page.html,finalUrl:iframeAcquired.page.finalUrl},depth,iframeAcquired.page.truncated,iframeDepth+1);
@@ -975,25 +993,31 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     }
     }catch(error:any){logDetails.push(`Isolated acquisition error for ${String(rawUrl)}: ${error instanceof Error?error.message:String(error)}; continuing to next candidate.`);observations.push({requestedUrl:String(rawUrl||'unknown'),wrapperUrl,surface,required,rootUrl:String(rawUrl||'unknown'),outcome:'ACQUISITION_FAILED',retryable:true,failureClass:'ISOLATED_ACQUISITION_ERROR',detail:`Per-URL failure isolated; remaining candidates continue: ${error instanceof Error?error.message:String(error)}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}
   }
-  for(const {surface:ref,parentUrl} of discordIframeSurfaces.values()){
+  for(const {surface:ref,parentUrls} of discordIframeSurfaces.values()){
     const acquired=await acquireDiscordPublicSurface({surface:ref,sourceSurface:surface,fetchImpl,resolveHost});
+    const parents=Array.from(parentUrls);
+    for(const parentUrl of parents){
+      for(const candidate of acquired.candidates){
+        candidate.observations=[...(candidate.observations||[]),{sourceSurface:surface,sourceUrl:parentUrl,rawLocator:candidate.rawLocator,sourcePageUrl:parentUrl,extractionConfidence:'EXPLICIT'}];
+      }
+    }
     discovered.push(...acquired.candidates);
     observations.push({
       requestedUrl:ref.canonicalUrl,
       surface,
-      required:true,
-      rootUrl:parentUrl,
+      required,
+      rootUrl:parents[0],
       outcome:acquired.outcome,
       retryable:acquired.retryable,
       failureClass:acquired.failureClass,
-      detail:`Discord ${ref.kind==='WIDGET'?'widget':'server page'} from same-page iframe: ${acquired.detail}`,
+      detail:`Discord ${ref.kind==='WIDGET'?'widget':'server page'} from same-page iframe (${parents.length} embedding page(s)): ${acquired.detail}`,
       observedAt:new Date().toISOString(),
       telemetry:{...staticCrawlerTelemetry({pagesInspected:acquired.pagesInspected,redirectsFollowed:0}),requestsStarted:Math.max(0,acquired.requestsStarted)},
     });
   }
   const candidates=mergeDiscordCandidates(discovered);const failed=observations.filter(item=>item.outcome==='ACQUISITION_FAILED').length,inspected=observations.filter(item=>item.outcome==='INSPECTED_NO_MATCH').length,partial=observations.filter(item=>item.outcome==='PARTIALLY_INSPECTED').length,found=observations.some(item=>item.outcome==='FOUND');const outcome:ExternalAcquisitionStatus=found?'FOUND':(failed&&inspected)||partial>0?'PARTIALLY_INSPECTED':failed?'ACQUISITION_FAILED':'INSPECTED_NO_MATCH';
   logDetails.push(`Crawled ${scannedCount} external link(s); retained ${candidates.length} distinct Discord candidate(s).`);
-  return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:logDetails.join('\n'),outcome,observations,candidates,domainWeightShadows,visitedUrls:crawledUrls,rootNavigation,communityIntent:communityIntents};
+  return {foundInvite:candidates[0]?.nativeInviteCode||null,foundLocation:candidates[0]?.sourceUrl,details:logDetails.join('\n'),outcome,observations,candidates,domainWeightShadows,visitedUrls:crawledUrls,rootNavigation,communityIntent:communityIntents,hasIframeContent:anyIframeContent};
 }
 
 /**
