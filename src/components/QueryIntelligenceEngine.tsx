@@ -313,12 +313,6 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
     return () => clearInterval(interval);
   }, [selectedCountry, selectedCollection, activeSubTab, extractedOffset, extractedSnapshot]);
 
-  // Page numbers belong to a country. Reset them when the filter changes.
-  useEffect(() => {
-    setExtractedOffset(0);
-    setExtractedSnapshot(null);
-  }, [selectedCountry]);
-
   // Handle Pause / Resume toggle
   const handleTogglePause = async () => {
     setIsPauseToggling(true);
@@ -760,7 +754,13 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
               </span>
               <select
                 value={selectedCountry}
-                onChange={e => setSelectedCountry(e.target.value)}
+                onChange={e => {
+                  // Batch the filter and ledger-page resets so country changes
+                  // issue one dashboard fetch, not an old-page fetch plus a reset.
+                  setSelectedCountry(e.target.value);
+                  setExtractedOffset(0);
+                  setExtractedSnapshot(null);
+                }}
                 className="px-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-xs font-semibold rounded-xl focus:outline-hidden focus:ring-2 focus:ring-indigo-500"
               >
                 <option value="All">All Countries</option>
