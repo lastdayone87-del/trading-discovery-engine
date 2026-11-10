@@ -66,8 +66,7 @@ function text(row: Row): string {
 }
 
 function increment(map: Record<string, number>, key: string | undefined): void {
-  if (!key) return;
-  map[key] = (map[key] || 0) + 1;
+  map[key || 'MISSING'] = (map[key || 'MISSING'] || 0) + 1;
 }
 
 const inputPath = process.argv[2];
@@ -84,7 +83,12 @@ lines.forEach((line, index) => {
   const trimmed = line.trim();
   if (!trimmed) return;
   try {
-    rows.push(JSON.parse(trimmed) as Row);
+    const parsed: unknown = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      invalidRows.push({ line: index + 1, error: 'Expected a JSON object' });
+      return;
+    }
+    rows.push(parsed as Row);
   } catch (error) {
     invalidRows.push({ line: index + 1, error: error instanceof Error ? error.message : String(error) });
   }

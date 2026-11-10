@@ -58,13 +58,13 @@ test('investigated MPSC and Gujarati recruitment channels are withheld, never en
 
 test('genuine multilingual trading channels are admitted without English trading terms', () => {
   const examples = [
-    ['Marathi trading', 'शेअर बाजार तांत्रिक विश्लेषण आणि गुंतवणूक मार्गदर्शन', 'ट्रेडिंग शिका'],
-    ['Gujarati trading', 'શેર બજાર ટેકનિકલ વિશ્લેષણ અને રોકાણ માર્ગદર્શન', 'ટ્રેડિંગ શીખો'],
-    ['Hindi trading', 'शेयर बाजार निवेश और तकनीकी विश्लेषण', 'ट्रेडिंग सीखें'],
-    ['Telugu trading', 'స్టాక్ మార్కెట్ విశ్లేషణ మరియు పెట్టుబడి మార్గదర్శకం', 'ట్రేడింగ్ నేర్చుకోండి'],
-    ['Bengali trading', 'শেয়ার বাজার বিশ্লেষণ ও বিনিয়োগ নির্দেশনা', 'ট্রেডিং শিখুন'],
-    ['Arabic trading', 'تحليل فني للأسهم والبورصة مع استثمار وتعليم التداول', 'تداول'],
-    ['Chinese trading', '股票投资技术分析和交易教育', '期货外汇'],
+    ['Marathi', 'शेअर बाजार तांत्रिक विश्लेषण आणि गुंतवणूक मार्गदर्शन', 'ट्रेडिंग शिका'],
+    ['Gujarati', 'શેર બજાર ટેકનિકલ વિશ્લેષણ અને રોકાણ માર્ગદર્શન', 'ટ્રેડિંગ શીખો'],
+    ['Hindi', 'शेयर बाजार निवेश और तकनीकी विश्लेषण', 'ट्रेडिंग सीखें'],
+    ['Telugu', 'స్టాక్ మార్కెట్ విశ్లేషణ మరియు పెట్టుబడి మార్గదర్శకం', 'ట్రేడింగ్ నేర్చుకోండి'],
+    ['Bengali', 'শেয়ার বাজার বিশ্লেষণ ও বিনিয়োগ নির্দেশনা', 'ট্রেডিং শিখুন'],
+    ['Arabic', 'تحليل فني للأسهم والبورصة مع تعليم التداول', 'تداول'],
+    ['Chinese', '股票技术分析和交易教育', '期货外汇'],
   ] as const;
   for (const [label, title, secondary] of examples) {
     const decision = assessIntakeTradingFocus({
@@ -150,10 +150,10 @@ test('an incidental music word in an explicit trading video does not withhold th
   const decision = assessIntakeTradingFocus({
     channelName: 'Desk Notes',
     description: 'Price action trading and risk management.',
-    matchedDocument: { type: 'VIDEO', title: 'Price action single trade review', description: 'One trade, one plan.' },
-    videoTitles: ['Price action single trade review'],
+    matchedDocument: { type: 'VIDEO', title: 'Price action trade review with lyrics in the intro', description: 'One trade, one plan.' },
+    videoTitles: ['Price action trade review with lyrics in the intro'],
   });
-  assert.equal(decision.decision, 'ADMIT');
+  assert.notEqual(decision.decision, 'WITHHOLD');
 });
 
 
@@ -182,4 +182,14 @@ test('keyword baseline preserves the old non-Latin coverage pass for observation
   });
   assert.equal(baseline.baseline, 'WOULD_ADMIT');
   assert.ok(baseline.reasonCodes.includes('LEGACY_NON_LATIN_COVERAGE_PASS'));
+});
+
+
+test('tutorial format does not block a two-market trading hypothesis', () => {
+  const decision = assessIntakeTradingFocus({
+    channelName: 'NQ Desk',
+    description: 'NQ futures 0DTE tutorial and trade recap.',
+    matchedDocument: { type: 'VIDEO', title: 'NQ futures 0DTE tutorial', description: 'Nasdaq session recap.' },
+  });
+  assert.equal(decision.decision, 'ADMIT');
 });

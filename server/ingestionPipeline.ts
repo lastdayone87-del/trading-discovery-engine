@@ -646,21 +646,6 @@ async function processChannelThroughPipelineInContext(
   // channels table trigger would rewrite an unbacked NEEDS_REVIEW back to
   // ENRICHMENT_PENDING. A later rediscovery/review carries fresh evidence.
   if (retrievalTriage.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE') {
-    if (existing && (existing.trading_status === 'TRADING_CONFIRMED' || existing.scan_status === 'COMPLETED' || isTerminalState(existing))) {
-      return {
-        channelId: candidate.channelId,
-        channelName: candidate.channelName,
-        isNew: false,
-        wasKnown: true,
-        persisted: true,
-        countryStatus: existing.country_status as IngestionPipelineOutcome['countryStatus'],
-        detectedCountry: existing.country || null,
-        tradingStatus: existing.trading_status || 'UNCERTAIN',
-        discordStatus: existing.discord_status,
-        discordInvite: existing.discord_invite || null,
-        channelRecord: existing,
-      };
-    }
     console.log(`[Unified Ingestion Pipeline - Triage] Deferring '${candidate.channelName}' from enrichment: ${retrievalTriage.reasonCodes.join(', ')}.`);
     void recordAdmissionShadow({
       channelId:candidate.channelId, priorState:'NOT_EVALUATED', classificationStatus:'UNCERTAIN', investigationState:'DEFERRED',
@@ -688,6 +673,52 @@ async function processChannelThroughPipelineInContext(
       console.warn(`[Unified Ingestion Pipeline - Triage] Country validation failed for deferred '${candidate.channelName}'; preserving intake deferral:`, error instanceof Error ? error.message : error);
     }
     const deferredCreatorCountry = deferredCountry?.detectedCreatorCountry || existing?.country || '';
+    if (existing && (existing.trading_status === 'TRADING_CONFIRMED' || existing.scan_status === 'COMPLETED' || isTerminalState(existing))) {
+      // Preserve the trading decision but never skip fresh country evidence.
+      if (deferredCountry?.status === 'REJECTED' && deferredCreatorCountry) {
+        const preserved = { ...existing };
+        applyGate1CountryRejectionToExisting(preserved, {
+          creatorCountry: deferredCreatorCountry,
+          score: deferredCountry.score,
+          validationStep: {
+            step: 'COUNTRY_VALIDATION',
+            title: `Country Validation (${deferredCreatorCountry})`,
+            status: 'REJECTED',
+            details: deferredCountry.decisionLogs,
+            timestamp: now,
+          },
+          now,
+        }, candidate);
+        await upsertChannel(preserved);
+        return {
+          channelId: candidate.channelId,
+          channelName: candidate.channelName,
+          isNew: false,
+          wasKnown: true,
+          persisted: true,
+          countryStatus: 'REJECTED',
+          detectedCountry: deferredCreatorCountry,
+          rejectionReason: deferredCountry.rejectionReason,
+          tradingStatus: preserved.trading_status || 'UNCERTAIN',
+          discordStatus: preserved.discord_status,
+          discordInvite: preserved.discord_invite || null,
+          channelRecord: preserved,
+        };
+      }
+      return {
+        channelId: candidate.channelId,
+        channelName: candidate.channelName,
+        isNew: false,
+        wasKnown: true,
+        persisted: true,
+        countryStatus: existing.country_status as IngestionPipelineOutcome['countryStatus'],
+        detectedCountry: existing.country || null,
+        tradingStatus: existing.trading_status || 'UNCERTAIN',
+        discordStatus: existing.discord_status,
+        discordInvite: existing.discord_invite || null,
+        channelRecord: existing,
+      };
+    }
     const intakeChannel = buildDeferredTradingIntakeChannel(
       candidate,
       existing,

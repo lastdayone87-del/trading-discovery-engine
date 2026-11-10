@@ -237,7 +237,11 @@ export function assessIntakeTradingFocus(input: IntakeTradingFocusInput): Intake
   // Multiple independent market-context families can establish a bounded
   // hypothesis (for example NQ futures + options), but one broad product word
   // alone is intentionally insufficient for canonical admission.
-  if (new Set(market).size >= 2 && !soft.length && !additional.length) {
+  // Lesson/coaching format words are not evidence against a concrete market
+  // hypothesis established by two independent market families. They still
+  // block a single ambiguous market word below.
+  const blockingSoft = soft.filter(name => name !== 'EDUCATION_FORMAT');
+  if (new Set(market).size >= 2 && !blockingSoft.length && !additional.length) {
     return decision('ADMIT', ['MULTIPLE_MARKET_CONTEXT_SIGNALS_CORROBORATE_RETRIEVAL'], positiveFamilies, negativeFamilies, matchedSignals);
   }
 
