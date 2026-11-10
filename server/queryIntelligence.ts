@@ -44,7 +44,7 @@ import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 import { assertCountryAllowed } from './countryExclusion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
-import { normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery, shouldGenerateNativeQueries } from './queryPlanner';
+import { isForbiddenProseQuery, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery, shouldGenerateNativeQueries } from './queryPlanner';
 import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
 import { isRewardEligibleQuota } from './queryQuality/accounting';
 import { selectionHistoryFor } from './queryQuality/composition';
@@ -70,7 +70,7 @@ import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCa
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
-import { isNuisanceVocabularySurface, reviewedNativePhraseLanguages } from './terminologySearchability';
+import { isExtractedStandaloneQuery, isNuisanceVocabularySurface, reviewedNativePhraseLanguages } from './terminologySearchability';
 import { assessLlmQueryCandidates, deriveDeterministicQueryCandidates, type ExtractedQueryCandidate, type ExtractedQuerySource } from './extractedQueryDiscovery';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
@@ -1863,6 +1863,22 @@ function buildSelectionResult(
 // 4. CANDIDATE QUERY GENERATOR
 // ==========================================
 
+/**
+ * Whether an accepted ledger row can be offered to the planner. Ineligible
+ * rows are rotated without consuming the bounded extracted-query offer.
+ */
+export function isOfferableExtractedCandidate(
+  candidate: { candidateText: string; language: string },
+  country: string,
+): boolean {
+  return !isForbiddenProseQuery(candidate.candidateText)
+    && isExtractedStandaloneQuery({
+      term: candidate.candidateText,
+      country,
+      language: candidate.language,
+    });
+}
+
 /** Generates auditable, compact candidates led by retrieval atoms and proven terminology. */
 export async function generateCandidateQueriesForCountry(
   country: string,
@@ -1907,18 +1923,28 @@ export async function generateCandidateQueriesForCountry(
       }
     }
   };
-  const pendingExtractedCandidates = [];
+  const eligibleExtractedCandidates = [];
+  const ineligibleExtractedCandidates = [];
   for (const candidate of standaloneExtractedCandidates) {
     const existingId = existingQueryLinks.get(normalizeQuery(candidate.candidateText));
     if (existingId) {
       await linkCandidate(candidate.id, existingId);
       continue;
     }
-    pendingExtractedCandidates.push(candidate);
+    const eligible = isOfferableExtractedCandidate(candidate, country);
+    (eligible ? eligibleExtractedCandidates : ineligibleExtractedCandidates).push(candidate);
   }
-  // Only the bounded offer is marked attempted. Unoffered rows stay fresh for
-  // the next batch instead of waiting out the rotation cooldown.
-  const extractedOffer = pendingExtractedCandidates.slice(0, Math.max(0, Math.floor(count * 0.4)));
+  // Ineligible rows rotate out without consuming the 40% offer. Otherwise a
+  // run of permanently invalid high-confidence rows would starve fresh
+  // candidates one cooldown cycle at a time.
+  if (ineligibleExtractedCandidates.length) {
+    await markExtractedQueryCandidatesAttempted(ineligibleExtractedCandidates.map(candidate => candidate.id)).catch(error => {
+      console.warn('[Extracted Query] failed to rotate ineligible candidates', error instanceof Error ? error.message : String(error));
+    });
+  }
+  // Only the bounded eligible offer is marked attempted. Unoffered rows stay
+  // fresh for the next batch instead of waiting out the rotation cooldown.
+  const extractedOffer = eligibleExtractedCandidates.slice(0, Math.max(0, Math.floor(count * 0.4)));
   if (extractedOffer.length) {
     await markExtractedQueryCandidatesAttempted(extractedOffer.map(candidate => candidate.id)).catch(error => {
       console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));

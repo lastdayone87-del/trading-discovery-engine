@@ -33,6 +33,7 @@ import {
   replayVocabularyForRetry,
   admitNativeCandidates,
   selectComplementaryPlaylists,
+  isOfferableExtractedCandidate,
   alignVideoIdsToTitles,
   buildLiteralSources,
   defaultReconcileExtractedTerm,
@@ -2506,6 +2507,12 @@ test('rule-admitted instruments are filtered from AI candidates', () => {
   assert.equal(excludeRuleAdmittedInstruments(undefined, ruleObserved), undefined);
   const source = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
   assert.match(source, /excludeRuleAdmittedInstruments\(values, ruleObserved\)/);
+});
+
+test('ineligible extracted rows rotate without consuming the offer', () => {
+  assert.equal(isOfferableExtractedCandidate({ candidateText: 'DAX Orderflow Strategie', language: 'de' }, 'Germany'), true);
+  assert.equal(isOfferableExtractedCandidate({ candidateText: 'weekly trade breakdown', language: 'en' }, 'United States'), false);
+  assert.equal(isOfferableExtractedCandidate({ candidateText: 'தங்கம் விலை பகுப்பாய்வு', language: 'ta' }, 'Singapore'), true);
 });
 
 test('playlists never trigger extraction without video evidence', () => {
