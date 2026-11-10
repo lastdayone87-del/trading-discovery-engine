@@ -2170,7 +2170,6 @@ export interface ExtractedQueryCandidateRecord {
   decision: 'ACCEPTED' | 'REJECTED';
   rejectionReasons: string[];
   standaloneEligible: boolean;
-  duplicateOf: number | null;
   duplicateCount: number;
   duplicateSources: Array<{ kind?: string; channelId?: string | null; videoId?: string | null; title?: string | null }>;
   queryId: number | null;
@@ -2268,7 +2267,7 @@ function mapExtractedCandidate(row: any): ExtractedQueryCandidateRecord {
     intent: String(row.intent || 'strategy'), confidence: Number(row.confidence || 0),
     decision: row.decision === 'ACCEPTED' ? 'ACCEPTED' : 'REJECTED',
     rejectionReasons: Array.isArray(row.rejection_reasons) ? row.rejection_reasons.map(String) : [],
-    standaloneEligible: row.standalone_eligible === true, duplicateOf: row.duplicate_of ? Number(row.duplicate_of) : null,
+    standaloneEligible: row.standalone_eligible === true,
     duplicateCount: Number(row.duplicate_count || 0),
     duplicateSources: Array.isArray(row.duplicate_sources) ? row.duplicate_sources : [],
     queryId: row.query_id ? Number(row.query_id) : null, createdAt: iso(row.created_at) || '',
@@ -2284,7 +2283,7 @@ export async function getStandaloneExtractedQueryCandidates(country: string, lim
   const res = await db.query(
     `SELECT c.* FROM extracted_query_candidates c
      WHERE c.country=$1 AND c.decision='ACCEPTED' AND c.standalone_eligible=true
-       AND c.duplicate_of IS NULL AND c.query_id IS NULL
+       AND c.query_id IS NULL
        AND (c.last_attempted_at IS NULL OR c.last_attempted_at < now() - interval '1 hour')
        AND NOT EXISTS (
          SELECT 1 FROM query_library ql
@@ -2342,11 +2341,11 @@ export async function getExtractedQueryCandidates(country?: string, limit = 100,
   const skipped = Math.max(0, Math.min(100000, Math.trunc(offset)));
   const res = await db.query(
     `SELECT c.*, ql.collection,
-       COALESCE(r.runs,0)::int AS runs, COALESCE(r.quota,0)::int AS quota,
+       COALESCE(r.runs,0)::int AS runs, COALESCE(r.quota,0)::float AS quota,
        COALESCE(l.new_channels,0)::int AS new_channels, COALESCE(l.quality_creators,0)::int AS quality_creators
      FROM extracted_query_candidates c
      LEFT JOIN query_library ql ON ql.id=c.query_id
-     LEFT JOIN LATERAL (SELECT count(*)::int runs, COALESCE(SUM(quota_used),0)::int quota FROM query_runs WHERE query_id=c.query_id) r ON true
+     LEFT JOIN LATERAL (SELECT count(*)::int runs, COALESCE(SUM(quota_used),0)::float/100.0 AS quota FROM query_runs WHERE query_id=c.query_id) r ON true
      LEFT JOIN LATERAL (SELECT COALESCE(SUM(unique_new_channels),0)::int new_channels, COALESCE(SUM(quality_creators_discovered),0)::int quality_creators FROM query_execution_logs WHERE query_id=c.query_id) l ON true
      WHERE ($1::text IS NULL OR LOWER(c.country)=LOWER($1))
      ORDER BY c.created_at DESC, c.id DESC LIMIT $2 OFFSET $3`,

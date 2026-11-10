@@ -124,24 +124,29 @@ function requiresTradingSemantics(provenance: string | undefined): boolean {
   return !GOVERNED_LICENSED_PROVENANCE.test(String(provenance || ''));
 }
 
-function gateAtom(atom: QueryAtom): ReturnType<typeof isSearchableTradingTerm> {
+function gateAtom(
+  atom: QueryAtom,
+  extractedStandalone = false,
+): ReturnType<typeof isSearchableTradingTerm> {
   return isSearchableTradingTerm({
     term: atom.term,
     termType: gateTypeFor(atom.sense.type),
     country: atom.sense.country,
     language: atom.sense.language,
-    // Extracted standalone candidates already proved trading intent in the
-    // ledger gate, including unspaced native scripts the English lexicon
-    // cannot attest. Every other provenance keeps the normal semantics gate.
-    requireTradingSemantics: atom.provenance === 'EXTRACTED_STANDALONE'
-      ? false
-      : requiresTradingSemantics(atom.provenance),
+    // Only a whole-query, single-atom extracted candidate carries its ledger
+    // proof. A mixed candidate with one tagged atom must not bypass semantics.
+    requireTradingSemantics: extractedStandalone ? false : requiresTradingSemantics(atom.provenance),
     // The legacy bridge uses the stored query as one atom; it may be longer
-    // than a normal atom without becoming an unbounded term. Extracted
-    // standalone candidates already passed the 2–6 token ledger gate.
+    // than a normal atom without becoming an unbounded term.
     allowExtendedTokens: atom.provenance === 'LEGACY_COMPATIBILITY',
-    maxTokens: atom.provenance === 'EXTRACTED_STANDALONE' ? 6 : undefined,
+    maxTokens: extractedStandalone ? 6 : undefined,
   });
+}
+
+function isExtractedStandaloneCandidate(candidate: QueryCandidate): boolean {
+  return candidate.atoms.length === 1
+    && candidate.atoms[0].provenance === 'EXTRACTED_STANDALONE'
+    && normalizeCompositionTerm(candidate.atoms[0].term) === normalizeCompositionTerm(candidate.query);
 }
 
 function attestationMatches(attestation: TermAttestation, sense: TermSense, profile: CountryMarketProfile): boolean {
@@ -156,12 +161,13 @@ function attestationMatches(attestation: TermAttestation, sense: TermSense, prof
 export function resolveCompositionTier(candidate: QueryCandidate, context: CompositionContext): QueryCompositionTier {
   const profile = context.profile || getCountryMarketProfile(candidate.country);
   const attestations = context.attestations || [];
+  const extractedStandalone = isExtractedStandaloneCandidate(candidate);
   const exact = candidate.atoms.every(atom => attestations.some(attestation => attestation.kind === 'EXACT' && attestationMatches(attestation, atom.sense, profile)));
   if (exact && candidate.atoms.length > 0) return 'ATTESTED_EXACT';
   const licensed = candidate.atoms.length > 0 && candidate.atoms.every(atom =>
     profile.languages.includes(atom.sense.language)
     && (atom.sense.country === candidate.country || atom.sense.country === 'GLOBAL')
-    && gateAtom(atom).eligible
+    && gateAtom(atom, extractedStandalone).eligible
   );
   if (licensed) return 'LICENSED_UNSEEN';
   return 'SPECULATIVE';
@@ -286,9 +292,7 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   const reviewedNativePhrase = candidate.atoms.length === 1
     && isReviewedNativePhrase(normalized)
     && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
-  const extractedStandalone = candidate.atoms.length === 1
-    && candidate.atoms[0].provenance === 'EXTRACTED_STANDALONE'
-    && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
+  const extractedStandalone = isExtractedStandaloneCandidate(candidate);
 
   if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
   // Registration only proves the country is known to the fixture. Dormant
@@ -321,7 +325,7 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
     if (!profile.languages.includes(candidate.language)) reasons.push('LANGUAGE_MISMATCH');
     if (atom.sense.market && !profile.markets.includes(atom.sense.market)) reasons.push('MARKET_MISMATCH');
     if (atom.sense.market && candidate.market && atom.sense.market !== candidate.market) reasons.push('CROSS_MARKET_ATOM');
-    const gate = gateAtom(atom);
+    const gate = gateAtom(atom, extractedStandalone);
     if (!gate.eligible) reasons.push(...gate.reasons.map(reason => `TERM_${reason.toUpperCase().replace(/-/g, '_')}`));
   }
 

@@ -190,6 +190,7 @@ export function languageScript(language: string): LanguageScript {
     case 'ko': return 'Hang';
     case 'ru': return 'Cyrl';
     case 'hi': return 'Deva';
+    case 'ta': return 'Taml';
     case 'en': case 'fr': case 'de': case 'nl': case 'da': case 'sv': case 'no':
     case 'es': case 'it': case 'pt': case 'lb': return 'Latn';
     default: return 'Zyyy';

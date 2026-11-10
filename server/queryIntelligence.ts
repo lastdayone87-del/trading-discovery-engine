@@ -768,6 +768,9 @@ export function isAdmissibleParsed(
   if (vocabularyAdmissible) return true;
   // The queries bucket has its own shape/intent/grounding rules. A literal but
   // unusable query (for example "live") must not suppress provider fallback.
+  // An admissible query-only response is still useful: the caller persists it
+  // through the extracted-query ledger, even though it does not create
+  // canonical terminology evidence.
   if (!ctx.country || !Array.isArray(parsed.queries)) return false;
   const sources = ctx.sources
     .filter(source => source.kind !== 'CHANNEL_NAME')
@@ -1069,6 +1072,7 @@ Return ONLY a valid JSON object with format:
       channel.channel_name,
       effDesc,
       ...effTitles,
+      ...effectivePlaylists.flatMap(playlist => [playlist.name, playlist.description || '']),
       languageContext?.language,
       languageContext?.locale,
     ]);

@@ -47,11 +47,11 @@ export interface ExtractedQueryAssessment {
 }
 
 const PROMO_PATTERNS: RegExp[] = [
-  /\b(free|gratis|gratuit|kostenlos|gratuita)\b/iu,
-  /\b(subscribe|abonne|abonnieren|suscr[ií]bete|like|follow|join|rejoindre|beitreten)\b/iu,
-  /\b(telegram|whatsapp|discord|link|bio|giveaway|promo|discount|offer)\b/iu,
+  /\b(free\s+(signals?|money|course|group|access|training|webinar)|gratis|gratuit|kostenlos|gratuita)\b/iu,
+  /\b(subscribe|abonne|abonnieren|suscr[ií]bete|rejoindre|beitreten|follow me|join (my|our|the) (group|channel|telegram|discord))\b/iu,
+  /\b(telegram|whatsapp|discord|link in bio|giveaway|promo|discount|offer)\b/iu,
   /\b(episode|ep|part|pt|vol|volume|season|saison|temporada|staffel)\s*#?\d+/iu,
-  /\b\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?\b/u,
+  /\b(?:0?[1-9]|[12]\d|3[01])[\/.-](?:0?[1-9]|1[0-2])[\/.-]\d{2,4}\b/u,
   /\b(20\d{2})\b/u,
   // Native promotional markers matter most on unspaced scripts, where the
   // Latin word-boundary patterns above cannot see them.
@@ -64,6 +64,7 @@ const CLICKBAIT_PATTERNS: RegExp[] = [
 ];
 const CTA_FORMAT = /\b(click|watch|download|notification|bell|button|shorts?|reels?|vlog|podcast|interview)\b/iu;
 const EMOJI_OR_SYMBOL = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/u;
+const EMOJI_OR_SYMBOL_GLOBAL = new RegExp(EMOJI_OR_SYMBOL.source, 'gu');
 const LEADING_STOPWORDS = new Set([
   'uh', 'oh', 'is', 'the', 'a', 'an', 'how', 'to', 'of', 'in', 'on', 'for', 'with', 'and', 'or',
   'de', 'la', 'le', 'les', 'du', 'des', 'et', 'der', 'die', 'das', 'und', 'het', 'een', 'van', 'en',
@@ -137,7 +138,7 @@ export function normalizeExtractedCandidate(text: string): string {
     .normalize('NFKC')
     .replace(/https?:\/\/\S+/giu, ' ')
     .replace(/[@#]\S*/gu, ' ')
-    .replace(EMOJI_OR_SYMBOL, ' ')
+    .replace(EMOJI_OR_SYMBOL_GLOBAL, ' ')
     .replace(/[\u200B-\u200D\uFEFF]/gu, '')
     .replace(/\s+/gu, ' ')
     .replace(/^[\s\-–—:|•·!?.,]+|[\s\-–—:|•·!?.,]+$/gu, '')
@@ -300,14 +301,14 @@ export function assessExtractedQueryCandidateDetailed(input: {
   if (!candidateText) {
     reasons.push('EMPTY');
   } else {
-    if (candidateText.length < 4) reasons.push('TOO_SHORT');
+    const unspaced = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(candidateText);
+    if (candidateText.length < (unspaced ? 2 : 4)) reasons.push('TOO_SHORT');
     if (candidateText.length > 80) reasons.push('TOO_LONG');
     if (EMOJI_OR_SYMBOL.test(candidateText) || /[@#]/u.test(candidateText)) reasons.push('EMOJI_OR_HASHTAG');
     if (CTA_FORMAT.test(candidateText)) reasons.push('CTA_FORMAT');
     if (isClickbait(candidateText)) reasons.push('CLICKBAIT');
     if (PROMO_PATTERNS.some(pattern => pattern.test(candidateText))) reasons.push('PROMO');
 
-    const unspaced = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(candidateText);
     const words = candidateText.split(/\s+/gu).filter(Boolean);
     if (words.length < (unspaced ? 1 : 2)) reasons.push('TOO_FEW_WORDS');
     if (words.length > 6) reasons.push('TOO_MANY_WORDS');
@@ -474,7 +475,16 @@ export function deriveDeterministicQueryCandidates(args: {
     }
     let perSource = 0;
     for (const segment of segments) {
-      for (const window of segmentWindows(segment)) {
+      const windows = segmentWindows(segment);
+      if (!windows.length) {
+        emitRejection(sink, {
+          text: segment, country: args.country, language: args.language,
+          sourceKind: source.kind, sourceIndex: source.index, sourceVideoId: source.videoId,
+          sourceTitle: source.text, reasons: ['NO_QUERY_WINDOW'],
+        });
+        continue;
+      }
+      for (const window of windows) {
         if (out.size >= max || perSource >= 4) break;
         const assessment = assessExtractedQueryCandidateDetailed({
           text: window, country: args.country, language: args.language,

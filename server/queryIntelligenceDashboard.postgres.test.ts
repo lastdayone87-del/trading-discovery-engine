@@ -145,13 +145,14 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
   process.env.PGSSL = 'disable';
   const db = await getDb();
   const suffix = `extracted-ledger-${Date.now()}-${process.pid}`;
+  const testCountry = `Test ${suffix}`;
   let reconciledQueryId: number | null = null;
   try {
     const candidate = {
       candidateKey: `${suffix}-key`,
       candidateText: 'Weekly trade analysis',
       normalizedText: 'weekly trade analysis',
-      country: 'United States',
+      country: testCountry,
       language: 'en',
       script: 'Latn',
       sourceKind: 'VIDEO_TITLE',
@@ -173,14 +174,14 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
       [candidate.candidateKey],
     )).rows[0].duplicate_count;
     assert.equal(Number(duplicateCount), 1);
-    const standalone = await getStandaloneExtractedQueryCandidates('United States', 50);
+    const standalone = await getStandaloneExtractedQueryCandidates(testCountry, 50);
     assert.ok(standalone.some(row => row.candidateKey === candidate.candidateKey));
     const candidateId = standalone.find(row => row.candidateKey === candidate.candidateKey)!.id;
     // A transient pre-link failure self-heals from existing query text.
     const reconciledQuery = await db.query(
       `INSERT INTO query_library(query,country,collection,intent,normalized_query,performance_score,times_executed)
-       VALUES($1,'United States','EXPERIMENTAL','GENERAL',$2,0,0) RETURNING id`,
-      [`${suffix} reconciled query`, 'matching normalized text'],
+       VALUES($1,$3,'EXPERIMENTAL','GENERAL',$2,0,0) RETURNING id`,
+      [`${suffix} reconciled query`, 'matching normalized text', testCountry],
     );
     reconciledQueryId = Number(reconciledQuery.rows[0].id);
     await persistExtractedQueryCandidates([{
@@ -189,17 +190,17 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
       candidateText: 'Matching normalized text',
       normalizedText: 'matching normalized text',
     }]);
-    assert.ok(await reconcileExtractedQueryCandidates('United States') >= 1);
+    assert.ok(await reconcileExtractedQueryCandidates(testCountry) >= 1);
     const reconciledRow = await db.query(
       'SELECT query_id FROM extracted_query_candidates WHERE candidate_key=$1',
       [`${suffix}-reconciled`],
     );
     assert.equal(Number(reconciledRow.rows[0].query_id), reconciledQueryId);
     await markExtractedQueryCandidatesAttempted([candidateId]);
-    const rotated = await getStandaloneExtractedQueryCandidates('United States', 50);
+    const rotated = await getStandaloneExtractedQueryCandidates(testCountry, 50);
     assert.ok(!rotated.some(row => row.candidateKey === candidate.candidateKey));
     await db.query('UPDATE extracted_query_candidates SET last_attempted_at=NULL WHERE id=$1', [candidateId]);
-    const lcb = await getExtractedQueryCandidates('United States', 100, 0);
+    const lcb = await getExtractedQueryCandidates(testCountry, 100, 0);
     assert.ok(lcb.some(row => row.candidateKey === candidate.candidateKey));
   } finally {
     await db.query('DELETE FROM extracted_query_candidates WHERE candidate_key LIKE $1', [`${suffix}%`]).catch(() => undefined);

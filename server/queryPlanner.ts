@@ -177,6 +177,10 @@ export function isCountryScriptCompatible(country: string, query: string): boole
   return /^[A-Z0-9./ -]{1,12}$/.test(query.trim());
 }
 
+export function isForbiddenProseQuery(query: string): boolean {
+  return FORBIDDEN_PROSE.test(query.normalize('NFKC').trim().replace(/\s+/g, ' '));
+}
+
 export function isRetrievalOrientedQuery(country: string, query: string, languageContext?: GlobalLanguageContext & { governed?: boolean }): boolean {
   const normalized = query.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const scriptCompatible = languageContext?.governed
@@ -187,7 +191,7 @@ export function isRetrievalOrientedQuery(country: string, query: string, languag
   const tokenLimit = isReviewedNativePhrase(normalized) ? 6 : languageContext?.governed ? 4 : 3;
   return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= tokenLimit &&
     !isBareShortTicker(normalized) &&
-    !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
+    !isForbiddenProseQuery(normalized) && scriptCompatible;
 }
 
 export function queriesOutsideCooldown(queries: QueryRecord[], now: Date, cooldownMinutes: number): QueryRecord[] {
@@ -521,6 +525,17 @@ export function planDiverseQueries(args: {
   // integrated with the same admission, execution authority and lifecycle as
   // every other query; the ledger gate already checked native intent/shape.
   const extractedStandaloneCandidates = (args.standaloneExtractedCandidates || [])
+    .filter(extracted => {
+      const normalized = normalizeQuery(extracted.candidateText);
+      return !blocked.has(normalized)
+        && !generated.has(normalized)
+        && !isForbiddenProseQuery(extracted.candidateText)
+        && isExtractedStandaloneQuery({
+          term: extracted.candidateText,
+          country: args.country,
+          language: extracted.language,
+        });
+    })
     .slice(0, Math.max(0, Math.floor(count * 0.4)))
     .map(extracted => {
       const standaloneAtom = atom(extracted.candidateText, 'LEARNED', (extracted.intent || 'strategy') as QueryIntent, 2, 'EXTRACTED_STANDALONE');
@@ -738,7 +753,8 @@ export function planDiverseQueries(args: {
     const globalContext = candidate.organic ? { ...candidate.organic.languageCapability.context, governed: true } : undefined;
     const extractedStandalone = candidate.template === 'EXTRACTED_STANDALONE';
     const retrievalOk = extractedStandalone
-      ? isExtractedStandaloneQuery({ term: query, country: args.country, language: candidate.extracted?.language })
+      ? !isForbiddenProseQuery(query)
+        && isExtractedStandaloneQuery({ term: query, country: args.country, language: candidate.extracted?.language })
       : isRetrievalOrientedQuery(args.country, query, globalContext);
     if (blocked.has(normalized) || generated.has(normalized) || !retrievalOk) return;
     if (hasTier3 && tier3Used >= Math.ceil(count / 5)) return;

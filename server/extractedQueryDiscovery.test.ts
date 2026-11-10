@@ -60,6 +60,21 @@ test('nuisance-only titles and promo fragments are rejected before the ledger', 
     text: 'ES', country: 'United States', language: 'en',
     sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'ES',
   }), null);
+  const shortReasons: string[] = [];
+  deriveDeterministicQueryCandidates({
+    sources: video('ES'), country: 'United States', language: 'en',
+    onRejected: candidate => shortReasons.push(...candidate.reasons),
+  });
+  assert.ok(shortReasons.includes('NO_QUERY_WINDOW'));
+  // Genuine finance phrases and numeric levels are not promotional noise.
+  assert.ok(assessExtractedQueryCandidate({
+    text: 'risk free rate strategy', country: 'United States', language: 'en',
+    sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: 'risk free rate strategy',
+  }));
+  assert.ok(assessExtractedQueryCandidate({
+    text: '1.5 extension trading strategy', country: 'United States', language: 'en',
+    sourceKind: 'VIDEO_TITLE', sourceIndex: 0, sourceTitle: '1.5 extension trading strategy',
+  }));
 });
 
 test('ambiguous single words do not turn everyday titles into searches', () => {
@@ -183,6 +198,12 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
   });
   assert.ok(chinese.some(candidate => candidate.candidateText === '比特币交易策略入门'));
   assert.ok(chinese.every(candidate => candidate.language === 'zh' && candidate.script === 'Hani'));
+
+  const shortJapanese = deriveDeterministicQueryCandidates({
+    sources: video('板読み'),
+    country: 'Japan', language: 'ja',
+  });
+  assert.ok(shortJapanese.some(candidate => candidate.candidateText === '板読み'));
 });
 
 test('LLM candidates use the same deterministic gate and duplicates merge', () => {
@@ -201,4 +222,5 @@ test('LLM candidates use the same deterministic gate and duplicates merge', () =
   const deterministic = deriveDeterministicQueryCandidates({ sources, country: 'United States', language: 'en' });
   assert.ok(deterministic.some(candidate => candidate.candidateKey === llm[0].candidateKey));
   assert.equal(normalizeExtractedCandidate('  Weekly   trade analysis!  '), 'Weekly trade analysis');
+  assert.equal(normalizeExtractedCandidate('🔴 Gold 🔥 Trading Analysis'), 'Gold Trading Analysis');
 });
