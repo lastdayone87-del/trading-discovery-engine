@@ -2,7 +2,8 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { assessIntakeTradingFocus } from './intakeTradingFocus';
-import { triageAutonomousSearchCandidate } from './candidateTriage';
+import { observeKeywordBaseline, triageAutonomousSearchCandidate } from './candidateTriage';
+import { buildDeferredTradingIntakeChannel } from './ingestionPipeline';
 import type { DiscoveredChannelRaw } from './youtube';
 
 function candidate(overrides: Partial<DiscoveredChannelRaw> & { channelName: string }): DiscoveredChannelRaw {
@@ -153,4 +154,32 @@ test('an incidental music word in an explicit trading video does not withhold th
     videoTitles: ['Price action single trade review'],
   });
   assert.equal(decision.decision, 'ADMIT');
+});
+
+
+test('deferred channel persistence uses INTAKE_DEFERRED and does not manufacture review debt', () => {
+  const channel = buildDeferredTradingIntakeChannel({
+    channelId: 'UCdefer00000000000000001',
+    channelName: 'Deferred Channel',
+    youtubeUrl: 'https://youtube.com/channel/UCdefer00000000000000001',
+    description: 'Sparse metadata',
+    videoTitles: [],
+  }, undefined, 'automated_query', '2026-11-10T00:00:00.000Z', ['INSUFFICIENT_CHANNEL_EVIDENCE']);
+  assert.equal(channel.scan_status, 'INTAKE_DEFERRED');
+  assert.equal(channel.trading_status, 'UNCERTAIN');
+  assert.equal(channel.country_status, 'UNCERTAIN');
+  assert.equal(channel.inspection_trail.at(-1)?.step, 'BIO');
+});
+
+test('keyword baseline preserves the old non-Latin coverage pass for observational comparison', () => {
+  const baseline = observeKeywordBaseline({
+    channelId: 'UClegacy0000000000000001',
+    channelName: 'सामान्य चैनल',
+    youtubeUrl: 'https://youtube.com/channel/UClegacy0000000000000001',
+    description: '',
+    videoTitles: [],
+    matchedDocument: { type: 'CHANNEL', title: 'सामान्य चैनल' },
+  });
+  assert.equal(baseline.baseline, 'WOULD_ADMIT');
+  assert.ok(baseline.reasonCodes.includes('LEGACY_NON_LATIN_COVERAGE_PASS'));
 });

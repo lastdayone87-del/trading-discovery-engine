@@ -830,10 +830,13 @@ export function assessChannelCountry(
       // can meet the evidence floor; a bio alone still cannot reject.
       const nonEmptyBio = String(input.aboutBio || '').trim();
       const languageSamples = [
-        ...(input.videoDescriptions || []),
+        // Put the creator bio first: aggregateContentLanguage considers only
+        // the first 10 samples, and the bio is the one creator-level sample
+        // that must never be dropped by a full recent-video set.
         ...(nonEmptyBio ? [nonEmptyBio] : []),
+        ...(input.videoDescriptions || []),
       ];
-      const bioIncluded = nonEmptyBio.length > 0 && languageSamples.length > (input.videoDescriptions || []).length;
+      const bioIncluded = nonEmptyBio.length > 0;
       const aggregated = aggregateContentLanguage(languageSamples, input.playlists || []);
       if (aggregated) {
         const isLiveExcluded = (country: string): boolean =>

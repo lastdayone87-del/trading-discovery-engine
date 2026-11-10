@@ -366,7 +366,7 @@ export async function revalidateConfirmedCountryForPreservedRow(
   }
 }
 
-function buildDeferredTradingIntakeChannel(
+export function buildDeferredTradingIntakeChannel(
   candidate: IngestionCandidate,
   existing: ChannelRecord | undefined,
   source: DiscoverySource,

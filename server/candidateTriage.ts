@@ -174,6 +174,16 @@ export function observeKeywordBaseline(
     videoTitles: [],
     videoDescriptions: [],
   }, source, false);
+  const retrievalText = [
+    unmarked.channelName,
+    unmarked.matchedDocument?.title,
+    unmarked.matchedDocument?.description,
+  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0).join(' ');
+  // v6 stopped auto-admitting non-Latin retrieval text. The observational
+  // baseline must still describe the old funnel, which did admit it.
+  if (decision.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE' && hasCoveredNonLatinScript(retrievalText)) {
+    return { baseline: 'WOULD_ADMIT', reasonCodes: ['LEGACY_NON_LATIN_COVERAGE_PASS'] };
+  }
   return {
     baseline: decision.disposition === 'PLAUSIBLE_TRADING_HYPOTHESIS' ? 'WOULD_ADMIT' : 'WOULD_WITHHOLD',
     reasonCodes: decision.reasonCodes,
