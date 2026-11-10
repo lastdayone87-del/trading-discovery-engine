@@ -5,7 +5,7 @@ import { assessLanguageCapability, type GlobalLanguageContext } from './globalLa
 import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './retrievalSpecificity';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
-import { isAmbiguousShortModifier, isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
+import { isAmbiguousShortModifier, isExtractedStandaloneQuery, isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
 import { isProductionConfiguredCountry } from './queryQuality/profiles';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
@@ -21,7 +21,7 @@ export interface SearchAtom {
   type: SearchAtomType;
   intent: QueryIntent;
   tier: QueryKnowledgeTier;
-  origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED' | 'ORGANIC' | 'FREE_SIGNAL' | 'DEMAND_SIGNAL';
+  origin: 'CURATED' | 'COUNTRY_VOCABULARY' | 'LEARNED' | 'EXTRACTED_STANDALONE' | 'ORGANIC' | 'FREE_SIGNAL' | 'DEMAND_SIGNAL';
   retrievalPolicy:RetrievalSpecificityDecision;
 }
 
@@ -177,6 +177,10 @@ export function isCountryScriptCompatible(country: string, query: string): boole
   return /^[A-Z0-9./ -]{1,12}$/.test(query.trim());
 }
 
+export function isForbiddenProseQuery(query: string): boolean {
+  return FORBIDDEN_PROSE.test(query.normalize('NFKC').trim().replace(/\s+/g, ' '));
+}
+
 export function isRetrievalOrientedQuery(country: string, query: string, languageContext?: GlobalLanguageContext & { governed?: boolean }): boolean {
   const normalized = query.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const scriptCompatible = languageContext?.governed
@@ -187,7 +191,7 @@ export function isRetrievalOrientedQuery(country: string, query: string, languag
   const tokenLimit = isReviewedNativePhrase(normalized) ? 6 : languageContext?.governed ? 4 : 3;
   return normalized.length >= 2 && normalized.length <= 40 && queryTokenCount(normalized) <= tokenLimit &&
     !isBareShortTicker(normalized) &&
-    !FORBIDDEN_PROSE.test(normalized) && scriptCompatible;
+    !isForbiddenProseQuery(normalized) && scriptCompatible;
 }
 
 export function queriesOutsideCooldown(queries: QueryRecord[], now: Date, cooldownMinutes: number): QueryRecord[] {
@@ -464,6 +468,15 @@ export function planDiverseQueries(args: {
   freeSignalCandidates?: FreeSignalQueryCandidate[];
   /** Optional paid demand surfaces. Only supplied when the paid adapter is enabled. */
   demandSignalCandidates?: DemandSignalQueryCandidate[];
+  /** Accepted standalone extracted-query candidates from the ledger. */
+  standaloneExtractedCandidates?: Array<{
+    id: number;
+    candidateText: string;
+    language: string;
+    intent: string;
+    confidence: number;
+    sourceTitle?: string | null;
+  }>;
   mode?: QueryGenerationMode;
   /**
    * Persistent-scope promotion basis. Set when the country was explicitly
@@ -498,13 +511,45 @@ export function planDiverseQueries(args: {
     template: 'ANCHOR_DEMAND_SIGNAL' | 'DEMAND_SIGNAL_STANDALONE';
     demand: DemandSignalQueryCandidate;
   };
+  type ExtractedPlanCandidate = { atoms: SearchAtom[]; template: 'EXTRACTED_STANDALONE'; extracted: NonNullable<typeof args.standaloneExtractedCandidates>[number] };
   const candidates: Array<{
     atoms: SearchAtom[];
-    template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'INSTRUMENT_MARKET' | 'MARKET_INSTRUMENT' | 'METHOD_INSTRUMENT' | 'ANCHOR_LEARNED' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC' | 'ANCHOR_FREE_SIGNAL' | 'FREE_SIGNAL_STANDALONE' | 'ANCHOR_DEMAND_SIGNAL' | 'DEMAND_SIGNAL_STANDALONE';
+    template: 'SINGLE_ATOM' | 'COMPACT_PAIR' | 'INSTRUMENT_MARKET' | 'MARKET_INSTRUMENT' | 'METHOD_INSTRUMENT' | 'ANCHOR_LEARNED' | 'EXTRACTED_STANDALONE' | 'ORGANIC_STANDALONE' | 'ANCHOR_ORGANIC' | 'ANCHOR_FREE_SIGNAL' | 'FREE_SIGNAL_STANDALONE' | 'ANCHOR_DEMAND_SIGNAL' | 'DEMAND_SIGNAL_STANDALONE';
     organic?: ReturnType<typeof admitOrganicQueryCandidates>[number];
     freeSignal?: FreeSignalQueryCandidate;
     demand?: DemandSignalQueryCandidate;
+    extracted?: ExtractedPlanCandidate['extracted'];
   }> = anchors.filter(searchAtom=>searchAtom.retrievalPolicy.eligibility==='STANDALONE'||searchAtom.retrievalPolicy.eligibility==='ANCHOR_ONLY').map(searchAtom => ({ atoms: [searchAtom], template: 'SINGLE_ATOM' }));
+
+  // Accepted extracted queries are first-class standalone surfaces. They are
+  // integrated with the same admission, execution authority and lifecycle as
+  // every other query; the ledger gate already checked native intent/shape.
+  const extractedStandaloneCandidates = (args.standaloneExtractedCandidates || [])
+    .filter(extracted => {
+      const normalized = normalizeQuery(extracted.candidateText);
+      return !blocked.has(normalized)
+        && !generated.has(normalized)
+        && !isForbiddenProseQuery(extracted.candidateText)
+        && isExtractedStandaloneQuery({
+          term: extracted.candidateText,
+          country: args.country,
+          language: extracted.language,
+        });
+    })
+    .slice(0, Math.max(0, Math.floor(count * 0.4)))
+    .map(extracted => {
+      const standaloneAtom = atom(extracted.candidateText, 'LEARNED', (extracted.intent || 'strategy') as QueryIntent, 2, 'EXTRACTED_STANDALONE');
+      standaloneAtom.retrievalPolicy = {
+        ...standaloneAtom.retrievalPolicy,
+        eligibility: 'STANDALONE',
+        specificity: Math.max(standaloneAtom.retrievalPolicy.specificity, 70),
+        ambiguity: Math.min(standaloneAtom.retrievalPolicy.ambiguity, 30),
+        reasonCodes: [...new Set([...standaloneAtom.retrievalPolicy.reasonCodes.filter(code => code !== 'EXPANSION_SURFACE_REQUIRES_TRADING_ANCHOR'), 'EXTRACTED_STANDALONE_QUERY'])],
+        requiredCompanionClasses: [],
+      };
+      return { atoms: [standaloneAtom], template: 'EXTRACTED_STANDALONE' as const, extracted };
+    });
+  candidates.splice(Math.min(2, candidates.length), 0, ...extractedStandaloneCandidates);
 
   // Only combine semantically compatible atoms: a concrete instrument/market
   // anchor plus one trading method. Formats and unrelated concepts never mix.
@@ -691,7 +736,7 @@ export function planDiverseQueries(args: {
   // for each creator-derived candidate still ahead in the ordering; deferred
   // filler is retried after the first pass when a reserved candidate fails a
   // gate, so the portfolio is not underfilled.
-  const CREATOR_DERIVED_TEMPLATES = new Set(['ANCHOR_LEARNED', 'ORGANIC_STANDALONE', 'ANCHOR_ORGANIC']);
+  const CREATOR_DERIVED_TEMPLATES = new Set(['ANCHOR_LEARNED', 'EXTRACTED_STANDALONE', 'ORGANIC_STANDALONE', 'ANCHOR_ORGANIC']);
   const isCreatorDerived = (candidate: (typeof candidates)[number]) => CREATOR_DERIVED_TEMPLATES.has(candidate.template);
   const creatorRemainingAfter = new Array<number>(candidates.length + 1).fill(0);
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
@@ -706,12 +751,24 @@ export function planDiverseQueries(args: {
     const normalized = normalizeQuery(query);
     const hasTier3 = candidate.atoms.some(item => item.tier === 3);
     const globalContext = candidate.organic ? { ...candidate.organic.languageCapability.context, governed: true } : undefined;
-    if (blocked.has(normalized) || generated.has(normalized) || !isRetrievalOrientedQuery(args.country, query, globalContext)) return;
+    const extractedStandalone = candidate.template === 'EXTRACTED_STANDALONE';
+    const retrievalOk = extractedStandalone
+      ? !isForbiddenProseQuery(query)
+        && isExtractedStandaloneQuery({ term: query, country: args.country, language: candidate.extracted?.language })
+      : isRetrievalOrientedQuery(args.country, query, globalContext);
+    if (blocked.has(normalized) || generated.has(normalized) || !retrievalOk) return;
     if (hasTier3 && tier3Used >= Math.ceil(count / 5)) return;
     if (hasTier3) tier3Used++;
     const tiers = [...new Set(candidate.atoms.map(item => item.tier))] as QueryKnowledgeTier[];
     const primary = candidate.atoms[0];
-    const preferredLanguage = supportedLanguages.length ? supportedLanguages[planned.length % supportedLanguages.length] : undefined;
+    // A native extracted query must carry its own language into admission and
+    // the search worker. Batch rotation only applies to generated surfaces.
+    const extractedLanguage = candidate.extracted?.language;
+    const preferredLanguage = candidate.template === 'EXTRACTED_STANDALONE'
+      && extractedLanguage
+      && supportedLanguages.includes(extractedLanguage)
+      ? extractedLanguage
+      : supportedLanguages.length ? supportedLanguages[planned.length % supportedLanguages.length] : undefined;
     const freeSignalTerminology = candidate.freeSignal
       ? provenBySurface.get(normalizeQuery(candidate.freeSignal.surface))
       : undefined;
@@ -719,7 +776,7 @@ export function planDiverseQueries(args: {
       normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''),
     );
     const atomSourceTypes = candidate.atoms.map(item =>
-      item.origin === 'LEARNED' ? 'TERMINOLOGY' as const
+      (item.origin === 'LEARNED' || item.origin === 'EXTRACTED_STANDALONE') ? 'TERMINOLOGY' as const
         : item.origin === 'FREE_SIGNAL' ? 'FREE_SIGNAL' as const
         : item.origin === 'DEMAND_SIGNAL' ? 'DEMAND_SIGNAL' as const
         : 'SEED' as const);
@@ -759,7 +816,9 @@ export function planDiverseQueries(args: {
       primaryTerm: primary.term,
       knowledgeTiers: tiers,
       generationMode: mode,
-      generationReason: candidate.template === 'SINGLE_ATOM'
+      generationReason: candidate.template === 'EXTRACTED_STANDALONE'
+        ? 'Selected an accepted standalone extracted query from the terminology candidate ledger.'
+        : candidate.template === 'SINGLE_ATOM'
         ? `Selected a compact ${primary.origin.toLowerCase()} ${primary.type.toLowerCase()} atom for YouTube retrieval.`
         : candidate.template === 'COMPACT_PAIR'
             ? 'Combined one concrete local instrument or market with one compatible trading method.'
@@ -802,11 +861,17 @@ export function planDiverseQueries(args: {
           demandSignalIds: candidate.demand.sourceIds,
           demandScore: candidate.demand.demandScore,
         } : {}),
+        ...(candidate.extracted ? {
+          extractedCandidateId: candidate.extracted.id,
+          extractedStandalone: true,
+          extractedCandidateLanguage: candidate.extracted.language,
+          extractedCandidateSourceTitle: candidate.extracted.sourceTitle || undefined,
+        } : {}),
         ...(scopePromotedAnchor || scopePromotedRegion ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
         retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,
-        learnedTerm: candidate.atoms.find(item => item.type === 'LEARNED')?.term,
+        learnedTerm: candidate.extracted ? undefined : candidate.atoms.find(item => item.type === 'LEARNED')?.term,
         preferredLanguage,
         languageLineage: preferredLanguage ? {
           policy: 'COUNTRY_SUPPORTED_LANGUAGE_ROTATION_V1',
@@ -831,7 +896,9 @@ export function planDiverseQueries(args: {
             ...(terminatedByGate.length > PLANNER_GATE_METADATA_LIMIT ? { suppressedTruncated: true } : {}),
           },
         } : {}),
-        selectionEvidence: provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
+        selectionEvidence: candidate.extracted
+          ? `Accepted standalone extracted query from the LCB ledger (confidence ${candidate.extracted.confidence.toFixed(2)}).`
+          : provenByTerm.has(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))
           ? `Canonical term ${provenByTerm.get(normalizeQuery(candidate.atoms.find(item => item.type === 'LEARNED')?.term || ''))!.id} ranked by time-decayed production yield.`
           : candidate.freeSignal
             ? `Free-signal candidate from ${candidate.freeSignal.provider} (${candidate.freeSignal.sourceIds.join(', ')}); candidate vocabulary only, never evidence.`

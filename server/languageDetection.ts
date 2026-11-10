@@ -12,9 +12,9 @@
 
 export type SupportedLanguage =
   | 'en' | 'fr' | 'de' | 'nl' | 'da' | 'sv' | 'no' | 'es' | 'it' | 'pt' | 'lb'
-  | 'ja' | 'zh' | 'ar' | 'ko' | 'ru' | 'hi' | 'und';
+  | 'ja' | 'zh' | 'ar' | 'ko' | 'ru' | 'hi' | 'ta' | 'und';
 
-export type LanguageScript = 'Latn' | 'Jpan' | 'Hani' | 'Arab' | 'Hang' | 'Cyrl' | 'Deva' | 'Zyyy';
+export type LanguageScript = 'Latn' | 'Jpan' | 'Hani' | 'Arab' | 'Hang' | 'Cyrl' | 'Deva' | 'Taml' | 'Zyyy';
 
 export interface LanguageDetection {
   language: SupportedLanguage;
@@ -36,6 +36,7 @@ const SCRIPT_PATTERNS: Array<[LanguageScript, RegExp, SupportedLanguage]> = [
   ['Arab', /\p{Script=Arabic}/u, 'ar'],
   ['Cyrl', /\p{Script=Cyrillic}/u, 'ru'],
   ['Deva', /\p{Script=Devanagari}/u, 'hi'],
+  ['Taml', /\p{Script=Tamil}/u, 'ta'],
   ['Hani', /\p{Script=Han}/u, 'zh'],
 ];
 
@@ -106,6 +107,7 @@ function detectScript(text: string): { script: LanguageScript; language: Support
   if (share('Arab') > 0.5) return { script: 'Arab', language: 'ar' };
   if (share('Cyrl') > 0.5) return { script: 'Cyrl', language: 'ru' };
   if (share('Deva') > 0.5) return { script: 'Deva', language: 'hi' };
+  if (share('Taml') > 0.5) return { script: 'Taml', language: 'ta' };
   if (share('Hani') > 0.5) return { script: 'Hani', language: 'zh' };
   // Unmodelled dominant scripts (for example Thai) stay undetermined rather
   // than being persisted as Latin just because a ticker appears in the text.
@@ -188,6 +190,7 @@ export function languageScript(language: string): LanguageScript {
     case 'ko': return 'Hang';
     case 'ru': return 'Cyrl';
     case 'hi': return 'Deva';
+    case 'ta': return 'Taml';
     case 'en': case 'fr': case 'de': case 'nl': case 'da': case 'sv': case 'no':
     case 'es': case 'it': case 'pt': case 'lb': return 'Latn';
     default: return 'Zyyy';

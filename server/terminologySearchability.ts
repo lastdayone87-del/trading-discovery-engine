@@ -53,6 +53,8 @@ export interface SearchabilityInput {
    * relax any semantic, script or shape gate.
    */
   allowExtendedTokens?: boolean;
+  /** Bounded standalone-query allowance (2–6 words) for extracted queries. */
+  maxTokens?: number;
 }
 
 export interface SearchabilityShape {
@@ -94,7 +96,7 @@ const MATH_ALPHANUMERIC = /[\u{1D400}-\u{1D7FF}]/u;
 const COUNTRY_SCRIPTS: Record<string, ReadonlySet<string>> = {
   Japan: new Set(['Jpan', 'Hani', 'Latn']),
   'United Arab Emirates': new Set(['Arab', 'Latn']),
-  Singapore: new Set(['Latn', 'Hani']),
+  Singapore: new Set(['Latn', 'Hani', 'Taml']),
 };
 const LATIN_COUNTRIES = new Set([
   'United States', 'United Kingdom', 'Canada', 'Australia', 'New Zealand',
@@ -114,6 +116,7 @@ const SCRIPT_PATTERNS: Array<[string, RegExp]> = [
   ['Deva', /\p{Script=Devanagari}/u],
   ['Hebr', /\p{Script=Hebrew}/u],
   ['Thai', /\p{Script=Thai}/u],
+  ['Taml', /\p{Script=Tamil}/u],
   ['Latn', /\p{Script=Latin}/u],
 ];
 
@@ -262,6 +265,18 @@ export function isReviewedNativePhrase(term: string): boolean {
   return reviewedNativePhraseLanguages(term).length > 0;
 }
 
+/** True when the surface contains a reviewed native phrase, not just equals it. */
+export function containsReviewedNativePhrase(term: string): boolean {
+  const key = phraseKey(term);
+  if (!key) return false;
+  return Object.values(REVIEWED_NATIVE_PHRASES).some(values => values.some(value => {
+    const phrase = phraseKey(value);
+    if (!phrase) return false;
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(key);
+  }));
+}
+
 /**
  * Compounds whose local reading is not trading intent. `トレード` is a
  * reviewed Japanese semantic, but `トレードオフ` (trade-off) and
@@ -407,11 +422,12 @@ export function isSearchableTradingTerm(input: SearchabilityInput): Searchabilit
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token))) add('cta-only');
   if (contentTokens.length > 0 && contentTokens.every(token => CTA_TOKENS.has(token) || FORMAT_TOKENS.has(token))) add('format-only');
   if (lowerTokens.length > 0 && lowerTokens.every(token => STOPWORDS.has(token))) add('stopword-only');
+  const configuredMax = Number.isFinite(input.maxTokens) && (input.maxTokens as number) > 0
+    ? Math.min(6, Math.max(2, Math.trunc(input.maxTokens as number)))
+    : null;
   const tokenLimit = input.allowExtendedTokens
     ? LEGACY_COMPATIBILITY_TOKEN_LIMIT
-    : isReviewedNativePhrase(normalizedTerm)
-      ? 6
-      : 3;
+    : configuredMax ?? (isReviewedNativePhrase(normalizedTerm) ? 6 : 3);
   if (termTokens.length > tokenLimit) add('too-many-tokens');
   if (input.requireTradingSemantics !== false
     && !hasGovernedTradingSemantics(normalizedTerm, { country: input.country, language: input.language })) add('no-trading-semantics');
@@ -504,4 +520,29 @@ export function orderDashboardTerminologyRows<T extends { search_eligible: boole
     .map((row, index) => ({ row, index }))
     .sort((a, b) => Number(b.row.search_eligible) - Number(a.row.search_eligible) || a.index - b.index)
     .map(({ row }) => row);
+}
+
+
+/**
+ * Standalone extracted-query gate. This is the same Q0 precision gate with a
+ * bounded 2–6 token allowance; it never grants anchor/query authority on its
+ * own (that is still the composition/execution gates).
+ */
+export function isExtractedStandaloneQuery(input: {
+  term: string;
+  country?: string | null;
+  language?: string | null;
+}): boolean {
+  return isSearchableTradingTerm({
+    term: input.term,
+    termType: 'PHRASE',
+    country: input.country,
+    language: input.language,
+    maxTokens: 6,
+    // Trading intent was already proven by the extraction ledger gate. That
+    // gate is script-aware, so unspaced native surfaces (for example Japanese)
+    // remain valid standalone queries even though the English lexicon cannot
+    // attest their semantics.
+    requireTradingSemantics: false,
+  }).eligible;
 }

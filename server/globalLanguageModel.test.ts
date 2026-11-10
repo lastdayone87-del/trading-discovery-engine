@@ -48,6 +48,17 @@ test('Vietnamese/Tagalog Latin-script content is not flagged transliterated', ()
   assert.equal(tl.transliterated, false);
 });
 
+test('Tamil native script is detected and capability-mapped', () => {
+  assert.deepEqual(detectScripts('தங்கம் விலை பகுப்பாய்வு'), ['Taml']);
+  const decision = assessLanguageCapability(
+    [{ field: 'query', text: 'தங்கம் விலை பகுப்பாய்வு', language: 'ta' }],
+    { contentLanguage: 'ta', contentScript: 'Taml' },
+    { controlledTrial: true },
+  );
+  assert.equal(decision.disposition, 'CONTROLLED_TRIAL', decision.reasonCodes.join(','));
+  assert.equal(decision.observations[0].primaryScript, 'Taml');
+});
+
 test('Bengali/Sinhala/Gurmukhi/Telugu/Thai native scripts are detected, not UNKNOWN', () => {
   const native: Array<[string, string, string]> = [
     ['bn', 'Beng', 'শেয়ার বাজার ট্রেডিং'],
