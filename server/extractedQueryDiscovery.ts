@@ -207,9 +207,11 @@ function hasTradingIntent(text: string, country?: string | null, language?: stri
   }
   if (weakMatches >= 2) return true;
   // The governed multilingual lexicon is the authority for native finance
-  // semantics. The local token lists below are a fast path, not the only
-  // source of truth for Japanese/Chinese/Tamil/Arabic vocabulary.
-  if (hasGovernedTradingSemantics(text, { country, language })) return true;
+  // semantics. Restrict it to non-Latin scripts: Latin broker/person names
+  // such as "Apex" must not turn a gaming title into a trading query. Latin
+  // text still needs a strong term or two weak trading terms above.
+  const hasNonLatinScript = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Tamil}\p{Script=Arabic}]/u.test(text);
+  if (hasNonLatinScript && hasGovernedTradingSemantics(text, { country, language })) return true;
   // Mixed native titles often carry their instrument as an ASCII ticker
   // (ETHの見方, DAX Analyse). Treat a known strong ticker as intent without
   // widening the generic native token list.

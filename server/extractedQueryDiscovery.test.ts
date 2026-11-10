@@ -267,6 +267,13 @@ test('non-Latin native scripts pass intent and preserve their script', () => {
     }),
     [],
   );
+  assert.deepEqual(
+    deriveDeterministicQueryCandidates({
+      sources: video('Apex Legends gameplay'),
+      country: 'United States', language: 'en',
+    }),
+    [],
+  );
   for (const title of ['高配当株', '株主優待']) {
     assert.ok(
       deriveDeterministicQueryCandidates({

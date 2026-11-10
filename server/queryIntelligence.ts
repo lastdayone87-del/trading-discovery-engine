@@ -938,6 +938,12 @@ export async function extractVocabularyFromCreator(
 
   if (!channel.country || channel.country === 'Unknown' || channel.trading_status !== 'TRADING_CONFIRMED') return [];
 
+  // Non-metadata inputs are invisible to every extraction path, including rule
+  // evidence and the playlist complement.
+  const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
+  const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
+  const effectivePlaylists = selectComplementaryPlaylists(effTitles, playlists);
+
   // 1. Rule-based extraction of instruments over the single canonical list
   // (KNOWN_INSTRUMENT_TERMS — shared with novelty classification, never
   // duplicated). Boundary-aware literal matching: 'ES' inside 'heroes' or
@@ -946,7 +952,7 @@ export async function extractVocabularyFromCreator(
   // twins below (different observation types would otherwise record the same
   // source mention twice and inflate evidence and occurrences).
   const ruleObserved = new Set<string>();
-  for (const hit of findRuleInstrumentHits(channel.channel_name, videoTitles, description, videoIds, origins, videoTitles.length > 0 ? playlists : [])) {
+  for (const hit of findRuleInstrumentHits(channel.channel_name, effTitles, effDesc, videoIds, origins, effectivePlaylists)) {
     // Persistence ordering mirrors the AI path: terminology evidence first,
     // extracted-term row only after a valid observation exists.
     const observationType = (hit.located.sourceKind === 'PLAYLIST_TITLE' || hit.located.sourceKind === 'PLAYLIST_DESCRIPTION')
@@ -967,14 +973,7 @@ export async function extractVocabularyFromCreator(
   }
 
   // 2. Deep Gemini Extraction if API Key is configured
-  // Non-metadata inputs (origins) are invisible to vocabulary provenance:
-  // titles/descriptions that are not YouTube metadata never become literal
-  // sources, rule spans, or quoted prompt context.
-  const effTitles = origins?.videoTitlesAreMetadata === false ? [] : videoTitles;
-  const effDesc = origins?.descriptionIsMetadata === false ? '' : description;
-  // Playlists are complementary context only. A channel with no video titles
-  // must not begin discovery from playlist text alone.
-  const effectivePlaylists = selectComplementaryPlaylists(effTitles, playlists);
+  // Non-metadata inputs are already excluded above from every source path.
   // Below-quality creators may contribute observations, but their text must
   // not become discovery queries. The same flag also keeps query-only provider
   // responses from suppressing Gemini fallback for an unusable bucket.
