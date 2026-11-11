@@ -28,17 +28,24 @@ function candidate(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function fakeDb(rows: Array<Record<string, unknown>>) {
+function fakeDb(rows: Array<Record<string, unknown>>, failureAgeMinutes?: number) {
   const inserts: unknown[][] = [];
+  const candidateQueries: string[] = [];
   const client = {
     query: async () => ({ rows: [], rowCount: 0 }),
     release: () => undefined,
   };
   return {
     inserts,
+    candidateQueries,
     db: {
       query: async (sql: string, params: unknown[]) => {
-        if (sql.includes('FROM channels c')) return { rows, rowCount: rows.length };
+        if (sql.includes('FROM channels c')) {
+          candidateQueries.push(sql);
+          // Model the candidate query's 15-minute failure-prefix exclusion.
+          const excluded = failureAgeMinutes !== undefined && failureAgeMinutes < 15;
+          return { rows: excluded ? [] : rows, rowCount: excluded ? 0 : rows.length };
+        }
         if (sql.includes('INSERT INTO operational_enrichment_recovery_events')) {
           inserts.push(params);
           return { rows: [], rowCount: 1 };
@@ -140,4 +147,46 @@ test('the enqueue-blocked branch backs off a non-materialized review', async () 
     'EXHAUSTED_REVIEW_NOT_MATERIALIZED',
     'STALE_ELIGIBILITY_PROJECTION',
   ]);
+});
+
+
+test('recent backoff excludes the candidate while an expired backoff leaves it eligible', async () => {
+  const recent = fakeDb([candidate()], 5);
+  const recentResult = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    cutoff: CUTOFF,
+    limit: 1,
+    db: recent.db,
+    materializeExhaustedReview: async () => ({
+      materialized: false,
+      reason: 'CURRENT_PENDING_REVIEW_PRESERVED',
+      eligibilityDecisionId: 'decision-recent',
+    }),
+    enqueueOperationalEnrichmentRecoveryJob: async () => false,
+    channelRowToRecord: async () => null,
+  } as any);
+  assert.equal(recentResult.scanned, 0);
+  assert.equal(recent.inserts.length, 0);
+  assert.match(recent.candidateQueries[0], /recent_failure\.event_key LIKE 'classification-resolution-failure:%'/);
+  assert.match(recent.candidateQueries[0], /recent_failure\.created_at>=now\(\)-interval '15 minutes'/);
+
+  const expired = fakeDb([candidate()], 30);
+  const expiredResult = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    cutoff: CUTOFF,
+    limit: 1,
+    db: expired.db,
+    materializeExhaustedReview: async () => ({
+      materialized: false,
+      reason: 'CURRENT_PENDING_REVIEW_PRESERVED',
+      eligibilityDecisionId: 'decision-expired',
+    }),
+    enqueueOperationalEnrichmentRecoveryJob: async () => false,
+    channelRowToRecord: async () => null,
+  } as any);
+  assert.equal(expiredResult.scanned, 1);
+  assert.equal(expired.inserts.length, 1);
+  assert.match(String(expired.inserts[0][0]), /^classification-resolution-failure:UC1:/);
 });
