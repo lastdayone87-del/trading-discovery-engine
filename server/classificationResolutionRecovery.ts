@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { ChannelRecord } from '../src/types';
 import { enqueueOperationalEnrichmentRecoveryJob } from './queueManager';
@@ -97,6 +98,11 @@ export interface ClassificationResolutionRecoveryOptions {
   limit?: number;
   cutoff?: string;
   now?: number;
+  /** Narrow test seams; production uses the module implementations. */
+  db?: any;
+  materializeExhaustedReview?: typeof materializeExhaustedReview;
+  enqueueOperationalEnrichmentRecoveryJob?: typeof enqueueOperationalEnrichmentRecoveryJob;
+  channelRowToRecord?: typeof channelRowToRecord;
 }
 
 export interface ClassificationResolutionRecoveryItem {
@@ -133,6 +139,30 @@ async function channelRowToRecord(db: any, channelId: string): Promise<ChannelRe
 }
 
 /**
+ * Remove a repeatedly non-materialized recovery row from the head of the next
+ * sweep. The candidate query excludes recent FAILURE_PREFIX events, so this is
+ * a short-lived backoff rather than a terminal state.
+ */
+export async function recordClassificationResolutionBackoff(
+  db: { query: (sql: string, params: unknown[]) => Promise<unknown> },
+  item: Pick<ClassificationResolutionRecoveryItem, 'channelId' | 'latestJobId' | 'scanStatus'>,
+  reasonCodes: string[],
+): Promise<void> {
+  await db.query(
+    `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
+     VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
+    [
+      `${FAILURE_PREFIX}${item.channelId}:${randomUUID()}`,
+      item.channelId,
+      item.latestJobId || 'none',
+      item.scanStatus,
+      JSON.stringify(reasonCodes),
+      CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
+    ],
+  ).catch(ledgerError => console.warn(`[ClassificationResolution] Backoff write failed for ${item.channelId}:`, ledgerError instanceof Error ? ledgerError.message : ledgerError));
+}
+
+/**
  * Bounded maintenance sweep for machine-owned unresolved channels.
  *
  * Forward-only by default: a system ledger row records the first run time and
@@ -144,7 +174,10 @@ async function channelRowToRecord(db: any, channelId: string): Promise<ChannelRe
 export async function reconcileClassificationResolutionGaps(
   options: ClassificationResolutionRecoveryOptions = {},
 ): Promise<ClassificationResolutionRecoveryResult> {
-  const db = await getDb();
+  const db = options.db || await getDb();
+  const materializeReview = options.materializeExhaustedReview || materializeExhaustedReview;
+  const enqueueRecovery = options.enqueueOperationalEnrichmentRecoveryJob || enqueueOperationalEnrichmentRecoveryJob;
+  const loadChannel = options.channelRowToRecord || channelRowToRecord;
   const dryRun = options.dryRun !== false;
   const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
   const limit = Math.min(200, Math.max(1, options.limit || 50));
@@ -265,24 +298,27 @@ export async function reconcileClassificationResolutionGaps(
         continue;
       }
       if (decision.action === 'EXHAUSTED_REVIEW') {
-        const review = await materializeExhaustedReview({
+        const review = await materializeReview({
           channelId: item.channelId,
           reasonCode: decision.reasonCodes[0] || 'ENRICHMENT_EXHAUSTED',
           reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
           evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles, policyVersion: CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION },
         });
         if (review.materialized) exhaustedReviews += 1;
-        else skipped += 1;
+        else {
+          skipped += 1;
+          await recordClassificationResolutionBackoff(db, item, ['EXHAUSTED_REVIEW_NOT_MATERIALIZED', review.reason || 'UNKNOWN']);
+        }
         continue;
       }
-      const channel = await channelRowToRecord(db, item.channelId);
+      const channel = await loadChannel(db, item.channelId);
       if (!channel) { skipped += 1; continue; }
       const cycle = item.recoveryCycles + 1;
       let accepted = false;
       const client = await db.connect();
       try {
         await client.query('BEGIN');
-        accepted = await enqueueOperationalEnrichmentRecoveryJob(channel, decision.reasonCodes, client);
+        accepted = await enqueueRecovery(channel, decision.reasonCodes, client);
         if (accepted) {
           await client.query(
             `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
@@ -305,14 +341,17 @@ export async function reconcileClassificationResolutionGaps(
         client.release();
       }
       if (!accepted) {
-        const review = await materializeExhaustedReview({
+        const review = await materializeReview({
           channelId: item.channelId,
           reasonCode: 'RECOVERY_ENQUEUE_BLOCKED',
           reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
           evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles },
         });
         if (review.materialized) exhaustedReviews += 1;
-        else skipped += 1;
+        else {
+          skipped += 1;
+          await recordClassificationResolutionBackoff(db, item, ['EXHAUSTED_REVIEW_NOT_MATERIALIZED', review.reason || 'UNKNOWN']);
+        }
         continue;
       }
       enqueued += 1;
@@ -321,18 +360,7 @@ export async function reconcileClassificationResolutionGaps(
       // Keep a deterministic failing head row from starving the rest of the
       // batch on every sweep. The exclusion is short-lived so transient
       // failures are retried after the backoff.
-      await db.query(
-        `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
-         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
-        [
-          `${FAILURE_PREFIX}${item.channelId}:${Date.now()}`,
-          item.channelId,
-          item.latestJobId || 'none',
-          item.scanStatus,
-          JSON.stringify(['ROW_APPLY_FAILED', 'CLASSIFICATION_RESOLUTION']),
-          CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
-        ],
-      ).catch(ledgerError => console.warn(`[ClassificationResolution] Failure backoff write failed for ${item.channelId}:`, ledgerError instanceof Error ? ledgerError.message : ledgerError));
+      await recordClassificationResolutionBackoff(db, item, ['ROW_APPLY_FAILED', 'CLASSIFICATION_RESOLUTION']);
       console.warn(JSON.stringify({
         event: 'classification_resolution_recovery_item_failed',
         channelId: item.channelId,

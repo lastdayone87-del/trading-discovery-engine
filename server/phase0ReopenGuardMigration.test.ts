@@ -90,7 +90,7 @@ test('recovery paths do not project a runnable state for a blocked reopen', () =
   assert.match(queueManager, /if\(job\.reopen_blocked\)return false;/);
   assert.match(queueManager, /enqueueOperationalEnrichmentRecoveryJob[\s\S]*?if\(job\.reopen_blocked\)return false;/);
   assert.match(communityRecovery, /if \(enqueued === false\) \{/);
-  assert.match(communityRecovery, /await upsertChannel\(channelRecord\);\s*continue;/);
+  assert.match(communityRecovery, /if \(enqueued === false\) \{[\s\S]*?await upsertChannel\(channelRecord\);[\s\S]*?continue;/);
   assert.match(enrichmentRecovery, /if \(enqueued === false\) return 'BLOCKED';/);
   assert.match(enrichmentRecovery, /if \(outcome === 'BLOCKED'\) \{/);
 });

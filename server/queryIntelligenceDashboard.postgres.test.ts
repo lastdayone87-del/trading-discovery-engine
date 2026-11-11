@@ -11,6 +11,7 @@ import {
   getStandaloneExtractedQueryCandidates,
   getExtractedQueryCandidates,
   markExtractedQueryCandidatesAttempted,
+  markExtractedQueryCandidatesCapDeferred,
   reconcileExtractedQueryCandidates,
   resetQueryIntelligenceSummaryCacheForTests,
 } from './db';
@@ -220,6 +221,13 @@ test('Stage 4 PostgreSQL: extracted query ledger deduplicates and serves accepte
     await db.query('UPDATE extracted_query_candidates SET last_attempted_at=NULL WHERE id=$1', [candidateId]);
     const lcb = await getExtractedQueryCandidates(testCountry, 100, 0);
     assert.ok(lcb.some(row => row.candidateKey === candidate.candidateKey));
+    await markExtractedQueryCandidatesCapDeferred([candidateId]);
+    const deferred = (await db.query(
+      'SELECT last_cap_deferred_at, cap_deferral_count FROM extracted_query_candidates WHERE id=$1',
+      [candidateId],
+    )).rows[0];
+    assert.ok(deferred.last_cap_deferred_at);
+    assert.equal(Number(deferred.cap_deferral_count), 1);
   } finally {
     await db.query('DELETE FROM extracted_query_candidates WHERE candidate_key LIKE $1', [`${suffix}%`]).catch(() => undefined);
     if (reconciledQueryId) await db.query('DELETE FROM query_library WHERE id=$1', [reconciledQueryId]).catch(() => undefined);

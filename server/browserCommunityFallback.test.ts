@@ -539,6 +539,49 @@ test('rendered gate refunds a zero-work startup failure', async () => {
   assert.equal(gate.admissionSnapshot().admissionsInWindow, 1);
 });
 
+test('rendered gate bounds a queued wait as capacity', async () => {
+  const governor = new RenderedAdmissionGovernor({
+    enabled: true,
+    nominalPerHour: 100,
+    emergencyPerHour: 100,
+    discoveryFloorPct: 0,
+    windowMs: 60_000,
+  }, () => 0);
+  const gate = new RenderedFallbackGate(1, 2, governor, 1_000);
+  assert.equal(gate.maxWaitMs, 1_000, 'explicit waits are clamped to the supported range');
+  let releaseFirst!: () => void;
+  const blocker = new Promise<void>(resolve => { releaseFirst = resolve; });
+
+  const first = gate.run(async () => { await blocker; }, 'RETRY');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  // Keep a ref'd handle alive so the unref'd production waiter timer cannot be
+  // cancelled by an otherwise idle test event loop.
+  const keepAlive = setTimeout(() => undefined, 10_000);
+  try {
+    await assert.rejects(
+      gate.run(async () => undefined, 'RETRY'),
+      (error: any) => {
+        const now = Date.now();
+        const retryAt = Number(error?.retryAt);
+        const gateWaitMs = Number(error?.gateWaitMs);
+        // No upper bound: a loaded event loop can delay the timeout callback,
+        // and production does not promise a hard wall-clock ceiling.
+        return error?.message === 'RENDERED_FALLBACK_SATURATED'
+          && retryAt > now
+          && gateWaitMs >= 900;
+      },
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
+  assert.equal(gate.snapshot().pending, 0, 'the timed-out waiter is removed');
+
+  const third = gate.run(async () => 'third', 'RETRY');
+  releaseFirst();
+  await first;
+  assert.equal(await third, 'third');
+});
+
 test('rendered gate exposes the admission id on a rejected startup', async () => {
   const governor = new RenderedAdmissionGovernor({
     enabled: true,

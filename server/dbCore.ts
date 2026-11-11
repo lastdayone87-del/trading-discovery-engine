@@ -1623,7 +1623,19 @@ export async function reconcileClassificationSighting(input: {
   return result.rowCount || 0;
 }
 
-export interface UpsertChannelOptions { preserveDiscordOnUpdate?: boolean; allowDiscordClear?: boolean; freshDiscordValidation?: boolean; requireCountrySnapshot?: CountryPolicySnapshot }
+export interface UpsertChannelOptions {
+  preserveDiscordOnUpdate?: boolean;
+  allowDiscordClear?: boolean;
+  freshDiscordValidation?: boolean;
+  requireCountrySnapshot?: CountryPolicySnapshot;
+  /** Refuse the write when a concurrent decision changed these projections. */
+  requireStatusSnapshot?: {
+    country?: string | null;
+    country_status?: string | null;
+    scan_status?: string | null;
+    trading_status?: string | null;
+  };
+}
 
 export async function upsertChannelWithResult(channel: ChannelRecord, options?: UpsertChannelOptions): Promise<boolean> {
   const db = await getDb();
@@ -1653,6 +1665,17 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
       await client.query('COMMIT');
       return false;
     }
+    if (options?.requireStatusSnapshot && locked) {
+      const expected = options.requireStatusSnapshot;
+      const changed = (expected.country !== undefined && String(locked.country || '') !== String(expected.country || ''))
+        || (expected.country_status !== undefined && String(locked.country_status || '') !== String(expected.country_status || ''))
+        || (expected.scan_status !== undefined && String(locked.scan_status || '') !== String(expected.scan_status || ''))
+        || (expected.trading_status !== undefined && String(locked.trading_status || '') !== String(expected.trading_status || ''));
+      if (changed) {
+        await client.query('COMMIT');
+        return false;
+      }
+    }
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);
     if (preserveDiscord && locked) {
@@ -1678,7 +1701,7 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
 }
 
 /** Compatibility wrapper for callers that only need the write side effect. */
-export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot'>): Promise<void> {
+export async function upsertChannel(channel: ChannelRecord, options?: Omit<UpsertChannelOptions, 'requireCountrySnapshot' | 'requireStatusSnapshot'>): Promise<void> {
   await upsertChannelWithResult(channel, options);
 }
 
@@ -2297,11 +2320,28 @@ export async function getStandaloneExtractedQueryCandidates(country: string, lim
            AND ql.status = 'ACTIVE'
            AND ql.normalized_query = c.normalized_text
        )
-     ORDER BY c.last_attempted_at NULLS FIRST, c.confidence DESC, c.updated_at DESC, c.id ASC
+     ORDER BY c.last_cap_deferred_at NULLS FIRST, c.last_attempted_at NULLS FIRST,
+       c.confidence DESC, c.updated_at DESC, c.id ASC
      LIMIT $2`,
     [canonicalCountry(country), Math.max(1, Math.min(100, Math.trunc(limit)))],
   );
   return res.rows.map(mapExtractedCandidate);
+}
+
+/**
+ * Lower the priority of candidates deferred by the actual-batch cap. They stay
+ * eligible (no cooldown), but move behind rows that have never been deferred.
+ */
+export async function markExtractedQueryCandidatesCapDeferred(ids: number[]): Promise<void> {
+  const values = ids.filter(id => Number.isSafeInteger(id) && id > 0);
+  if (!values.length) return;
+  const db = await getDb();
+  await db.query(
+    `UPDATE extracted_query_candidates
+     SET last_cap_deferred_at=now(), cap_deferral_count=cap_deferral_count+1, updated_at=now()
+     WHERE id = ANY($1::bigint[])`,
+    [values],
+  );
 }
 
 /** Record that the planner was offered these candidates, so it can rotate. */
@@ -2655,11 +2695,58 @@ export async function upsertQueryRecord(record:{query:string;country:string;coll
   ).filter((item:QueryDuplicateHistoryItem)=>item.query&&normalizeQueryText(item.query)!==normalized);
   const admission=admitQueryRecord({query,country:record.country,primary_term:record.primaryTerm,generation_metadata:admissionMetadata},{history,now:new Date().toISOString()});
   const generationMetadata=withQueryAdmission(admissionMetadata,admission.admission);
-  const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=excluded.collection,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=excluded.generation_metadata RETURNING *`,[query,normalized,record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)]);
+  const res=await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=CASE WHEN COALESCE(query_library.generation_metadata,'{}'::jsonb) ? 'queryHold' THEN 'REJECTED' ELSE excluded.collection END,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=CASE WHEN COALESCE(query_library.generation_metadata,'{}'::jsonb) ? 'queryHold' THEN query_library.generation_metadata ELSE excluded.generation_metadata END RETURNING *`,[query,normalized,record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)]);
   return rowToQuery(res.rows[0]);
 }
-export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
+export async function updateQueryExecutionStats(queryId:number,stats:{totalChannelsFound:number;uniqueChannelsFound:number;qualityChannelsFound:number;communityChannelsFound:number;avgQualityScore:number;performanceScore:number;newCollection?:'PROVEN'|'EXPERIMENTAL'|'REJECTED';}):Promise<void>{const db=await getDb(); await db.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=CASE WHEN collection='REJECTED' AND COALESCE(generation_metadata,'{}'::jsonb) ? 'queryHold' THEN collection ELSE COALESCE($7,collection) END WHERE id=$8`,[stats.totalChannelsFound,stats.uniqueChannelsFound,stats.qualityChannelsFound,stats.communityChannelsFound,stats.avgQualityScore,stats.performanceScore,stats.newCollection||null,queryId]);}
 export async function setQueryCollection(queryId:number,collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED'):Promise<void>{const db=await getDb(); await db.query('UPDATE query_library SET collection=$1 WHERE id=$2',[collection,queryId]);}
+/**
+ * Quarantine a query after a post-retrieval consistency failure. The collection
+ * is terminal for autonomous selection; the hold evidence is retained in
+ * generation_metadata and on the run for review. Idempotent and never deletes
+ * evidence.
+ */
+export async function holdQueryForResultConsistency(queryId:number,runId:string|null,details:{
+  policyVersion:string; reasonCodes:string[]; incompatibleShare:number; sampleSize:number;
+  incompatibleScripts?:string[]; expectedScripts?:string[]; country?:string; query?:string;
+}):Promise<void>{
+  const db=await getDb();
+  const client=await db.connect();
+  const payload={queryHold:{...details,at:new Date().toISOString()}};
+  try{
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE query_library
+       SET collection='REJECTED',
+           generation_metadata=jsonb_set(
+             COALESCE(generation_metadata,'{}'::jsonb)||$2::jsonb,
+             '{queryHold,at}',
+             to_jsonb(COALESCE(generation_metadata->'queryHold'->>'at', $2::jsonb->'queryHold'->>'at'))
+           )
+       WHERE id=$1`,
+      [queryId,JSON.stringify(payload)],
+    );
+    if(runId){
+      await client.query(
+        `UPDATE query_runs
+         SET next_page_token=NULL,
+             performance_details=jsonb_set(
+               COALESCE(performance_details,'{}'::jsonb)||$2::jsonb,
+               '{queryHold,at}',
+               to_jsonb(COALESCE(performance_details->'queryHold'->>'at', $2::jsonb->'queryHold'->>'at'))
+             )
+         WHERE id=$1`,
+        [runId,JSON.stringify(payload)],
+      );
+    }
+    await client.query('COMMIT');
+  }catch(error){
+    await client.query('ROLLBACK').catch(()=>undefined);
+    throw error;
+  }finally{
+    client.release();
+  }
+}
 export async function addQueryExecutionLog(log:{query_id?:number;query_run_id?:string;query:string;country:string;executed_at:string;channels_discovered:number;unique_new_channels:number;quality_creators_discovered:number;communities_discovered:number;cycle_quality_score:number;logs?:string[];}):Promise<void>{const db=await getDb(); await db.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`,[log.query_run_id||null,log.query_id||null,log.query,log.country,log.executed_at,log.channels_discovered,log.unique_new_channels,log.quality_creators_discovered,log.communities_discovered,log.cycle_quality_score,JSON.stringify(log.logs||[])]);}
 export async function getRecentQueryExecutionLogs(limit=20):Promise<QueryExecutionLog[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_execution_logs ORDER BY executed_at DESC LIMIT $1',[limit]); return res.rows.map(r=>({id:r.id,query_id:r.query_id||undefined,query:r.query,country:r.country,executed_at:iso(r.executed_at)||'',channels_discovered:r.channels_discovered||0,unique_new_channels:r.unique_new_channels||0,quality_creators_discovered:r.quality_creators_discovered||0,communities_discovered:r.communities_discovered||0,cycle_quality_score:r.cycle_quality_score||0,logs:parseJson(r.logs,[])}));}
 export async function saveExtractedTerm(country:string,term:string,category:'terminology'|'instrument'|'phrase'|'format',sourceChannelId?:string,clientOverride?:{query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>}):Promise<void>{const outerRunner=clientOverride||await getDb();const poolLike='connect' in (outerRunner as object)&&typeof (outerRunner as {connect?:unknown}).connect==='function'&&!('release' in (outerRunner as object));const client=poolLike?await (outerRunner as unknown as import('pg').Pool).connect():null;const runner=((client??outerRunner)as unknown as {query:(text:string,params?:unknown[])=>Promise<{rows:Array<Record<string,unknown>>}>});try{if(client)await runner.query('BEGIN');const db={query:(text:string,params?:unknown[])=>runner.query(text,params)};const clean=term.trim(); if(!clean){if(client)await runner.query('COMMIT');return;}
@@ -3523,7 +3610,7 @@ export async function getJobByIdempotencyKey(idempotencyKey: string): Promise<Du
 }
 
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||'',reopen_generation:r.reopen_generation==null?0:Number(r.reopen_generation)};}
-export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
+export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[],enrichProbeOnly=false):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
     // Single priority-preserving claim loop: always consider the globally
     // highest-priority pending candidate first. Unguarded candidates claim
     // immediately (identical to the legacy path); guarded candidates evaluate
@@ -3537,7 +3624,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
     const deniedIds: string[] = [];
     const lockedGuards = new Set<ClaimBudgetGuard>();
     for (;;) {
-      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]);
+      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND (NOT $5::boolean OR type <> 'ENRICH_CHANNEL' OR (COALESCE((payload->>'enrichmentStage')::int,1)<=2 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))) AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds,enrichProbeOnly]);
       if (!res.rowCount) break;
       const row = res.rows[0];
       const guard = budgetGuards.find(g => g.types.includes(String(row.type)) && (!effectiveTypes || effectiveTypes.some(t => g.types.includes(t))));
@@ -3550,7 +3637,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
       if (verdict.exhausted && effectiveTypes) effectiveTypes = effectiveTypes.filter(t => !guard.types.includes(t));
     }
     if (deniedIds.length && effectiveTypes !== null && !effectiveTypes.length) { await client.query('COMMIT'); return null; }
-    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,generation,status) VALUES($1,$2,$3,'PROCESSING')`,[job.id,upd.rows[0].attempts,Number(upd.rows[0].reopen_generation||0)]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
+    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND (NOT $5::boolean OR type <> 'ENRICH_CHANNEL' OR (COALESCE((payload->>'enrichmentStage')::int,1)<=2 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))) AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds,enrichProbeOnly]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,generation,status) VALUES($1,$2,$3,'PROCESSING')`,[job.id,upd.rows[0].attempts,Number(upd.rows[0].reopen_generation||0)]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
     }catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
   // Trace persistence is deliberately outside the claim transaction. The old
   // implementation inserted diagnostic rows before COMMIT, so any trace-only
@@ -5293,6 +5380,8 @@ export async function completeQueryRun(runId: string, metrics: {
    * performance_details via the metrics JSON; never affects scoring.
    */
   latencyBreakdownMs?: { workerTotalMs: number; quotaWaitMs: number; retrievalMs: number; channelProcessingMs: number };
+  /** Post-retrieval consistency hold, persisted atomically with completion. */
+  queryHold?: { hold?: boolean } | null;
 }): Promise<void> {
   const db = await getDb();
   const client = await db.connect();
@@ -5418,7 +5507,7 @@ export async function completeQueryRun(runId: string, metrics: {
       };
       const marker = await client.query(`INSERT INTO query_run_accounting_attributions(query_run_id,query_id,attribution_version,performance_score,metrics) VALUES($1,$2,'query-run-accounting-v1',$3,$4) ON CONFLICT(query_run_id) DO NOTHING RETURNING query_run_id`, [runId, run.rows[0].query_id, metrics.performanceScore || 0, JSON.stringify(attributionMetrics)]);
       if (marker.rowCount) {
-        await client.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=COALESCE($7,collection) WHERE id=$8`, [metrics.distinctResults, metrics.newChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.averageQualityScore || 0, metrics.performanceScore || 0, metrics.newCollection || null, run.rows[0].query_id]);
+        await client.query(`UPDATE query_library SET times_executed=times_executed+1,last_executed=now(),total_channels_found=total_channels_found+$1,unique_channels_found=unique_channels_found+$2,quality_channels_found=quality_channels_found+$3,community_channels_found=community_channels_found+$4,avg_quality_score=ROUND(((avg_quality_score*times_executed)+$5)/(times_executed+1)),performance_score=$6,collection=CASE WHEN collection='REJECTED' AND COALESCE(generation_metadata,'{}'::jsonb) ? 'queryHold' THEN collection ELSE COALESCE($7,collection) END WHERE id=$8`, [metrics.distinctResults, metrics.newChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.averageQualityScore || 0, metrics.performanceScore || 0, metrics.newCollection || null, run.rows[0].query_id]);
         await client.query(`INSERT INTO query_execution_logs(query_run_id,query_id,query,country,executed_at,channels_discovered,unique_new_channels,quality_creators_discovered,communities_discovered,cycle_quality_score,logs) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(query_run_id) WHERE query_run_id IS NOT NULL DO NOTHING`, [runId, run.rows[0].query_id, row.query, row.country, iso(row.completed_at)!, metrics.distinctResults, metrics.newChannels, metrics.qualityChannels, metrics.communitiesDiscovered, metrics.performanceScore || 0, JSON.stringify([`Durable autonomous ${row.retrieval_lane} lane run ${runId} completed via linked query-run accounting.`])]);
         await attributeTerminologyPerformance(rowToQuery(row), attributionMetrics, metrics.quotaUsed, row.retrieval_lane, row.search_ordering, client);
       }
@@ -5835,6 +5924,15 @@ export async function topUpQuotaReservation(args: {
   if (!Number.isFinite(args.additionalUnits) || args.additionalUnits <= 0) return false;
 
   const db = await getDb();
+  // A top-up for a missing/expired reservation cannot succeed. Check that
+  // cheaply before paying for the backlog and seven-day demand scans.
+  const reservationExists = await db.query(
+    `SELECT 1 FROM quota_reservations
+      WHERE operation_type=$1 AND operation_id=$2 AND allocation=$3
+        AND status='RESERVED' AND expires_at>now() LIMIT 1`,
+    [args.operationType, args.operationId, args.allocation],
+  );
+  if (!reservationExists.rowCount) return false;
   const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {

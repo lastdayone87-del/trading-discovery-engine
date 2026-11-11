@@ -51,6 +51,7 @@ import {
   markQueryRunResumeUnavailable,
   createContinuationRunSegment,
   setQueryRunJobId,
+  holdQueryForResultConsistency,
   markCommunityInspectionStarted,
   markSiteInspectionsClaimed,
   markSiteInspectionsDiscarded,
@@ -71,6 +72,7 @@ import {
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
 import { resolveExecutionSearchWindow } from './retrievalExperiment';
+import { assessQueryResultConsistency, shouldContinueSearchAfterConsistency } from './queryResultConsistency';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
 import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
@@ -593,6 +595,7 @@ interface AutonomousRunFinalizationArgs {
   createContinuation: boolean;
   continuationExplorationPagesRemaining: number;
   continuationResumeMode: ContinuationResumeMode;
+  queryHold?: import('./queryResultConsistency').QueryResultConsistencyDecision | null;
 }
 
 /**
@@ -710,6 +713,7 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
   }
   await completeQueryRun(args.queryRunId, {
     ...finalMetrics,
+    ...(args.queryHold?.hold ? { queryHold: args.queryHold } : {}),
     uniqueChannels: finalMetrics.newChannels,
     qualityChannels: finalMetrics.qualityChannels,
     communitiesDiscovered: finalMetrics.communitiesDiscovered,
@@ -1365,6 +1369,7 @@ export async function processNextSearchJob(
   // Groq organization that is clear of BOTH its persisted cooldown and its
   // process-local cooldown still allows the claim so jobs can reach the
   // already-working fallback.
+  let enrichProbeOnly = false;
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
@@ -1398,6 +1403,7 @@ export async function processNextSearchJob(
            LIMIT 1`)).rowCount
       : 0;
     const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
+    enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable;
     if (enrichmentFullyClaimable || enrichmentProbe) {
       claimableTypes.push('ENRICH_CHANNEL');
       // Classification jobs require the semantic decision and remain gated
@@ -1438,7 +1444,7 @@ export async function processNextSearchJob(
   if (claimableTypes.length === 0) return false;
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
-  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS]);
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS], enrichProbeOnly);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
@@ -1645,7 +1651,7 @@ export async function processNextSearchJob(
       // REJECTED rows are terminal for every pipeline (isTerminalState) and
       // are additionally guarded explicitly here (P2) so a future terminal
       // state change can never let an excluded creator spend enrichment quota.
-      if (!channel || channel.country_status === 'REJECTED' || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+      if (!channel || channel.country_status === 'REJECTED' || channel.scan_status === 'INTAKE_DEFERRED' || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
         // Retry repair: a retried ENRICH job replays vocabulary extraction so a
         // save that failed after its observation committed cannot strand rows
         // behind this early completion (same bars as the ingestion helper).
@@ -2130,6 +2136,38 @@ export async function processNextSearchJob(
       searchRetrievalGrossMs += Date.now() - fallbackStartMs;
     }
     const distinctExtracted = [...new Map(extracted.map(channel => [channel.channelId, channel])).values()];
+    // Post-retrieval intent consistency: a query that returns a high share of
+    // scripts outside the target country's profile is held before any channel
+    // is persisted or queued for enrichment. The search quota is already spent;
+    // this guard prevents the far larger downstream spend and preserves the
+    // result evidence on the query/run for operator review.
+    const queryResultConsistency = queryId && source === 'automated_query'
+      ? assessQueryResultConsistency(country, distinctExtracted)
+      : null;
+    const queryResultHold = queryResultConsistency?.hold === true;
+    if (queryResultHold) {
+      await holdQueryForResultConsistency(queryId!, queryRunId, {
+        policyVersion: queryResultConsistency!.policyVersion,
+        reasonCodes: queryResultConsistency!.reasonCodes,
+        incompatibleShare: queryResultConsistency!.incompatibleShare,
+        sampleSize: queryResultConsistency!.sampleSize,
+        incompatibleScripts: queryResultConsistency!.incompatibleScripts,
+        expectedScripts: queryResultConsistency!.expectedScripts,
+        country,
+        query,
+      });
+      console.warn(JSON.stringify({
+        event: 'query_result_consistency_hold',
+        queryId,
+        queryRunId,
+        country,
+        query,
+        incompatibleShare: queryResultConsistency!.incompatibleShare,
+        sampleSize: queryResultConsistency!.sampleSize,
+        incompatibleScripts: queryResultConsistency!.incompatibleScripts,
+        timestamp: new Date().toISOString(),
+      }));
+    }
     const queryRecord=queryId?await getQueryById(queryId):null;
     const observations: QueryObservation[] = [];
     const sightings = [];
@@ -2142,7 +2180,7 @@ export async function processNextSearchJob(
     // worker.
     const classificationDecoupling = resolveClassificationDecouplingConfig();
     let classificationBackpressure: ClassificationBackpressureState | null = null;
-    for (const [index, raw] of distinctExtracted.entries()) {
+    for (const [index, raw] of (queryResultHold ? [] : distinctExtracted).entries()) {
       // A durable nomination is written before channel processing. When the
       // ledger is OFF, legacy channel_sightings remain the compatibility path.
       const nomination=await recordNomination({channelId:raw.channelId,sourceType:source,queryId,queryRunId,jobId:job.id,
@@ -2219,7 +2257,7 @@ export async function processNextSearchJob(
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
-      await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+      if (sightings.length) await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
       const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '50'));
       // A malformed setting must not become an unbounded (or NaN) page
       // ceiling. Fall back to the same 50-page default the migration seeds;
@@ -2396,13 +2434,18 @@ export async function processNextSearchJob(
       };
       await recordAutonomousPage(pageObservation);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
-      if (deferDecision) {
+      if (!queryResultHold && deferDecision) {
         if (decisionV2.deferReason === 'QUOTA') await deferAutonomousRunForQuota(queryRunId, decisionV2.primaryReason);
         else await deferAutonomousRunForTime(queryRunId, decisionV2.primaryReason);
         await completeJob(job.id);
         return true;
       }
-      if (continuationEnabled && decision.shouldContinue && searchPage?.nextPageToken) {
+      if (shouldContinueSearchAfterConsistency({
+        queryResultHold,
+        continuationEnabled,
+        decisionShouldContinue: decision.shouldContinue === true,
+        hasNextPageToken: Boolean(searchPage?.nextPageToken),
+      })) {
         let incPageReservationId: string | undefined;
 
         // Incremental Treatment Page Quota Reservation Boundary
@@ -2511,8 +2554,8 @@ export async function processNextSearchJob(
         channelLoopStartMs,
         channelLoopEndMs,
         trial,
-        nextPageToken: searchPage?.nextPageToken || null,
-        createContinuation: shouldCreateContinuationSegment({
+        nextPageToken: queryResultHold ? null : (searchPage?.nextPageToken || null),
+        createContinuation: queryResultHold ? false : shouldCreateContinuationSegment({
           paginationEnabled: continuationEnabled,
           usingV2,
           primaryReason: decision.primaryReason,
@@ -2521,7 +2564,23 @@ export async function processNextSearchJob(
         }),
         continuationExplorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
         continuationResumeMode: resumeModeForProvider(providerKey),
+        queryHold: queryResultConsistency,
       });
+      if (queryResultHold) {
+        // completeQueryRun recomputes collection from the empty/held page
+        // metrics. Re-assert the terminal hold after finalization so a later
+        // selector cannot promote or re-use the query.
+        await holdQueryForResultConsistency(queryId, queryRunId, {
+          policyVersion: queryResultConsistency!.policyVersion,
+          reasonCodes: queryResultConsistency!.reasonCodes,
+          incompatibleShare: queryResultConsistency!.incompatibleShare,
+          sampleSize: queryResultConsistency!.sampleSize,
+          incompatibleScripts: queryResultConsistency!.incompatibleScripts,
+          expectedScripts: queryResultConsistency!.expectedScripts,
+          country,
+          query,
+        });
+      }
     }
     await completeJob(job.id);
     return true;
@@ -4309,6 +4368,14 @@ export function shouldCompleteSuppressedRetryJob(inspection:{
 }
 
 export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<boolean>{
+  // A recovery sweep may have selected this channel before a concurrent
+  // classification ruled it out of scope. Re-check at the enqueue boundary so
+  // an OUT_OF_SCOPE terminal closure cannot be reopened by that stale sweep.
+  if(source==='RECOVERY'){
+    const runner:{query:(sql:string,params?:unknown[])=>Promise<{rows:any[]}>}=clientOverride||await getDb();
+    const scope=await runner.query(`SELECT scope_eligibility FROM channels WHERE channel_id=$1`,[channelId]);
+    if(String(scope.rows?.[0]?.scope_eligibility||'').trim().toUpperCase()==='OUT_OF_SCOPE')return false;
+  }
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
@@ -4377,7 +4444,7 @@ export function operationalEnrichmentRecoveryKey(channelId:string):string{return
  * without a database; the enqueue path itself is unchanged.
  */
 export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'channel_thumbnail_url'>,reasonCodes:string[]){
-  return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:1},recoveryReasonCodes:reasonCodes};
+  return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:0},recoveryReasonCodes:reasonCodes};
 }
 export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<boolean>{
   const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:30,maxAttempts:4,clientOverride});

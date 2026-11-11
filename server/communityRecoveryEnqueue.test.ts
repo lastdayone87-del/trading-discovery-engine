@@ -65,6 +65,34 @@ test('community retry enqueue is idempotent per channel and keeps the bounded at
   assert.equal(communityAcquisitionRetryKey('UC_IDEMPOTENT'), 'community-acquisition-retry:UC_IDEMPOTENT');
 });
 
+test('recovery enqueue refuses a channel that is now OUT_OF_SCOPE', async () => {
+  const queries: Array<{ sql: string; values?: unknown[] }> = [];
+  const client = {
+    async query(sql: string, values?: unknown[]) {
+      queries.push({ sql, values });
+      if (sql.includes('SELECT scope_eligibility FROM channels')) {
+        return { rows: [{ scope_eligibility: 'OUT_OF_SCOPE' }], rowCount: 1 };
+      }
+      if (sql.includes('INSERT INTO jobs')) {
+        return { rows: [jobRow], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  const enqueued = await enqueueCommunityAcquisitionRetry(
+    'UC_OUT_OF_SCOPE',
+    saturationDirective,
+    'RECOVERY',
+    client as any,
+  );
+  assert.equal(enqueued, false);
+  assert.equal(
+    queries.filter(query => query.sql.includes('INSERT INTO jobs')).length,
+    0,
+    'an out-of-scope recovery enqueue must not reopen the terminal retry',
+  );
+});
+
 test('community retry enqueue merges per-seed click progress monotonically against the current row', async () => {
   const client = mockClient();
   await enqueueCommunityAcquisitionRetry('UC_CLICK', {

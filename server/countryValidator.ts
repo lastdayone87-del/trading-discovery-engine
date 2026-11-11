@@ -186,7 +186,8 @@ export function applyTargetCountryBoundary(result: ValidationResult, targetCount
 
   if (globalContext || !detected || detected === target) return result;
 
-  const reason = `Creator country ${detected} differs from pinned discovery country ${target}; retained for normal processing because creator country ${detected} is not itself excluded.`;
+  const retention = result.gateDisposition === 'NEEDS_REVIEW' ? 'retained for review' : 'retained for normal processing';
+  const reason = `Creator country ${detected} differs from pinned discovery country ${target}; ${retention} because the available evidence does not establish a domicile-grade exclusion.`;
   return {
     ...result,
     decisionLogs: `${result.decisionLogs}\nTarget Country Boundary: RETAINED — ${reason}`
