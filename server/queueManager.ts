@@ -86,7 +86,7 @@ import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import './youtubeInnertubeProvider';
-import { EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, isExtractedQueryDiscoveryEnabled, isExtractedStandaloneQueryRow, replayVocabularyForRetry } from './queryIntelligence';
+import { calculateCreatorQualityScore, evaluateQueryPerformance, extractVocabularyFromCreator, isExtractedStandaloneQueryRow, loadExtractedQueryDiscoveryEnabled, replayVocabularyForRetry } from './queryIntelligence';
 import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuationMetrics, type FunnelOutcome, type QueryFunnelMetrics, type QueryObservation } from './queryPerformance';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
@@ -1962,7 +1962,7 @@ export async function processNextSearchJob(
       // must not spend YouTube quota after extracted discovery is disabled.
       if (authorityQueryRecord
         && isExtractedStandaloneQueryRow(authorityQueryRecord)
-        && !isExtractedQueryDiscoveryEnabled(await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false'))) {
+        && !(await loadExtractedQueryDiscoveryEnabled())) {
         console.log(`[Extracted Query] Withheld automated search job ${job.id} for "${query}" (${country}): feature is paused.`);
         if (queryRunId) await failQueryRun(queryRunId, new Error('Extracted query discovery is paused.'), true);
         await completeJob(job.id);

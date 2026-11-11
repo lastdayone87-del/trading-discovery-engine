@@ -17,7 +17,7 @@ import {
 import { ProviderCallError, type ProviderCallEvent } from './providerResilience';
 import { isAdmissibleParsed, extractVocabularyFromCreator } from './queryIntelligence';
 import { buildNoveltyBaseline } from './terminologyIntelligence';
-import { getDb, setAppSetting } from './db';
+import { getAppSetting, getDb, setAppSetting } from './db';
 
 const GROQ_ENV_PATTERN = /^GROQ_/;
 
@@ -1232,6 +1232,7 @@ test('paused extracted query discovery writes no candidate ledger rows', {
   const realFetch = globalThis.fetch;
   const suffix = `pause${Date.now().toString(36)}${process.pid}`;
   const channelId = `GROQ_PAUSE_${suffix}`;
+  const previousExtractedSetting = await getAppSetting('extracted_query_discovery_enabled', '');
   try {
     await setAppSetting('extracted_query_discovery_enabled', 'false');
     withEnv({ GROQ_API_KEY: 'test-paused-key' }, 'org-paused');
@@ -1278,5 +1279,6 @@ test('paused extracted query discovery writes no candidate ledger rows', {
     restoreGroqEnv(saved);
     resetGroqCooldownForTests();
     resetGroqVocabularyPacingForTests();
+    await setAppSetting('extracted_query_discovery_enabled', previousExtractedSetting);
   }
 });

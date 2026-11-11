@@ -98,6 +98,13 @@ export function isExtractedQueryDiscoveryEnabled(value: unknown): boolean {
   return String(value ?? '').trim().toLowerCase() === 'true';
 }
 
+/** Single fail-closed reader used by extraction, generation and selection. */
+export async function loadExtractedQueryDiscoveryEnabled(): Promise<boolean> {
+  return isExtractedQueryDiscoveryEnabled(
+    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
+  );
+}
+
 /** True for rows owned by the paused feature, including its quarantine marker. */
 export function isExtractedStandaloneQueryRow(row: { generation_metadata?: unknown }): boolean {
   const metadata = row.generation_metadata;
@@ -1005,9 +1012,7 @@ export async function extractVocabularyFromCreator(
   // Below-quality creators may contribute observations, but their text must
   // not become discovery queries. The same flag also keeps query-only provider
   // responses from suppressing Gemini fallback for an unusable bucket.
-  const extractedQueryDiscoveryEnabled = isExtractedQueryDiscoveryEnabled(
-    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
-  );
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
   const queryCandidatesEligible = extractedQueryDiscoveryEnabled
     && options?.promotionEligible !== false
     && options?.persistLegacyTerm !== false;
@@ -1444,9 +1449,7 @@ export async function selectNextQueryForCountry(
   const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
   const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
 
-  const extractedQueryDiscoveryEnabled = isExtractedQueryDiscoveryEnabled(
-    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
-  );
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
   const loadQueries = async (): Promise<QueryRecord[]> =>
     filterPausedExtractedQueryRows(await getQueriesByCountry(country), extractedQueryDiscoveryEnabled);
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
@@ -1932,9 +1935,7 @@ export async function generateCandidateQueriesForCountry(
   options: { scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' } = {}
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  const extractedQueryDiscoveryEnabled = isExtractedQueryDiscoveryEnabled(
-    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
-  );
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
   if (extractedQueryDiscoveryEnabled) {
     await reconcileExtractedQueryCandidates(country).catch(error => {
       console.warn('[Extracted Query] reconciliation failed', error instanceof Error ? error.message : String(error));
