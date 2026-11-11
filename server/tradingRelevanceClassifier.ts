@@ -1,5 +1,20 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
 import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
+import { resolveClassificationRouting, resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
+
+/**
+ * Semantic provider outcomes only. A deterministic provider failure must not
+ * relabel a semantic attempt as degraded or abstained.
+ */
+export function semanticProviderOutcomeFlags(
+  providers: Array<{ provider?: string; outcome?: string }>,
+): { abstained: boolean; failed: boolean } {
+  const semantic = providers.filter(provider => /semantic/.test(String(provider.provider)));
+  return {
+    abstained: semantic.some(provider => String(provider.outcome).startsWith('ABSTAINED_')),
+    failed: semantic.some(provider => String(provider.outcome).startsWith('FAILED_')),
+  };
+}
 
 /**
  * Main Entry Point: Classifies a YouTube Channel's Trading Relevance
@@ -46,6 +61,22 @@ export async function classifyTradingRelevanceDetailed(
   // the cache key covers documents the ledger's checksum omits.
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
+  const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
+  const routingMode = resolveClassificationRoutingMode();
+  const videoDocuments = input.videos?.length
+    ? input.videos
+    : (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] || '' }));
+  // Keep one document per video. Collapsing identical text would hide two
+  // distinct uploads from the mismatch guard.
+  const videoTexts = videoDocuments
+    .map(video => [video.title, video.description].filter(Boolean).join('\n').trim())
+    .filter(Boolean);
+  const routing = resolveClassificationRouting(decision, {
+    independentEvidence: corroboration?.disposition === 'PASS',
+    videoTexts,
+    mode: routingMode,
+  });
+  if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 
   // Map to legacy breakdown format while adding rich evidence audit details
   const reasoningLogs: string[] = [
@@ -73,14 +104,31 @@ export async function classifyTradingRelevanceDetailed(
     reasoningLogs.push(`[-EVIDENCE] (${neg.source} / ${neg.reliability}): ${neg.fact}${provSuffix}`);
   }
 
-  const semanticServed = !!decision.geminiSemanticSummary || String(decision.classificationMethod || '').startsWith('SEMANTIC_');
-  const classificationMethod: TradingRelevanceBreakdown['classification_method'] = semanticServed
-    ? 'AI_SEMANTIC_CLASSIFIER'
-    : decision.classificationMethod === 'DETERMINISTIC_EVIDENCE'
+  // An abstention is not semantic service. Use the routing result so a
+  // deterministic fast-track is not misreported as AI-reviewed and a
+  // semantic abstention is not presented as a semantic verdict.
+  const legacyReporting = routingMode === 'LEGACY';
+  // Only semantic provider failures/abstentions may affect semantic labels;
+  // a deterministic provider failure must not relabel a semantic attempt.
+  const { abstained: semanticAbstained, failed: semanticFailed } =
+    semanticProviderOutcomeFlags(decision.evidenceCollection.providers || []);
+  const semanticServed = legacyReporting
+    ? (!!decision.geminiSemanticSummary || String(decision.classificationMethod || '').startsWith('SEMANTIC_'))
+    : routing.semanticUsed;
+  const classificationMethod: TradingRelevanceBreakdown['classification_method'] = legacyReporting
+    ? (semanticServed ? 'AI_SEMANTIC_CLASSIFIER'
+      : decision.classificationMethod === 'DETERMINISTIC_EVIDENCE' ? 'DETERMINISTIC_EVIDENCE'
+        : decision.classificationMethod === 'DEGRADED_HEURISTIC' ? 'DEGRADED_HEURISTIC'
+          : 'HEURISTIC_ONLY')
+    : routing.route === 'DETERMINISTIC_TRADING' || routing.route === 'DETERMINISTIC_NON_TRADING'
       ? 'DETERMINISTIC_EVIDENCE'
-      : decision.classificationMethod === 'DEGRADED_HEURISTIC'
-        ? 'DEGRADED_HEURISTIC'
-        : 'HEURISTIC_ONLY';
+      : semanticServed
+        ? 'AI_SEMANTIC_CLASSIFIER'
+        : routing.semanticAttempted
+          ? semanticAbstained ? 'SEMANTIC_ABSTAINED' : semanticFailed ? 'DEGRADED_HEURISTIC' : 'SEMANTIC_ABSTAINED'
+          : decision.classificationMethod === 'DEGRADED_HEURISTIC'
+            ? 'DEGRADED_HEURISTIC'
+            : 'HEURISTIC_ONLY';
   const noEvidence = decision.evidenceCount !== undefined
     ? decision.evidenceCount === 0
     : [...decision.positiveEvidence, ...decision.negativeEvidence].every(item => item.category === 'SEMANTIC_ABSTENTION');
@@ -88,6 +136,9 @@ export async function classifyTradingRelevanceDetailed(
     stage_a_score: Math.round(decision.totalPositiveWeight),
     consistency_ratio: decision.multiVideoConsistencyRatio,
     ai_reviewed: semanticServed,
+    // Cost accounting needs attempted AI calls (including abstentions), while
+    // `ai_reviewed`/`semantic_used` report whether semantic evidence served.
+    semantic_attempted: legacyReporting ? semanticServed : routing.semanticAttempted,
     fast_heuristic_status: decision.status === 'TRADING_CONFIRMED' ? 'FAST_ACCEPT' : decision.status === 'NON_TRADING' ? 'FAST_REJECT' : 'UNCERTAIN',
     classification_method: classificationMethod,
     // Every non-empty assessment is scored by the unified decision policy,
@@ -96,7 +147,18 @@ export async function classifyTradingRelevanceDetailed(
     ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,
-    reasoning: reasoningLogs
+    ...(legacyReporting ? {} : {
+      classification_route: routing.route,
+      deterministic_fast_track: routing.fastTrack,
+      semantic_used: routing.semanticUsed,
+      human_review_candidate: routing.humanReview,
+      routing_fallback_reason: routing.fallbackReason,
+      routing_policy_version: routing.version,
+    }),
+    reasoning: [
+      ...reasoningLogs,
+      ...(legacyReporting ? [] : [`Deterministic-first route: ${routing.route} | fastTrack=${routing.fastTrack} | semanticUsed=${routing.semanticUsed} | fallback=${routing.fallbackReason || 'none'} | ${routing.reasonCodes.join(', ')}`]),
+    ]
   };
 
   const result: TradingClassificationResult = {

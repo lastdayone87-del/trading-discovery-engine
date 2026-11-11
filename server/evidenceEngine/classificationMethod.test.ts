@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ConfigurableWeightedStrategy } from './scoringEngine';
+import { semanticProviderOutcomeFlags } from '../tradingRelevanceClassifier';
 import { evaluateClassificationStages } from './stagedClassification';
 import { getLayeredKnowledgeContext } from './knowledgePacks';
 import type { EvidenceCollectionReport, EvidenceItem } from './types';
@@ -139,4 +140,21 @@ test('degraded evidence remains degraded even with a non-decisive recognition re
   );
   assert.equal(decision.status, 'UNCERTAIN');
   assert.equal(decision.classificationMethod, 'DEGRADED_HEURISTIC');
+});
+
+test('deterministic provider failures do not make a semantic attempt look degraded', () => {
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'channel_metadata', outcome: 'FAILED_PROVIDER' },
+      { provider: 'gemini_semantic', outcome: 'ABSTAINED_LOW_CONFIDENCE' },
+    ]),
+    { abstained: true, failed: false },
+  );
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'channel_metadata', outcome: 'FAILED_PROVIDER' },
+      { provider: 'gemini_semantic', outcome: 'EXECUTED_WITH_EVIDENCE' },
+    ]),
+    { abstained: false, failed: false },
+  );
 });
