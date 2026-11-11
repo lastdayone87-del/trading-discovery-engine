@@ -30,6 +30,7 @@ import {
   getStandaloneExtractedQueryCandidates,
   linkExtractedQueryCandidate,
   markExtractedQueryCandidatesAttempted,
+  markExtractedQueryCandidatesCapDeferred,
   reconcileExtractedQueryCandidates,
   persistQueryTerminologyDigest,
   getQueryRunReward,
@@ -1942,14 +1943,10 @@ export async function generateCandidateQueriesForCountry(
       console.warn('[Extracted Query] failed to rotate ineligible candidates', error instanceof Error ? error.message : String(error));
     });
   }
-  // Only the bounded eligible offer is marked attempted. Unoffered rows stay
-  // fresh for the next batch instead of waiting out the rotation cooldown.
+  // Offer only the bounded eligible slice. Attempts are recorded after
+  // planning, so a candidate discarded solely by the actual-batch cap stays
+  // available for the next batch instead of waiting out a cooldown.
   const extractedOffer = eligibleExtractedCandidates.slice(0, Math.max(0, Math.floor(count * 0.4)));
-  if (extractedOffer.length) {
-    await markExtractedQueryCandidatesAttempted(extractedOffer.map(candidate => candidate.id)).catch(error => {
-      console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
-    });
-  }
   const countryVocab = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
   // Free signals are candidate vocabulary only. Read stored signals when the
   // flag is on; on a cold country, refresh once (provider failure falls back
@@ -1977,6 +1974,7 @@ export async function generateCandidateQueriesForCountry(
         sourceIds: [signal.providerSignalId || `${signal.provider}:${signal.normalizedSurface}`],
       }))
     : [];
+  const capDeferredExtractedIds = new Set<number>();
   const planned = planDiverseQueries({
     country,
     count,
@@ -1996,8 +1994,28 @@ export async function generateCandidateQueriesForCountry(
       sourceTitle: candidate.sourceTitle,
     })),
     mode,
-    scopePromotionBasis: options.scopePromotionBasis
+    scopePromotionBasis: options.scopePromotionBasis,
+    onExtractedCapDeferred: ids => ids.forEach(id => capDeferredExtractedIds.add(id)),
   });
+  const plannedExtractedCandidateIds = new Set(planned
+    .map(item => Number((item.metadata as any)?.extractedCandidateId || 0))
+    .filter(id => Number.isSafeInteger(id) && id > 0));
+  const offeredExtractedIds = new Set(extractedOffer.map(candidate => candidate.id));
+  // Rotate planner-blocked or failed offers, but leave cap-deferred candidates
+  // available for the next batch.
+  const rotateExtractedIds = [...offeredExtractedIds]
+    .filter(id => !plannedExtractedCandidateIds.has(id) && !capDeferredExtractedIds.has(id));
+  if (capDeferredExtractedIds.size) {
+    await markExtractedQueryCandidatesCapDeferred([...capDeferredExtractedIds]).catch(error => {
+      console.warn('[Extracted Query] failed to record cap deferral', error instanceof Error ? error.message : String(error));
+    });
+  }
+  const attemptedExtractedIds = [...new Set([...plannedExtractedCandidateIds, ...rotateExtractedIds])];
+  if (attemptedExtractedIds.length) {
+    await markExtractedQueryCandidatesAttempted(attemptedExtractedIds).catch(error => {
+      console.warn('[Extracted Query] failed to record planner attempt', error instanceof Error ? error.message : String(error));
+    });
+  }
   const newQueries: QueryRecord[] = [];
   // One country history read for the batch. Without this every planned
   // candidate rescans every same-country row to rebuild duplicate history.

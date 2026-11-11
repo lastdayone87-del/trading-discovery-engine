@@ -9,7 +9,11 @@ to `autonomous-query-authority-v3` on 2026-10-29 as part of the Q0–Q8
 query-quality admission program, and candidate triage advanced from
 `candidate-triage-v4-contextual-admission` to
 `candidate-triage-v5-latin-market-finance` on 2026-11-02 when the
-precision-first Latin-market signal was added. No benchmark run, observation or
+precision-first Latin-market signal was added, and then from v5 to
+`candidate-triage-v6-intake-trading-focus` on 2026-11-09 when the non-Latin
+blanket admission was replaced by the evidence-based ADMIT/WITHHOLD/DEFER
+gate. No benchmark run, observation or execution record existed under any of
+these values. No benchmark run, observation or
 execution record existed under the earlier values, so these are pre-execution
 corrections rather than post-execution amendments. The same program also
 advanced the serving query selector from the legacy UCB1 branch to
@@ -23,7 +27,7 @@ ordering, and scheduling is restricted to free rows and fails closed rather
 than falling back to the official provider. No benchmark run, observation or
 execution record existed before any of these revisions. The spec version is
 unchanged; `verifyFrozenBenchmarkVersions()` now requires
-v3 and v5 and continues to fail closed on any other drift.
+v3 and v6 and continues to fail closed on any other drift.
 
 - Benchmark specification version: `benchmark-preregistration-v1`
 - Engine base commit (merged main after PR #492): `4b49e0c01ac53eebf0080fae29bd6aaabb803cfc`
@@ -56,7 +60,7 @@ v3 and v5 and continues to fail closed on any other drift.
 | Graph expansion policy (P3) | `graph-expansion-v1`, `GRAPH_MAX_DEPTH=2`, `GRAPH_MAX_FANOUT=10` | `server/graphExpansionPolicy.ts:12-14` |
 | Relationship canary | `relationship-canary-v1`, `MAX_SEEDS=10`, `MAX_DEPTH=2`, `MAX_FANOUT=10`, `MAX_DEPTH2_PARENTS=5`, `MAX_CHANNELS_PER_RUN=150`, `ESTIMATED_DOWNSTREAM_UNITS=305` | `server/relationshipCanary.ts:31-48` |
 | Autonomous query authority | `autonomous-query-authority-v3` (pre-execution revision; `4b49e0c` contains v2) | `server/autonomousQueryAuthority.ts:6` |
-| Candidate triage | `candidate-triage-v5-latin-market-finance` (pre-execution revision) | `server/candidateTriage.ts:9` |
+| Candidate triage | `candidate-triage-v6-intake-trading-focus` (pre-execution revision) | `server/candidateTriage.ts:16` |
 | DB migrations | 137 files, latest `137_domain_memory.sql` | `server/db/migrations/` |
 | Assignment/hash | sha256 hex slice `(0,8)` mod 10000; no separate salt field exists — assignment identity/version inputs = `policyVersion + experimentId + opportunityKey` (see §6) | `server/querySelectionExperiments.ts:137-139`, `server/retrievalExperiment.ts:114-117` |
 | Feature-gate states | All benchmark-relevant experimental gates default OFF/false/0 (see §3 table); the serving-selector control has no gate | §3 |

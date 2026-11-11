@@ -10,6 +10,7 @@ import { isSearchableTradingTerm } from '../terminologySearchability';
 import {
   QUERY_SOURCE_REGISTRY,
   admitQueryRecord,
+  candidateFromQueryRecord,
   revalidateQueryRecordAdmission,
   withQueryAdmission,
 } from './admission';
@@ -1030,9 +1031,9 @@ test('Q6: zero-quota runs are separate, stop coverage is completed-only, compati
   assert.deepEqual(dashboard.selection.admissionRejections, [{ reason: 'SPECULATIVE_EVIDENCE_ONLY', count: 1 }]);
 });
 
-test('Q8: frozen benchmark guard requires authority v3 and triage v5, rejects older drift', () => {
+test('Q8: frozen benchmark guard requires authority v3 and triage v6, rejects older drift', () => {
   assert.equal(AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION, 'autonomous-query-authority-v3');
-  assert.equal(CANDIDATE_TRIAGE_POLICY_VERSION, 'candidate-triage-v5-latin-market-finance');
+  assert.equal(CANDIDATE_TRIAGE_POLICY_VERSION, 'candidate-triage-v6-intake-trading-focus');
   assert.doesNotThrow(() => verifyFrozenBenchmarkVersions());
   assert.throws(
     () => verifyFrozenBenchmarkVersions({ candidateTriage: 'candidate-triage-v4-contextual-admission' }),
@@ -2133,4 +2134,33 @@ test('Q2: CDL anchored bootstrap templates admit without granting PR557 provenan
     assert.equal(decision.candidate.atoms[1]?.provenance, origin, 'bootstrap atoms keep their own provenance');
     assert.notEqual(decision.candidate.atoms[1]?.provenance, 'PR557', 'candidate vocabulary must still pass the semantic lexicon');
   }
+});
+
+
+test('Q0: broker and platform atoms map to an entity sense, not terminology', () => {
+  const broker = candidateFromQueryRecord({
+    country: 'Belgium',
+    query: 'BEL20 Bolero aandelen',
+    primary_term: 'BEL20',
+    generation_metadata: {
+      atoms: [
+        { term: 'BEL20', type: 'INSTRUMENT', origin: 'CURATED' },
+        { term: 'Bolero aandelen', type: 'BROKER', origin: 'COUNTRY_VOCABULARY' },
+      ],
+    },
+  } as never);
+  assert.equal(broker.atoms[1]?.sense.type, 'ENTITY');
+
+  const platform = candidateFromQueryRecord({
+    country: 'United States',
+    query: 'NQ Futures Topstep',
+    primary_term: 'NQ Futures',
+    generation_metadata: {
+      atoms: [
+        { term: 'NQ Futures', type: 'INSTRUMENT', origin: 'CURATED' },
+        { term: 'Topstep', type: 'PLATFORM', origin: 'COUNTRY_VOCABULARY' },
+      ],
+    },
+  } as never);
+  assert.equal(platform.atoms[1]?.sense.type, 'ENTITY');
 });
