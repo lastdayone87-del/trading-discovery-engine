@@ -20,6 +20,9 @@ test('recovery reuses the existing cooldown, cycle ceiling and active-job exclus
   assert.match(recovery, /OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES/);
   assert.match(recovery, /NOT EXISTS\([\s\S]*?active\.status IN\('PENDING','PROCESSING'\)/);
   assert.match(recovery, /operational-enrichment-terminal:/);
+  assert.match(recovery, /date_trunc\('milliseconds', last_checked\)/);
+  assert.match(recovery, /CLASSIFY_DISCOVERED_CHANNEL/);
+  assert.match(recovery, /classification-resolution-failure:/);
   assert.match(recovery, /await client\.query\('BEGIN'\)[\s\S]*?enqueueOperationalEnrichmentRecoveryJob[\s\S]*?INSERT INTO operational_enrichment_recovery_events/);
 });
 
@@ -37,14 +40,14 @@ test('the normal eligibility path preserves an exhausted pending review lineage'
   const store = read('./reviewEligibility/store.ts');
   assert.match(store, /evidence_snapshot->>'reasonFamily'='EVIDENCE_EXHAUSTED'/);
   assert.match(store, /preservedExhaustedReview:true/);
+  assert.match(store, /SET trading_status='NEEDS_REVIEW',scan_status='NEEDS_REVIEW'/);
   assert.match(store, /SELECT pg_advisory_xact_lock/);
 });
 
 test('recovery excludes active jobs and guards the permanent projection against races', () => {
   const recovery = read('./classificationResolutionRecovery.ts');
-  assert.match(recovery, /AS has_active_job/);
-  assert.match(recovery, /hasActiveJob: row\.has_active_job === true/);
-  assert.match(recovery, /last_checked IS NOT DISTINCT FROM \$2::timestamptz/);
+  assert.match(recovery, /hasActiveJob: false/);
+  assert.match(recovery, /date_trunc\('milliseconds', last_checked\) IS NOT DISTINCT FROM date_trunc\('milliseconds', \$2::timestamptz\)/);
   assert.match(recovery, /if \(projected\.rowCount\) permanentFailures \+= 1/);
   assert.match(recovery, /terminalFailureClass === 'UNKNOWN'/);
   assert.match(recovery, /decision\.action === 'SKIP_COOLDOWN'/);
@@ -56,6 +59,7 @@ test('the maintenance sweep defaults to read-only until explicitly enabled', () 
   const scheduler = read('./operationalMaintenanceScheduler.ts');
   assert.match(scheduler, /CLASSIFICATION_RESOLUTION_RECOVERY_APPLY/);
   assert.match(scheduler, /dryRun: !classificationResolutionRecoveryApplyEnabled\(\)/);
+  assert.match(scheduler, /result\.failures > 0/);
 });
 
 test('the cooldown probe reserves its interval before scanning and skips hydrated jobs', () => {
@@ -70,6 +74,7 @@ test('the dry-run script is write-safe and validates flags', () => {
   assert.match(script, /--limit must be an integer/);
   assert.match(script, /--cutoff requires --include-legacy/);
   assert.match(script, /finally \{[\s\S]*?db\.end\(\)/);
+  assert.match(script, /process\.exitCode = 1/);
 });
 
 test('the migration avoids a validated CHECK and blocking index build on jobs', () => {

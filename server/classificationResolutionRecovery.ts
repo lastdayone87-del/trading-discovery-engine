@@ -9,6 +9,7 @@ export const CLASSIFICATION_RESOLUTION_RECOVERY_CYCLE_LIMIT = OPERATIONAL_ENRICH
 export const CLASSIFICATION_RESOLUTION_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 const CUTOFF_EVENT_KEY = 'classification-resolution-recovery:cutoff';
 const CYCLE_PREFIX = 'operational-enrichment:';
+const FAILURE_PREFIX = 'classification-resolution-failure:';
 
 export type ResolutionRecoveryAction =
   | 'SKIP_TERMINAL'
@@ -161,17 +162,11 @@ export async function reconcileClassificationResolutionGaps(
             EXISTS(SELECT 1 FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE 'operational-enrichment-terminal:%') AS terminal_recovery_marker,
-            EXISTS(
-              SELECT 1 FROM jobs active
-               WHERE active.payload->>'channelId'=c.channel_id
-                 AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
-                 AND active.status IN('PENDING','PROCESSING')
-            ) AS has_active_job
        FROM channels c
        LEFT JOIN LATERAL (
          SELECT job.id,job.status,job.terminal_failure_class,job.attempts,job.updated_at
            FROM jobs job
-          WHERE job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
+          WHERE job.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
             AND job.payload->>'channelId'=c.channel_id
           ORDER BY job.updated_at DESC NULLS LAST,job.created_at DESC NULLS LAST,job.id DESC
           LIMIT 1
@@ -180,6 +175,12 @@ export async function reconcileClassificationResolutionGaps(
         AND c.scan_status IN('ENRICHMENT_PENDING','FAILED')
         AND ($1::boolean OR COALESCE(c.last_checked,c.created_at) >= $2::timestamptz)
         AND COALESCE(c.country_status,'') <> 'REJECTED'
+        AND NOT EXISTS(
+          SELECT 1 FROM operational_enrichment_recovery_events recent_failure
+           WHERE recent_failure.channel_id=c.channel_id
+             AND recent_failure.event_key LIKE '${FAILURE_PREFIX}%'
+             AND recent_failure.created_at>=now()-interval '15 minutes'
+        )
         AND NOT EXISTS(
           SELECT 1 FROM jobs active
            WHERE active.payload->>'channelId'=c.channel_id
@@ -196,7 +197,8 @@ export async function reconcileClassificationResolutionGaps(
     const decision = resolveResolutionRecoveryAction({
       tradingStatus: String(row.trading_status),
       scanStatus: String(row.scan_status),
-      hasActiveJob: row.has_active_job === true,
+      // The candidate query already excludes every active job type.
+      hasActiveJob: false,
       latestJobStatus: row.latest_job_status ? String(row.latest_job_status) : null,
       terminalFailureClass: row.terminal_failure_class ? String(row.terminal_failure_class) : null,
       recoveryCycles: Number(row.recovery_cycles) || 0,
@@ -239,7 +241,7 @@ export async function reconcileClassificationResolutionGaps(
         continue;
       }
       if (decision.action === 'PROJECT_PERMANENT_FAILURE') {
-        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND last_checked IS NOT DISTINCT FROM $2::timestamptz AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
+        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND date_trunc('milliseconds', last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds', $2::timestamptz) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
         if (projected.rowCount) permanentFailures += 1;
         else skipped += 1;
         continue;
@@ -298,6 +300,21 @@ export async function reconcileClassificationResolutionGaps(
       enqueued += 1;
     } catch (error) {
       failures += 1;
+      // Keep a deterministic failing head row from starving the rest of the
+      // batch on every sweep. The exclusion is short-lived so transient
+      // failures are retried after the backoff.
+      await db.query(
+        `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
+         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
+        [
+          `${FAILURE_PREFIX}${item.channelId}:${Date.now()}`,
+          item.channelId,
+          item.latestJobId || 'none',
+          item.scanStatus,
+          JSON.stringify(['ROW_APPLY_FAILED', 'CLASSIFICATION_RESOLUTION']),
+          CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
+        ],
+      ).catch(ledgerError => console.warn(`[ClassificationResolution] Failure backoff write failed for ${item.channelId}:`, ledgerError instanceof Error ? ledgerError.message : ledgerError));
       console.warn(JSON.stringify({
         event: 'classification_resolution_recovery_item_failed',
         channelId: item.channelId,

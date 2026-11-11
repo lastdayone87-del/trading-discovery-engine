@@ -25,6 +25,10 @@ export async function recordReviewEligibilityShadow(input:ReviewEligibilityInput
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`review-eligibility:${input.channelId}`]);
     const exhaustedPending=await client.query(`SELECT 1 FROM channel_reviews WHERE channel_id=$1 AND state='PENDING' AND evidence_snapshot->>'reasonFamily'='EVIDENCE_EXHAUSTED' FOR UPDATE`,[input.channelId]);
     if(exhaustedPending.rowCount){
+      // The pipeline upsert can overwrite the review projection's serving
+      // state while the exhausted review is still pending. Re-assert it so a
+      // normal eligibility pass cannot re-queue enrichment behind the review.
+      await client.query(`UPDATE channels SET trading_status='NEEDS_REVIEW',scan_status='NEEDS_REVIEW',updated_at=now() WHERE channel_id=$1 AND trading_status NOT IN('TRADING_CONFIRMED','NON_TRADING','HUMAN_REJECTED')`,[input.channelId]);
       await client.query('COMMIT');
       return {...evaluation,mode,configuredMode:configured,recorded:false,idempotent:true,preservedExhaustedReview:true};
     }
