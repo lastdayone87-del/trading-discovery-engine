@@ -12,7 +12,7 @@ import {
   findAdmissionCandidate,
   getAdmissionAmbiguousRate,
   getAdmissionMode,
-  recordAdmissionDecision,
+  recordAdmissionOutcome,
   updateAdmissionCandidate,
   type AdmissionCandidateRow,
 } from './store';
@@ -181,22 +181,24 @@ export async function verifyAdmissionCandidate(
     if (country.status === 'REJECTED') {
       const reasonCodes = ['COUNTRY_POLICY_REJECTED', country.rejectionReason || 'COUNTRY_REJECTED'];
       if (!options.dryRun) {
-        await recordAdmissionDecision({
-          candidateId: row.id,
-          decisionKey: `${row.id}:REJECT_COUNTRY:${hash}`,
-          channelId: evidence.channelId,
-          decision: 'REJECT_COUNTRY',
-          reasonCodes,
-          evidenceHash: hash,
-        });
-        await updateAdmissionCandidate({
-          id: row.id,
-          status: 'REJECTED_COUNTRY',
-          decision: 'REJECT_COUNTRY',
-          reasonCodes,
-          evidence,
-          evidenceHash: hash,
-          attempts: Number(row.attempts || 0) + 1,
+        await recordAdmissionOutcome({
+          decision: {
+            candidateId: row.id,
+            decisionKey: `${row.id}:REJECT_COUNTRY:${hash}`,
+            channelId: evidence.channelId,
+            decision: 'REJECT_COUNTRY',
+            reasonCodes,
+            evidenceHash: hash,
+          },
+          candidate: {
+            id: row.id,
+            status: 'REJECTED_COUNTRY',
+            decision: 'REJECT_COUNTRY',
+            reasonCodes,
+            evidence,
+            evidenceHash: hash,
+            attempts: Number(row.attempts || 0) + 1,
+          },
         });
         const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
         if (existing) {
@@ -312,28 +314,31 @@ export async function verifyAdmissionCandidate(
     }
   }
   if (!options.dryRun) {
-    recordedDecisionId = await recordAdmissionDecision({
-      candidateId: row.id,
-      decisionKey: `${row.id}:${policy.decision}:${hash}`,
-      channelId: evidence.channelId,
-      decision: policy.decision,
-      reasonCodes: policy.reasonCodes,
-      evidenceHash: hash,
-      judgment: effectiveJudgment,
+    const recorded = await recordAdmissionOutcome({
+      decision: {
+        candidateId: row.id,
+        decisionKey: `${row.id}:${policy.decision}:${hash}`,
+        channelId: evidence.channelId,
+        decision: policy.decision,
+        reasonCodes: policy.reasonCodes,
+        evidenceHash: hash,
+        judgment: effectiveJudgment,
+      },
+      candidate: {
+        id: row.id,
+        status: policy.status,
+        decision: policy.decision,
+        reasonCodes: policy.reasonCodes,
+        evidence,
+        evidenceHash: hash,
+        judgment: effectiveJudgment,
+        model: effectiveJudgment.model,
+        attempts: Number(row.attempts || 0) + 1,
+        nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
+        expiresAt: row.expires_at || (policy.hold ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString() : null),
+      },
     });
-    await updateAdmissionCandidate({
-      id: row.id,
-      status: policy.status,
-      decision: policy.decision,
-      reasonCodes: policy.reasonCodes,
-      evidence,
-      evidenceHash: hash,
-      judgment: effectiveJudgment,
-      model: effectiveJudgment.model,
-      attempts: Number(row.attempts || 0) + 1,
-      nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
-      expiresAt: row.expires_at || (policy.hold ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString() : null),
-    });
+    recordedDecisionId = recorded.decisionId;
   }
 
   if (policy.rejected && options.archiveRejectedExistingChannel && !options.dryRun) {

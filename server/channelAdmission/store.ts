@@ -9,6 +9,10 @@ import type {
 } from './types';
 import { ADMISSION_POLICY_VERSION } from './policy';
 
+type AdmissionQueryable = {
+  query: (text: string, values?: any[]) => Promise<{ rows: any[]; rowCount?: number | null }>;
+};
+
 export interface AdmissionCandidateRow {
   id: string;
   candidate_key: string;
@@ -186,8 +190,9 @@ export async function updateAdmissionCandidate(input: {
   attempts?: number;
   nextCheckAt?: string | null;
   expiresAt?: string | null;
+  client?: AdmissionQueryable;
 }): Promise<AdmissionCandidateRow | null> {
-  const db = await getDb();
+  const db = input.client || await getDb();
   const result = await db.query(
     `UPDATE semantic_admission_candidates SET
        status=$2,
@@ -222,8 +227,9 @@ export async function recordAdmissionDecision(input: {
   reasonCodes: string[];
   evidenceHash?: string;
   judgment?: SemanticJudgment;
+  client?: AdmissionQueryable;
 }): Promise<string | null> {
-  const db = await getDb();
+  const db = input.client || await getDb();
   const result = await db.query(
     `INSERT INTO semantic_admission_decisions(candidate_id,decision_key,channel_id,decision,reason_codes,evidence_hash,semantic_output,policy_version)
      VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb,$8)
@@ -236,6 +242,32 @@ export async function recordAdmissionDecision(input: {
     ],
   );
   return result.rows[0]?.id ? String(result.rows[0].id) : null;
+}
+
+/**
+ * Persists the ledger decision and the candidate projection atomically. The
+ * worker can then recover the whole outcome from an idempotent retry without
+ * leaving a terminal candidate that has no decision, or a decision that has
+ * no candidate projection.
+ */
+export async function recordAdmissionOutcome(input: {
+  decision: Parameters<typeof recordAdmissionDecision>[0];
+  candidate: Parameters<typeof updateAdmissionCandidate>[0];
+}): Promise<{ decisionId: string | null; candidate: AdmissionCandidateRow | null }> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const decisionId = await recordAdmissionDecision({ ...input.decision, client });
+    const candidate = await updateAdmissionCandidate({ ...input.candidate, client });
+    await client.query('COMMIT');
+    return { decisionId, candidate };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{

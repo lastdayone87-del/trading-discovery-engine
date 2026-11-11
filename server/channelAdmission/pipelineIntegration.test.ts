@@ -36,6 +36,9 @@ test('pipeline source wires a confirmed admission to the synthetic classifier', 
   assert.match(pipeline, /candidate\.admissionConfirmedTrading === true && candidate\.admissionDecisionId/);
   assert.match(pipeline, /buildAdmissionConfirmedClassification/);
   assert.match(pipeline, /Boolean\(candidate\.admissionDecisionId\)/);
+  const gate = queue.indexOf("if (!options?.admissionBypass && (await getAdmissionMode()) === 'ACTIVE')");
+  const legacyHandoff = queue.indexOf('return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);');
+  assert.ok(gate > -1 && legacyHandoff > gate, 'the admission gate must precede the legacy pipeline handoff');
 });
 
 test('legacy dashboard predicate hides pre-admission rows', () => {
