@@ -644,7 +644,11 @@ async function processChannelThroughPipelineInContext(
   // ledger and can be rediscovered later by independent evidence.
   // A semantic admission decision supersedes the legacy lexical intake gate.
   // Admitted channels must not be re-deferred by the pre-admission heuristic.
-  const retrievalTriage = options?.forceClassification === true || Boolean(candidate.admissionDecisionId)
+  const durableAdmission = Boolean(candidate.admissionDecisionId)
+    || existing?.admission_status === 'ADMITTED'
+    || existing?.admission_status === 'ADMITTED_AMBIGUOUS'
+    || Boolean(existing?.admission_decision_id);
+  const retrievalTriage = options?.forceClassification === true || durableAdmission
     ? null
     : triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
   if (retrievalTriage && retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
