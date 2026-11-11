@@ -1625,7 +1625,7 @@ export async function processNextSearchJob(
       // REJECTED rows are terminal for every pipeline (isTerminalState) and
       // are additionally guarded explicitly here (P2) so a future terminal
       // state change can never let an excluded creator spend enrichment quota.
-      if (!channel || channel.country_status === 'REJECTED' || channel.scan_status === 'INTAKE_DEFERRED' || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
+      if (!channel || channel.country_status === 'REJECTED' || isTerminalState(channel) || channel.trading_status !== 'UNCERTAIN') {
         // Retry repair: a retried ENRICH job replays vocabulary extraction so a
         // save that failed after its observation committed cannot strand rows
         // behind this early completion (same bars as the ingestion helper).
