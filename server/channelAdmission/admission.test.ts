@@ -384,7 +384,8 @@ test('pending admissions do not trip the contamination guard', () => {
     tradingConfirmed: 0,
     priorZeroQualityPages: 2,
   });
-  assert.equal(decision.stop, false);
+  assert.equal(decision.stop, true);
+  assert.equal(decision.quarantine, false);
 });
 
 test('admission jobs resolve quota provenance before a channels row exists', async () => {

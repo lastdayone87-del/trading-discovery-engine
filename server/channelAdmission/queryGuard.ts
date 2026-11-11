@@ -30,10 +30,15 @@ export interface QueryAdmissionGuardDecision {
  */
 export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): QueryAdmissionGuardDecision {
   const total = Math.max(0, input.outcomes.total);
-  if (input.pageNumber < 2 || total < 8) return { stop: false, quarantine: false, reasonCodes: [] };
-  // Do not judge a page while its admission jobs are still queued. A later
-  // page will see the settled outcomes and can stop the run then.
-  if (Number(input.outcomes.pending || 0) > 0) return { stop: false, quarantine: false, reasonCodes: [] };
+  if (input.pageNumber < 2) return { stop: false, quarantine: false, reasonCodes: [] };
+  // Do not judge a page while its admission jobs are still queued, but do not
+  // let pagination run away before those verdicts exist. Stop this run without
+  // quarantining the query; the query remains selectable after the admissions
+  // settle.
+  if (Number(input.outcomes.pending || 0) > 0) {
+    return { stop: true, quarantine: false, reasonCodes: ['ADMISSION_PENDING_WAIT'] };
+  }
+  if (total < 8) return { stop: false, quarantine: false, reasonCodes: [] };
   const rejectedShare = input.outcomes.rejected / total;
   const unresolvedShare = (input.outcomes.rejected + input.outcomes.held) / total;
   const reasonCodes: string[] = [];
