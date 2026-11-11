@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { ChannelRecord } from '../src/types';
 import { enqueueOperationalEnrichmentRecoveryJob } from './queueManager';
@@ -130,6 +131,30 @@ async function channelRowToRecord(db: any, channelId: string): Promise<ChannelRe
   const result = await db.query('SELECT * FROM channels WHERE channel_id=$1', [channelId]);
   if (!result.rowCount) return null;
   return result.rows[0] as ChannelRecord;
+}
+
+/**
+ * Remove a repeatedly non-materialized recovery row from the head of the next
+ * sweep. The candidate query excludes recent FAILURE_PREFIX events, so this is
+ * a short-lived backoff rather than a terminal state.
+ */
+export async function recordClassificationResolutionBackoff(
+  db: { query: (sql: string, params: unknown[]) => Promise<unknown> },
+  item: Pick<ClassificationResolutionRecoveryItem, 'channelId' | 'latestJobId' | 'scanStatus'>,
+  reasonCodes: string[],
+): Promise<void> {
+  await db.query(
+    `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
+     VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
+    [
+      `${FAILURE_PREFIX}${item.channelId}:${randomUUID()}`,
+      item.channelId,
+      item.latestJobId || 'none',
+      item.scanStatus,
+      JSON.stringify(reasonCodes),
+      CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
+    ],
+  ).catch(ledgerError => console.warn(`[ClassificationResolution] Backoff write failed for ${item.channelId}:`, ledgerError instanceof Error ? ledgerError.message : ledgerError));
 }
 
 /**
@@ -272,7 +297,10 @@ export async function reconcileClassificationResolutionGaps(
           evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles, policyVersion: CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION },
         });
         if (review.materialized) exhaustedReviews += 1;
-        else skipped += 1;
+        else {
+          skipped += 1;
+          await recordClassificationResolutionBackoff(db, item, ['EXHAUSTED_REVIEW_NOT_MATERIALIZED', review.reason || 'UNKNOWN']);
+        }
         continue;
       }
       const channel = await channelRowToRecord(db, item.channelId);
@@ -312,7 +340,10 @@ export async function reconcileClassificationResolutionGaps(
           evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles },
         });
         if (review.materialized) exhaustedReviews += 1;
-        else skipped += 1;
+        else {
+          skipped += 1;
+          await recordClassificationResolutionBackoff(db, item, ['EXHAUSTED_REVIEW_NOT_MATERIALIZED', review.reason || 'UNKNOWN']);
+        }
         continue;
       }
       enqueued += 1;
@@ -321,18 +352,7 @@ export async function reconcileClassificationResolutionGaps(
       // Keep a deterministic failing head row from starving the rest of the
       // batch on every sweep. The exclusion is short-lived so transient
       // failures are retried after the backoff.
-      await db.query(
-        `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
-         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
-        [
-          `${FAILURE_PREFIX}${item.channelId}:${Date.now()}`,
-          item.channelId,
-          item.latestJobId || 'none',
-          item.scanStatus,
-          JSON.stringify(['ROW_APPLY_FAILED', 'CLASSIFICATION_RESOLUTION']),
-          CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
-        ],
-      ).catch(ledgerError => console.warn(`[ClassificationResolution] Failure backoff write failed for ${item.channelId}:`, ledgerError instanceof Error ? ledgerError.message : ledgerError));
+      await recordClassificationResolutionBackoff(db, item, ['ROW_APPLY_FAILED', 'CLASSIFICATION_RESOLUTION']);
       console.warn(JSON.stringify({
         event: 'classification_resolution_recovery_item_failed',
         channelId: item.channelId,
