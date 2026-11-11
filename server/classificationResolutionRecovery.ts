@@ -146,7 +146,7 @@ export async function reconcileClassificationResolutionGaps(
        ) latest ON true
       WHERE c.trading_status='UNCERTAIN'
         AND c.scan_status IN('ENRICHMENT_PENDING','FAILED')
-        AND ($1::boolean OR c.last_checked IS NULL OR c.last_checked >= $2::timestamptz)
+        AND ($1::boolean OR COALESCE(c.last_checked,c.created_at) >= $2::timestamptz)
       ORDER BY c.last_checked ASC NULLS FIRST,c.channel_id
       LIMIT $3`,
     [Boolean(options.includeLegacy), cutoff, limit],
