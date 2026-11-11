@@ -263,4 +263,9 @@ test('inspection lane is wired into every rendered fallback call', () => {
   assert.match(fallback, /retryAt,telemetry/, 'saturation result must carry the governor retry hint');
   assert.match(fallback, /renderedFallbackGate\.refund\(failedAdmissionId\)/);
   assert.match(fallback, /renderedCrawlStarted\(\{ inspectedPages, telemetry \}\)/);
+  assert.match(
+    fallback,
+    /telemetry\.gateWaitMs = Math\.max\(telemetry\.gateWaitMs \|\| 0, timedOutWaitMs\)/,
+    'timed-out waits must be recorded in fallback telemetry',
+  );
 });

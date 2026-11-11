@@ -10,7 +10,7 @@ import { isProductionConfiguredCountry } from './queryQuality/profiles';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
 export type QueryGenerationMode = 'EXPLORATION' | 'EXPLOITATION' | 'COLD_START';
-export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
+export type SearchAtomType = 'INSTRUMENT' | 'METHOD' | 'MARKET' | 'BROKER' | 'PLATFORM' | 'FORMAT' | 'LEARNED' | 'CONCEPT' | 'ENTITY' | 'TOPIC' | 'NEIGHBORHOOD' | 'COVERAGE';
 export type QueryCandidateSource = 'TERMINOLOGY' | 'FREE_SIGNAL' | 'SEED' | 'MIXED' | 'DEMAND_SIGNAL';
 
 /** Per-query cap for the repeated searchability-gate audit snapshot. */
@@ -48,7 +48,7 @@ export interface ProvenTerminologyAtom { id: number; term: string; score: number
 const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryIntent]>> = {
   'United States': [['NQ Futures', 'INSTRUMENT', 'futures'], ['ES Futures', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Chart', 'METHOD', 'indicators'], ['ICT', 'METHOD', 'strategy'], ['Volume Profile', 'METHOD', 'indicators'], ['Premarket', 'FORMAT', 'premarket_prep']],
   'United Kingdom': [['FTSE Trading', 'INSTRUMENT', 'stocks'], ['GBPUSD', 'INSTRUMENT', 'forex'], ['Spread Betting', 'METHOD', 'strategy'], ['London Session', 'MARKET', 'session_analysis'], ['Price Action', 'METHOD', 'strategy'], ['Trading Psychology', 'METHOD', 'psychology']],
-  Germany: [['DAX Analyse', 'INSTRUMENT', 'market_analysis'], ['DAX Trading', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Trading', 'METHOD', 'indicators'], ['Börsenanalyse', 'MARKET', 'market_analysis'], ['Technische Analyse', 'METHOD', 'education'], ['Futures Handel', 'METHOD', 'futures']],
+  Germany: [['DAX', 'INSTRUMENT', 'stocks'], ['DAX Analyse', 'INSTRUMENT', 'market_analysis'], ['DAX Trading', 'INSTRUMENT', 'futures'], ['Bund', 'INSTRUMENT', 'futures'], ['Order Flow', 'METHOD', 'strategy'], ['Footprint Trading', 'METHOD', 'indicators'], ['Börsenanalyse', 'MARKET', 'market_analysis'], ['Technische Analyse', 'METHOD', 'education'], ['Futures Handel', 'METHOD', 'futures']],
   France: [['CAC40 Analyse', 'INSTRUMENT', 'market_analysis'], ['Analyse Technique', 'METHOD', 'education'], ['Trading Futures', 'METHOD', 'futures'], ['Smart Money', 'METHOD', 'strategy'], ['Euronext', 'MARKET', 'stocks'], ['Journal Trading', 'FORMAT', 'trading_journals'], ['Flux Ordres', 'METHOD', 'strategy']],
   Spain: [['IBEX35', 'INSTRUMENT', 'stocks'], ['Análisis Técnico', 'METHOD', 'education'], ['Trading Forex', 'METHOD', 'forex'], ['Order Flow', 'METHOD', 'strategy'], ['Trading Intradía', 'METHOD', 'live_trading'], ['Futuros Trading', 'METHOD', 'futures']],
   Netherlands: [['AEX Trading', 'INSTRUMENT', 'stocks'], ['Technische Analyse', 'METHOD', 'education'], ['Opties Handelen', 'METHOD', 'options'], ['Beurs Analyse', 'MARKET', 'market_analysis'], ['Daghandel', 'METHOD', 'live_trading'], ['Order Flow', 'METHOD', 'strategy']],
@@ -76,24 +76,24 @@ const COUNTRY_SEARCH_ATOMS: Record<string, Array<[string, SearchAtomType, QueryI
  * queries, so they do not need to be paired with a global instrument.
  */
 const COUNTRY_NATIVE_QUERY_ATOMS: Record<string, Array<[string, SearchAtomType, QueryIntent]>> = {
-  'United States': [['premarket analysis', 'MARKET', 'premarket_prep'], ['opening bell', 'MARKET', 'session_analysis'], ['Topstep', 'MARKET', 'strategy'], ['Apex Trader', 'MARKET', 'strategy']],
-  'United Kingdom': [['London open', 'MARKET', 'session_analysis'], ['spread betting', 'METHOD', 'strategy'], ['IG Index', 'MARKET', 'stocks'], ['Trading 212', 'MARKET', 'stocks']],
-  Germany: [['DAX Analyse heute', 'MARKET', 'market_analysis'], ['DAX Analyse aktuell', 'MARKET', 'market_analysis'], ['Charttechnik DAX', 'MARKET', 'market_analysis'], ['Orderflow DAX', 'MARKET', 'strategy'], ['Trade Republic', 'MARKET', 'stocks'], ['XTB DAX', 'MARKET', 'stocks']],
-  France: [['analyse technique CAC', 'MARKET', 'market_analysis'], ["CAC 40 aujourd'hui", 'MARKET', 'market_analysis'], ['carnet ordres CAC', 'MARKET', 'strategy'], ['Boursorama CAC 40', 'MARKET', 'stocks'], ['Bourse Direct', 'MARKET', 'stocks'], ['PEA bourse', 'MARKET', 'stocks']],
+  'United States': [['premarket analysis', 'MARKET', 'premarket_prep'], ['opening bell', 'MARKET', 'session_analysis'], ['Topstep', 'PLATFORM', 'strategy'], ['Apex Trader', 'PLATFORM', 'strategy']],
+  'United Kingdom': [['London open', 'MARKET', 'session_analysis'], ['spread betting', 'METHOD', 'strategy'], ['IG Index', 'BROKER', 'stocks'], ['Trading 212', 'BROKER', 'stocks']],
+  Germany: [['DAX Analyse heute', 'MARKET', 'market_analysis'], ['DAX Analyse aktuell', 'MARKET', 'market_analysis'], ['Charttechnik DAX', 'MARKET', 'market_analysis'], ['Orderflow DAX', 'MARKET', 'strategy'], ['Trade Republic', 'BROKER', 'stocks'], ['XTB DAX', 'BROKER', 'stocks']],
+  France: [['analyse technique CAC', 'MARKET', 'market_analysis'], ["CAC 40 aujourd'hui", 'MARKET', 'market_analysis'], ['carnet ordres CAC', 'MARKET', 'strategy'], ['Boursorama CAC 40', 'BROKER', 'stocks'], ['Bourse Direct', 'BROKER', 'stocks'], ['PEA bourse', 'MARKET', 'stocks']],
   Spain: [['análisis técnico IBEX', 'MARKET', 'market_analysis'], ['IBEX 35 hoy', 'MARKET', 'market_analysis'], ['bolsa española análisis', 'MARKET', 'market_analysis'], ['velas japonesas', 'METHOD', 'indicators'], ['operativa intradía', 'METHOD', 'live_trading'], ['Bolsamanía IBEX', 'MARKET', 'market_analysis']],
   Netherlands: [['technische analyse AEX', 'MARKET', 'market_analysis'], ['AEX opening', 'MARKET', 'session_analysis'], ['opties AEX', 'MARKET', 'options'], ['Daghandel AEX', 'MARKET', 'live_trading'], ['Nico Bakker', 'MARKET', 'market_analysis'], ['Tostrams AEX', 'MARKET', 'market_analysis']],
   Italy: [['analisi tecnica FTSE', 'MARKET', 'market_analysis'], ['FTSE MIB oggi', 'MARKET', 'market_analysis'], ['analisi ciclica', 'METHOD', 'market_analysis'], ['titoli FTSE MIB', 'MARKET', 'stocks'], ['Milano Finanza', 'MARKET', 'market_analysis'], ['Teleborsa FTSE', 'MARKET', 'market_analysis']],
   Japan: [['日経225先物', 'MARKET', 'futures'], ['日経225 デイトレード', 'MARKET', 'live_trading'], ['日経225 チャート分析', 'MARKET', 'market_analysis'], ['ドル円 デイトレード', 'MARKET', 'forex'], ['板読み トレード', 'MARKET', 'strategy'], ['東京市場 オープン', 'MARKET', 'session_analysis']],
-  Denmark: [['OMXC25 analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aktier', 'MARKET', 'market_analysis'], ['aktiehandel Danmark', 'MARKET', 'stocks'], ['Nordnet Danmark', 'MARKET', 'stocks']],
-  Sweden: [['OMXS30 analys', 'MARKET', 'market_analysis'], ['teknisk analys aktier', 'MARKET', 'market_analysis'], ['börsanalys Stockholm', 'MARKET', 'market_analysis'], ['Avanza aktier', 'MARKET', 'stocks']],
-  Norway: [['OBX analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aksjer', 'MARKET', 'market_analysis'], ['Oslo Børs analyse', 'MARKET', 'market_analysis'], ['Nordnet aksjer', 'MARKET', 'stocks']],
-  Switzerland: [['Schweizer Börse Analyse', 'MARKET', 'market_analysis'], ['Charttechnik SMI', 'MARKET', 'market_analysis'], ['Swissquote SMI', 'MARKET', 'stocks']],
-  Belgium: [['BEL20 analyse', 'MARKET', 'market_analysis'], ['beursanalyse België', 'MARKET', 'market_analysis'], ['Euronext Brussels analyse', 'MARKET', 'market_analysis'], ['Bolero aandelen', 'MARKET', 'stocks']],
-  Luxembourg: [['LuxX Analyse', 'MARKET', 'market_analysis'], ['Bourse Luxembourg analyse', 'MARKET', 'market_analysis'], ['Swissquote Luxembourg', 'MARKET', 'stocks']],
-  Ireland: [['ISEQ 20 analyse', 'MARKET', 'market_analysis'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Davy Select', 'MARKET', 'stocks']],
-  Singapore: [['STI analysis', 'MARKET', 'market_analysis'], ['SGX analysis', 'MARKET', 'market_analysis'], ['Singapore market outlook', 'MARKET', 'market_analysis'], ['DBS Vickers', 'MARKET', 'stocks']],
-  'New Zealand': [['NZX 50 analysis', 'MARKET', 'market_analysis'], ['NZX market wrap', 'MARKET', 'market_analysis'], ['Sharesies investing', 'MARKET', 'stocks']],
-  'United Arab Emirates': [['تداول الأسهم الإمارات', 'MARKET', 'stocks'], ['تحليل فني دبي', 'MARKET', 'market_analysis'], ['DFM trading', 'MARKET', 'stocks'], ['ADX trading', 'MARKET', 'stocks'], ['Sarwa investing', 'MARKET', 'stocks']],
+  Denmark: [['OMXC25 analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aktier', 'MARKET', 'market_analysis'], ['aktiehandel Danmark', 'MARKET', 'stocks'], ['Nordnet Danmark', 'BROKER', 'stocks']],
+  Sweden: [['OMXS30 analys', 'MARKET', 'market_analysis'], ['teknisk analys aktier', 'MARKET', 'market_analysis'], ['börsanalys Stockholm', 'MARKET', 'market_analysis'], ['Avanza aktier', 'BROKER', 'stocks']],
+  Norway: [['OBX analyse', 'MARKET', 'market_analysis'], ['teknisk analyse aksjer', 'MARKET', 'market_analysis'], ['Oslo Børs analyse', 'MARKET', 'market_analysis'], ['Nordnet aksjer', 'BROKER', 'stocks']],
+  Switzerland: [['Schweizer Börse Analyse', 'MARKET', 'market_analysis'], ['Charttechnik SMI', 'MARKET', 'market_analysis'], ['Swissquote SMI', 'BROKER', 'stocks']],
+  Belgium: [['BEL20 analyse', 'MARKET', 'market_analysis'], ['beursanalyse België', 'MARKET', 'market_analysis'], ['Euronext Brussels analyse', 'MARKET', 'market_analysis'], ['Bolero aandelen', 'BROKER', 'stocks']],
+  Luxembourg: [['LuxX Analyse', 'MARKET', 'market_analysis'], ['Bourse Luxembourg analyse', 'MARKET', 'market_analysis'], ['Swissquote Luxembourg', 'BROKER', 'stocks']],
+  Ireland: [['ISEQ 20 analyse', 'MARKET', 'market_analysis'], ['Euronext Dublin', 'MARKET', 'market_analysis'], ['Davy Select', 'BROKER', 'stocks']],
+  Singapore: [['STI analysis', 'MARKET', 'market_analysis'], ['SGX analysis', 'MARKET', 'market_analysis'], ['Singapore market outlook', 'MARKET', 'market_analysis'], ['DBS Vickers', 'BROKER', 'stocks']],
+  'New Zealand': [['NZX 50 analysis', 'MARKET', 'market_analysis'], ['NZX market wrap', 'MARKET', 'market_analysis'], ['Sharesies investing', 'PLATFORM', 'stocks']],
+  'United Arab Emirates': [['تداول الأسهم الإمارات', 'MARKET', 'stocks'], ['تحليل فني دبي', 'MARKET', 'market_analysis'], ['DFM trading', 'MARKET', 'stocks'], ['ADX trading', 'MARKET', 'stocks'], ['Sarwa investing', 'PLATFORM', 'stocks']],
 };
 
 export function getCuratedQueryCountries(): string[] {
@@ -337,7 +337,15 @@ export function planCountryNativeProposalQuery(args: {
   if (reviewedPhrase && queryTokenCount(nativeTerm) > 3) return wholePhrase();
   const anchor = countryAtoms(args.country, args.countryVocabulary)
     .filter(item => ['STANDALONE', 'ANCHOR_ONLY'].includes(item.retrievalPolicy.eligibility))
-    .find(item => isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`));
+    .find(item => {
+      // Do not create stuttering pairs such as `DAX DAX Analyse`: if the
+      // reviewed phrase already contains the anchor token, run the phrase
+      // whole instead of prefixing it again.
+      const anchorTokens = new Set(normalizeQuery(item.term).split(' '));
+      const repeatsAnchor = normalizeQuery(nativeTerm).split(' ')
+        .some(token => token.length >= 3 && anchorTokens.has(token));
+      return !repeatsAnchor && isRetrievalOrientedQuery(args.country, `${item.term} ${nativeTerm}`);
+    });
   if (!anchor) return reviewedPhrase ? wholePhrase() : null;
   const query = `${anchor.term} ${nativeTerm}`;
   // Even a short reviewed phrase can overflow once the anchor is added; in
@@ -426,17 +434,76 @@ export function capDemandSignalCandidates<T>(candidates: T[], count: number): T[
   return candidates.slice(0, Math.floor(requested * 0.3));
 }
 
+const REVIEWED_BROKER_PLATFORM_SURFACE = /\b(bourse\s*direct|xtb|boursorama|trade\s*republic|scalable\s*capital|etoro|ig\s*group|interactive\s*brokers|degiro|bolero|dbs\s*vickers|trading\s*212|swissquote|saxo|plus500|cmc\s*markets|fidelity|robinhood|webull)\b/iu;
+
+const SAFE_REVIEWED_MARKET_QUALIFIER = new RegExp(
+  '\\b(dax|ibex|cac|bel ?20|euronext|nyse|nasdaq|s&p|ftse|aex|smi|omx|tsx|asx|nzx|sgx|nikkei|topix|kospi|bist|bovespa|moex|jse|hose|set|bursa|stock\\s*exchange|bourse|börse|beurs|market\\s*outlook|market\\s*wrap|opening|session)\\b'
+  + '|(?<![\\p{L}\\p{N}])(?:تحليل|تداول)(?![\\p{L}\\p{N}])',
+  'iu',
+);
+
+/**
+ * Whether a reviewed native surface is currently eligible to stand alone.
+ * Saved rows can carry older ambiguity/companion metadata, so execution
+ * authority re-evaluates the surface with this same rule instead of rejecting
+ * a phrase that the current planner still emits.
+ */
+export function isReviewedNativeStandaloneSurface(input: {
+  term: string;
+  type?: string | null;
+  specificity?: number | null;
+  ambiguity?: number | null;
+}): boolean {
+  const term = String(input.term || '').normalize('NFKC').trim().replace(/\s+/g, ' ');
+  if (!term) return false;
+  const type = String(input.type || '').toUpperCase();
+  if (['BROKER', 'PLATFORM', 'PROPFIRM'].includes(type) || REVIEWED_BROKER_PLATFORM_SURFACE.test(term)) return false;
+  const reviewedMethod = type === 'METHOD'
+    && Number(input.specificity ?? 0) >= 55
+    && Number(input.ambiguity ?? 100) <= 60;
+  const reviewedMarket = type === 'MARKET'
+    && !/\bsti\b/i.test(term)
+    && (queryTokenCount(term) >= 3 || SAFE_REVIEWED_MARKET_QUALIFIER.test(term));
+  return reviewedMethod || reviewedMarket;
+}
+
 function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAtom[] {
   const curated = (COUNTRY_SEARCH_ATOMS[country] || []).map(([term, type, intent]) => atom(term, type, intent, 1, 'CURATED'));
   const nativeQueries = (COUNTRY_NATIVE_QUERY_ATOMS[country] || []).map(([term, type, intent]) => {
     const nativeAtom = atom(term, type, intent, 1, 'COUNTRY_VOCABULARY');
-    // These are reviewed local surfaces, not ambiguous generic markets. They
-    // are allowed to stand alone; the generic MARKET specificity policy would
-    // otherwise force a companion and lose the actual local search phrase.
+    // Reviewed local surfaces are audit provenance, not an authorization to
+    // ignore retrieval specificity. High-ambiguity MARKET/BROKER/PLATFORM
+    // surfaces remain MODIFIER_ONLY and are paired with an authorized anchor
+    // below. The reviewed allowlist deliberately promotes only curated
+    // MARKET/METHOD phrases into the standalone band by raising specificity to
+    // at least 60 and lowering ambiguity to at most 45; that override is
+    // intentional and the evaluated semantic class remains in the audit trail.
+    // Specific multi-token market phrases (DAX Analyse heute, NZX 50
+    // analysis, Singapore market outlook) are safe reviewed surfaces. Short
+    // acronym/broker surfaces (STI analysis, Bolero aandelen, DBS Vickers)
+    // remain modifier-only. Broker/platform names are never standalone.
+    const reviewedStandalone = isReviewedNativeStandaloneSurface({
+      term: nativeAtom.term,
+      type: nativeAtom.type,
+      specificity: nativeAtom.retrievalPolicy.specificity,
+      ambiguity: nativeAtom.retrievalPolicy.ambiguity,
+    });
     nativeAtom.retrievalPolicy = {
       ...nativeAtom.retrievalPolicy,
-      eligibility: 'STANDALONE',
-      reasonCodes: [...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'],
+      ...(reviewedStandalone ? {
+        eligibility: 'STANDALONE' as const,
+        specificity: Math.max(nativeAtom.retrievalPolicy.specificity, 60),
+        ambiguity: Math.min(nativeAtom.retrievalPolicy.ambiguity, 45),
+        requiredCompanionClasses: [],
+        reasonCodes: [...new Set([
+          ...nativeAtom.retrievalPolicy.reasonCodes.filter(code =>
+            code !== 'AMBIGUOUS_MARKET_CONTEXT_REQUIRES_COMPANION'
+            && code !== 'UNGOVERNED_METHOD_REQUIRES_TRADING_ANCHOR'),
+          'REVIEWED_NATIVE_PHRASE',
+        ])],
+      } : {
+        reasonCodes: [...new Set([...nativeAtom.retrievalPolicy.reasonCodes, 'REVIEWED_NATIVE_PHRASE'])],
+      }),
     };
     return nativeAtom;
   });
@@ -454,6 +521,37 @@ function countryAtoms(country: string, vocabulary?: CountryVocabulary): SearchAt
     if ((isRetrievalOrientedQuery(country, candidate.term) || isBareShortTicker(candidate.term)) && !unique.has(normalizeQuery(candidate.term))) unique.set(normalizeQuery(candidate.term), candidate);
   }
   return [...unique.values()];
+}
+
+/**
+ * Cap extracted standalone queries by the actual planned batch size. The
+ * pre-selection cap bounds the requested offer; this second guard prevents an
+ * underfilled batch (for example one surviving query) from being 100%
+ * extracted. The 40% share is an initial safeguard, not a permanent ceiling:
+ * later allocation policy can raise it only with measured evidence.
+ */
+export function capExtractedStandaloneShare<T extends { metadata: { queryTemplate?: string } }>(
+  planned: T[],
+  onDeferred?: (deferred: T[]) => void,
+): T[] {
+  if (!planned.length) return planned;
+  const extractedCount = planned.filter(item => item.metadata?.queryTemplate === 'EXTRACTED_STANDALONE').length;
+  const otherCount = planned.length - extractedCount;
+  // k / (k + others) <= 0.4  =>  k <= (2/3) * others.
+  const maxExtracted = Math.floor((otherCount * 2) / 3);
+  let kept = 0;
+  const deferred: T[] = [];
+  const capped = planned.filter(item => {
+    if (item.metadata?.queryTemplate !== 'EXTRACTED_STANDALONE') return true;
+    if (kept >= maxExtracted) {
+      deferred.push(item);
+      return false;
+    }
+    kept += 1;
+    return true;
+  });
+  if (deferred.length) onDeferred?.(deferred);
+  return capped;
 }
 
 export function planDiverseQueries(args: {
@@ -492,6 +590,8 @@ export function planDiverseQueries(args: {
    * authorization source.
    */
   scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
+  /** Cap-deferred extracted candidates remain eligible for a later batch. */
+  onExtractedCapDeferred?: (candidateIds: number[]) => void;
 }): PlannedQuery[] {
   const count = Math.max(1, args.count);
   const mode = args.mode || (args.existingQueries.length ? 'EXPLORATION' : 'COLD_START');
@@ -573,6 +673,35 @@ export function planDiverseQueries(args: {
     .flatMap(anchor => methods.map(method => ({ atoms: [anchor, method], template: 'COMPACT_PAIR' as const })))
     .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
   candidates.push(...compatiblePairs);
+
+  // Reviewed native surfaces that are not authorized to stand alone are still
+  // useful retrieval modifiers. Pair each with an authorized anchor instead of
+  // dropping it or promoting it to an ambiguous single. This is the path that
+  // keeps `STI analysis` and `Bolero aandelen` in companion-shaped queries
+  // (for example `USDSGD STI analysis` / `BEL20 Bolero aandelen`) while
+  // preventing the bare acronym/broker surface from searching on its own.
+  const nativeCompanionModifiers = anchors.filter(item =>
+    item.origin === 'COUNTRY_VOCABULARY'
+    && item.retrievalPolicy.eligibility === 'MODIFIER_ONLY'
+    && item.retrievalPolicy.requiredCompanionClasses.length > 0
+    && item.retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE'),
+  );
+  const nativeCompanionPairs = pairingAnchors
+    .flatMap(anchor => nativeCompanionModifiers
+      .filter(modifier => modifier.retrievalPolicy.requiredCompanionClasses.includes(anchor.type))
+      .filter(modifier => {
+        // Do not emit a pair that repeats a token already in the anchor
+        // ("DAX XTB DAX"). The pair must add a distinct surface, not restate
+        // the anchor.
+        const anchorTokens = new Set(normalizeQuery(anchor.term).split(' '));
+        return !normalizeQuery(modifier.term).split(' ').some(token => token.length >= 3 && anchorTokens.has(token));
+      })
+      .map(modifier => ({
+        atoms: [anchor, modifier],
+        template: 'COMPACT_PAIR' as const,
+      })))
+    .filter(candidate => isRetrievalOrientedQuery(args.country, candidate.atoms.map(item => item.term).join(' ')));
+  candidates.push(...nativeCompanionPairs);
 
   // A concrete local instrument plus a local market/exchange is a safe,
   // country-specific retrieval shape when the finite method combinations have
@@ -868,7 +997,7 @@ export function planDiverseQueries(args: {
           extractedCandidateSourceTitle: candidate.extracted.sourceTitle || undefined,
         } : {}),
         ...(scopePromotedAnchor || scopePromotedRegion ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis } : {}),
-        retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes},
+        retrievalSpecificity:{policyVersion:primary.retrievalPolicy.policyVersion,eligibility:primary.retrievalPolicy.eligibility,specificity:primary.retrievalPolicy.specificity,ambiguity:primary.retrievalPolicy.ambiguity,reasonCodes:primary.retrievalPolicy.reasonCodes,requiredCompanionClasses:primary.retrievalPolicy.requiredCompanionClasses},
         atoms: candidate.atoms.map((item, position) => ({ ...item, role: position === 0 ? 'ANCHOR' : 'MODIFIER', position })),
         localTier1Term: primary.term,
         learnedTerm: candidate.extracted ? undefined : candidate.atoms.find(item => item.type === 'LEARNED')?.term,
@@ -938,7 +1067,12 @@ export function planDiverseQueries(args: {
     if (planned.length >= count) break;
     trySelect(candidate);
   }
-  return planned;
+  return capExtractedStandaloneShare(planned, deferred => {
+    const ids = deferred
+      .map(item => Number((item.metadata as any)?.extractedCandidateId || 0))
+      .filter(id => Number.isSafeInteger(id) && id > 0);
+    if (ids.length) args.onExtractedCapDeferred?.(ids);
+  });
 }
 
 export function reformulatePollutedQuery(args: {
@@ -973,7 +1107,8 @@ export function reformulatePollutedQuery(args: {
             eligibility: primaryAtom.retrievalPolicy.eligibility,
             specificity: primaryAtom.retrievalPolicy.specificity,
             ambiguity: primaryAtom.retrievalPolicy.ambiguity,
-            reasonCodes: primaryAtom.retrievalPolicy.reasonCodes
+            reasonCodes: primaryAtom.retrievalPolicy.reasonCodes,
+            requiredCompanionClasses: primaryAtom.retrievalPolicy.requiredCompanionClasses
           }
         }
       };

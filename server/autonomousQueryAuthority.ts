@@ -1,5 +1,5 @@
 import type { QueryRecord } from '../src/types';
-import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery } from './queryPlanner';
+import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface } from './queryPlanner';
 import { isExtractedStandaloneQuery } from './terminologySearchability';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 import { revalidateQueryRecordAdmission } from './queryQuality/admission';
@@ -258,6 +258,50 @@ export function evaluateAutonomousQueryAuthority(
   if (atoms.length) {
     const staleAtom = atoms.find(atom => atom.retrievalPolicy?.policyVersion !== RETRIEVAL_SPECIFICITY_POLICY_VERSION);
     if (staleAtom) return { eligible: false, reasonCodes: ['ATOM_POLICY_PROVENANCE_STALE'], retrievalPolicyVersion: specificity.policyVersion };
+    // Reviewed native surfaces are audit provenance, not an authorization to
+    // ignore companion requirements. Older rows were written with
+    // eligibility=STANDALONE while retaining the generic ambiguity and
+    // requiredCompanionClasses metadata; a bare high-ambiguity surface (STI,
+    // Bolero, a broker/platform name) must not execute alone.
+    const earlyReviewedNativeSurface = Array.isArray(atoms[0]?.retrievalPolicy?.reasonCodes)
+      && atoms[0].retrievalPolicy.reasonCodes.includes('REVIEWED_NATIVE_PHRASE');
+    const primaryIsMethod = String(atoms[0]?.type || '').toUpperCase() === 'METHOD';
+    const topLevelCompanionClasses = Array.isArray(specificity.requiredCompanionClasses)
+      ? specificity.requiredCompanionClasses.map(String)
+      : [];
+    // Legacy rows predate the top-level copy and may still carry the
+    // requirement only on the atom. Exclude METHOD atoms: reviewed methods
+    // are explicitly authorized standalone and their generic companion
+    // requirement must not override that.
+    const atomCompanionClasses = atoms
+      .filter(atom => String(atom.type || '').toUpperCase() !== 'METHOD')
+      .flatMap(atom => Array.isArray(atom.retrievalPolicy?.requiredCompanionClasses)
+        ? atom.retrievalPolicy.requiredCompanionClasses.map(String)
+        : []);
+    const companionClasses = [...new Set([
+      ...(primaryIsMethod ? [] : topLevelCompanionClasses),
+      ...atomCompanionClasses,
+    ])];
+    const currentReviewedStandalone = earlyReviewedNativeSurface && (
+      String(atoms[0]?.type || '').toUpperCase() === 'METHOD'
+      || isReviewedNativeStandaloneSurface({
+        term: String(atoms[0]?.term || query.query),
+        type: String(atoms[0]?.type || ''),
+        specificity: Number(atoms[0]?.retrievalPolicy?.specificity ?? specificity.specificity),
+        ambiguity: Number(atoms[0]?.retrievalPolicy?.ambiguity ?? specificity.ambiguity),
+      })
+    );
+    if (
+      template === 'SINGLE_ATOM'
+      && earlyReviewedNativeSurface
+      && !currentReviewedStandalone
+    ) {
+      return {
+        eligible: false,
+        reasonCodes: ['REVIEWED_NATIVE_REQUIRES_COMPANION'],
+        retrievalPolicyVersion: specificity.policyVersion,
+      };
+    }
     const anchor = atoms[0]?.retrievalPolicy?.eligibility;
     if (
       !['STANDALONE', 'ANCHOR_ONLY'].includes(String(anchor))

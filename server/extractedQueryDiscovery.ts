@@ -74,6 +74,28 @@ const LEADING_STOPWORDS = new Set([
   'de', 'la', 'le', 'les', 'du', 'des', 'et', 'der', 'die', 'das', 'und', 'het', 'een', 'van', 'en',
   'el', 'los', 'las', 'y', 'il', 'gli', 'di', 'e', 'para', 'por', 'con', 'sur', 'dans',
 ]);
+// Function words that are safe to trim from either edge of a window. Keep this
+// list to prepositions/articles/conjunctions: content words such as "order",
+// "volume" or "support" are trading vocabulary and must never be trimmed.
+const TRAILING_STOPWORDS = new Set([
+  ...LEADING_STOPWORDS,
+  'at', 'by', 'from', 'as', 'than', 'that', 'this', 'these', 'those', 'what', 'why', 'when', 'where',
+  'who', 'which', 'into', 'over', 'under', 'after', 'before', 'about', 'around', 'through', 'during',
+  'without', 'within', 'across', 'between', 'among', 'per', 'via', 'versus', 'vs', 'is', 'are', 'was',
+  'were', 'be', 'been', 'being',
+  'für', 'mit', 'von', 'oder', 'den', 'dem', 'des', 'ein', 'eine', 'einer', 'einem', 'einen', 'zu',
+  'zum', 'zur', 'auf', 'aus', 'bei', 'nach', 'vor', 'über', 'unter', 'im', 'am', 'an', 'um', 'als',
+  'wie', 'wer', 'wo', 'wann', 'warum', 'dass', 'ob',
+  'pour', 'avec', 'ou', 'au', 'aux', 'dans', 'sous', 'par', 'vers', 'chez', 'entre', 'sans', 'avant',
+  'après', 'pendant', 'depuis', 'contre', 'comme', 'que', 'qui', 'quoi', 'où', 'quand', 'pourquoi',
+  'comment',
+  'para', 'por', 'o', 'del', 'al', 'a', 'sobre', 'bajo', 'sin', 'antes', 'después', 'durante', 'desde',
+  'contra', 'como', 'que', 'quien', 'donde', 'cuando', 'porque', 'cómo',
+  'per', 'e', 'di', 'del', 'della', 'dei', 'degli', 'lo', 'i', 'gli', 'uno', 'una', 'su', 'sotto',
+  'tra', 'fra', 'senza', 'prima', 'dopo', 'da', 'contro', 'che', 'chi', 'dove', 'quando', 'perché',
+  'voor', 'met', 'of', 'van', 'het', 'aan', 'bij', 'naar', 'uit', 'tussen', 'zonder', 'na', 'tijdens',
+  'sinds', 'tegen', 'dat', 'die', 'wat', 'wie', 'waar', 'wanneer', 'waarom', 'hoe',
+]);
 const STRONG_INTENT_TOKENS = new Set([
   'trade', 'trading', 'trader', 'trades', 'traden', 'handel', 'handelsstrategie',
   'technical', 'technische', 'tecnica', 'técnica', 'technique', 'chartanalyse', 'charttechnik',
@@ -121,27 +143,30 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
     script: /[\p{Script=Han}]/u,
     tokens: [
       '股票', '股市', '交易', '黄金', '外匯', '外汇', '期貨', '期货', '比特幣', '比特币',
-      '加密', '趨勢', '趋势', '支撐', '支撑', '阻力', '投資', '投资', '基金', '期權', '期权',
+      '加密', '趨勢', '趋势', '支撐', '支撑', '阻力', '基金', '期權', '期权',
       '港股', '美股', '行情', 'K線', 'K线', '技術分析', '技术分析', '短線', '短线', '波段',
-      // Kanji-only Japanese surfaces share Han; include their finance terms so
-      // titles such as 日経225先物 are not rejected before language detection.
-      // Prefer compounds over bare words (株, 注文, 指数, 見方, 戦略) that occur
-      // in ordinary Japanese and Chinese text.
-      '日経', '先物', '相場', '投資', '日足', '時間足', '板読み', '板情報', '前場', '後場', '東京市場', '株式取引', '株価',
-      '株価指数', '日経平均', '高配当株', '株主優待', '配当', '株主', '証券', '為替', '金利', '銘柄', 'チャート',
+      // Kanji-only Japanese surfaces share Han; include specific trading
+      // compounds rather than generic finance nouns (投資, 株主, 金利, 相場)
+      // that occur in ordinary phrases such as 投資詐欺 or 株主総会.
+      '日経', '先物', '日足', '時間足', '板読み', '板情報', '前場', '後場', '東京市場', '株式取引', '株価',
+      '株価指数', '日経平均', '高配当株', '株主優待', '証券', '為替', '銘柄', 'チャート',
+      '投資信託', '株式投資', 'オプション取引', '先物取引', '信用取引', '空売り', '損切り', '利確',
+      'ナンピン', 'レバレッジ', '移動平均', '金利見通し', '金利政策', '相場分析', '相場見通し',
+      '仮想通貨', '暗号資産',
     ],
   },
   {
     script: /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
     tokens: [
-      'トレード', '相場', '先物', 'チャート', 'テクニカル', '投資',
-      '日足', '時間足', 'ローソク足', '板読み', '板情報', 'デイトレード', 'スイング',
-      '株式取引', '株価', '株価指数', '日経平均',
+      'トレード', '先物', 'チャート', 'テクニカル', '日足', '時間足', 'ローソク足',
+      '板読み', '板情報', 'デイトレード', 'スイング', '株式取引', '株価', '株価指数',
+      '日経平均', 'ビットコイン', 'イーサリアム', '仮想通貨', '暗号資産',
+      'レバレッジ', 'ナンピン', 'サポートライン', 'レジスタンスライン', 'ファンダメンタルズ',
     ],
   },
   {
     script: /[\p{Script=Hangul}]/u,
-    tokens: ['주식', '시장', '거래', '분석', '전략', '투자', '비트코인', '암호화폐', '선물', '차트', '금', '주가'],
+    tokens: ['주식', '시장', '거래', '분석', '전략', '투자', '비트코인', '이더리움', '암호화폐', '선물', '옵션', '차트', '주가', '코스피', '코스닥', '환율', '원화', '매매', '금값', '금시세', '금투자', '주식거래', '주식시장', '주식투자', '주식매매', '주식분석', '주식전략'],
   },
   {
     script: /[\p{Script=Tamil}]/u,
@@ -149,7 +174,7 @@ const SCRIPT_INTENT_TOKENS: Array<{ script: RegExp; tokens: string[] }> = [
   },
   {
     script: /[\p{Script=Arabic}]/u,
-    tokens: ['تداول', 'سوق', 'أسهم', 'ذهب', 'تحليل', 'استراتيجية', 'عملات', 'نفط', 'مؤشر', 'استثمار', 'فوركس'],
+    tokens: ['تداول', 'سوق', 'أسهم', 'الذهب', 'سعر الذهب', 'أسعار الذهب', 'تداول الذهب', 'تحليل', 'استراتيجية', 'عملات', 'نفط', 'مؤشر', 'استثمار', 'فوركس'],
   },
 ];
 
@@ -194,6 +219,29 @@ function containsLiteralPhrase(source: string, candidate: string): boolean {
   return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(source);
 }
 
+function containsNativeToken(text: string, token: string): boolean {
+  // Han/Kana are unspaced and Tamil inflects by suffix; substring matching is
+  // the meaningful form there.
+  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Tamil}]/u.test(token)) {
+    return text.includes(token);
+  }
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (/\p{Script=Arabic}/u.test(token)) {
+    // Arabic attaches articles/particles (الذهب, للسوق, للتداول) but arbitrary
+    // substrings such as التسوق ("shopping") must not match سوق. Pronoun
+    // endings are allowed only on explicit trading nouns: تداولنا is trading,
+    // while ذهبنا is the past-tense verb "we went".
+    const allowsPronounEnding = /^(?:تداول|أسهم|استثمار|تحليل|عملات|نفط|مؤشر|فوركس)$/u.test(token);
+    const suffix = allowsPronounEnding
+      ? '(?:يات|تان|ات|ين|ون|ان|ية|ها|هم|هن|كم|نا|ك)?'
+      : '(?:يات|تان|ات|ين|ون|ان|ية)?';
+    return new RegExp(`(?<![\\p{L}\\p{N}])(?:ال|لل|بال|كال|فال|وال|و|ف|ب|ل|ك)?${escaped}${suffix}(?![\\p{L}\\p{N}])`, 'iu').test(text);
+  }
+  // Hangul is spaced: require a real word boundary and rely on explicit
+  // compounds (주식거래, 주식시장) instead of matching 주식 inside 주식회사.
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(text);
+}
+
 function hasTradingIntent(text: string, country?: string | null, language?: string | null): boolean {
   const words = text
     .toLocaleLowerCase('en')
@@ -225,7 +273,7 @@ function hasTradingIntent(text: string, country?: string | null, language?: stri
     return base !== lower && NUMBERED_TICKER_BASES.has(base);
   })) return true;
   for (const { script, tokens } of SCRIPT_INTENT_TOKENS) {
-    if (script.test(text) && tokens.some(token => text.includes(token))) return true;
+    if (script.test(text) && tokens.some(token => containsNativeToken(text, token))) return true;
   }
   // Non-Latin surfaces must match a finance/market token. A blanket "any
   // unspaced script" pass would admit travel, gaming and lifestyle titles.
@@ -241,7 +289,7 @@ function trimLeadingStopwords(words: string[]): string[] {
 function trimWindow(words: string[]): string[] {
   let start = 0;
   let end = words.length;
-  const isStop = (word: string) => LEADING_STOPWORDS.has(word.toLocaleLowerCase('en').replace(/[^\p{L}\p{N}]/gu, ''));
+  const isStop = (word: string) => TRAILING_STOPWORDS.has(word.toLocaleLowerCase('en').replace(/[^\p{L}\p{N}]/gu, ''));
   while (start < end - 1 && isStop(words[start])) start += 1;
   while (end > start + 1 && isStop(words[end - 1])) end -= 1;
   return words.slice(start, end);

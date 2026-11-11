@@ -17,7 +17,7 @@ export function evaluateRetrievalSpecificity(input:{semanticClass:string;governe
   const kind=input.semanticClass.toUpperCase();let eligibility:RetrievalEligibility='INELIGIBLE',specificity=20,ambiguity=80,requiredCompanionClasses:string[]=[];const reasonCodes:string[]=[];
   if(['INSTRUMENT','PLATFORM','BROKER','PROPFIRM'].includes(kind)){
     if(input.governed){eligibility='STANDALONE';specificity=95;ambiguity=5;reasonCodes.push('GOVERNED_CONCRETE_TRADING_ENTITY');}
-    else{eligibility='MODIFIER_ONLY';specificity=62;ambiguity=48;requiredCompanionClasses=['METHOD','STRATEGY','MARKET'];reasonCodes.push('UNGOVERNED_ENTITY_REQUIRES_TRADING_ANCHOR');}
+    else{eligibility='MODIFIER_ONLY';specificity=62;ambiguity=48;requiredCompanionClasses=['INSTRUMENT','METHOD','STRATEGY','MARKET'];reasonCodes.push('UNGOVERNED_ENTITY_REQUIRES_TRADING_ANCHOR');}
   }
   else if(['METHOD','STRATEGY'].includes(kind)){
     if(input.governed){eligibility='STANDALONE';specificity=82;ambiguity=18;reasonCodes.push('GOVERNED_TRADING_METHOD');}

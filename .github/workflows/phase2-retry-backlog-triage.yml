@@ -1,0 +1,63 @@
+name: Phase 2 retry backlog triage
+
+on:
+  pull_request:
+    paths:
+      - 'server/db/migrations/**'
+      - 'server/retryBacklogTriage.ts'
+      - 'server/retryBacklogTriage.test.ts'
+      - 'server/retryBacklogTriageApply.ts'
+      - 'server/retryBacklogTriage.postgres.test.ts'
+      - 'scripts/phase2RetryBacklogTriage.ts'
+      - 'scripts/phase2RetryBacklogApply.ts'
+      - 'docs/phase-2-retry-backlog-triage.md'
+      - 'server/db.ts'
+      - 'server/dbCore.ts'
+      - 'scripts/runMigrations.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/phase2-retry-backlog-triage.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phase2_retry_triage
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d phase2_retry_triage"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase2_retry_triage
+      PHASE2_RETRY_TRIAGE_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/phase2_retry_triage
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations to isolated test database
+        run: npx tsx scripts/runMigrations.ts
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Retry triage static assertions
+        run: node --import tsx --test server/retryBacklogTriage.test.ts
+      - name: Retry triage PostgreSQL regression
+        run: node --import tsx --test server/retryBacklogTriage.postgres.test.ts

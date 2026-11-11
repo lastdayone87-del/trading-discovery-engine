@@ -3,7 +3,8 @@ import {
   getDb,
   reconcileStaleClassificationSightings,
   recoverStaleChannelLocks,
-  upsertChannel
+  upsertChannel,
+  upsertChannelWithResult
 } from './db';
 import { shouldRunStaleChannelLockRecovery } from './staleChannelLockRecovery';
 import { reconcileOrphanInvestigations, recoverStaleInvestigationSteps } from './investigationWorkflow';
@@ -273,7 +274,7 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
     reconcileCommunityAcquisitionRecovery: () => reconcileCommunityAcquisitionRecovery(
       getDb,
       getChannelById,
-      upsertChannel,
+      upsertChannelWithResult,
       20,
       Date.now(),
       (channelId, reactivationReasonCodes, priorRetryReason) => enqueueCommunityAcquisitionRetry(channelId, {
