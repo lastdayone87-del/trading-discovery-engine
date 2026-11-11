@@ -9,6 +9,8 @@
  * Usage:
  *   npx tsx scripts/revalidateIntakeDeferredChannels.ts --limit=50
  *   npx tsx scripts/revalidateIntakeDeferredChannels.ts --limit=50 --apply
+ *   npx tsx scripts/revalidateIntakeDeferredChannels.ts --limit=50 \
+ *     --include-classification-pending
  */
 import { randomUUID } from 'node:crypto';
 import { getChannelById, getDb } from '../server/db';
@@ -37,6 +39,10 @@ function argValue(name: string): string | undefined {
   return process.argv.find(arg => arg.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
 }
 
+function argFlag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
 function candidateFromRow(row: DeferredRow): DiscoveredChannelRaw {
   const jobCandidate = row.enrich_payload?.candidate;
   if (jobCandidate && typeof jobCandidate === 'object') {
@@ -45,6 +51,7 @@ function candidateFromRow(row: DeferredRow): DiscoveredChannelRaw {
       channelId: row.channel_id,
       channelName: jobCandidate.channelName || row.channel_name,
       youtubeUrl: jobCandidate.youtubeUrl || row.youtube_url,
+      quotaOrigin: jobCandidate.quotaOrigin || row.enrich_payload?.quotaOrigin || undefined,
     } as DiscoveredChannelRaw;
   }
   return {
@@ -88,6 +95,9 @@ async function main() {
   if (apply && offset > 0) throw new Error('APPLY_REQUIRES_OFFSET_ZERO');
   const country = argValue('country')?.trim();
   const explicitTarget = argValue('target-country')?.trim();
+  const scanStatuses = argFlag('include-classification-pending')
+    ? ['INTAKE_DEFERRED', 'CLASSIFICATION_PENDING']
+    : ['INTAKE_DEFERRED'];
   const db = await getDb();
   if (apply) {
     if ((await getAdmissionMode()) !== 'ACTIVE') throw new Error('CHANNEL_ADMISSION_OFF');
@@ -98,9 +108,12 @@ async function main() {
     ? `AND NOT EXISTS (
          SELECT 1 FROM semantic_admission_candidates cac
           WHERE cac.channel_id=c.channel_id
-            AND cac.status='WAITING_EVIDENCE'
-            AND cac.next_check_at IS NOT NULL
-            AND cac.next_check_at > now()
+            AND (
+              cac.status='EXPIRED_MISSING_EVIDENCE'
+              OR (cac.status='WAITING_EVIDENCE'
+                  AND cac.next_check_at IS NOT NULL
+                  AND cac.next_check_at > now())
+            )
        )`
     : '';
   const result = await db.query(
@@ -112,12 +125,12 @@ async function main() {
          SELECT payload FROM jobs WHERE type='ENRICH_CHANNEL' AND payload->>'channelId'=c.channel_id
          ORDER BY created_at DESC LIMIT 1
        ) j ON true
-      WHERE c.scan_status='INTAKE_DEFERRED'
+      WHERE c.scan_status = ANY($4::text[])
         AND ($2::text IS NULL OR LOWER(c.country)=LOWER($2))
         ${waitingFilter}
       ORDER BY c.first_seen, c.channel_id
       LIMIT $1 OFFSET $3`,
-    [limit, country || null, offset],
+    [limit, country || null, offset, scanStatuses],
   );
   const rows = result.rows as DeferredRow[];
   const counts = { admitted: 0, ambiguous: 0, rejected: 0, held: 0, expired: 0, country: 0, failed: 0 };
@@ -177,9 +190,10 @@ async function main() {
             await resumeAdmittedCandidate(input, refreshed).catch(retryError => {
               console.error(JSON.stringify({ event: 'intake_deferred_classification_retry_failed', channelId: row.channel_id, error: retryError instanceof Error ? retryError.message : String(retryError) }));
             });
-          } else {
+          } else if (!['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE'].includes(refreshed.status)) {
             await enqueueAdmissionVerification({
               candidate: input,
+              runAfter: refreshed.next_check_at || undefined,
               attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
             }).catch(retryError => {
               console.error(JSON.stringify({ event: 'intake_deferred_verification_retry_failed', channelId: row.channel_id, error: retryError instanceof Error ? retryError.message : String(retryError) }));
@@ -205,6 +219,7 @@ async function main() {
     offset,
     country: country || null,
     targetCountry: explicitTarget || null,
+    scanStatuses,
     selected: rows.length,
     counts,
   }));

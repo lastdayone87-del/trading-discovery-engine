@@ -47,7 +47,7 @@ test('manual recheck preserves existing classification when fresh YouTube acquis
 });
 
 test('manual recheck still fails closed on degraded classifier provider coverage before diagnostic writes', () => {
-  const classify = ingestion.indexOf('classifyTradingRelevanceDetailed(classifierInput)');
+  const classify = ingestion.indexOf('await classifyTradingRelevanceDetailed(classifierInput)');
   const guard = ingestion.indexOf('manualRecheckDegradedError(productionClassification.decision.evidenceCollection)');
   const diagnostic = ingestion.indexOf('observeProductionDiagnosticReliably', classify);
   assert.ok(classify >= 0 && guard > classify && diagnostic > guard);

@@ -93,9 +93,17 @@ export function assessExtractedQueryAdmission(input: {
   return { eligible: true, reasonCodes: [] };
 }
 
+function isMeaningfulCitationQuote(quote: string): boolean {
+  const words = quote.split(/\s+/).filter(Boolean);
+  if (quote.length < 4) return false;
+  // A single short token can be a lucky substring (for example "the" or
+  // "gold"). Require either a phrase or a substantive single token.
+  return words.length >= 2 ? quote.length >= 5 : quote.length >= 6;
+}
+
 function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {
   const quote = normalizeEvidenceText(citation.quote);
-  if (!quote) return null;
+  if (!quote || !isMeaningfulCitationQuote(quote)) return null;
   if (citation.field === 'channel_name') {
     return normalizeEvidenceText(evidence.channelName).includes(quote) ? 'name' : null;
   }
@@ -144,13 +152,15 @@ export function independentCitationCount(
 
 function domainFamily(domain: string): string {
   const value = String(domain || '').toUpperCase();
+  // Finance must be checked before NEWS so CRYPTO_NEWS and finance-news
+  // domains corroborate with each other rather than splitting into NEWS.
+  if (/(FINANCE|INVEST|PERSONAL_FINANCE|CRYPTO_NEWS)/.test(value)) return 'FINANCE';
   if (/(NEWS|POLITIC|BUSINESS_NEWS|CURRENT_AFFAIRS)/.test(value)) return 'NEWS';
   if (/(AI_RESEARCH|TECHNOLOGY|TECH_REVIEWS|CONSUMER_GOODS|SCIENCE|EDUCATION)/.test(value)) return 'TECH_EDUCATION';
-  if (/(HOME|GARDEN|INTERIOR|ARCHITECTURE|DESIGN)/.test(value)) return 'HOME_DESIGN';
+  if (/(HOME|GARDEN|INTERIOR|ARCHITECTURE|DESIGN|HISTORY|ARCHAEOLOG|CULTURE)/.test(value)) return 'CULTURE_DESIGN';
   if (/(GAMBL|BETTING|CASINO|ROULETTE)/.test(value)) return 'GAMBLING';
   if (/(COOK|RECIPE|FOOD)/.test(value)) return 'COOKING';
   if (/(ANIME|FICTION|MANHWA|ENTERTAINMENT|MUSIC|MOVIE)/.test(value)) return 'ENTERTAINMENT';
-  if (/(FINANCE|INVEST|PERSONAL_FINANCE|CRYPTO_NEWS)/.test(value)) return 'FINANCE';
   return value;
 }
 
@@ -158,7 +168,13 @@ export function hasCorroboratedUnrelatedDomain(judgment: SemanticJudgment): bool
   const domains = judgment.unrelatedDomains
     .filter(item => Number(item.confidence) >= 0.6)
     .sort((a, b) => Number(b.confidence) - Number(a.confidence));
-  if (!domains.length) return false;
+  if (!domains.length) {
+    // A judge can identify the unrelated subject through several independent
+    // citations without naming a taxonomy domain confidently. The caller
+    // already requires validated citations, so three independent unrelated
+    // citations are sufficient corroboration on their own.
+    return judgment.citations.filter(citation => citation.supports === 'UNRELATED').length >= 3;
+  }
   return new Set(domains.map(item => domainFamily(item.domain))).size === 1
     || (Number(domains[0].confidence) >= 0.8 && Number(domains[1]?.confidence || 0) < 0.5);
 }
@@ -280,10 +296,11 @@ export function decideAdmission(input: {
   // it is a general channel that happens to touch finance. This prevents
   // general news/business channels from being admitted as "ambiguous".
   if ((effective.mainSubject === 'MIXED' || effective.mainSubject === 'UNKNOWN')
-    && tradingCitations === 0
+    && (tradingCitations === 0 || Number(effective.tradingFocus) <= rejectThreshold)
     && unrelatedCitations >= 2
     && valid >= 2
-    && hasCorroboratedUnrelatedDomain(effective)) {
+    && hasCorroboratedUnrelatedDomain(effective)
+    && !hasStrongTradingSupport(evidence, effective)) {
     return {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
@@ -294,7 +311,12 @@ export function decideAdmission(input: {
     };
   }
 
-  if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0 && unrelatedCitations >= 2 && valid >= 2 && hasCorroboratedUnrelatedDomain(effective)) {
+  if (effective.mainSubject === 'FINANCE_ADJACENT'
+    && Number(effective.tradingFocus) < rejectThreshold
+    && tradingCitations === 0
+    && unrelatedCitations >= 2
+    && valid >= 2
+    && hasCorroboratedUnrelatedDomain(effective)) {
     return {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
@@ -344,9 +366,11 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
       : [],
     citations: citations.flatMap((item: any) => {
       const supports = String(item?.supports || '').toUpperCase();
+      const field = String(item?.field || '').trim();
       if (!['TRADING', 'UNRELATED', 'FINANCE_ADJACENT'].includes(supports)) return [];
+      if (!['channel_name', 'bio', 'link', 'video_title', 'video_description'].includes(field)) return [];
       return [{
-        field: String(item?.field || 'bio') as SemanticCitation['field'],
+        field: field as SemanticCitation['field'],
         index: Number.isInteger(item?.index) ? item.index : undefined,
         quote: String(item?.quote || ''),
         supports: supports as SemanticCitation['supports'],

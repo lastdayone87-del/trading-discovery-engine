@@ -1097,7 +1097,9 @@ async function dashboardServingPredicate(db:InstanceType<typeof Pool>):Promise<{
     WHERE s.setting_key='release5_dashboard_serving_mode'`);
   const control=result.rows[0];
   if(!control||control.setting_value==='OFF'||control.setting_value!==control.mode||control.decision!=='PROMOTE')return {predicate:OPERATOR_VISIBLE_CHANNEL_SQL,scope:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'};
-  const projected=`EXISTS(SELECT 1 FROM dashboard_corpus_projection dcp WHERE dcp.channel_id=channels.channel_id AND dcp.corpus IN('CONFIRMED','REVIEW'))`;
+  const projected=`scan_status <> 'INTAKE_DEFERRED'
+    AND scan_status <> 'CLASSIFICATION_PENDING'
+    AND EXISTS(SELECT 1 FROM dashboard_corpus_projection dcp WHERE dcp.channel_id=channels.channel_id AND dcp.corpus IN('CONFIRMED','REVIEW'))`;
   if(control.mode==='ACTIVE')return {predicate:projected,scope:'RELEASE5_ACTIVE_DASHBOARD_CORPUS'};
   const assigned=`EXISTS(SELECT 1 FROM release5_serving_assignments rsa WHERE rsa.capability='DASHBOARD_CORPUS' AND rsa.channel_id=channels.channel_id AND rsa.activation_id=(SELECT activation_id FROM release5_rollout_projection WHERE capability='DASHBOARD_CORPUS') AND rsa.assigned=true)`;
   return {predicate:`((${assigned}) AND (${projected}) OR (NOT (${assigned}) AND (${OPERATOR_VISIBLE_CHANNEL_SQL})))`,scope:'RELEASE5_CANARY_DASHBOARD_CORPUS'};

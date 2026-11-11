@@ -6,7 +6,7 @@ import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
 import { assertCountryAllowed } from '../countryExclusion';
 import { fetchAdmissionEvidence } from './evidence';
-import { ADMISSION_POLICY_VERSION, decideAdmission } from './policy';
+import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP, decideAdmission } from './policy';
 import { admissionEvidenceChecksum, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
 import {
   findAdmissionCandidate,
@@ -108,7 +108,7 @@ async function enqueueClassificationAfterAdmission(input: {
       country: input.targetCountry,
     }),
     discoveryJobId: input.discoveryJobId || `admission:${input.candidate.channelId}`,
-    quotaOrigin: 'NORMAL',
+    quotaOrigin: input.candidate.quotaOrigin,
     forceExtraction: false,
   });
   const job = await enqueueClassificationJobAtomic(input.candidate.channelId, payload, {
@@ -124,6 +124,7 @@ async function enqueueClassificationAfterAdmission(input: {
 }
 
 export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, row: AdmissionCandidateRow): Promise<boolean> {
+  await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
   const channel = await getChannelById(row.channel_id);
   if (!channel) return false;
   const queued = await enqueueClassificationAfterAdmission({
@@ -259,7 +260,7 @@ export async function verifyAdmissionCandidate(
     judgment = await judge.judge(evidence, 'PRIMARY');
   } catch (error) {
     const attempts = Number(row.attempts || 0) + 1;
-    const expired = attempts >= 3;
+    const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
     const reasonCodes = [expired ? 'SEMANTIC_UNAVAILABLE_EXPIRED' : 'SEMANTIC_UNAVAILABLE_RETRY', error instanceof Error ? error.message : String(error)];
     if (!options.dryRun) {
       await updateAdmissionCandidate({
@@ -300,7 +301,7 @@ export async function verifyAdmissionCandidate(
   let recordedDecisionId: string | null = null;
   if (policy.ambiguous) {
     const health = await getAdmissionAmbiguousRate().catch(() => null);
-    const cap = Math.max(0, Math.min(1, Number(process.env.ADMISSION_AMBIGUOUS_RATE_CAP || 0.35)));
+    const cap = Math.max(0, Math.min(1, Number(process.env.ADMISSION_AMBIGUOUS_RATE_CAP || DEFAULT_AMBIGUOUS_RATE_CAP)));
     if (health && health.rate > cap) {
       console.warn(JSON.stringify({
         event: 'admission_ambiguous_rate_above_cap',
@@ -345,7 +346,7 @@ export async function verifyAdmissionCandidate(
     const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
     if (existing) {
       existing.trading_status = 'NON_TRADING';
-      existing.trading_confidence_score = Math.max(0, Math.min(100, Number(judgment.tradingFocus) || 0));
+      existing.trading_confidence_score = Math.max(0, Math.min(100, Number(effectiveJudgment.tradingFocus) || 0));
       existing.trading_category = 'Unrelated';
       existing.scan_status = 'SKIPPED_NON_TRADING';
       existing.discord_status = 'UNCERTAIN';
@@ -400,6 +401,9 @@ export async function verifyAdmissionCandidate(
       input.candidate.admissionStatus = policy.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
       input.candidate.admissionConfirmedTrading = policy.status === 'ADMITTED';
       input.candidate.admissionTradingConfidence = effectiveJudgment.tradingFocus;
+      input.candidate.admissionCitations = effectiveJudgment.citations;
+      input.candidate.admissionModel = effectiveJudgment.model;
+      input.candidate.admissionEvidenceHash = hash;
       input.candidate.admissionCategory = judgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
         candidate: input.candidate,

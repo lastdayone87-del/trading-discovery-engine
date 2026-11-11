@@ -210,6 +210,10 @@ export interface DiscoveredChannelRaw {
   admissionStatus?: 'ADMITTED' | 'ADMITTED_AMBIGUOUS';
   admissionConfirmedTrading?: boolean;
   admissionTradingConfidence?: number;
+  /** Validated semantic citations and model provenance carried into classification. */
+  admissionCitations?: Array<{ field: string; index?: number; quote: string; supports: string }>;
+  admissionModel?: string;
+  admissionEvidenceHash?: string;
   admissionCategory?: string;
   /** True when this admission created the channel row; reporting must not call it known. */
   admissionNewlyCreated?: boolean;

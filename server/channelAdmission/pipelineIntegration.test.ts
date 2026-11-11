@@ -8,6 +8,13 @@ const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8
 const dbCore = readFileSync(new URL('../dbCore.ts', import.meta.url), 'utf8');
 const queryIntelligence = readFileSync(new URL('../queryIntelligence.ts', import.meta.url), 'utf8');
 
+function functionSource(source: string, name: string): string {
+  const start = source.indexOf(`export async function ${name}(`);
+  if (start < 0) return '';
+  const next = source.indexOf('\nexport ', start + 10);
+  return source.slice(start, next < 0 ? undefined : next);
+}
+
 test('confident admission produces a first-class TRADING_CONFIRMED result without #618 re-decision', () => {
   const built = buildAdmissionConfirmedClassification(
     { channel_name: 'Confirmed Trader', description: 'technical analysis and price action', country: 'United Arab Emirates' },
@@ -22,6 +29,11 @@ test('confident admission produces a first-class TRADING_CONFIRMED result withou
       admissionConfirmedTrading: true,
       admissionTradingConfidence: 93,
       admissionCategory: 'General Trading',
+      admissionModel: 'gemini/gemini-3.8-flash',
+      admissionCitations: [
+        { field: 'bio', quote: 'technical analysis and price action', supports: 'TRADING' },
+        { field: 'video_title', index: 0, quote: 'Gold analysis', supports: 'TRADING' },
+      ],
     },
   );
   assert.equal(built.result.status, 'TRADING_CONFIRMED');
@@ -31,14 +43,16 @@ test('confident admission produces a first-class TRADING_CONFIRMED result withou
   assert.equal(built.decision.confidenceScore, 93);
 });
 
-test('pipeline source wires a confirmed admission to the synthetic classifier', () => {
-  assert.match(pipeline, /candidate\.admissionDecisionId/);
-  assert.match(pipeline, /candidate\.admissionConfirmedTrading === true && candidate\.admissionDecisionId/);
-  assert.match(pipeline, /buildAdmissionConfirmedClassification/);
-  assert.match(pipeline, /Boolean\(candidate\.admissionDecisionId\)/);
-  const gate = queue.indexOf("if (!options?.admissionBypass && (await getAdmissionMode()) === 'ACTIVE')");
-  const legacyHandoff = queue.indexOf('return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);');
-  assert.ok(gate > -1 && legacyHandoff > gate, 'the admission gate must precede the legacy pipeline handoff');
+test('confirmed admission branch precedes the legacy classifier in the pipeline slice', () => {
+  const start = pipeline.indexOf('const admissionShortcut =');
+  const end = pipeline.indexOf('const classificationRouting = productionClassification.decision.deterministicRouting;', start);
+  assert.ok(start > -1 && end > start, 'classification branch must exist');
+  const slice = pipeline.slice(start, end);
+  const confirmed = slice.indexOf('candidate.admissionConfirmedTrading === true');
+  const classifier = slice.indexOf('await classifyTradingRelevanceDetailed(classifierInput)');
+  assert.ok(confirmed > -1 && classifier > confirmed, 'confirmed admission must be selected before the legacy classifier');
+  assert.match(slice, /buildAdmissionConfirmedClassification/);
+  assert.match(slice, /getAdmissionMode\(\)\) === 'ACTIVE'/);
 });
 
 test('legacy dashboard predicate hides pre-admission rows', () => {
@@ -46,10 +60,13 @@ test('legacy dashboard predicate hides pre-admission rows', () => {
   assert.match(dbCore, /scan_status <> 'CLASSIFICATION_PENDING'/);
 });
 
-test('search-worker source contract wires admission before classification and stores matched document', () => {
-  assert.match(queue, /upsertAdmissionCandidate/);
-  assert.match(queue, /enqueueAdmissionVerification/);
-  assert.match(queue, /VERIFY_CHANNEL_ADMISSION/);
+test('search-worker admission path stores the sighting and never falls through to the pipeline', () => {
+  const admit = functionSource(queue, 'admitDiscoveredChannel');
+  assert.ok(admit.length > 0, 'admitDiscoveredChannel must exist');
+  assert.match(admit, /upsertAdmissionCandidate/);
+  assert.match(admit, /enqueueAdmissionVerification/);
+  assert.match(admit, /pending: true/);
+  assert.ok(!admit.includes('processChannelThroughPipeline'), 'admission must not fall through to the ungated pipeline');
   assert.match(queue, /matchedDocument: raw\.matchedDocument \|\| null/);
   assert.match(queue, /getAdmissionPageOutcomes/);
   assert.match(queue, /evaluateQueryAdmissionGuard/);
@@ -70,9 +87,17 @@ test('query guard and revalidation are wired as first-class components', () => {
 });
 
 test('all discovery sources pass the admission gate and admission honors the kill switch', () => {
-  assert.match(queue, /processDiscoveredChannel\([\s\S]*?getAdmissionMode/);
-  assert.match(queue, /admissionBypass/);
-  assert.match(queue, /admissionSemanticClaimable/);
+  const shared = functionSource(queue, 'processDiscoveredChannel');
+  const admission = functionSource(queue, 'admitDiscoveredChannel');
+  assert.ok(shared.length > 0 && admission.length > 0);
+  assert.match(shared, /getAdmissionMode/);
+  assert.match(shared, /admissionBypass/);
+  assert.match(shared, /upsertAdmissionCandidate/);
+  const gate = shared.indexOf("if (!options?.admissionBypass && (await getAdmissionMode()) === 'ACTIVE')");
+  const legacyHandoff = shared.indexOf('return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);');
+  assert.ok(gate > -1 && legacyHandoff > gate, 'the admission gate must precede the legacy pipeline handoff');
+  assert.match(queue, /admissionModeActive = \(await getAdmissionMode\(\)\) === 'ACTIVE'/);
+  assert.match(queue, /admissionSemanticClaimable = admissionModeActive && await admissionSemanticRouteHealthy\(\)/);
   const worker = readFileSync(new URL('./worker.ts', import.meta.url), 'utf8');
   assert.match(worker, /getAdmissionMode\(\)\) === 'OFF'/);
 });
@@ -84,4 +109,49 @@ test('legacy apply is guarded against unstable paging and silent failures', () =
   assert.match(revalidation, /process\.exitCode = 1/);
   assert.match(revalidation, /target-country/);
   assert.match(revalidation, /getChannelById\(row\.channel_id\)/);
+});
+
+test('confirmed admission carries citations and flags missing confidence for review', () => {
+  const withProvenance = buildAdmissionConfirmedClassification(
+    { channel_name: 'Cited Trader', description: 'technical analysis' },
+    {
+      channelId: 'UC-cited',
+      channelName: 'Cited Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-cited',
+      description: 'technical analysis',
+      videoTitles: ['Gold analysis'],
+      admissionDecisionId: 'decision-2',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionCategory: 'General Trading',
+      admissionModel: 'groq/openai-gpt-oss-120b',
+      admissionCitations: [
+        { field: 'bio', quote: 'technical analysis', supports: 'TRADING' },
+        { field: 'video_title', index: 0, quote: 'Gold analysis', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(withProvenance.decision.confidenceScore, 88);
+  assert.equal(withProvenance.decision.positiveEvidence.length, 2);
+  assert.equal(withProvenance.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
+  assert.equal(withProvenance.decision.evidenceCollection.providers[0].provider, 'groq_semantic');
+  assert.equal(withProvenance.decision.deterministicRouting?.humanReview, false);
+
+  const missingConfidence = buildAdmissionConfirmedClassification(
+    { channel_name: 'No Score', description: 'technical analysis' },
+    {
+      channelId: 'UC-no-score',
+      channelName: 'No Score',
+      youtubeUrl: 'https://youtube.com/channel/UC-no-score',
+      description: 'technical analysis',
+      videoTitles: [],
+      admissionDecisionId: 'decision-3',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+    },
+  );
+  assert.equal(missingConfidence.decision.confidenceScore, 0);
+  assert.equal(missingConfidence.decision.evidenceCollection.sufficiency, 'INSUFFICIENT');
+  assert.equal(missingConfidence.decision.deterministicRouting?.humanReview, true);
 });

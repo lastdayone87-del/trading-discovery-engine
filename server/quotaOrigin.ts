@@ -195,7 +195,7 @@ export async function resolveJobQuotaOrigin(
   // entity_bindings, so it may have no channels row. The adapter still has its
   // own canary controls and ordinary quota; treat a missing source row as
   // NORMAL for this job type only, while an existing PROBE row stays sticky.
-  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS' || job.type === 'VERIFY_CHANNEL_ADMISSION';
+  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS';
   let resolved: ResolvedQuotaOrigin = hinted ?? 'NORMAL';
   for (const channelId of channelIds) {
     if (!byId.has(channelId)) {

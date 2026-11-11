@@ -17,10 +17,14 @@ UPDATE channels
  WHERE admitted_at IS NULL
    AND scan_status NOT IN ('INTAKE_DEFERRED', 'CLASSIFICATION_PENDING');
 
+-- LEGACY_HOLD is provenance, not a permanent rejection. INTAKE_DEFERRED rows
+-- are revalidated by the opt-in script; CLASSIFICATION_PENDING rows remain on
+-- their existing classification path and can also be selected explicitly with
+-- --include-classification-pending.
 UPDATE channels
    SET admission_status = 'LEGACY_HOLD'
  WHERE admission_status IS NULL
-   AND scan_status = 'INTAKE_DEFERRED';
+   AND scan_status IN ('INTAKE_DEFERRED', 'CLASSIFICATION_PENDING');
 
 CREATE INDEX IF NOT EXISTS channels_admission_status_idx
   ON channels (admission_status, first_seen DESC);

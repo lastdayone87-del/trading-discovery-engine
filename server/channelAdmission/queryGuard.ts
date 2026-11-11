@@ -13,6 +13,8 @@ export interface QueryAdmissionGuardInput {
   tradingPrecision: number;
   qualityChannels: number;
   tradingConfirmed: number;
+  /** Admission-created channels whose downstream classification is still running. */
+  classificationPending?: number;
   priorZeroQualityPages?: number;
 }
 
@@ -50,7 +52,10 @@ export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): Qu
     reasonCodes.push('ADMISSION_UNRESOLVED_SHARE_HIGH', 'TRADING_PRECISION_LOW');
     return { stop: true, quarantine: true, reasonCodes };
   }
-  if (input.qualityChannels === 0 && input.tradingConfirmed === 0 && (input.priorZeroQualityPages || 0) >= 1) {
+  if (input.qualityChannels === 0
+    && input.tradingConfirmed === 0
+    && Number(input.classificationPending || 0) === 0
+    && (input.priorZeroQualityPages || 0) >= 1) {
     reasonCodes.push('ZERO_QUALITY_AND_ZERO_CONFIRMED_PAGES');
     // Low yield stops this run but is not enough to permanently reject a query.
     return { stop: true, quarantine: false, reasonCodes };

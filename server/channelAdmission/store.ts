@@ -138,11 +138,14 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
   );
   const mapped = mapRow(result.rows[0]);
   if (input.queryRunId) {
+    // A missing sighting makes the page/run outcome counts undercount and can
+    // prevent the query guard from stopping a contaminated run. Let the caller
+    // retry the candidate instead of silently continuing.
     await db.query(
       `INSERT INTO semantic_admission_sightings(candidate_id,query_run_id,page_number,result_rank,matched_document)
        VALUES($1,$2,$3,$4,$5::jsonb)`,
       [mapped.id, input.queryRunId, input.pageNumber || null, input.resultRank || null, JSON.stringify(matchedDocument)],
-    ).catch(error => console.warn('[ChannelAdmission] sighting write failed:', error instanceof Error ? error.message : error));
+    );
   }
   return mapped;
 }
@@ -160,6 +163,7 @@ export async function enqueueAdmissionVerification(input: {
     candidateKey: admissionCandidateKey(input.candidate.candidate.channelId),
     channelId: input.candidate.candidate.channelId,
     candidate: input.candidate.candidate,
+    quotaOrigin: input.candidate.candidate.quotaOrigin,
     targetCountry: input.candidate.targetCountry,
     source: input.candidate.source,
     query: input.candidate.query,
@@ -260,6 +264,7 @@ export async function recordAdmissionOutcome(input: {
     await client.query('BEGIN');
     const decisionId = await recordAdmissionDecision({ ...input.decision, client });
     const candidate = await updateAdmissionCandidate({ ...input.candidate, client });
+    if (!candidate) throw new Error('ADMISSION_CANDIDATE_NOT_FOUND');
     await client.query('COMMIT');
     return { decisionId, candidate };
   } catch (error) {

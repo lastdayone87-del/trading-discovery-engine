@@ -101,13 +101,15 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                 <span className="px-2 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 font-mono text-[10px] font-bold">
                   {channel.trading_relevance_breakdown.classification_method === 'AI_SEMANTIC_CLASSIFIER'
                     ? 'Calibrated (semantic)'
-                    : channel.trading_relevance_breakdown.classification_method === 'SEMANTIC_ABSTAINED'
-                      ? 'Semantic abstained'
-                      : channel.trading_relevance_breakdown.classification_method === 'DETERMINISTIC_EVIDENCE'
-                      ? 'Deterministic evidence'
-                      : channel.trading_relevance_breakdown.classification_method === 'DEGRADED_HEURISTIC'
-                        ? 'Degraded heuristic'
-                        : 'Heuristic'}
+                    : channel.trading_relevance_breakdown.classification_method === 'SEMANTIC_ADMISSION'
+                      ? 'Semantic admission'
+                      : channel.trading_relevance_breakdown.classification_method === 'SEMANTIC_ABSTAINED'
+                        ? 'Semantic abstained'
+                        : channel.trading_relevance_breakdown.classification_method === 'DETERMINISTIC_EVIDENCE'
+                        ? 'Deterministic evidence'
+                        : channel.trading_relevance_breakdown.classification_method === 'DEGRADED_HEURISTIC'
+                          ? 'Degraded heuristic'
+                          : 'Heuristic'}
                 </span>
               </div>
 

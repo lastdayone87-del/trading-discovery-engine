@@ -163,6 +163,7 @@ test('a single incidental trading title does not reject a genuine trading channe
     videos: [
       { title: 'Nifty 50 आज का विश्लेषण', description: 'Technical analysis और price action.' },
       { title: 'Bank Nifty ट्रेड सेटअप', description: 'Market structure और risk management.' },
+      { title: 'Weekend cooking vlog', description: 'A personal cooking video.' },
       { title: 'Weekly market outlook', description: 'Support and resistance levels.' },
     ],
   });
@@ -378,7 +379,7 @@ test('finance-adjacent rejection requires independent citation proof', () => {
 test('pending admissions do not trip the contamination guard', () => {
   const decision = evaluateQueryAdmissionGuard({
     pageNumber: 2,
-    outcomes: { admitted: 0, ambiguous: 0, rejected: 0, held: 0, pending: 10, total: 0 },
+    outcomes: { admitted: 0, ambiguous: 0, rejected: 8, held: 0, pending: 10, total: 8 },
     tradingPrecision: 0,
     qualityChannels: 0,
     tradingConfirmed: 0,
@@ -396,7 +397,15 @@ test('admission jobs resolve quota provenance before a channels row exists', asy
   }, {
     query: async () => ({ rows: [], rowCount: 0 }),
   });
-  assert.equal(origin, 'NORMAL');
+  assert.equal(origin, 'UNKNOWN');
+
+  const hinted = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-probe-admission', quotaOrigin: 'PROBE' },
+  }, {
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  assert.equal(hinted, 'PROBE');
 });
 
 test('second judgment is marked effective when it supplies the decisive citations', () => {
@@ -453,4 +462,82 @@ test('citations without an explicit support label cannot authorize rejection', (
     },
   });
   assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+});
+
+test('missing citation fields and trivial quotes cannot authorize rejection', () => {
+  const missingField = decideAdmission({
+    evidence: kikifoodies,
+    judgment: {
+      mainSubject: 'UNRELATED',
+      tradingFocus: 0,
+      unrelatedDomains: [{ domain: 'COOKING', confidence: 0.9 }],
+      incidentalTradingMentions: [],
+      citations: [
+        { field: '' as any, quote: 'Cooking made SIMPLE', supports: 'UNRELATED' },
+        { field: '' as any, quote: 'Sliced Bread Recipe', index: 0, supports: 'UNRELATED' },
+      ],
+      explanation: 'missing fields',
+    },
+  });
+  assert.equal(missingField.decision, 'ADMIT_AMBIGUOUS');
+
+  const trivialQuote = decideAdmission({
+    evidence: kikifoodies,
+    judgment: judgment({
+      subject: 'UNRELATED', focus: 0,
+      citations: [citation('bio', 'the'), citation('video_title', 'a', 0)],
+      domains: ['COOKING'],
+    }),
+  });
+  assert.equal(trivialQuote.decision, 'ADMIT_AMBIGUOUS');
+});
+
+test('crypto-news and finance domains corroborate as one finance family', () => {
+  const result = decideAdmission({
+    evidence: kikifoodies,
+    judgment: judgment({
+      subject: 'UNRELATED', focus: 0,
+      citations: [citation('bio', 'Cooking made SIMPLE'), citation('video_title', 'Sliced Bread Recipe', 0)],
+      domains: ['CRYPTO_NEWS', 'FINANCE'],
+    }),
+  });
+  assert.equal(result.decision, 'REJECT_UNRELATED');
+});
+
+test('strong finance-adjacent trading focus is not rejected', () => {
+  const result = decideAdmission({
+    evidence: kikifoodies,
+    judgment: judgment({
+      subject: 'FINANCE_ADJACENT', focus: 80,
+      citations: [citation('bio', 'Cooking made SIMPLE'), citation('video_title', 'Sliced Bread Recipe', 0)],
+      domains: ['FINANCE'],
+    }),
+  });
+  assert.notEqual(result.decision, 'REJECT_UNRELATED');
+  assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+});
+
+test('zero-quality stop waits for admission-created classifications', () => {
+  const pending = evaluateQueryAdmissionGuard({
+    pageNumber: 2,
+    outcomes: { admitted: 8, ambiguous: 0, rejected: 0, held: 0, pending: 0, total: 8 },
+    tradingPrecision: 0,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    classificationPending: 4,
+    priorZeroQualityPages: 2,
+  });
+  assert.equal(pending.stop, false);
+
+  const settled = evaluateQueryAdmissionGuard({
+    pageNumber: 2,
+    outcomes: { admitted: 8, ambiguous: 0, rejected: 0, held: 0, pending: 0, total: 8 },
+    tradingPrecision: 0,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    classificationPending: 0,
+    priorZeroQualityPages: 2,
+  });
+  assert.equal(settled.stop, true);
+  assert.equal(settled.quarantine, false);
 });

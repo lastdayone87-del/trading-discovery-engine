@@ -349,6 +349,38 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
   return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
 }
 
+/** True only for the pre-migration semantic-admission schema. */
+function isMissingAdmissionSchemaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const namesAdmissionRelation = /semantic_admission_(candidates|decisions|sightings|model_calls)/i.test(message);
+  const missingRelation = /relation ["']?[^"']*["']? does not exist/i.test(message);
+  return namesAdmissionRelation && ((error as { code?: unknown })?.code === '42P01' || missingRelation);
+}
+
+/**
+ * Admission judge health is independent of the enrichment route. The judge
+ * always has a Gemini primary and a Groq second/fallback route, so admission
+ * is claimable while at least one configured route is healthy.
+ */
+async function admissionSemanticRouteHealthy(): Promise<boolean> {
+  const geminiRoutes = configuredGeminiRoutes();
+  const groqRoutes = configuredGroqRoutes();
+  const [geminiCooling, groqCooling, geminiFreeCooling] = await Promise.all([
+    geminiRoutes.length > 0
+      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
+      : isGeminiSemanticCooldownActive(),
+    groqRoutes.length > 0
+      ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(
+          await isGroqOrgCooldownActive(groqRouteOrg(route)),
+          groqOrgCooldownRemainingMs(groqRouteOrg(route)),
+        ))))
+      : isGroqSemanticCooldownActive(),
+    isGeminiFreeSemanticCooldownActive(),
+  ]);
+  const configured = geminiRoutes.length > 0 || groqRoutes.length > 0 || shouldUseGeminiFreeSemantic();
+  return configured && !(geminiCooling && groqCooling && geminiFreeCooling);
+}
+
 /**
  * Maps a worker execution marker to the coverage-borrow bypass flag. Only an
  * explicit retry-owned reacquisition marker bypasses borrowed coverage; every
@@ -1265,13 +1297,11 @@ export async function admitDiscoveredChannel(input: {
         return { outcome: admissionPendingOutcome(raw), pending: true };
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const infrastructureMissing = /semantic_admission_(candidates|decisions)|VERIFY_CHANNEL_ADMISSION|does not exist|relation .* does not exist/i.test(message);
-      if (!infrastructureMissing) throw error;
+      if (!isMissingAdmissionSchemaError(error)) throw error;
       console.warn(JSON.stringify({
         event: 'channel_admission_unavailable_legacy_fallback',
         channelId: raw.channelId,
-        reason: message.slice(0, 300),
+        reason: (error instanceof Error ? error.message : String(error)).slice(0, 300),
         timestamp: new Date().toISOString(),
       }));
     }
@@ -1459,7 +1489,8 @@ export async function processNextSearchJob(
   // process-local cooldown still allows the claim so jobs can reach the
   // already-working fallback.
   let enrichProbeOnly = false;
-  let admissionSemanticClaimable = (await getAdmissionMode()) === 'ACTIVE';
+  const admissionModeActive = (await getAdmissionMode()) === 'ACTIVE';
+  let admissionSemanticClaimable = admissionModeActive;
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
@@ -1480,7 +1511,7 @@ export async function processNextSearchJob(
       if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
     const enrichmentFullyClaimable = enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive });
-    admissionSemanticClaimable = enrichmentFullyClaimable;
+    admissionSemanticClaimable = admissionModeActive && await admissionSemanticRouteHealthy();
     const nowMs = Date.now();
     const probeTimeAllowed = !enrichmentFullyClaimable && semanticCooldownProbeAllowed(lastSemanticCooldownEnrichProbeAt, nowMs);
     // Reserve the interval before awaiting the scan. Empty results and
@@ -2541,8 +2572,14 @@ export async function processNextSearchJob(
         return true;
       }
       const [admissionOutcomes, admissionPageOutcomes] = await Promise.all([
-        getAdmissionRunOutcomes(queryRunId).catch(() => null),
-        getAdmissionPageOutcomes(queryRunId, pageNumber).catch(() => null),
+        getAdmissionRunOutcomes(queryRunId).catch(error => {
+          if (isMissingAdmissionSchemaError(error)) return null;
+          throw error;
+        }),
+        getAdmissionPageOutcomes(queryRunId, pageNumber).catch(error => {
+          if (isMissingAdmissionSchemaError(error)) return null;
+          throw error;
+        }),
       ]);
       const admissionGuard = admissionOutcomes && admissionPageOutcomes && Number(admissionPageOutcomes.pending || 0) === 0
         ? evaluateQueryAdmissionGuard({
@@ -2551,6 +2588,7 @@ export async function processNextSearchJob(
             tradingPrecision: metrics.tradingPrecision,
             qualityChannels: metrics.qualityChannels,
             tradingConfirmed: metrics.tradingConfirmed,
+            classificationPending: metrics.classificationPending,
             priorZeroQualityPages: prior.v2Streaks.lowValue,
           })
         : { stop: false, quarantine: false, reasonCodes: [] as string[] };
@@ -3389,8 +3427,7 @@ export async function processDiscoveredChannel(
         }
         return admissionPendingOutcome(raw);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!/semantic_admission_(candidates|decisions)|VERIFY_CHANNEL_ADMISSION|does not exist|relation .* does not exist/i.test(message)) throw error;
+        if (!isMissingAdmissionSchemaError(error)) throw error;
       }
     }
   }

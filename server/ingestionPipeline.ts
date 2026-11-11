@@ -43,6 +43,7 @@ import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './re
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { buildAdmissionConfirmedClassification } from './channelAdmission/confirmedTrading';
+import { getAdmissionMode } from './channelAdmission/store';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
@@ -1152,7 +1153,10 @@ async function processChannelThroughPipelineInContext(
     search_match_context:candidate.matchedDocument?{type:candidate.matchedDocument.type,provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
-  const productionClassification = candidate.admissionConfirmedTrading === true && candidate.admissionDecisionId
+  const admissionShortcut = candidate.admissionConfirmedTrading === true
+    && Boolean(candidate.admissionDecisionId)
+    && (await getAdmissionMode()) === 'ACTIVE';
+  const productionClassification = admissionShortcut
     ? buildAdmissionConfirmedClassification(classifierInput, candidate)
     : await classifyTradingRelevanceDetailed(classifierInput);
   const classificationRouting = productionClassification.decision.deterministicRouting;

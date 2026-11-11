@@ -149,6 +149,13 @@ async function assertAdmissionBudgetAvailable(): Promise<void> {
     if (Number(count.rows[0]?.used || 0) >= cap) throw new Error('ADMISSION_SEMANTIC_BUDGET_EXHAUSTED');
   } catch (error) {
     if (error instanceof Error && error.message === 'ADMISSION_SEMANTIC_BUDGET_EXHAUSTED') throw error;
+    const code = (error as { code?: unknown })?.code;
+    const message = error instanceof Error ? error.message : String(error);
+    // A read-only dry-run must remain usable before migration 178. There is no
+    // ledger to overspend yet, and read-only mode writes nothing.
+    if (code === '42P01' || /semantic_admission_model_calls.*does not exist|relation .*semantic_admission_model_calls/i.test(message)) {
+      return;
+    }
     throw new Error('ADMISSION_SEMANTIC_BUDGET_UNAVAILABLE');
   }
 }
@@ -206,7 +213,7 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         ]
       : [
           { client: this.options.secondaryClient ?? groqDefaultClient(), model: this.options.secondaryModel || process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL },
-          { client: geminiDefaultClient(), model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL },
+          { client: this.options.primaryClient ?? geminiDefaultClient(), model: this.options.primaryModel || process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL },
         ];
     const checksum = admissionEvidenceChecksum(evidence);
     let lastError: unknown;
@@ -226,15 +233,10 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         );
         const normalized = normalizeSemanticJudgment(raw, attempt.model);
         if (!normalized) throw new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT');
-        // A fallback provider is a capacity bridge, not a replacement for the
-        // primary multilingual judge. Accept its decisive answers, but never
-        // let its uncertainty become an ambiguous admission; retry the primary
-        // provider instead.
-        if (role === 'PRIMARY' && attemptIndex > 0
-          && (normalized.mainSubject === 'MIXED' || normalized.mainSubject === 'UNKNOWN'
-            || (normalized.mainSubject === 'UNRELATED' && independentCitationCount(evidence, normalized, 'UNRELATED') < 2))) {
-          throw new Error('ADMISSION_SEMANTIC_FALLBACK_AMBIGUOUS');
-        }
+        // A fallback provider is a capacity bridge. Its decisive answers are
+        // used directly; its ambiguity is returned to policy after complete
+        // evidence so ambiguous creators are admitted for downstream
+        // classification instead of being held as if evidence were missing.
         if (!this.options.readOnly) await writeAdmissionCache(cacheKey, checksum, attempt.model, normalized);
         return normalized;
       } catch (error) {
