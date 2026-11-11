@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getDb, enqueueJob } from './db';
+import { findCountryExclusion } from './countryExclusion';
 import type { ChannelRecord } from '../src/types';
 import type { IntakeTradingFocusAssessment } from './intakeTradingFocus';
 
@@ -109,19 +110,24 @@ export async function recordIntakeDeferredReview(input: IntakeDeferredReviewInpu
     countryStatus: input.countryStatus || null,
     country: input.country || null,
   };
+  const evidenceHash = checksum({ system, evidence });
   await db.query(
     `INSERT INTO intake_deferred_reviews(
        channel_id,review_version,state,system_snapshot,evidence_snapshot,language,country,
-       metadata_quality,recheck_attempts,last_checked_at,next_recheck_at
-     ) VALUES($1,1,'PENDING',$2::jsonb,$3::jsonb,$4,$5,$6,0,now(),now()+interval '1 hour')
+       metadata_quality,recheck_attempts,last_checked_at,next_recheck_at,last_evidence_hash
+     ) VALUES($1,1,'PENDING',$2::jsonb,$3::jsonb,$4,$5,$6,0,now(),now()+interval '1 hour',$7)
      ON CONFLICT(channel_id) DO UPDATE SET
        system_snapshot=excluded.system_snapshot,
        evidence_snapshot=excluded.evidence_snapshot,
        language=COALESCE(excluded.language,intake_deferred_reviews.language),
        country=COALESCE(excluded.country,intake_deferred_reviews.country),
        metadata_quality=COALESCE(excluded.metadata_quality,intake_deferred_reviews.metadata_quality),
-       review_version=CASE WHEN intake_deferred_reviews.state='SUPERSEDED'
-         THEN intake_deferred_reviews.review_version+1 ELSE intake_deferred_reviews.review_version END,
+       review_version=CASE
+         WHEN intake_deferred_reviews.state='SUPERSEDED' THEN intake_deferred_reviews.review_version+1
+         WHEN intake_deferred_reviews.last_evidence_hash IS DISTINCT FROM excluded.last_evidence_hash
+           THEN intake_deferred_reviews.review_version+1
+         ELSE intake_deferred_reviews.review_version END,
+       last_evidence_hash=excluded.last_evidence_hash,
        state=CASE WHEN intake_deferred_reviews.state='SUPERSEDED'
          THEN 'PENDING' ELSE intake_deferred_reviews.state END,
        decision=CASE WHEN intake_deferred_reviews.state='SUPERSEDED' THEN NULL ELSE intake_deferred_reviews.decision END,
@@ -145,6 +151,7 @@ export async function recordIntakeDeferredReview(input: IntakeDeferredReviewInpu
       input.language || null,
       input.country || null,
       input.metadataQuality || null,
+      evidenceHash,
     ],
   );
 }
@@ -241,6 +248,7 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`intake-review:${input.channelId}`]);
     const prior = await client.query(
       `SELECT * FROM intake_deferred_review_decisions WHERE idempotency_key=$1`,
       [input.idempotencyKey],
@@ -298,6 +306,9 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
       throw Object.assign(new Error(`Review is already ${row.state}.`), { status: 409 });
     }
     const channel = row.channel_snapshot as ChannelRecord;
+    if (channel.scan_status !== 'INTAKE_DEFERRED') {
+      throw Object.assign(new Error(`Channel is no longer deferred (${channel.scan_status}); review is stale.`), { status: 409 });
+    }
     const corrections = input.corrections || {};
     const correctedCountry = typeof corrections.country === 'string' ? corrections.country.trim() : '';
     const correctedLanguage = typeof corrections.language === 'string' ? corrections.language.trim() : '';
@@ -310,13 +321,11 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
         ...(channel.country_status === 'CONFIRMED' && channel.country ? [channel.country] : []),
         ...(countryToCheck ? [countryToCheck] : []),
       ])];
+      const exclusions = (await client.query(`SELECT country_name,reason FROM excluded_countries`)).rows;
       for (const country of countriesToCheck) {
-        const exclusion = await client.query(
-          `SELECT country_name,reason FROM excluded_countries WHERE LOWER(country_name)=LOWER($1) LIMIT 1`,
-          [country],
-        );
-        if (exclusion.rowCount) {
-          throw Object.assign(new Error(`Country ${country} is excluded by policy: ${exclusion.rows[0].reason}`), { status: 422 });
+        const exclusion = findCountryExclusion(country, exclusions as any);
+        if (exclusion) {
+          throw Object.assign(new Error(`Country ${country} is excluded by policy: ${exclusion.reason}`), { status: 422 });
         }
       }
     }
@@ -564,7 +573,7 @@ export async function listHumanEvaluationSamples(filters: {
   offset?: number;
 } = {}): Promise<HumanEvaluationSample[]> {
   const db = await getDb();
-  const limit = Math.min(5000, Math.max(1, filters.limit || 200));
+  const limit = Math.min(50000, Math.max(1, filters.limit || 200));
   const offset = Math.max(0, Math.trunc(filters.offset || 0));
   const result = await db.query(
     `SELECT * FROM human_evaluation_samples

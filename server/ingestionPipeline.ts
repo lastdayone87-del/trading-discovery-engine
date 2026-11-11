@@ -689,6 +689,30 @@ async function processChannelThroughPipelineInContext(
       console.warn(`[Unified Ingestion Pipeline - Triage] Country validation failed for deferred '${candidate.channelName}'; preserving intake deferral:`, error instanceof Error ? error.message : error);
     }
     const deferredCreatorCountry = deferredCountry?.detectedCreatorCountry || existing?.country || '';
+    // A human TRADING approval hands the channel to ENRICHMENT_PENDING with a
+    // queued enrichment job. Preserve that handoff when rediscovery runs before
+    // the job starts; otherwise sparse evidence can send it back to deferred and
+    // the queued job will skip it.
+    const handoffChannel = existing ? await getChannelById(existing.channel_id) : null;
+    if (handoffChannel && handoffChannel.scan_status === 'ENRICHMENT_PENDING') {
+      const activeEnrichment = await hasActiveEnrichmentJob(handoffChannel.channel_id, options?.jobId).catch(() => true);
+      if (activeEnrichment) {
+        return {
+          channelId: candidate.channelId,
+          channelName: candidate.channelName,
+          isNew: false,
+          wasKnown: true,
+          persisted: true,
+          countryStatus: handoffChannel.country_status as IngestionPipelineOutcome['countryStatus'],
+          detectedCountry: handoffChannel.country || null,
+          tradingStatus: handoffChannel.trading_status || 'UNCERTAIN',
+          discordStatus: handoffChannel.discord_status,
+          discordInvite: handoffChannel.discord_invite || null,
+          channelRecord: handoffChannel,
+          skippedTerminalState: true,
+        };
+      }
+    }
     if (existing && (existing.trading_status === 'TRADING_CONFIRMED' || existing.scan_status === 'COMPLETED' || isTerminalState(existing))) {
       // Preserve the trading decision but never skip fresh country evidence.
       if (deferredCountry?.status === 'REJECTED' && deferredCreatorCountry) {

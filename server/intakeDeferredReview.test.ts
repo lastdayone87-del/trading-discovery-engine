@@ -223,7 +223,7 @@ test('review and evaluation routes are reviewer-protected and registered', () =>
   assert.match(server, /app\.post\('\/api\/intake-deferred\/:channelId\/decision'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/samples'/);
   assert.match(server, /app\.get\('\/api\/human-evaluation\/metrics'/);
-  assert.match(server, /offset \+= page\.length/);
+  assert.match(server, /listHumanEvaluationSamples\(\{ limit: 50000 \}\)/);
   assert.match(server, /req\.operator\?\.actorId \|\| resolveReviewerIdentity\(claimedReviewer\)/);
   assert.match(server, /reviewerClaimed/);
   assert.match(server, /const requestedState = String\(req\.query\.state/);
@@ -268,4 +268,29 @@ test('LIKELY excluded-country recheck never feeds the weak stored country back a
   assert.match(source, /snapshotReviewVersion/);
   assert.match(source, /FOR UPDATE OF r,c/);
   assert.match(source, /String\(row\.country \|\| ''\) !== String\(args\.snapshotCountry/);
+});
+
+test('recheck protects scope, retries, aliases, snapshots and sweep concurrency', () => {
+  const worker = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(worker, /resolveScopeEligibility\(channel\.country\)/);
+  assert.doesNotMatch(worker, /scope_eligibility \|\| resolveScopeEligibility/);
+  assert.match(worker, /recheck_attempts=recheck_attempts\+1/);
+  assert.match(worker, /evidence_snapshot=\$2::jsonb,[\s\S]{0,80}metadata_quality=\$3,last_evidence_hash=\$4,recheck_attempts=recheck_attempts\+1/);
+  assert.match(worker, /jsonb_set\(payload,'\{candidate\}'/);
+  assert.match(worker, /cachedEvidence/);
+  assert.match(worker, /evaluateLowAudienceGate\(channel\.subscriber_count/);
+  assert.match(worker, /subscriber_count=\$8/);
+  const module = readFileSync(new URL('./intakeDeferredReview.ts', import.meta.url), 'utf8');
+  assert.match(module, /findCountryExclusion/);
+  assert.match(module, /pg_advisory_xact_lock/);
+  assert.match(module, /last_evidence_hash IS DISTINCT FROM/);
+  assert.match(module, /channel\.scan_status !== 'INTAKE_DEFERRED'/);
+  assert.match(module, /evidenceHash/);
+  assert.match(module, /pg_advisory_xact_lock/);
+  const sweep = readFileSync(new URL('./intakeDeferredSweep.ts', import.meta.url), 'utf8');
+  assert.match(sweep, /dueNow/);
+  assert.match(sweep, /activeJob/);
+  assert.match(sweep, /pg_advisory_xact_lock/);
+  const migration = readFileSync(new URL('./db/migrations/177_intake_deferred_review.sql', import.meta.url), 'utf8');
+  assert.match(migration, /\) >= 3\s+AND COALESCE\(length/);
 });

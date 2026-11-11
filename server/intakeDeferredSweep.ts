@@ -66,10 +66,15 @@ export async function sweepIntakeDeferredReviews(options: {
       }
       await client.query('BEGIN');
       inTransaction = true;
+      // Serialize sweeps and human decisions for this channel before taking
+      // row locks, so the two paths cannot deadlock on job/review ordering.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`intake-review:${channelId}`]);
       // Re-read under the lock: a human decision may have committed after the
       // due-row snapshot, and the old recheck must not act on a newer review.
       const lockedReview = await client.query(
-        `SELECT r.review_version,r.state,r.decision,r.evidence_snapshot,c.scan_status
+        `SELECT r.review_version,r.state,r.decision,r.evidence_snapshot,r.next_recheck_at,
+                COALESCE(r.last_checked_at,c.last_checked,c.first_seen) AS last_activity,
+                c.scan_status
          FROM intake_deferred_reviews r JOIN channels c USING(channel_id)
          WHERE r.channel_id=$1 FOR UPDATE OF r`,
         [channelId],
@@ -78,6 +83,23 @@ export async function sweepIntakeDeferredReviews(options: {
       const stateEligible = review
         && (review.state === 'PENDING' || (review.state === 'DECIDED' && review.decision === 'AMBIGUOUS'));
       if (!review || review.scan_status !== 'INTAKE_DEFERRED' || !stateEligible) {
+        skipped += 1;
+        await client.query('COMMIT');
+        inTransaction = false;
+        continue;
+      }
+      const nowMs = Date.now();
+      const dueNow = (!review.next_recheck_at || new Date(review.next_recheck_at).getTime() <= nowMs)
+        && (!review.last_activity || new Date(review.last_activity).getTime() <= nowMs - minAgeMinutes * 60_000);
+      const activeJob = await client.query(
+        `SELECT 1 FROM jobs
+         WHERE status IN ('PENDING','PROCESSING')
+           AND type='ENRICH_CHANNEL'
+           AND (payload->>'channelId'=$1 OR idempotency_key LIKE 'intake-recheck:%'||$1||':%')
+         LIMIT 1`,
+        [channelId],
+      );
+      if (!dueNow || activeJob.rowCount) {
         skipped += 1;
         await client.query('COMMIT');
         inTransaction = false;

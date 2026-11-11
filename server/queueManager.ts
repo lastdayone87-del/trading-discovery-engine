@@ -1429,26 +1429,88 @@ async function processIntakeDeferredRecheckJob(
   const enrichmentPercent = Number(await getAppSetting('discovery_enrichment_quota_percent', process.env.DISCOVERY_ENRICHMENT_QUOTA_PERCENT || '10'));
   let reserved = false;
   try {
-    reserved = await tryReserveQuota({
-      operationType: 'ENRICH_CHANNEL',
-      operationId: job.id,
-      allocation: 'ENRICHMENT',
-      units: 2,
-      dailyBudget,
-      allocationPercent: enrichmentPercent,
-    });
-    if (!reserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
-    const enriched = await fetchYouTubeChannelEnrichment(channelId, candidate, 1, async additionalUnits => {
-      const toppedUp = await topUpQuotaReservation({
+    // A retry after a successful fetch reuses the candidate checkpoint saved
+    // on the job instead of paying for the same evidence again.
+    const cachedEvidence = Number(candidate.enrichmentStage || 0) >= 1;
+    let enriched: DiscoveredChannelRaw;
+    if (cachedEvidence) {
+      enriched = candidate;
+    } else {
+      reserved = await tryReserveQuota({
         operationType: 'ENRICH_CHANNEL',
         operationId: job.id,
         allocation: 'ENRICHMENT',
-        additionalUnits,
+        units: 2,
         dailyBudget,
         allocationPercent: enrichmentPercent,
       });
-      if (!toppedUp) throw new QuotaAllocationExhaustedError('ENRICHMENT');
-    }, 'enrichment');
+      if (!reserved) throw new QuotaAllocationExhaustedError('ENRICHMENT');
+      enriched = await fetchYouTubeChannelEnrichment(channelId, candidate, 1, async additionalUnits => {
+        const toppedUp = await topUpQuotaReservation({
+          operationType: 'ENRICH_CHANNEL',
+          operationId: job.id,
+          allocation: 'ENRICHMENT',
+          additionalUnits,
+          dailyBudget,
+          allocationPercent: enrichmentPercent,
+        });
+        if (!toppedUp) throw new QuotaAllocationExhaustedError('ENRICHMENT');
+      }, 'enrichment');
+      await (await getDb()).query(
+        `UPDATE jobs SET payload=jsonb_set(payload,'{candidate}',$2::jsonb,true),updated_at=now() WHERE id=$1`,
+        [job.id, JSON.stringify(enriched)],
+      );
+    }
+    if (enriched.subscriberCount != null) channel.subscriber_count = enriched.subscriberCount;
+    // Re-apply the absolute low-audience gate with the count returned by the
+    // fetch. A stale stored count must not keep spending quota every recheck.
+    if (evaluateLowAudienceGate(channel.subscriber_count == null ? undefined : String(channel.subscriber_count)).shouldSkipDeepEnrichment) {
+      const skippedAt = new Date().toISOString();
+      channel.scan_status = 'SKIPPED_LOW_AUDIENCE';
+      channel.last_checked = skippedAt;
+      channel.inspection_trail = [...(channel.inspection_trail || []), {
+        step: 'BIO',
+        title: 'Low-Audience Budget Gate',
+        status: 'SKIPPED',
+        details: `Subscribers: ${channel.subscriber_count ?? 'unknown'} (< 30). Recheck completed without further provider work.`,
+        timestamp: skippedAt,
+      }];
+      const audienceDb = await getDb();
+      const audienceClient = await audienceDb.connect();
+      let audienceTransaction = false;
+      try {
+        await audienceClient.query('BEGIN');
+        audienceTransaction = true;
+        await audienceClient.query(`SELECT 1 FROM intake_deferred_reviews WHERE channel_id=$1 FOR UPDATE`, [channelId]);
+        const projected = await audienceClient.query(
+          `UPDATE channels
+           SET scan_status='SKIPPED_LOW_AUDIENCE',subscriber_count=$2,last_checked=$3,
+               inspection_trail=$4::jsonb,updated_at=now()
+           WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
+          [channelId, channel.subscriber_count ?? null, skippedAt, JSON.stringify(channel.inspection_trail)],
+        );
+        if (projected.rowCount) {
+          await audienceClient.query(
+            `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
+             WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+            [channelId],
+          );
+        }
+        await audienceClient.query('COMMIT');
+        audienceTransaction = false;
+      } catch (error) {
+        if (audienceTransaction) await audienceClient.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        audienceClient.release();
+      }
+      if (reserved) {
+        await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+        reserved = false;
+      }
+      await completeJob(job.id);
+      return true;
+    }
     // Fresh country evidence from the same bounded fetch must be evaluated
     // before the trading-focus transition. A newly discovered excluded country
     // is terminal; a confirmed/likely country is projected into the channel.
@@ -1484,13 +1546,45 @@ async function processIntakeDeferredRecheckJob(
         timestamp: rejectedAt,
       }];
       await upsertChannel(channel);
+      const rejectionEvidence = {
+        candidate: {
+          channelName: enriched.channelName,
+          youtubeUrl: enriched.youtubeUrl,
+          description: enriched.description,
+          videoTitles: enriched.videoTitles,
+          videoDescriptions: enriched.videoDescriptions,
+          matchedDocument: enriched.matchedDocument,
+          channelLinks: enriched.channelLinks,
+          subscriberCount: enriched.subscriberCount,
+          locationTag: enriched.locationTag,
+        },
+        targetCountry,
+        source,
+        countryRejection: {
+          status: recheckCountry.status,
+          detectedCountry: recheckCountry.detectedCreatorCountry,
+          score: recheckCountry.score,
+          decisionLogs: recheckCountry.decisionLogs,
+        },
+      };
+      const rejectionHash = createHash('sha256').update(JSON.stringify(rejectionEvidence)).digest('hex');
+      const rejectionQuality = deriveMetadataQuality({
+        description: enriched.description,
+        videoTitles: enriched.videoTitles,
+        videoDescriptions: enriched.videoDescriptions,
+      });
       await (await getDb()).query(
-        `UPDATE intake_deferred_reviews SET state='SUPERSEDED',next_recheck_at=NULL,updated_at=now()
+        `UPDATE intake_deferred_reviews
+         SET state='SUPERSEDED',next_recheck_at=NULL,evidence_snapshot=$2::jsonb,
+             metadata_quality=$3,last_evidence_hash=$4,recheck_attempts=recheck_attempts+1,
+             last_checked_at=$5,updated_at=now()
          WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
-        [channelId],
+        [channelId, JSON.stringify(rejectionEvidence), rejectionQuality, rejectionHash, rejectedAt],
       );
-      await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-      reserved = false;
+      if (reserved) {
+        await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+        reserved = false;
+      }
       await completeJob(job.id);
       return true;
     }
@@ -1598,9 +1692,9 @@ async function processIntakeDeferredRecheckJob(
           `UPDATE channels
            SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',
                country=$4,country_status=$5,confidence_score=$6,scope_eligibility=$7,
-               last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
+               subscriber_count=$8,last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
            WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
-          [channelId, now, JSON.stringify(channel.inspection_trail), channel.country, channel.country_status, channel.confidence_score, channel.scope_eligibility || resolveScopeEligibility(channel.country)],
+          [channelId, now, JSON.stringify(channel.inspection_trail), channel.country, channel.country_status, channel.confidence_score, resolveScopeEligibility(channel.country), channel.subscriber_count ?? null],
         );
         if (!projected.rowCount) {
           await admitClient.query('ROLLBACK');
@@ -1637,8 +1731,10 @@ async function processIntakeDeferredRecheckJob(
         admitClient.release();
       }
       if (admitNeedsSettlement) {
-        await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-        reserved = false;
+        if (reserved) {
+          await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+          reserved = false;
+        }
         await completeJob(job.id);
         return true;
       }
@@ -1683,8 +1779,10 @@ async function processIntakeDeferredRecheckJob(
         [channelId],
       );
     }
-    await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
-    reserved = false;
+    if (reserved) {
+      await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
+      reserved = false;
+    }
     await completeJob(job.id);
     return true;
   } catch (error) {

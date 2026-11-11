@@ -358,14 +358,9 @@ async function startServer() {
   });
   app.get('/api/human-evaluation/metrics', requireReviewer, async (_req, res) => {
     try {
-      const samples: HumanEvaluationSample[] = [];
-      let offset = 0;
-      for (;;) {
-        const page = await listHumanEvaluationSamples({ limit: 1000, offset });
-        samples.push(...page);
-        if (page.length < 1000) break;
-        offset += page.length;
-      }
+      // Read the ledger in one statement so a decision committed between
+      // page reads cannot shift the offset and double-count a sample.
+      const samples: HumanEvaluationSample[] = await listHumanEvaluationSamples({ limit: 50000 });
       res.json({
         overall: computeEvaluationMetrics(samples),
         byLanguage: computeEvaluationBreakdown(samples, 'language'),

@@ -119,7 +119,15 @@ SELECT
   NULL,
   c.country,
   CASE
-    WHEN COALESCE(length(j.payload->'candidate'->>'description'),0) >= 80 THEN 'RICH'
+    WHEN GREATEST(
+      COALESCE(jsonb_array_length(
+        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoTitles')='array'
+             THEN j.payload->'candidate'->'videoTitles' ELSE '[]'::jsonb END),0),
+      COALESCE(jsonb_array_length(
+        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoDescriptions')='array'
+             THEN j.payload->'candidate'->'videoDescriptions' ELSE '[]'::jsonb END),0)
+    ) >= 3
+    AND COALESCE(length(j.payload->'candidate'->>'description'),0) >= 80 THEN 'RICH'
     WHEN GREATEST(
       COALESCE(jsonb_array_length(
         CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoTitles')='array'
