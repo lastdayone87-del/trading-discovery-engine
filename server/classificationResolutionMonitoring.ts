@@ -180,7 +180,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
                 THEN COALESCE(latest.decision->'deterministicRouting'->>'semanticUsed','false')
                 ELSE CASE WHEN EXISTS(
                   SELECT 1 FROM jsonb_array_elements(COALESCE(latest.decision->'evidenceCollection'->'providers','[]'::jsonb)) p
-                   WHERE p->>'provider' IN('gemini_semantic','groq_semantic')
+                   WHERE p->>'provider' IN('gemini_semantic','groq_semantic','gemini_free_semantic')
                      AND p->>'outcome'='EXECUTED_WITH_EVIDENCE'
                 ) THEN 'true' ELSE 'false' END
               END AS semantic_used,
@@ -188,7 +188,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
                 THEN COALESCE(latest.decision->'deterministicRouting'->>'semanticAttempted','false')
                 ELSE CASE WHEN EXISTS(
                   SELECT 1 FROM jsonb_array_elements(COALESCE(latest.decision->'evidenceCollection'->'providers','[]'::jsonb)) p
-                   WHERE p->>'provider' IN('gemini_semantic','groq_semantic')
+                   WHERE p->>'provider' IN('gemini_semantic','groq_semantic','gemini_free_semantic')
                      AND p->>'availability' IN('AVAILABLE','FAILED')
                      AND p->>'outcome' NOT IN('SUPPRESSED_BY_POLICY','NOT_APPLICABLE','UNAVAILABLE_CONFIGURATION')
                 ) THEN 'true' ELSE 'false' END

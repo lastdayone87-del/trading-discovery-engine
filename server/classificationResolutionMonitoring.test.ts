@@ -71,5 +71,5 @@ test('key-cap alert counts settled usage plus live leases and requires enforceme
   assert.match(source, /youtube_key_cap_shadow_leases/);
   assert.match(source, /hardCapEnforced && String\(quota\.last_reset\) === quotaDay/);
   assert.match(source, /deterministicRouting' \? 'semanticUsed'/);
-  assert.match(source, /gemini_semantic','groq_semantic/);
+  assert.match(source, /gemini_semantic','groq_semantic','gemini_free_semantic/);
 });

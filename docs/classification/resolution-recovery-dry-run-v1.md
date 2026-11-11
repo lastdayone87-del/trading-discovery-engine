@@ -59,7 +59,7 @@ No legacy row has a pending review. These rows predate the forward-recovery cuto
 - Recent 7-day consumption: autonomous **793,500**; enrichment **54,808**.
 - Due enrichment: 5,885 stage 1 and 19 stage 2.
 - Estimated due demand: 13,727 units.
-- Dynamic protected reserve: **13,727 units** (demand-driven; protected-share floor 10%), released as the backlog falls.
+- Dynamic protected reserve: **13,727 units** (demand-driven; capped at 10% of remaining quota), released as the backlog falls.
 - Available to autonomous discovery: **456,962 units**.
 - No fixed quota partition was introduced.
 

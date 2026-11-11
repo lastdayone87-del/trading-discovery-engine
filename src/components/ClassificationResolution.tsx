@@ -132,7 +132,7 @@ export const ClassificationResolution: React.FC = () => {
                 <div>Daily limit: <b>{n(data.quota.dailyLimit)}</b></div>
                 <div>Used: <b>{n(data.quota.used)}</b> · Remaining: <b>{n(data.quota.remaining)}</b></div>
                 <div>Due stage 1/2: <b>{n(data.quota.dueStage1)}</b> / <b>{n(data.quota.dueStage2)}</b></div>
-                <div>Reserved for enrichment: <b>{n(data.quota.reserveUnits)}</b> <span>(demand-driven; protected-share floor {pct(data.quota.protectedShare)})</span></div>
+                <div>Reserved for enrichment: <b>{n(data.quota.reserveUnits)}</b> <span>(demand-driven; capped at {pct(data.quota.protectedShare)} of remaining)</span></div>
                 <div>Recent 7-day consumption: autonomous <b>{n(data.quota.recentAutonomousUnits)}</b> · enrichment <b>{n(data.quota.recentEnrichmentUnits)}</b></div>
                 <div className="text-[10px] text-slate-400 pt-1">Reserve is demand-driven and released as the due backlog clears.</div>
               </div>
