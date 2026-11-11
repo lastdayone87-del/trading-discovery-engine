@@ -9,11 +9,12 @@ import {resolveReviewReason, type ReviewReasonAction} from './reviewReasons';
 import {isQualityCreator} from './queryPerformance';
 
 export type ReviewState = 'NOT_REQUIRED'|'PENDING'|'APPROVED'|'REJECTED'|'SUPERSEDED';
-export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN';
+export type ReviewAction = 'APPROVE'|'REJECT'|'FORCE_RESCAN'|'REQUEST_RESCAN';
 export class ReviewConflictError extends Error { status = 409; }
 export class ReviewNotFoundError extends Error { status = 404; }
 export function resolveReviewTransition(state:ReviewState,action:ReviewAction):ReviewState {
   if(action==='FORCE_RESCAN') { if(state!=='REJECTED') throw new ReviewConflictError('Force rescan is only permitted for a rejected review.'); return 'PENDING'; }
+  if(action==='REQUEST_RESCAN') { if(state!=='PENDING') throw new ReviewConflictError('A rescan request is only permitted for a pending review.'); return 'SUPERSEDED'; }
   if(state!=='PENDING') throw new ReviewConflictError(`Review is already ${state}.`);
   return action==='APPROVE'?'APPROVED':'REJECTED';
 }
@@ -46,7 +47,7 @@ export interface DecideInput { channelId:string; action:ReviewAction; expectedVe
 export async function decideReview(input:DecideInput) {
   if(!Number.isInteger(input.expectedVersion)||input.expectedVersion<1) throw new Error('reviewVersion must be a positive integer.');
   if(!input.reviewer.trim()||!input.idempotencyKey.trim()) throw new Error('reviewer and idempotencyKey are required.');
-  const structured=input.action==='FORCE_RESCAN'?null:resolveReviewReason(input.action as ReviewReasonAction,String(input.reviewReasonCode||''),String(input.reviewReasonVersion||''),input.reviewReasonOther);
+  const structured=(input.action==='FORCE_RESCAN'||input.action==='REQUEST_RESCAN')?null:resolveReviewReason(input.action as ReviewReasonAction,String(input.reviewReasonCode||''),String(input.reviewReasonVersion||''),input.reviewReasonOther);
   const reason=structured?.display||input.reason?.trim();if(!reason)throw new Error('reason is required.');
   const db=await getDb(); const client=await db.connect();
   try {
@@ -86,13 +87,19 @@ export async function decideReview(input:DecideInput) {
       await client.query(`SET LOCAL app.force_review_rescan='on'`);
       await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
       await client.query(`UPDATE channels SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',discord_status='UNCERTAIN',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
-      await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('FORCE_REVIEW_RESCAN',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion}),`force-review-rescan:${input.channelId}:${nextVersion}`]);
+      const jobKey=input.action==='REQUEST_RESCAN'?`request-review-rescan:${input.channelId}:${nextVersion}`:`force-review-rescan:${input.channelId}:${nextVersion}`;
+      await client.query(`INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key) VALUES('FORCE_REVIEW_RESCAN',$1,1000,4,$2) ON CONFLICT(idempotency_key) DO NOTHING`,[JSON.stringify({channelId:input.channelId,reviewVersion:nextVersion,requestedBy:input.action==='REQUEST_RESCAN'?'REQUEST_RESCAN':'FORCE_RESCAN'}),jobKey]);
     }
     const inserted=await client.query(`INSERT INTO channel_review_decisions(channel_id,decision,previous_status,resulting_status,reviewer,reason,notes,review_version,evidence_snapshot,idempotency_key,reason_code,reason_catalog_version,reason_other_text) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,[input.channelId,input.action,row.state,resulting,input.reviewer.trim(),reason,input.notes?.trim()||null,nextVersion,JSON.stringify(evidence),input.idempotencyKey,structured?.code||'LEGACY_FREE_TEXT',structured?.version||'legacy',structured?.otherText||null]);
     const lineage=await client.query(`SELECT s.query_run_id,s.query_id,r.job_id,r.country,r.retrieval_lane FROM channel_sightings s JOIN query_runs r ON r.id=s.query_run_id WHERE s.channel_id=$1 ORDER BY s.observed_at DESC LIMIT 1`,[input.channelId]);
     const origin=lineage.rows[0];
-    await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,'CHANNEL',$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13) ON CONFLICT(event_key) DO NOTHING`,[`review:${input.channelId}:version:${nextVersion}:v1`,input.channelId,input.action==='FORCE_RESCAN'?'REVIEW_CORRECTED':'REVIEW_VERIFIED',origin?`query-run:${origin.query_run_id}:selected:v1`:null,origin?.query_id||null,origin?.query_run_id||null,origin?.job_id||null,origin?.country||row.channel_snapshot?.country||null,origin?.retrieval_lane||null,input.action==='FORCE_RESCAN'?'CORRECTIVE':'VERIFIED',REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,JSON.stringify({action:input.action,previousStatus:row.state,resultingStatus:resulting,reviewVersion:nextVersion,reasonCode:structured?.code||'LEGACY_FREE_TEXT'})]);
-    const updatedReview=await client.query(`UPDATE channel_reviews SET state=$2::review_state,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2::review_state='PENDING'::review_state THEN NULL ELSE now() END,pending_since=CASE WHEN $2::review_state='PENDING'::review_state THEN now() ELSE pending_since END,updated_at=now() WHERE channel_id=$1 RETURNING state,review_version`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
+    // A rescan request is not a human correction or verification. Its durable
+    // audit lives in channel_review_decisions; do not feed it into the
+    // corrective-learning outcome stream.
+    if(input.action!=='REQUEST_RESCAN'){
+      await client.query(`INSERT INTO outcome_events(event_key,subject_type,subject_id,event_type,event_version,source_event_key,query_id,query_run_id,job_id,country,retrieval_lane,verification_status,policy_version,feature_version,event_time,payload) VALUES($1,'CHANNEL',$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,now(),$13) ON CONFLICT(event_key) DO NOTHING`,[`review:${input.channelId}:version:${nextVersion}:v1`,input.channelId,input.action==='FORCE_RESCAN'?'REVIEW_CORRECTED':'REVIEW_VERIFIED',origin?`query-run:${origin.query_run_id}:selected:v1`:null,origin?.query_id||null,origin?.query_run_id||null,origin?.job_id||null,origin?.country||row.channel_snapshot?.country||null,origin?.retrieval_lane||null,input.action==='FORCE_RESCAN'?'CORRECTIVE':'VERIFIED',REPLAY_POLICY_VERSION,REPLAY_FEATURE_VERSION,JSON.stringify({action:input.action,previousStatus:row.state,resultingStatus:resulting,reviewVersion:nextVersion,reasonCode:structured?.code||'LEGACY_FREE_TEXT'})]);
+    }
+    const updatedReview=await client.query(`UPDATE channel_reviews SET state=$2::review_state,review_version=$3,evidence_snapshot=$4,decided_at=CASE WHEN $2::review_state='PENDING'::review_state THEN NULL ELSE now() END,pending_since=CASE WHEN $2::review_state='PENDING'::review_state THEN now() WHEN $2::review_state='SUPERSEDED'::review_state THEN NULL ELSE pending_since END,updated_at=now() WHERE channel_id=$1 RETURNING state,review_version`,[input.channelId,resulting,nextVersion,JSON.stringify(evidence)]);
     const updatedChannel=await client.query(`SELECT channel_id,trading_status,scan_status,discord_status FROM channels WHERE channel_id=$1`,[input.channelId]);
     if(updatedReview.rowCount!==1||updatedChannel.rowCount!==1)throw new Error('Review decision persistence verification failed.');
     const qualityScore=Number(row.channel_snapshot?.quality_score||0);
@@ -109,7 +116,7 @@ export async function decideReview(input:DecideInput) {
       .catch(error=>console.warn(`[DecisionEvaluation] Ground-truth label failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     if(input.action==='APPROVE'&&row.channel_snapshot?.trading_status!=='TRADING_CONFIRMED')void recordFalseNegativeIncident({channelId:input.channelId,reviewDecisionId:inserted.rows[0].id,priorStatus:row.channel_snapshot?.trading_status||'UNKNOWN',evidenceSnapshot:evidence})
       .catch(error=>console.warn(`[CorrectiveLearning] False-negative diagnosis failed for ${input.channelId}:`,error instanceof Error?error.message:error));
-    if(input.action!=='FORCE_RESCAN')void recordAdmissionShadow({channelId:input.channelId,priorState:'NOT_EVALUATED',classificationStatus:input.action==='APPROVE'?'TRADING_CONFIRMED':'HUMAN_REJECTED',investigationState:'COMPLETED',reviewId:inserted.rows[0].id,candidateHypothesis:{humanDecision:input.action},evidenceCoverage:{reviewVersion:nextVersion}})
+    if(input.action==='APPROVE'||input.action==='REJECT')void recordAdmissionShadow({channelId:input.channelId,priorState:'NOT_EVALUATED',classificationStatus:input.action==='APPROVE'?'TRADING_CONFIRMED':'HUMAN_REJECTED',investigationState:'COMPLETED',reviewId:inserted.rows[0].id,candidateHypothesis:{humanDecision:input.action},evidenceCoverage:{reviewVersion:nextVersion}})
       .catch(error=>console.warn(`[CandidateAdmission] review shadow write failed for ${input.channelId}:`,error instanceof Error?error.message:error));
     const channel=updatedChannel.rows[0];
     return {decision:inserted.rows[0],review:{state:updatedReview.rows[0].state,reviewVersion:updatedReview.rows[0].review_version},channel:{channelId:channel.channel_id,tradingStatus:channel.trading_status,scanStatus:channel.scan_status,discordStatus:channel.discord_status},queuePending:updatedReview.rows[0].state==='PENDING',idempotent:false};

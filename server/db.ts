@@ -3,6 +3,8 @@
 // and independently testable without changing the rest of the database surface.
 export * from './dbCore';
 
+import { isOfficialYouTubeQuotaFenceError } from './officialYouTubeQuotaFence';
+import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownExpiryMs, resolveGeminiOrgSemanticCooldownExpiryMs, resolveGeminiOrgBucketExpiryMs, resolveGroqSemanticCooldownExpiryMs, resolveGroqOrgCooldownExpiryMs, resolveGeminiFreeSemanticCooldownExpiryMs, failedProviderOrg } from './dbCore';
 import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure, normalizeCapacityLeaseRunAfter } from './acquisitionJobClockPolicy';
 import { acquisitionEvidenceFromError, classifyAcquisitionFailure, type AcquisitionFailureClassification } from './acquisitionFailureClassification';
@@ -206,6 +208,12 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
       bumpJobFailureDisposition(disposition);
     }
   };
+  const terminalFailureClass = disposition !== 'FAILED' ? null
+    : isYouTubePermanentInputError(error) ? 'PERMANENT_INPUT'
+      : isOfficialYouTubeQuotaFenceError(error) || String(error?.code || '') === 'INVESTIGATION_DEADLINE_EXCEEDED' ? 'POLICY_TERMINAL'
+        : decision.operationallyBlocked ? 'PROVIDER_QUOTA'
+          : retryableInfrastructure ? 'RETRYABLE'
+            : 'UNKNOWN';
   const persistedMessage=decision.operationallyBlocked&&!capacityLease?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;
   const transientAnchor=retryableInfrastructure?new Date(firstFailureAt).toISOString():null;
 
@@ -213,15 +221,15 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
     if(capacityLease){
       // Renew only capacity bookkeeping. first_transient_failure_at and
       // created_at are deliberately absent from this statement.
-      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,${capacityLeaseRefreshSetSql('$4')} WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),String(CAPACITY_LEASE_DURATION_MS)]);
+      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,terminal_failure_class=NULL,${capacityLeaseRefreshSetSql('$4')} WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),String(CAPACITY_LEASE_DURATION_MS)]);
     }else{
-      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,first_transient_failure_at=COALESCE(first_transient_failure_at,$4::timestamptz),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),transientAnchor]);
+      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,terminal_failure_class=NULL,first_transient_failure_at=COALESCE(first_transient_failure_at,$4::timestamptz),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),transientAnchor]);
     }
   }else if(disposition==='FAILED'){
-    await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,first_transient_failure_at=CASE WHEN $3::boolean THEN COALESCE(first_transient_failure_at,$4::timestamptz) ELSE first_transient_failure_at END,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,retryableInfrastructure,transientAnchor]);
+    await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,terminal_failure_class=$5,first_transient_failure_at=CASE WHEN $3::boolean THEN COALESCE(first_transient_failure_at,$4::timestamptz) ELSE first_transient_failure_at END,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,retryableInfrastructure,transientAnchor,terminalFailureClass]);
   }else{
     const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
-    await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,first_transient_failure_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
+    await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,terminal_failure_class=NULL,first_transient_failure_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
   }
   // The job-row transition above is the disposition: count it here so a
   // failure in the secondary attempts bookkeeping below cannot omit it.

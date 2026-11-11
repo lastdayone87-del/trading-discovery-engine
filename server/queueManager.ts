@@ -314,6 +314,15 @@ export function enrichChannelClaimableDuringCooldown(input: {
   return false;
 }
 
+/** Bounded probe cadence while every semantic route is cooling. The probe
+ * exists so stage-1/2 evidence acquisition can persist its YouTube payload and
+ * the next attempt can skip the provider fetch. It is not a general claim
+ * throttle and does not bypass the queue pause. */
+export const SEMANTIC_COOLDOWN_ENRICH_PROBE_INTERVAL_MS = 15_000;
+export function semanticCooldownProbeAllowed(lastProbeAt: number, now = Date.now(), intervalMs = SEMANTIC_COOLDOWN_ENRICH_PROBE_INTERVAL_MS): boolean {
+  return lastProbeAt <= 0 || now - lastProbeAt >= Math.max(1_000, intervalMs);
+}
+
 /**
  * Groq fallback cooldown composition for the ENRICH claim gate.
  * Groq is usable as a fallback only when BOTH cooldown mechanisms are clear:
@@ -917,6 +926,7 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
 export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
+let lastSemanticCooldownEnrichProbeAt = 0;
 let lastAutonomousResumeSweepAt = 0;
 
 /** Persist a resumable quota deferral. The run is not completed and the
@@ -1359,6 +1369,7 @@ export async function processNextSearchJob(
   // Groq organization that is clear of BOTH its persisted cooldown and its
   // process-local cooldown still allows the claim so jobs can reach the
   // already-working fallback.
+  let enrichProbeOnly = false;
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
@@ -1378,13 +1389,28 @@ export async function processNextSearchJob(
       groqFallbackConfigured = fallbackRoutes.length > 0 && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true';
       if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
-    if (enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive })) {
+    const enrichmentFullyClaimable = enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive });
+    const nowMs = Date.now();
+    const probeTimeAllowed = !enrichmentFullyClaimable && semanticCooldownProbeAllowed(lastSemanticCooldownEnrichProbeAt, nowMs);
+    // Reserve the interval before awaiting the scan. Empty results and
+    // concurrent workers must not re-run the probe query on every tick.
+    if (probeTimeAllowed) lastSemanticCooldownEnrichProbeAt = nowMs;
+    const probeStagesAvailable = probeTimeAllowed
+      ? (await (await getDb()).query(`SELECT 1 FROM jobs
+           WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now()
+             AND COALESCE((payload->>'enrichmentStage')::int,1)<=2
+             AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1))
+           LIMIT 1`)).rowCount
+      : 0;
+    const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
+    enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable;
+    if (enrichmentFullyClaimable || enrichmentProbe) {
       claimableTypes.push('ENRICH_CHANNEL');
-      // Classification jobs perform the same semantic work and consult the
-      // same route health. The flag only stops NEW enqueues; every durable
-      // classification already queued must stay claimable so a rollback drains
-      // instead of stranding PENDING jobs behind the legacy inline path.
-      if (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE)) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
+      // Classification jobs require the semantic decision and remain gated
+      // while every semantic route is cooling. ENRICH is allowed as a bounded
+      // probe: stage-1/2 evidence is persisted before the semantic attempt, so
+      // the next pass can resume without re-spending YouTube quota.
+      if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE))) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
   }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
@@ -1418,7 +1444,7 @@ export async function processNextSearchJob(
   if (claimableTypes.length === 0) return false;
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
-  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS]);
+  const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS], enrichProbeOnly);
   if (!job) return false;
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
@@ -4418,10 +4444,10 @@ export function operationalEnrichmentRecoveryKey(channelId:string):string{return
  * without a database; the enqueue path itself is unchanged.
  */
 export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'channel_thumbnail_url'>,reasonCodes:string[]){
-  return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:1},recoveryReasonCodes:reasonCodes};
+  return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:0},recoveryReasonCodes:reasonCodes};
 }
 export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<boolean>{
-  const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:10,maxAttempts:4,clientOverride});
+  const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:30,maxAttempts:4,clientOverride});
   if(job.reopen_blocked)return false;
   await (clientOverride||await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
   return true;

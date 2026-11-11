@@ -45,7 +45,7 @@ test('budget guards are defined for exactly the corpus claim types', async () =>
   }
   // The claim path passes the guards into claimNextJob, where admission is
   // evaluated atomically inside the claim transaction.
-  assert.match(queueManager, /\['RECONCILIATION_REQUIRED'\], \[\.\.\.CORPUS_CLAIM_BUDGET_GUARDS, \.\.\.RESOLUTION_CLAIM_BUDGET_GUARDS\]\)/);
+  assert.match(queueManager, /\['RECONCILIATION_REQUIRED'\], \[\.\.\.CORPUS_CLAIM_BUDGET_GUARDS, \.\.\.RESOLUTION_CLAIM_BUDGET_GUARDS\](?:, enrichProbeOnly)?\)/);
 });
 
 test('guard evaluation recovers the claim transaction after transient failure', async () => {

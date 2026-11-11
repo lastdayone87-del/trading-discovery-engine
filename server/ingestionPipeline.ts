@@ -53,6 +53,7 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
+import { materializeExhaustedReview } from './reviewEligibility/exhaustedReview';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
 import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
@@ -1293,17 +1294,17 @@ async function processChannelThroughPipelineInContext(
       const withheldChannel: ChannelRecord = existing || {
         channel_id:candidate.channelId, channel_name:candidate.channelName, youtube_url:candidate.youtubeUrl,
         country:creatorCountry, country_status:countryVal.status, confidence_score:countryVal.score,
-        discord_status:'UNCERTAIN', discord_invite:null, scan_status:'NEEDS_REVIEW', scan_attempts:0,
+        discord_status:'UNCERTAIN', discord_invite:null, scan_status:'ENRICHMENT_PENDING', scan_attempts:0,
         discovery_source:source, first_seen:now, last_checked:now, inspection_trail:[countryValidationStep],
         subscriber_count:candidate.subscriberCount,
         channel_thumbnail_url:candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
-        trading_status:'NEEDS_REVIEW', trading_confidence_score:tradingVal.confidenceScore,
+        trading_status:'UNCERTAIN', trading_confidence_score:tradingVal.confidenceScore,
         trading_category:tradingVal.category, trading_relevance_breakdown:tradingVal.breakdown
       };
       withheldChannel.country=creatorCountry; withheldChannel.country_status=countryVal.status; withheldChannel.confidence_score=countryVal.score;
-      withheldChannel.trading_status='NEEDS_REVIEW'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
+      withheldChannel.trading_status='UNCERTAIN'; withheldChannel.trading_confidence_score=tradingVal.confidenceScore;
       withheldChannel.trading_category=tradingVal.category; withheldChannel.trading_relevance_breakdown=tradingVal.breakdown;
-      withheldChannel.scan_status='NEEDS_REVIEW';
+      withheldChannel.scan_status='ENRICHMENT_PENDING';
       // This branch performs no Discord validation. Reuse the shared
       // classification-only projection so an existing invite is never cleared
       // merely because the row is not recognized as an established selection.
@@ -1315,10 +1316,34 @@ async function processChannelThroughPipelineInContext(
         candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
         evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
         .catch(error=>console.warn(`[CandidateAdmission] post-enrichment withholding write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
-      void recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,classificationStatus:'UNCERTAIN',investigationState:'NEEDS_REVIEW',plausibleTradingHypothesis:false,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:false,countryAllowed:true,operationalFailure:false,providerDegraded:productionClassification.decision.evidenceCollection.degraded,unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false,decidedAt:productionClassification.decision.timestamp})
-        .catch(error=>console.warn(`[ReviewEligibility] withholding shadow write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+      // One authoritative exhaustion path: create a review row and let the
+      // review trigger project NEEDS_REVIEW. This replaces the previous race
+      // between a direct NEEDS_REVIEW write and the eligibility reconciler.
+      try {
+        const review = await materializeExhaustedReview({
+          channelId: candidate.channelId,
+          classificationDiagnosticId,
+          reasonCode: 'NO_INDEPENDENT_HYPOTHESIS_AFTER_ENRICHMENT',
+          reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN'],
+          evidenceSummary: {
+            confidence: tradingVal.confidenceScore,
+            sufficiency: productionClassification.decision.evidenceCollection.sufficiency,
+            independentHypothesis: false,
+            enrichmentStage: currentStage,
+          },
+          decidedAt: productionClassification.decision.timestamp,
+        });
+        if (!review.materialized && review.reason === 'STALE_ELIGIBILITY_PROJECTION') {
+          // A newer review projection may already own this channel. Only move
+          // a still-pending scan state and never overwrite the newer status.
+          await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
+        }
+      } catch (error) {
+        console.error(`[ClassificationResolution] Exhausted review creation failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
+        await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
+      }
       const authoritativeWithheld=(await getChannelById(candidate.channelId))||withheldChannel;
-      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:'NEEDS_REVIEW',discordStatus:authoritativeWithheld.discord_status,discordInvite:authoritativeWithheld.discord_invite??null,channelRecord:authoritativeWithheld};
+      return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:authoritativeWithheld.trading_status,discordStatus:authoritativeWithheld.discord_status,discordInvite:authoritativeWithheld.discord_invite??null,channelRecord:authoritativeWithheld};
     }
 
     const legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
@@ -1385,12 +1410,40 @@ async function processChannelThroughPipelineInContext(
     if (lifecycle.shouldEnqueue) {
       const action=ACTIONS.find(item=>item.action===appliedAction),nextStage=action?.enrichmentStage||Math.min(2,currentStage+1);
       if(isEnrichmentStageExhausted(isEnrichmentPass,currentStage,nextStage)){
-        // The pass already executed this stage. Close the machine-owned
-        // marker instead of enqueueing the same stage forever.
-        const terminal=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:'COMPLETED',hasOtherActiveEnrichmentJob:false});
-        if(terminal.scanStatus!==authoritativeChannel.scan_status){
-          const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,terminal.scanStatus,now,options?.jobId);
-          if(refreshed)Object.assign(authoritativeChannel,refreshed);
+        // The pass already executed this stage. Do not leave a machine-owned
+        // COMPLETED/UNCERTAIN row: create the bounded human-review fallback.
+        if(authoritativeChannel.trading_status==='UNCERTAIN'){
+          try{
+            const review=await materializeExhaustedReview({
+              channelId:candidate.channelId,classificationDiagnosticId,
+              reasonCode:'ENRICHMENT_STAGE_EXHAUSTED',
+              reasonCodes:['MACHINE_EXHAUSTED_UNCERTAIN'],
+              evidenceSummary:{
+                confidence:tradingVal.confidenceScore,
+                sufficiency:productionClassification.decision.evidenceCollection.sufficiency,
+                independentHypothesis,
+                enrichmentStage:currentStage,
+              },
+              decidedAt:productionClassification.decision.timestamp,
+            });
+            if(!review.materialized&&review.reason==='STALE_ELIGIBILITY_PROJECTION'){
+              const blocked=await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
+              if(blocked)Object.assign(authoritativeChannel,blocked);
+            }else{
+              const refreshed=await getChannelById(candidate.channelId);
+              if(refreshed)Object.assign(authoritativeChannel,refreshed);
+            }
+          }catch(error){
+            console.error(`[ClassificationResolution] Stage-exhausted review creation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);
+            const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
+            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+          }
+        }else{
+          const terminal=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:'COMPLETED',hasOtherActiveEnrichmentJob:false});
+          if(terminal.scanStatus!==authoritativeChannel.scan_status){
+            const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,terminal.scanStatus,now,options?.jobId);
+            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+          }
         }
       }else{
         const vitality=deriveVitalityScheduling(productionClassification.input.activity_metadata,productionClassification.decision.timestamp),priority=10+vitality.jobPriorityDelta,payload={ channelId: candidate.channelId, targetCountry, source, candidate, enrichmentStage:nextStage, quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL', evidenceAcquisitionDecisionId:evidencePlan?.decisionId, evidenceAction:appliedAction, vitalityScheduling:vitality };
@@ -1468,18 +1521,31 @@ async function processChannelThroughPipelineInContext(
           }
         }else enqueued=await enqueueEnrichment();
         if(enqueued?.reopen_blocked===true){
-          // The stable same-stage pass is already terminal. Project the honest
-          // terminal state, but update only the committed row's scan status so
-          // a concurrent recovery/recheck cannot be overwritten by this stale
-          // snapshot. The same UPDATE excludes a later-stage active job in one
-          // statement, which narrows the race to a job committed after that
-          // statement's snapshot. A worker that still owns the channel will
-          // reassert its marker; no separate read can orphan the pending row.
-          // A blocked FAILED job is FAILED, never COMPLETED.
-          const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
-          if(blocked.scanStatus!==authoritativeChannel.scan_status){
-            const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,blocked.scanStatus,now,options?.jobId);
-            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+          // A blocked COMPLETED pass with unresolved semantics is exhausted,
+          // not successfully resolved. Create the human-review fallback. A
+          // blocked FAILED job remains FAILED for the bounded recovery sweep.
+          if(String(enqueued.status).toUpperCase()==='COMPLETED'&&authoritativeChannel.trading_status==='UNCERTAIN'){
+            try{
+              await materializeExhaustedReview({
+                channelId:candidate.channelId,classificationDiagnosticId,
+                reasonCode:'ENRICHMENT_REOPEN_BLOCKED_COMPLETED',
+                reasonCodes:['MACHINE_EXHAUSTED_UNCERTAIN'],
+                evidenceSummary:{confidence:tradingVal.confidenceScore,sufficiency:productionClassification.decision.evidenceCollection.sufficiency,independentHypothesis,enrichmentStage:currentStage},
+                decidedAt:productionClassification.decision.timestamp,
+              });
+              const refreshed=await getChannelById(candidate.channelId);
+              if(refreshed)Object.assign(authoritativeChannel,refreshed);
+            }catch(error){
+              console.error(`[ClassificationResolution] Blocked-completed review creation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);
+              const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
+              if(refreshed)Object.assign(authoritativeChannel,refreshed);
+            }
+          }else{
+            const blocked=resolveEnrichmentReopenBlockedLifecycle(authoritativeChannel,{blockedJobStatus:enqueued.status,hasOtherActiveEnrichmentJob:false});
+            if(blocked.scanStatus!==authoritativeChannel.scan_status){
+              const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,blocked.scanStatus,now,options?.jobId);
+              if(refreshed)Object.assign(authoritativeChannel,refreshed);
+            }
           }
         }
       }

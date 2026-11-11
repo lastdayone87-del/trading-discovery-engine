@@ -5,6 +5,8 @@ import {assignAdmissionCanary} from '../candidateAdmission/policy';
 import {evaluateReviewEligibilityV2,REVIEW_ELIGIBILITY_POLICY_VERSION,type ReviewEligibilityInput} from './policy';
 
 async function reconcileMachineOwnedReview(client:any,channelId:string,evaluationStatus?:string){
+  const pending=await client.query(`SELECT evidence_snapshot FROM channel_reviews WHERE channel_id=$1 AND state='PENDING' FOR UPDATE`,[channelId]);
+  if(pending.rows[0]?.evidence_snapshot?.reasonFamily==='EVIDENCE_EXHAUSTED')return;
   await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',pending_since=NULL,updated_at=now() WHERE channel_id=$1 AND state='PENDING'`,[channelId]);
   await client.query(`UPDATE channels SET trading_status=CASE WHEN trading_status='NEEDS_REVIEW' THEN 'UNCERTAIN' ELSE trading_status END,scan_status=CASE WHEN scan_status='NEEDS_REVIEW' THEN 'ENRICHMENT_PENDING' ELSE scan_status END,last_checked=now() WHERE channel_id=$1`,[channelId]);
   const linked = await client.query(`SELECT id, policy_version FROM investigations WHERE subject_type='CHANNEL' AND subject_id=$1 AND state='NEEDS_REVIEW' FOR UPDATE`,[channelId]);
@@ -20,6 +22,16 @@ export async function recordReviewEligibilityShadow(input:ReviewEligibilityInput
   let decisionId:string|undefined;
   try{
     await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`review-eligibility:${input.channelId}`]);
+    const exhaustedPending=await client.query(`SELECT 1 FROM channel_reviews WHERE channel_id=$1 AND state='PENDING' AND evidence_snapshot->>'reasonFamily'='EVIDENCE_EXHAUSTED' FOR UPDATE`,[input.channelId]);
+    if(exhaustedPending.rowCount){
+      // The pipeline upsert can overwrite the review projection's serving
+      // state while the exhausted review is still pending. Re-assert it so a
+      // normal eligibility pass cannot re-queue enrichment behind the review.
+      await client.query(`UPDATE channels SET trading_status='NEEDS_REVIEW',scan_status='NEEDS_REVIEW',updated_at=now() WHERE channel_id=$1 AND trading_status NOT IN('TRADING_CONFIRMED','NON_TRADING','HUMAN_REJECTED')`,[input.channelId]);
+      await client.query('COMMIT');
+      return {...evaluation,mode,configuredMode:configured,recorded:false,idempotent:true,preservedExhaustedReview:true};
+    }
     const prior=await client.query('SELECT version,decision_id,status FROM review_eligibility_projection WHERE channel_id=$1 FOR UPDATE',[input.channelId]),version=Number(prior.rows[0]?.version||0);
     const decisionTime=input.decidedAt ? new Date(input.decidedAt).toISOString() : undefined;
     const decision=await client.query(`INSERT INTO review_eligibility_decisions(decision_key,channel_id,classification_diagnostic_id,investigation_id,creator_focus_snapshot_id,status,reason_codes,input_snapshot,input_checksum,policy_version,mode,assignment_basis_points,randomization_value,assigned,serving_authority,decided_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,COALESCE($15::timestamptz,now())) ON CONFLICT(decision_key) DO NOTHING RETURNING id,decided_at`,[key,input.channelId,input.classificationDiagnosticId||null,input.investigationId||null,input.creatorFocusSnapshotId||null,evaluation.status,JSON.stringify(evaluation.reasonCodes),JSON.stringify(snapshot),checksum,REVIEW_ELIGIBILITY_POLICY_VERSION,mode,basis,assignment.randomizationValue,configured==='CANARY'&&assignment.assigned,decisionTime||null]);

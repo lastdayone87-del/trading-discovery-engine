@@ -16,9 +16,14 @@ test('post-enrichment no-independent-hypothesis path is reviewable, never silent
   const start=source.indexOf("if (currentStage > 0 && !independentHypothesis)");
   const end=source.indexOf('const legacyAction',start);
   const block=source.slice(start,end);
-  assert.match(block,/trading_status='NEEDS_REVIEW'/);
-  assert.match(block,/scan_status='NEEDS_REVIEW'/);
-  assert.match(block,/tradingStatus:'NEEDS_REVIEW'/);
+  // The single exhaustion path creates an authoritative human review row.
+  // It must not write NEEDS_REVIEW directly (the old race) or COMPLETE silently.
+  assert.match(block,/materializeExhaustedReview\(/);
+  assert.match(block,/NO_INDEPENDENT_HYPOTHESIS_AFTER_ENRICHMENT/);
+  assert.doesNotMatch(block,/trading_status='NEEDS_REVIEW'/);
+  assert.doesNotMatch(block,/scan_status='NEEDS_REVIEW'/);
+  assert.doesNotMatch(block,/tradingStatus:\s*'NEEDS_REVIEW'/);
+  assert.doesNotMatch(block,/scan_status='COMPLETED'/);
 });
 
 test('evidence-complete human ambiguity is not remapped to UNCERTAIN/COMPLETED',()=>{

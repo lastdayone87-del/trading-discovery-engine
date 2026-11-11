@@ -2,23 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  classificationResolutionRecoveryApplyEnabled,
   createOperationalMaintenanceScheduler,
   type OperationalMaintenanceDependencies
 } from './operationalMaintenanceScheduler';
 import { STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS } from './staleChannelLockRecovery';
 
-const ALL_TASKS = [
-  'locks',
-  'investigations',
-  'orphans',
-  'community',
-  'legacy',
-  'projection',
-  'enrichment',
-  'phaseb',
-  'resume',
-  'classification'
-];
+const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'phaseb', 'resume', 'classification'];
 
 function createDeps(failAt?: string) {
   const calls: string[] = [];
@@ -34,6 +24,7 @@ function createDeps(failAt?: string) {
     reconcileLegacyCommunityRetryOwnership: make('legacy'),
     projectProviderDeferredEnrichment: make('projection'),
     reconcileOperationalEnrichmentRecovery: make('enrichment'),
+    reconcileClassificationResolutionGaps: make('resolution'),
     triggerPhaseBObservationReconciliation: make('phaseb'),
     resumeOrphanedAutonomousPages: make('resume'),
     reconcileStaleClassificationSightings: make('classification')
@@ -356,4 +347,26 @@ test('maintenance health is exposed on the queue status endpoint', () => {
   const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
   assert.match(server, /getOperationalMaintenanceSchedulerHealth/);
   assert.match(server, /operational: getOperationalMaintenanceSchedulerHealth\(\)/);
+});
+
+test('the resolution sweep is read-only unless apply is explicitly enabled', () => {
+  assert.equal(classificationResolutionRecoveryApplyEnabled({}), false);
+  assert.equal(classificationResolutionRecoveryApplyEnabled({ CLASSIFICATION_RESOLUTION_RECOVERY_APPLY: 'false' }), false);
+  assert.equal(classificationResolutionRecoveryApplyEnabled({ CLASSIFICATION_RESOLUTION_RECOVERY_APPLY: 'TRUE' }), true);
+});
+
+
+test('the resolution sweep is throttled independently of the maintenance tick', async () => {
+  const { calls, dependencies } = createDeps();
+  let now = 1_000_000;
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    now: () => now,
+    classificationResolutionSweepIntervalMs: 60_000,
+  });
+  await scheduler.run();
+  await scheduler.run();
+  assert.equal(calls.filter(call => call === 'resolution').length, 1);
+  now += 61_000;
+  await scheduler.run();
+  assert.equal(calls.filter(call => call === 'resolution').length, 2);
 });

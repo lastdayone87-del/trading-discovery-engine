@@ -3563,7 +3563,7 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   try{
   db=opts.clientOverride||await getDb();
   const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
-  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
+  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,terminal_failure_class=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.terminal_failure_class END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
   // Three explicit conflict policies:
   //  - preventReopen: never reopen any terminal row (explicit recovery only).
   //  - preventCompletedReopen: keep a completed job terminal, but still let a
@@ -3610,7 +3610,7 @@ export async function getJobByIdempotencyKey(idempotencyKey: string): Promise<Du
 }
 
 function rowToJob(r:any):DurableJob{return {id:r.id,type:r.type,status:r.status,payload:parseJson(r.payload,{}),attempts:r.attempts,max_attempts:r.max_attempts,run_after:iso(r.run_after)||'',locked_by:r.locked_by,locked_at:iso(r.locked_at),last_error:r.last_error,created_at:iso(r.created_at)||'',reopen_generation:r.reopen_generation==null?0:Number(r.reopen_generation)};}
-export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[]):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
+export async function claimNextJob(workerId:string,types?:string[],excludedErrorPatterns?:string[],excludedReconciliationStatuses?:string[],budgetGuards:ClaimBudgetGuard[]=[],enrichProbeOnly=false):Promise<DurableJob|null>{const db=await getDb(); const client=await db.connect(); let claimed:DurableJob|null=null;try{await client.query('BEGIN');
     // Single priority-preserving claim loop: always consider the globally
     // highest-priority pending candidate first. Unguarded candidates claim
     // immediately (identical to the legacy path); guarded candidates evaluate
@@ -3624,7 +3624,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
     const deniedIds: string[] = [];
     const lockedGuards = new Set<ClaimBudgetGuard>();
     for (;;) {
-      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]);
+      const res=await client.query(`SELECT id,type,payload FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND (NOT $5::boolean OR type <> 'ENRICH_CHANNEL' OR (COALESCE((payload->>'enrichmentStage')::int,1)<=2 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))) AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} LIMIT 1 FOR UPDATE SKIP LOCKED`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds,enrichProbeOnly]);
       if (!res.rowCount) break;
       const row = res.rows[0];
       const guard = budgetGuards.find(g => g.types.includes(String(row.type)) && (!effectiveTypes || effectiveTypes.some(t => g.types.includes(t))));
@@ -3637,7 +3637,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
       if (verdict.exhausted && effectiveTypes) effectiveTypes = effectiveTypes.filter(t => !guard.types.includes(t));
     }
     if (deniedIds.length && effectiveTypes !== null && !effectiveTypes.length) { await client.query('COMMIT'); return null; }
-    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,generation,status) VALUES($1,$2,$3,'PROCESSING')`,[job.id,upd.rows[0].attempts,Number(upd.rows[0].reopen_generation||0)]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
+    const res=await client.query(`SELECT * FROM jobs WHERE status='PENDING' AND run_after<=now() AND ($1::text[] IS NULL OR type=ANY($1)) AND ($2::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND EXISTS (SELECT 1 FROM unnest($2::text[]) pattern WHERE COALESCE(last_error,'') LIKE pattern))) AND ($3::text[] IS NULL OR NOT (type='RETRY_COMMUNITY_ACQUISITION' AND COALESCE(payload->>'reconciliationStatus','NONE')=ANY($3::text[]))) AND NOT (type='RETRY_COMMUNITY_ACQUISITION' AND CASE WHEN btrim(COALESCE(payload->>'retryLifecycleVersion','')) ~ '^[0-9]+$' THEN btrim(payload->>'retryLifecycleVersion')::numeric ELSE 0 END < 2 AND COALESCE(payload->>'retryReason','') <> 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE') AND (NOT $5::boolean OR type <> 'ENRICH_CHANNEL' OR (COALESCE((payload->>'enrichmentStage')::int,1)<=2 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))) AND NOT (id = ANY($4::uuid[])) ORDER BY ${claimOrderByClause()} FOR UPDATE SKIP LOCKED LIMIT 1`,[effectiveTypes||null,excludedErrorPatterns||null,excludedReconciliationStatuses||null,deniedIds,enrichProbeOnly]); if(!res.rowCount){await client.query('COMMIT'); return null;} const job=res.rows[0];const upd=await client.query(`UPDATE jobs SET status='PROCESSING',locked_by=$1,locked_at=now(),attempts=attempts+1,updated_at=now() WHERE id=$2 RETURNING *`,[workerId,job.id]);await client.query(`INSERT INTO job_attempts(job_id,attempt_number,generation,status) VALUES($1,$2,$3,'PROCESSING')`,[job.id,upd.rows[0].attempts,Number(upd.rows[0].reopen_generation||0)]); await client.query('COMMIT');claimed=rowToJob(upd.rows[0]);
     }catch(e){await client.query('ROLLBACK'); throw e;}finally{client.release();}
   // Trace persistence is deliberately outside the claim transaction. The old
   // implementation inserted diagnostic rows before COMMIT, so any trace-only
@@ -3646,7 +3646,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
   const traceId=String(claimed?.payload?.traceId||'');
   if(traceId){try{await db.query(`INSERT INTO discovery_execution_trace(trace_id,stage,outcome,detail) VALUES($1,'WORKER_POLLING','REACHED',$2),($1,'QUEUE_CLAIM','REACHED',$3)`,[traceId,JSON.stringify({workerId,claimableTypes:types||null}),JSON.stringify({workerId,jobId:claimed!.id,type:claimed!.type})]);}catch(error){console.warn('[Execution Trace] Claim trace unavailable; discovery claim remains committed.',error instanceof Error?error.message:error);}}
   return claimed;}
-export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
+export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 
 /**
  * Durable affirmative proof that community inspection genuinely began for one
@@ -5709,6 +5709,128 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   }
 }
 
+export interface EnrichmentQuotaProtectionInput {
+  dailyBudget: number;
+  actualUsed: number;
+  reservedTotal: number;
+  dueStage1: number;
+  dueStage2: number;
+  recentAutonomousUnits: number;
+  recentEnrichmentUnits: number;
+}
+
+export interface EnrichmentQuotaProtection {
+  remainingUnits: number;
+  dueDemandUnits: number;
+  reserveUnits: number;
+  protectedShare: number;
+  discoveryAvailableUnits: number;
+  reasonCodes: string[];
+}
+
+/**
+ * Backlog-aware, demand-driven enrichment quota protection.
+ *
+ * The reserve is not a fixed partition. It is the smaller of:
+ *   - the actual estimated units needed by due stage-1/stage-2 enrichment;
+ *   - a fairness share derived from recent actual consumption (10%-50%).
+ *
+ * Stage 1 costs 2 units; stage 2 costs 103 units. Already-hydrated jobs cost 0
+ * and are excluded by the caller's due counts. When the backlog falls, the
+ * reserve falls with it; when demand rises, the reserve rises up to the
+ * fairness ceiling while discovery keeps at least half of the remaining pool.
+ */
+export function calculateEnrichmentQuotaReserve(input: EnrichmentQuotaProtectionInput): EnrichmentQuotaProtection {
+  const dailyBudget = Math.max(0, Number(input.dailyBudget) || 0);
+  const actualUsed = Math.max(0, Number(input.actualUsed) || 0);
+  const reservedTotal = Math.max(0, Number(input.reservedTotal) || 0);
+  const remainingUnits = Math.max(0, dailyBudget - actualUsed - reservedTotal);
+  const dueDemandUnits = Math.max(0, Math.floor(
+    Math.max(0, input.dueStage1) * 2
+    + Math.max(0, input.dueStage2) * 103
+  ));
+  const recentAutonomous = Math.max(0, Number(input.recentAutonomousUnits) || 0);
+  const recentEnrichment = Math.max(0, Number(input.recentEnrichmentUnits) || 0);
+  const recentTotal = recentAutonomous + recentEnrichment;
+  const recentEnrichmentShare = recentTotal > 0 ? recentEnrichment / recentTotal : 0.10;
+  const protectedShare = Math.min(0.50, Math.max(0.10, recentEnrichmentShare));
+  const reserveUnits = dueDemandUnits <= 0
+    ? 0
+    : Math.min(remainingUnits, dueDemandUnits, Math.floor(remainingUnits * protectedShare));
+  return {
+    remainingUnits,
+    dueDemandUnits,
+    reserveUnits,
+    protectedShare,
+    discoveryAvailableUnits: Math.max(0, remainingUnits - reserveUnits),
+    reasonCodes: [
+      dueDemandUnits > 0 ? 'ENRICHMENT_BACKLOG_DEMAND' : 'NO_DUE_ENRICHMENT',
+      recentTotal > 0 ? 'RECENT_CONSUMPTION_SHARE' : 'NO_RECENT_CONSUMPTION_HISTORY',
+    ],
+  };
+}
+
+interface EnrichmentQuotaDemand {
+  dueStage1: number;
+  dueStage2: number;
+  recentAutonomousUnits: number;
+  recentEnrichmentUnits: number;
+}
+
+/**
+ * Read the demand estimate outside the quota_tracker row lock. The estimate is
+ * intentionally allowed to be a few milliseconds stale: holding the singleton
+ * admission lock while scanning the enrichment backlog serializes every quota
+ * reservation in the process.
+ */
+async function readEnrichmentQuotaDemand(runner: any): Promise<EnrichmentQuotaDemand> {
+  const [dueEnrichment, recentConsumption] = await Promise.all([
+    runner.query(
+      `SELECT
+         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)<=1
+           AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage1,
+         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)>=2
+           AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage2
+       FROM jobs job
+      WHERE job.type='ENRICH_CHANNEL'
+        AND (
+          (job.status='PENDING' AND job.run_after<=now())
+          OR (job.status='PROCESSING' AND NOT EXISTS(
+            SELECT 1 FROM quota_reservations qr
+             WHERE qr.operation_type='ENRICH_CHANNEL' AND qr.operation_id=job.id::text AND qr.status='RESERVED'
+          ))
+        )`,
+    ),
+    runner.query(
+      `SELECT allocation,COALESCE(SUM(units),0)::int AS units
+         FROM quota_reservations
+        WHERE status='CONSUMED' AND reserved_at>=now()-interval '7 days'
+        GROUP BY allocation`,
+    ),
+  ]);
+  const recentByAllocation = new Map<string, number>(recentConsumption.rows.map((item: any) => [String(item.allocation), Number(item.units) || 0]));
+  return {
+    dueStage1: Number(dueEnrichment.rows[0]?.stage1) || 0,
+    dueStage2: Number(dueEnrichment.rows[0]?.stage2) || 0,
+    recentAutonomousUnits: recentByAllocation.get('AUTONOMOUS') || 0,
+    recentEnrichmentUnits: recentByAllocation.get('ENRICHMENT') || 0,
+  };
+}
+
+function protectedEnrichmentUnitsForAutonomous(
+  dailyBudget: number,
+  actualUsed: number,
+  reservedTotal: number,
+  demand: EnrichmentQuotaDemand,
+): number {
+  return calculateEnrichmentQuotaReserve({
+    dailyBudget,
+    actualUsed,
+    reservedTotal,
+    ...demand,
+  }).reserveUnits;
+}
+
 export async function tryReserveQuota(args: {
   operationType: string;
   operationId: string;
@@ -5718,6 +5840,16 @@ export async function tryReserveQuota(args: {
   allocationPercent: number;
 }): Promise<boolean> {
   const db = await getDb();
+  // Retries of an already-funded operation should not repeat the backlog and
+  // seven-day consumption scans before the transaction's cheap re-check.
+  const alreadyReserved = await db.query(
+    `SELECT 1 FROM quota_reservations
+      WHERE operation_type=$1 AND operation_id=$2 AND status='RESERVED'
+        AND expires_at>now() AND units>=$3 LIMIT 1`,
+    [args.operationType, args.operationId, args.units],
+  );
+  if (alreadyReserved.rowCount) return true;
+  const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -5750,10 +5882,18 @@ export async function tryReserveQuota(args: {
       [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
+    const protectedEnrichmentUnits = demand
+      ? protectedEnrichmentUnitsForAutonomous(
+          args.dailyBudget,
+          Number(row.actual_used) || 0,
+          Number(row.reserved_total) || 0,
+          demand,
+        )
+      : 0;
     // Allocation percentages are scheduling preferences, not hard partitions.
-    // Hard partitions strand usable provider capacity and can defer executable
-    // work until the next YouTube Pacific quota day while the shared pool still has quota.
-    if (row.actual_used + row.reserved_total + args.units > args.dailyBudget) {
+    // The dynamic reserve protects only the actual demand of the due enrichment
+    // backlog; it is released as the backlog falls. Discovery keeps the rest.
+    if (row.actual_used + row.reserved_total + args.units + protectedEnrichmentUnits > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
     }
@@ -5784,6 +5924,16 @@ export async function topUpQuotaReservation(args: {
   if (!Number.isFinite(args.additionalUnits) || args.additionalUnits <= 0) return false;
 
   const db = await getDb();
+  // A top-up for a missing/expired reservation cannot succeed. Check that
+  // cheaply before paying for the backlog and seven-day demand scans.
+  const reservationExists = await db.query(
+    `SELECT 1 FROM quota_reservations
+      WHERE operation_type=$1 AND operation_id=$2 AND allocation=$3
+        AND status='RESERVED' AND expires_at>now() LIMIT 1`,
+    [args.operationType, args.operationId, args.allocation],
+  );
+  if (!reservationExists.rowCount) return false;
+  const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -5823,7 +5973,15 @@ export async function topUpQuotaReservation(args: {
     );
     const currentUnits = Number(existing.rows[0].units);
     const { actual_used: actualUsed, other_reserved_total: otherReservedTotal } = totals.rows[0];
-    if (Number(actualUsed) + Number(otherReservedTotal) + currentUnits + args.additionalUnits > args.dailyBudget) {
+    const protectedEnrichmentUnits = demand
+      ? protectedEnrichmentUnitsForAutonomous(
+          args.dailyBudget,
+          Number(actualUsed) || 0,
+          Number(otherReservedTotal) || 0,
+          demand,
+        )
+      : 0;
+    if (Number(actualUsed) + Number(otherReservedTotal) + currentUnits + args.additionalUnits + protectedEnrichmentUnits > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
     }

@@ -19,7 +19,7 @@ interface Props {
 }
 export interface DashboardChannelFilters {search:string;country:string;countryStatus:string;tradingStatus:string;discordStatus:string;scanStatus:string;recentInvites?:boolean}
 
-type ReviewAction = 'approve' | 'reject' | 'force-rescan';
+type ReviewAction = 'approve' | 'reject' | 'force-rescan' | 'request-rescan';
 
 export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, onReviewCompleted, reviewEnabled = false, pendingReviewCount, onFiltersChange }) => {
   const [searchTerm, setSearchTerm] = useState('');
@@ -125,8 +125,8 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
       return;
     }
 
-    const reason = action==='force-rescan'?window.prompt('Reason for force rescan')?.trim():undefined;
-    if(action==='force-rescan'&&!reason)return;
+    const reason = action==='force-rescan'||action==='request-rescan'?window.prompt(action==='force-rescan'?'Reason for force rescan':'Reason for requesting more evidence')?.trim():undefined;
+    if((action==='force-rescan'||action==='request-rescan')&&!reason)return;
     setReviewError('');
     setReviewSuccess('');
     setReviewBusy(`${channelId}:${action}`);
@@ -141,7 +141,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
       setReviewDetails(null);
       setPendingDecision(null);
       setDecidedChannelIds(previous => new Set(previous).add(channelId));
-      const label = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'queued for rescan';
+      const label = action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : action === 'request-rescan' ? 'queued for another evidence pass' : 'queued for rescan';
       setReviewSuccess(`${details.channelName} was ${label}. Channel status is ${result.channel.tradingStatus}; it has been removed from the pending review queue.`);
       // Optimistic state above is immediate; server-backed counts and rows follow.
       void onReviewCompleted?.().catch(error => setReviewError(error instanceof Error ? `Decision saved, but refresh failed: ${error.message}` : 'Decision saved, but refresh failed.'));
@@ -863,6 +863,7 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                 <>
                   <button disabled={Boolean(reviewBusy)} onClick={() => beginDecision(reviewDetails.channelId, 'approve', reviewDetails)} className="flex items-center gap-1 bg-emerald-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><CheckCircle2 size={16} />Approve</button>
                   <button disabled={Boolean(reviewBusy)} onClick={() => beginDecision(reviewDetails.channelId, 'reject', reviewDetails)} className="flex items-center gap-1 bg-rose-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><XCircle size={16} />Reject</button>
+                  <button disabled={Boolean(reviewBusy)} onClick={() => handleReviewAction(reviewDetails.channelId, 'request-rescan', reviewDetails)} className="flex items-center gap-1 bg-amber-600 disabled:opacity-50 text-white rounded-lg px-3 py-2 text-sm font-semibold"><RefreshCw size={16} />Request more evidence</button>
                 </>
               )}
               {reviewDetails.state === 'REJECTED' && (
