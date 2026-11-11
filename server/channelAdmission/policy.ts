@@ -16,7 +16,7 @@ export const DEFAULT_AMBIGUOUS_RATE_CAP = 0.35;
  * admission on their own.
  */
 const TRADING_ANCHOR_PATTERNS: RegExp[] = [
-  /\b(?:technical\s*analysis|price\s*action|order\s*flow|market\s*structure|volume\s*profile|risk\s*management|trade\s*setup|trade\s*journal|back\s*test|backtest|live\s*trad(?:e|ing)|day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|scalp(?:ing)?|prop\s*firm|funded\s*trader|trading\s*(?:strategy|education|signals?|course|system)|stock\s*(?:market|trading)|share\s*market|equity\s*market|forex(?:\s*(?:trading|market))?|futures?\s*(?:trading|market)|options?\s*(?:trading|market)|crypto\s*trading)\b/iu,
+  /\b(?:technical\s*analysis|price\s*action|order\s*flow|market\s*structure|volume\s*profile|risk\s*management|trade\s*setup|trade\s*journal|trade\s*analysis|trading\s*analysis|market\s*analysis|back\s*test|backtest|live\s*trad(?:e|ing)|day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|scalp(?:ing)?|prop\s*firm|funded\s*trader|trading\s*(?:strategy|education|signals?|course|system)|stock\s*(?:market|trading)|share\s*market|equity\s*market|forex(?:\s*(?:trading|market))?|futures?\s*(?:trading|market)|options?\s*(?:trading|market)|crypto\s*trading)\b/iu,
   /\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd|nifty|bank\s*nifty|sensex|dax|cac\s*40|ftse\s*100|nikkei|omx(?:c25|s30)?|aex|bel\s*20|smi|tsx|asx(?:\s*200)?|nasdaq|s&p\s*500|sp500|bitcoin|btc|ethereum|eth)\b/iu,
   /\b(?:gold|silver|crude|natural\s*gas|copper)\s+(?:analysis|forecast|outlook|trading|market|price)\b/iu,
   /(?:تداول|تحليل\s*فني|أسهم|الأسهم|بورصة|البورصة|فوركس|عملات\s*رقمية)/u,
@@ -63,10 +63,14 @@ export function hasGamblingTerm(text: string): boolean {
 export function assessExtractedQueryAdmission(input: {
   candidateText: string;
   sourceTitle?: string | null;
+  sourceTitles?: Array<string | null | undefined>;
   sourceKind?: string | null;
 }): { eligible: boolean; reasonCodes: string[] } {
   const candidate = String(input.candidateText || '').trim();
-  const source = String(input.sourceTitle || '').trim();
+  const sourceTexts = [input.sourceTitle, ...(input.sourceTitles || [])]
+    .map(value => String(value || '').trim())
+    .filter(Boolean);
+  const source = sourceTexts.join(' ');
   const reasonCodes: string[] = [];
   if (!candidate) return { eligible: false, reasonCodes: ['QUERY_EMPTY'] };
 
@@ -98,7 +102,8 @@ function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): s
     return normalizeEvidenceText(evidence.description).includes(quote) ? 'bio' : null;
   }
   if (citation.field === 'link') {
-    return evidence.links.some(link => normalizeEvidenceText(link).includes(quote)) ? `link:${quote}` : null;
+    const index = evidence.links.findIndex(link => normalizeEvidenceText(link).includes(quote));
+    return index >= 0 ? `link:${index}` : null;
   }
   if (citation.field === 'video_title' || citation.field === 'video_description') {
     const candidates = citation.index == null
@@ -189,6 +194,7 @@ export function decideAdmission(input: {
     || primary.mainSubject === 'UNKNOWN'
     || (primary.mainSubject === 'UNRELATED' && primaryUnrelatedCitations < 2)
   ) ? secondary : primary;
+  const effectiveRole = effective === secondary ? 'SECOND' : 'PRIMARY';
   const evidenceText = `${evidence.channelName} ${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`;
   const tradingCitations = independentCitationCount(evidence, effective, 'TRADING');
   const financeCitations = independentCitationCount(evidence, effective, 'FINANCE_ADJACENT');
@@ -211,6 +217,7 @@ export function decideAdmission(input: {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
       reasonCodes,
+      effectiveRole,
       rejected: true, admitted: false, hold: false, ambiguous: false,
       citationsValid: true, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
     };
@@ -220,13 +227,28 @@ export function decideAdmission(input: {
   const financeWithTrading = effective.mainSubject === 'FINANCE_ADJACENT'
     && tradingCitations >= 1
     && (financeCitations >= 1 || hasTradingAnchor(evidenceText));
-  if (clearlyTrading || financeWithTrading) {
-    reasonCodes.push(clearlyTrading ? 'SEMANTIC_TRADING_WITH_CITATIONS' : 'SEMANTIC_FINANCE_WITH_TRADING_ACTIVITY');
+  if (clearlyTrading) {
+    reasonCodes.push('SEMANTIC_TRADING_WITH_CITATIONS');
     return {
       decision: 'ADMIT',
       status: 'ADMITTED',
       reasonCodes,
+      effectiveRole,
       rejected: false, admitted: true, hold: false, ambiguous: false,
+      citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+    };
+  }
+
+  // Finance-adjacent is not confidently a trading creator. Admit it to the
+  // downstream deterministic/AI classifier instead of bypassing #618.
+  if (financeWithTrading) {
+    reasonCodes.push('SEMANTIC_FINANCE_WITH_TRADING_ACTIVITY', 'ADMIT_FOR_DOWNSTREAM_CLASSIFICATION');
+    return {
+      decision: 'ADMIT_AMBIGUOUS',
+      status: 'ADMITTED_AMBIGUOUS',
+      reasonCodes,
+      effectiveRole,
+      rejected: false, admitted: true, hold: false, ambiguous: true,
       citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
     };
   }
@@ -242,6 +264,7 @@ export function decideAdmission(input: {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
       reasonCodes: ['MIXED_WITHOUT_TRADING_EVIDENCE', ...effective.unrelatedDomains.map(item => `DOMAIN_${item.domain}`)],
+      effectiveRole,
       rejected: true, admitted: false, hold: false, ambiguous: false,
       citationsValid: true, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
     };
@@ -252,6 +275,7 @@ export function decideAdmission(input: {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
       reasonCodes: ['FINANCE_ADJACENT_WITHOUT_TRADING_FOCUS', ...effective.unrelatedDomains.map(item => `DOMAIN_${item.domain}`)],
+      effectiveRole,
       rejected: true, admitted: false, hold: false, ambiguous: false,
       citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
     };
@@ -294,12 +318,16 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
         quote: String(item?.quote || ''),
       }))
       : [],
-    citations: citations.map((item: any) => ({
-      field: String(item?.field || 'bio') as SemanticCitation['field'],
-      index: Number.isInteger(item?.index) ? item.index : undefined,
-      quote: String(item?.quote || ''),
-      supports: String(item?.supports || 'UNRELATED').toUpperCase() as SemanticCitation['supports'],
-    })).filter((item: SemanticCitation) => item.quote.trim().length > 0),
+    citations: citations.flatMap((item: any) => {
+      const supports = String(item?.supports || '').toUpperCase();
+      if (!['TRADING', 'UNRELATED', 'FINANCE_ADJACENT'].includes(supports)) return [];
+      return [{
+        field: String(item?.field || 'bio') as SemanticCitation['field'],
+        index: Number.isInteger(item?.index) ? item.index : undefined,
+        quote: String(item?.quote || ''),
+        supports: supports as SemanticCitation['supports'],
+      }];
+    }).filter((item: SemanticCitation) => item.quote.trim().length > 0),
     language: raw.language ? String(raw.language) : undefined,
     explanation: String(raw.reasoning || raw.explanation || ''),
     model,

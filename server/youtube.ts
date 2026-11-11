@@ -211,6 +211,8 @@ export interface DiscoveredChannelRaw {
   admissionConfirmedTrading?: boolean;
   admissionTradingConfidence?: number;
   admissionCategory?: string;
+  /** True when this admission created the channel row; reporting must not call it known. */
+  admissionNewlyCreated?: boolean;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
@@ -1379,8 +1381,10 @@ export async function fetchVideoSnippetsByIds(videoIds: string[]): Promise<Array
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
   let accounted = false;
+  let attemptedProviderCount = 0;
   try {
     const providerIndexes = await availableKeyIndexes(keyPool, 1);
+    attemptedProviderCount = providerIndexes.length;
     for (let attempt = 0; attempt < providerIndexes.length; attempt += 1) {
       const currentIndex = providerIndexes[attempt];
       const apiKey = keyPool[currentIndex];
@@ -1409,7 +1413,7 @@ export async function fetchVideoSnippetsByIds(videoIds: string[]): Promise<Array
         if (isQuotaExceeded(error)) quotaExceededCount += 1;
       }
     }
-    acquisition.providerFailed(quotaExceededCount === keyPool.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+    acquisition.providerFailed(quotaExceededCount === attemptedProviderCount ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
     throwIfAllProvidersCoolingDown(keyPool);
     if (!accounted) throw new Error('Video snippet acquisition failed for every configured provider.');
     return [];

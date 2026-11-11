@@ -80,6 +80,7 @@ export interface AdmissionPolicyResult {
   citationsValid: boolean;
   independentUnrelatedCitations: number;
   independentTradingCitations: number;
+  effectiveRole?: 'PRIMARY' | 'SECOND';
 }
 
 export interface AdmissionCandidateInput {

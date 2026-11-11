@@ -48,9 +48,9 @@ test('search worker enqueues admission before classification and stores matched 
   assert.match(queue, /enqueueAdmissionVerification/);
   assert.match(queue, /VERIFY_CHANNEL_ADMISSION/);
   assert.match(queue, /matchedDocument: raw\.matchedDocument \|\| null/);
-  assert.match(queue, /getAdmissionRunOutcomes/);
+  assert.match(queue, /getAdmissionPageOutcomes/);
   assert.match(queue, /evaluateQueryAdmissionGuard/);
-  assert.match(queue, /setQueryCollection\(queryId, 'REJECTED'\)/);
+  assert.match(queue, /quarantineQuery\(queryId, admissionGuard\.reasonCodes\)/);
 });
 
 test('extracted query offer uses the trading-anchor/gambling guard', () => {
@@ -64,4 +64,21 @@ test('query guard and revalidation are wired as first-class components', () => {
   assert.match(revalidation, /archiveRejectedExistingChannel: apply/);
   assert.match(revalidation, /dryRun: !apply/);
   assert.match(revalidation, /intake_deferred_revalidation_summary/);
+});
+
+test('all discovery sources pass the admission gate and admission honors the kill switch', () => {
+  assert.match(queue, /processDiscoveredChannel\([\s\S]*?getAdmissionMode/);
+  assert.match(queue, /admissionBypass/);
+  assert.match(queue, /admissionSemanticClaimable/);
+  const worker = readFileSync(new URL('./worker.ts', import.meta.url), 'utf8');
+  assert.match(worker, /getAdmissionMode\(\)\) === 'OFF'/);
+});
+
+test('legacy apply is guarded against unstable paging and silent failures', () => {
+  const revalidation = readFileSync(new URL('../../scripts/revalidateIntakeDeferredChannels.ts', import.meta.url), 'utf8');
+  assert.match(revalidation, /APPLY_REQUIRES_OFFSET_ZERO/);
+  assert.match(revalidation, /INVALID_LIMIT/);
+  assert.match(revalidation, /process\.exitCode = 1/);
+  assert.match(revalidation, /target-country/);
+  assert.match(revalidation, /getChannelById\(row\.channel_id\)/);
 });

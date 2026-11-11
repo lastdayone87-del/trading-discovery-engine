@@ -77,9 +77,17 @@ function fakeRow(row: DeferredRow): AdmissionCandidateRow {
 
 async function main() {
   const apply = process.argv.includes('--apply');
-  const limit = Math.max(1, Math.min(500, Number(argValue('limit') || 50)));
-  const offset = Math.max(0, Number(argValue('offset') || 0));
+  const parsedLimit = Number(argValue('limit') || 50);
+  const parsedOffset = Number(argValue('offset') || 0);
+  if (!Number.isFinite(parsedLimit) || parsedLimit < 1) throw new Error('INVALID_LIMIT');
+  if (!Number.isFinite(parsedOffset) || parsedOffset < 0) throw new Error('INVALID_OFFSET');
+  const limit = Math.min(500, Math.floor(parsedLimit));
+  const offset = Math.floor(parsedOffset);
+  // Applied rows leave the INTAKE_DEFERRED set, so offset paging would skip
+  // unprocessed rows. Apply batches intentionally start at offset zero.
+  if (apply && offset > 0) throw new Error('APPLY_REQUIRES_OFFSET_ZERO');
   const country = argValue('country')?.trim();
+  const explicitTarget = argValue('target-country')?.trim();
   const db = await getDb();
   if (apply) {
     const schema = await db.query(`SELECT to_regclass('public.semantic_admission_candidates') AS table_oid`);
@@ -114,7 +122,7 @@ async function main() {
   const counts = { admitted: 0, ambiguous: 0, rejected: 0, held: 0, expired: 0, country: 0, failed: 0 };
   for (const row of rows) {
     const candidate = candidateFromRow(row);
-    const targetCountry = String(row.country || row.enrich_payload?.targetCountry || '');
+    const targetCountry = String(explicitTarget || row.enrich_payload?.targetCountry || '');
     const source = String(row.discovery_source || 'automated_query') as DiscoverySource;
     const input: AdmissionCandidateInput = { candidate, targetCountry, source };
     try {
@@ -178,9 +186,11 @@ async function main() {
     limit,
     offset,
     country: country || null,
+    targetCountry: explicitTarget || null,
     selected: rows.length,
     counts,
   }));
+  if (counts.failed > 0) process.exitCode = 1;
 }
 
 main().catch(error => {

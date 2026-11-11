@@ -20,7 +20,7 @@ UPDATE channels
 UPDATE channels
    SET admission_status = 'LEGACY_HOLD'
  WHERE admission_status IS NULL
-   AND scan_status IN ('INTAKE_DEFERRED', 'CLASSIFICATION_PENDING');
+   AND scan_status = 'INTAKE_DEFERRED';
 
 CREATE INDEX IF NOT EXISTS channels_admission_status_idx
   ON channels (admission_status, first_seen DESC);
@@ -69,6 +69,7 @@ CREATE INDEX IF NOT EXISTS semantic_admission_candidates_run_idx
 CREATE TABLE IF NOT EXISTS semantic_admission_decisions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   candidate_id uuid REFERENCES semantic_admission_candidates(id) ON DELETE SET NULL,
+  decision_key text NOT NULL UNIQUE,
   channel_id text NOT NULL,
   decision text NOT NULL,
   reason_codes jsonb NOT NULL DEFAULT '[]'::jsonb,
@@ -90,7 +91,8 @@ ON CONFLICT (setting_key) DO NOTHING;
 -- the primary defense; this also stops the known bad queries from re-entering
 -- the planner before revalidation.
 UPDATE query_library
-   SET collection='REJECTED', status='REJECTED'
+   SET collection='REJECTED', status='REJECTED',
+       generation_metadata=COALESCE(generation_metadata,'{}'::jsonb) || '{"queryHold":{"source":"semantic-admission-migration-178","reasonCodes":["GAMBLING_SOURCE_VIDEO","NO_CONCRETE_TRADING_ANCHOR"]}}'::jsonb
  WHERE normalized_query IN (
    'systems keep showing up in trading',
    'martingale betting system in trading'
@@ -116,3 +118,16 @@ CREATE TABLE IF NOT EXISTS semantic_admission_model_calls (
 
 CREATE INDEX IF NOT EXISTS semantic_admission_model_calls_day_idx
   ON semantic_admission_model_calls (created_at);
+
+CREATE TABLE IF NOT EXISTS semantic_admission_sightings (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  candidate_id uuid NOT NULL REFERENCES semantic_admission_candidates(id) ON DELETE CASCADE,
+  query_run_id uuid,
+  page_number integer,
+  result_rank integer,
+  matched_document jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS semantic_admission_sightings_run_page_idx
+  ON semantic_admission_sightings (query_run_id, page_number);

@@ -68,7 +68,7 @@ export async function fetchAdmissionEvidence(input: {
       .slice(0, 10);
     const description = String(enriched.description || base.description || '').trim();
     const coverage: AdmissionEvidence['evidenceCoverage'] =
-      videos.length > 0 || description.length > 0 ? 'COMPLETE' : 'PARTIAL';
+      (videos.length > 0 || description.length > 0) && !detailFailure ? 'COMPLETE' : 'PARTIAL';
     return {
       ...base,
       channelName: enriched.channelName || base.channelName,

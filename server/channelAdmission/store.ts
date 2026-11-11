@@ -106,7 +106,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
        raw_observation=EXCLUDED.raw_observation,
        declared_language=COALESCE(EXCLUDED.declared_language,semantic_admission_candidates.declared_language),
        status=CASE
-         WHEN semantic_admission_candidates.status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY','ADMITTED','ADMITTED_AMBIGUOUS')
+         WHEN semantic_admission_candidates.status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY','ADMITTED','ADMITTED_AMBIGUOUS','EXPIRED_MISSING_EVIDENCE')
            THEN semantic_admission_candidates.status
          WHEN semantic_admission_candidates.status='WAITING_EVIDENCE'
            AND semantic_admission_candidates.next_check_at IS NOT NULL
@@ -131,7 +131,15 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
       input.candidate.detectedLanguages?.[0]?.language || null,
     ],
   );
-  return mapRow(result.rows[0]);
+  const mapped = mapRow(result.rows[0]);
+  if (input.queryRunId) {
+    await db.query(
+      `INSERT INTO semantic_admission_sightings(candidate_id,query_run_id,page_number,result_rank,matched_document)
+       VALUES($1,$2,$3,$4,$5::jsonb)`,
+      [mapped.id, input.queryRunId, input.pageNumber || null, input.resultRank || null, JSON.stringify(matchedDocument)],
+    ).catch(error => console.warn('[ChannelAdmission] sighting write failed:', error instanceof Error ? error.message : error));
+  }
+  return mapped;
 }
 
 export async function enqueueAdmissionVerification(input: {
@@ -207,6 +215,7 @@ export async function updateAdmissionCandidate(input: {
 
 export async function recordAdmissionDecision(input: {
   candidateId: string;
+  decisionKey: string;
   channelId: string;
   decision: AdmissionDecision;
   reasonCodes: string[];
@@ -215,11 +224,12 @@ export async function recordAdmissionDecision(input: {
 }): Promise<string | null> {
   const db = await getDb();
   const result = await db.query(
-    `INSERT INTO semantic_admission_decisions(candidate_id,channel_id,decision,reason_codes,evidence_hash,semantic_output,policy_version)
-     VALUES($1,$2,$3,$4::jsonb,$5,$6::jsonb,$7)
+    `INSERT INTO semantic_admission_decisions(candidate_id,decision_key,channel_id,decision,reason_codes,evidence_hash,semantic_output,policy_version)
+     VALUES($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb,$8)
+     ON CONFLICT (decision_key) DO UPDATE SET decision=EXCLUDED.decision,reason_codes=EXCLUDED.reason_codes,semantic_output=EXCLUDED.semantic_output
      RETURNING id`,
     [
-      input.candidateId, input.channelId, input.decision, JSON.stringify(input.reasonCodes || []),
+      input.candidateId, input.decisionKey, input.channelId, input.decision, JSON.stringify(input.reasonCodes || []),
       input.evidenceHash || null, input.judgment ? JSON.stringify(input.judgment) : null,
       ADMISSION_POLICY_VERSION,
     ],
@@ -237,14 +247,20 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
 }> {
   const db = await getDb();
   const result = await db.query(
-    `SELECT
+    `WITH scoped AS (
+       SELECT DISTINCT c.id,c.status
+         FROM semantic_admission_candidates c
+         JOIN semantic_admission_sightings s ON s.candidate_id=c.id
+        WHERE s.query_run_id=$1
+     )
+     SELECT
        COUNT(*) FILTER (WHERE status='ADMITTED')::int admitted,
        COUNT(*) FILTER (WHERE status='ADMITTED_AMBIGUOUS')::int ambiguous,
        COUNT(*) FILTER (WHERE status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY'))::int rejected,
        COUNT(*) FILTER (WHERE status IN ('WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int held,
        COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
        COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int total
-     FROM semantic_admission_candidates WHERE query_run_id=$1`,
+     FROM scoped`,
     [queryRunId],
   );
   const row = result.rows[0] || {};
@@ -268,14 +284,20 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
 }> {
   const db = await getDb();
   const result = await db.query(
-    `SELECT
+    `WITH scoped AS (
+       SELECT DISTINCT c.id,c.status
+         FROM semantic_admission_candidates c
+         JOIN semantic_admission_sightings s ON s.candidate_id=c.id
+        WHERE s.query_run_id=$1 AND s.page_number=$2
+     )
+     SELECT
        COUNT(*) FILTER (WHERE status='ADMITTED')::int admitted,
        COUNT(*) FILTER (WHERE status='ADMITTED_AMBIGUOUS')::int ambiguous,
        COUNT(*) FILTER (WHERE status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY'))::int rejected,
        COUNT(*) FILTER (WHERE status IN ('WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int held,
        COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
        COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int total
-     FROM semantic_admission_candidates WHERE query_run_id=$1 AND page_number=$2`,
+     FROM scoped`,
     [queryRunId, pageNumber],
   );
   const row = result.rows[0] || {};
@@ -288,7 +310,6 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
     total: Number(row.total || 0),
   };
 }
-
 
 export async function getAdmissionAmbiguousRate(): Promise<{ admitted: number; ambiguous: number; rate: number }> {
   const db = await getDb();
@@ -304,4 +325,17 @@ export async function getAdmissionAmbiguousRate(): Promise<{ admitted: number; a
   const ambiguous = Number(result.rows[0]?.ambiguous || 0);
   const total = admitted + ambiguous;
   return { admitted, ambiguous, rate: total ? ambiguous / total : 0 };
+}
+
+
+export async function quarantineQuery(queryId: number, reasonCodes: string[]): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE query_library
+        SET collection='REJECTED',
+            status='REJECTED',
+            generation_metadata=COALESCE(generation_metadata,'{}'::jsonb) || jsonb_build_object('queryHold',$2::jsonb)
+      WHERE id=$1`,
+    [queryId, JSON.stringify({ reasonCodes, source: 'semantic-admission', at: new Date().toISOString() })],
+  );
 }

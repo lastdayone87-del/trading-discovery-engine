@@ -209,6 +209,8 @@ export interface PipelineExecutionOptions {
   /** Discord-evidence reclassification must evaluate a previously COMPLETED
    * row once; confirmed rows remain terminal. */
   forceClassification?: boolean;
+  /** Internal: caller already passed the semantic admission decision. */
+  admissionBypass?: boolean;
 }
 
 /**

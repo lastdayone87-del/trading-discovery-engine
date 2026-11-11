@@ -140,32 +140,32 @@ async function writeAdmissionCache(cacheKey: string, checksum: string, model: st
   }
 }
 
-async function assertAdmissionModelBudget(): Promise<void> {
+async function reserveAdmissionModelCall(role: 'PRIMARY' | 'SECOND', provider: string, model: string): Promise<void> {
   const cap = Math.max(1, Number(process.env.ADMISSION_SEMANTIC_DAILY_CALL_CAP || 5000));
+  let client: any;
   try {
     const db = await getDb();
-    const result = await db.query(
-      `SELECT COUNT(*)::int AS used FROM semantic_admission_model_calls
-        WHERE created_at >= date_trunc('day', now())`,
+    client = await db.connect();
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('semantic_admission_model_budget'))`);
+    const count = await client.query(
+      `SELECT COUNT(*)::int AS used FROM semantic_admission_model_calls WHERE created_at >= date_trunc('day', now())`,
     );
-    if (Number(result.rows[0]?.used || 0) >= cap) {
+    if (Number(count.rows[0]?.used || 0) >= cap) {
+      await client.query('ROLLBACK');
       throw new Error('ADMISSION_SEMANTIC_BUDGET_EXHAUSTED');
     }
-  } catch (error) {
-    if (error instanceof Error && error.message === 'ADMISSION_SEMANTIC_BUDGET_EXHAUSTED') throw error;
-    // Budget ledger failure fails open; provider failover still protects spend.
-  }
-}
-
-async function recordAdmissionModelCall(role: 'PRIMARY' | 'SECOND', provider: string, model: string): Promise<void> {
-  try {
-    const db = await getDb();
-    await db.query(
+    await client.query(
       `INSERT INTO semantic_admission_model_calls(role,provider,model) VALUES($1,$2,$3)`,
       [role, provider, model],
     );
-  } catch {
+    await client.query('COMMIT');
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => undefined);
+    if (error instanceof Error && error.message === 'ADMISSION_SEMANTIC_BUDGET_EXHAUSTED') throw error;
     // Budget ledger failure fails open; provider failover still protects spend.
+  } finally {
+    client?.release?.();
   }
 }
 
@@ -200,9 +200,8 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
       const cacheKey = admissionCacheKey(role, attempt.model, checksum);
       const cached = this.options.readOnly ? null : await readAdmissionCache(cacheKey);
       if (cached) return cached;
-      await assertAdmissionModelBudget();
       try {
-        if (!this.options.readOnly) await recordAdmissionModelCall(role, attempt.client.batchGroup || 'unknown', attempt.model);
+        if (!this.options.readOnly) await reserveAdmissionModelCall(role, attempt.client.batchGroup || 'unknown', attempt.model);
         const raw = await attempt.client.classify(
           buildAdmissionPrompt(evidence, role),
           attempt.model,

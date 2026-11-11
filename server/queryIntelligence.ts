@@ -1870,13 +1870,20 @@ function buildSelectionResult(
  * rows are rotated without consuming the bounded extracted-query offer.
  */
 export function isOfferableExtractedCandidate(
-  candidate: { candidateText: string; language: string; sourceTitle?: string | null; sourceKind?: string | null },
+  candidate: {
+    candidateText: string;
+    language: string;
+    sourceTitle?: string | null;
+    sourceKind?: string | null;
+    duplicateSources?: Array<{ title?: string | null }>;
+  },
   country: string,
 ): boolean {
   if (isForbiddenProseQuery(candidate.candidateText)) return false;
   const admission = assessExtractedQueryAdmission({
     candidateText: candidate.candidateText,
     sourceTitle: candidate.sourceTitle || '',
+    sourceTitles: (candidate.duplicateSources || []).map(source => source?.title || null),
     sourceKind: candidate.sourceKind || '',
   });
   if (!admission.eligible) return false;

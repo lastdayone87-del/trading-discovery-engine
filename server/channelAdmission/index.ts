@@ -92,6 +92,7 @@ async function enqueueClassificationAfterAdmission(input: {
   queryRunId?: string;
   discoveryJobId?: string;
   pageNumber?: number;
+  admissionDecisionId?: string;
 }): Promise<boolean> {
   const payload = buildClassificationJobPayload({
     candidate: input.candidate,
@@ -112,11 +113,13 @@ async function enqueueClassificationAfterAdmission(input: {
   const job = await enqueueClassificationJobAtomic(input.candidate.channelId, payload, {
     priority: 20,
     maxAttempts: 4,
-    idempotencyKey: `admission-classify:${input.candidate.channelId}:v1`,
+    idempotencyKey: `admission-classify:${input.candidate.channelId}:${input.admissionDecisionId || 'v1'}`,
     preventCompletedReopen: true,
   });
   if (job == null) return await hasActiveClassificationJob(input.candidate.channelId);
-  return job.status === 'PENDING' || job.status === 'PROCESSING';
+  // A completed job already owns this decision; a blocked reopen is still a
+  // completed classification attempt and must not put the worker in a retry loop.
+  return job.status === 'PENDING' || job.status === 'PROCESSING' || job.status === 'COMPLETED';
 }
 
 export interface VerifyAdmissionOptions {
@@ -158,6 +161,14 @@ export async function verifyAdmissionCandidate(
     if (country.status === 'REJECTED') {
       const reasonCodes = ['COUNTRY_POLICY_REJECTED', country.rejectionReason || 'COUNTRY_REJECTED'];
       if (!options.dryRun) {
+        await recordAdmissionDecision({
+          candidateId: row.id,
+          decisionKey: `${row.id}:REJECT_COUNTRY:${hash}`,
+          channelId: evidence.channelId,
+          decision: 'REJECT_COUNTRY',
+          reasonCodes,
+          evidenceHash: hash,
+        });
         await updateAdmissionCandidate({
           id: row.id,
           status: 'REJECTED_COUNTRY',
@@ -166,13 +177,6 @@ export async function verifyAdmissionCandidate(
           evidence,
           evidenceHash: hash,
           attempts: Number(row.attempts || 0) + 1,
-        });
-        await recordAdmissionDecision({
-          candidateId: row.id,
-          channelId: evidence.channelId,
-          decision: 'REJECT_COUNTRY',
-          reasonCodes,
-          evidenceHash: hash,
         });
         const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
         if (existing) {
@@ -270,6 +274,7 @@ export async function verifyAdmissionCandidate(
   }
 
   const policy = decideAdmission({ evidence, judgment, secondJudgment });
+  const effectiveJudgment = policy.effectiveRole === 'SECOND' && secondJudgment ? secondJudgment : judgment;
   let recordedDecisionId: string | null = null;
   if (policy.ambiguous) {
     const health = await getAdmissionAmbiguousRate().catch(() => null);
@@ -287,6 +292,15 @@ export async function verifyAdmissionCandidate(
     }
   }
   if (!options.dryRun) {
+    recordedDecisionId = await recordAdmissionDecision({
+      candidateId: row.id,
+      decisionKey: `${row.id}:${policy.decision}:${hash}`,
+      channelId: evidence.channelId,
+      decision: policy.decision,
+      reasonCodes: policy.reasonCodes,
+      evidenceHash: hash,
+      judgment: effectiveJudgment,
+    });
     await updateAdmissionCandidate({
       id: row.id,
       status: policy.status,
@@ -294,19 +308,11 @@ export async function verifyAdmissionCandidate(
       reasonCodes: policy.reasonCodes,
       evidence,
       evidenceHash: hash,
-      judgment: secondJudgment || judgment,
-      model: (secondJudgment || judgment).model,
+      judgment: effectiveJudgment,
+      model: effectiveJudgment.model,
       attempts: Number(row.attempts || 0) + 1,
       nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
       expiresAt: row.expires_at || (policy.hold ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString() : null),
-    });
-    recordedDecisionId = await recordAdmissionDecision({
-      candidateId: row.id,
-      channelId: evidence.channelId,
-      decision: policy.decision,
-      reasonCodes: policy.reasonCodes,
-      evidenceHash: hash,
-      judgment: secondJudgment || judgment,
     });
   }
 
@@ -337,6 +343,7 @@ export async function verifyAdmissionCandidate(
       const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
       const decisionId = recordedDecisionId || randomUUID();
       if (!existing) {
+        input.candidate.admissionNewlyCreated = true;
         await insertChannelIfAbsent(admittedChannel({
           evidence,
           decisionId,
@@ -367,7 +374,7 @@ export async function verifyAdmissionCandidate(
       input.candidate.admissionDecisionId = decisionId;
       input.candidate.admissionStatus = policy.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
       input.candidate.admissionConfirmedTrading = policy.status === 'ADMITTED';
-      input.candidate.admissionTradingConfidence = judgment.tradingFocus;
+      input.candidate.admissionTradingConfidence = effectiveJudgment.tradingFocus;
       input.candidate.admissionCategory = judgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
         candidate: input.candidate,
@@ -378,6 +385,7 @@ export async function verifyAdmissionCandidate(
         queryRunId: input.queryRunId,
         discoveryJobId: input.discoveryJobId,
         pageNumber: input.pageNumber,
+        admissionDecisionId: decisionId,
       });
       if (!queued) throw new Error('ADMISSION_CLASSIFICATION_ENQUEUE_FAILED');
     }

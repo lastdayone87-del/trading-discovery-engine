@@ -396,3 +396,57 @@ test('admission jobs resolve quota provenance before a channels row exists', asy
   });
   assert.equal(origin, 'NORMAL');
 });
+
+test('second judgment is marked effective when it supplies the decisive citations', () => {
+  const result = decideAdmission({
+    evidence: kikifoodies,
+    judgment: judgment({
+      subject: 'UNRELATED', focus: 0,
+      citations: [citation('bio', 'Cooking made SIMPLE')],
+    }),
+    secondJudgment: judgment({
+      subject: 'UNRELATED', focus: 0,
+      citations: [citation('bio', 'Cooking made SIMPLE'), citation('video_title', 'Sliced Bread Recipe', 0)],
+    }),
+  });
+  assert.equal(result.decision, 'REJECT_UNRELATED');
+  assert.equal(result.effectiveRole, 'SECOND');
+});
+
+test('two quotes from one link are not independent rejection evidence', () => {
+  const linked = evidence({
+    name: 'Link Test',
+    bio: 'A general channel.',
+    videos: [{ title: 'General video' }],
+  });
+  linked.links = ['https://example.com/about'];
+  const result = decideAdmission({
+    evidence: linked,
+    judgment: judgment({
+      subject: 'UNRELATED', focus: 0,
+      citations: [
+        citation('link', 'example.com', undefined, 'UNRELATED'),
+        citation('link', 'about', undefined, 'UNRELATED'),
+      ],
+    }),
+  });
+  assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+});
+
+test('citations without an explicit support label cannot authorize rejection', () => {
+  const result = decideAdmission({
+    evidence: kikifoodies,
+    judgment: {
+      mainSubject: 'UNRELATED',
+      tradingFocus: 0,
+      unrelatedDomains: [{ domain: 'COOKING', confidence: 0.9 }],
+      incidentalTradingMentions: [],
+      citations: [
+        { field: 'bio', quote: 'Cooking made SIMPLE' } as any,
+        { field: 'video_title', quote: 'Sliced Bread Recipe', index: 0 } as any,
+      ],
+      explanation: 'missing supports',
+    },
+  });
+  assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+});
