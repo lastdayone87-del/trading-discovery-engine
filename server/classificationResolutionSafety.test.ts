@@ -29,6 +29,24 @@ test('exhausted review materialization records dashboard lineage and projection 
   assert.match(materializer, /review_eligibility_events/);
   assert.match(materializer, /input\.classificationDiagnosticId \|\| 'none'\}:\$\{checksum\}/);
   assert.match(materializer, /pg_advisory_xact_lock/);
+  assert.match(materializer, /WHERE excluded\.decided_at >= review_eligibility_projection\.decided_at/);
+  assert.match(materializer, /STALE_ELIGIBILITY_PROJECTION/);
+});
+
+test('the normal eligibility path preserves an exhausted pending review lineage', () => {
+  const store = read('./reviewEligibility/store.ts');
+  assert.match(store, /evidence_snapshot->>'reasonFamily'='EVIDENCE_EXHAUSTED'/);
+  assert.match(store, /preservedExhaustedReview:true/);
+  assert.match(store, /SELECT pg_advisory_xact_lock/);
+});
+
+test('recovery excludes active jobs and guards the permanent projection against races', () => {
+  const recovery = read('./classificationResolutionRecovery.ts');
+  assert.match(recovery, /AS has_active_job/);
+  assert.match(recovery, /hasActiveJob: row\.has_active_job === true/);
+  assert.match(recovery, /last_checked IS NOT DISTINCT FROM \$2::timestamptz/);
+  assert.match(recovery, /if \(projected\.rowCount\) permanentFailures \+= 1/);
+  assert.match(recovery, /terminalFailureClass === 'UNKNOWN'/);
 });
 
 test('the dry-run script is write-safe and validates flags', () => {

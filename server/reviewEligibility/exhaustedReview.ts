@@ -125,19 +125,25 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
           REVIEW_ELIGIBILITY_POLICY_VERSION,
         ],
       );
-      await client.query(
+      const projected = await client.query(
         `INSERT INTO review_eligibility_projection(
            channel_id,status,version,decision_id,reason_codes,evidence_checksum,policy_version,decided_at
          ) VALUES($1,'ELIGIBLE',$2,$3,$4,$5,$6,$7)
          ON CONFLICT(channel_id) DO UPDATE SET
            status='ELIGIBLE',version=excluded.version,decision_id=excluded.decision_id,
            reason_codes=excluded.reason_codes,evidence_checksum=excluded.evidence_checksum,
-           policy_version=excluded.policy_version,decided_at=excluded.decided_at,updated_at=now()`,
+           policy_version=excluded.policy_version,decided_at=excluded.decided_at,updated_at=now()
+         WHERE excluded.decided_at >= review_eligibility_projection.decided_at
+         RETURNING decision_id`,
         [
           input.channelId, version, decisionId, JSON.stringify(reasonCodes), checksum,
           REVIEW_ELIGIBILITY_POLICY_VERSION, decidedAt,
         ],
       );
+      if (!projected.rowCount || String(projected.rows[0].decision_id) !== decisionId) {
+        await client.query('ROLLBACK');
+        return { materialized: false, reason: 'STALE_ELIGIBILITY_PROJECTION', eligibilityDecisionId: decisionId };
+      }
     }
 
     const materialized = await materializeEligibleReviewInTransaction(client, {
