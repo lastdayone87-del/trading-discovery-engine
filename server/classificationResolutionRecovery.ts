@@ -98,6 +98,11 @@ export interface ClassificationResolutionRecoveryOptions {
   limit?: number;
   cutoff?: string;
   now?: number;
+  /** Narrow test seams; production uses the module implementations. */
+  db?: any;
+  materializeExhaustedReview?: typeof materializeExhaustedReview;
+  enqueueOperationalEnrichmentRecoveryJob?: typeof enqueueOperationalEnrichmentRecoveryJob;
+  channelRowToRecord?: typeof channelRowToRecord;
 }
 
 export interface ClassificationResolutionRecoveryItem {
@@ -169,7 +174,10 @@ export async function recordClassificationResolutionBackoff(
 export async function reconcileClassificationResolutionGaps(
   options: ClassificationResolutionRecoveryOptions = {},
 ): Promise<ClassificationResolutionRecoveryResult> {
-  const db = await getDb();
+  const db = options.db || await getDb();
+  const materializeReview = options.materializeExhaustedReview || materializeExhaustedReview;
+  const enqueueRecovery = options.enqueueOperationalEnrichmentRecoveryJob || enqueueOperationalEnrichmentRecoveryJob;
+  const loadChannel = options.channelRowToRecord || channelRowToRecord;
   const dryRun = options.dryRun !== false;
   const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
   const limit = Math.min(200, Math.max(1, options.limit || 50));
@@ -290,7 +298,7 @@ export async function reconcileClassificationResolutionGaps(
         continue;
       }
       if (decision.action === 'EXHAUSTED_REVIEW') {
-        const review = await materializeExhaustedReview({
+        const review = await materializeReview({
           channelId: item.channelId,
           reasonCode: decision.reasonCodes[0] || 'ENRICHMENT_EXHAUSTED',
           reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
@@ -303,14 +311,14 @@ export async function reconcileClassificationResolutionGaps(
         }
         continue;
       }
-      const channel = await channelRowToRecord(db, item.channelId);
+      const channel = await loadChannel(db, item.channelId);
       if (!channel) { skipped += 1; continue; }
       const cycle = item.recoveryCycles + 1;
       let accepted = false;
       const client = await db.connect();
       try {
         await client.query('BEGIN');
-        accepted = await enqueueOperationalEnrichmentRecoveryJob(channel, decision.reasonCodes, client);
+        accepted = await enqueueRecovery(channel, decision.reasonCodes, client);
         if (accepted) {
           await client.query(
             `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
@@ -333,7 +341,7 @@ export async function reconcileClassificationResolutionGaps(
         client.release();
       }
       if (!accepted) {
-        const review = await materializeExhaustedReview({
+        const review = await materializeReview({
           channelId: item.channelId,
           reasonCode: 'RECOVERY_ENQUEUE_BLOCKED',
           reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],

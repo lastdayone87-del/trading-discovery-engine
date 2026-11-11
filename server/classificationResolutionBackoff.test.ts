@@ -1,9 +1,54 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
-import { recordClassificationResolutionBackoff } from './classificationResolutionRecovery';
+import {
+  reconcileClassificationResolutionGaps,
+  recordClassificationResolutionBackoff,
+} from './classificationResolutionRecovery';
 
-const source = readFileSync(new URL('./classificationResolutionRecovery.ts', import.meta.url), 'utf8');
+const CUTOFF = '1970-01-01T00:00:00.000Z';
+
+function candidate(overrides: Record<string, unknown> = {}) {
+  return {
+    channel_id: 'UC1',
+    channel_name: 'Creator',
+    trading_status: 'UNCERTAIN',
+    scan_status: 'FAILED',
+    last_checked: '2026-01-01T00:00:00.000Z',
+    latest_job_id: 'job-1',
+    latest_job_status: 'FAILED',
+    terminal_failure_class: 'RETRYABLE',
+    latest_job_attempts: 1,
+    latest_job_updated_at: '2026-01-01T00:00:00.000Z',
+    channel_created_at: '2025-01-01T00:00:00.000Z',
+    recovery_cycles: 3,
+    last_recovery_at: null,
+    terminal_recovery_marker: false,
+    recovery_cooldown_active: false,
+    ...overrides,
+  };
+}
+
+function fakeDb(rows: Array<Record<string, unknown>>) {
+  const inserts: unknown[][] = [];
+  const client = {
+    query: async () => ({ rows: [], rowCount: 0 }),
+    release: () => undefined,
+  };
+  return {
+    inserts,
+    db: {
+      query: async (sql: string, params: unknown[]) => {
+        if (sql.includes('FROM channels c')) return { rows, rowCount: rows.length };
+        if (sql.includes('INSERT INTO operational_enrichment_recovery_events')) {
+          inserts.push(params);
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      connect: async () => client,
+    },
+  };
+}
 
 test('a non-materialized exhausted review writes a short-lived backoff event', async () => {
   const calls: Array<{ sql: string; params: unknown[] }> = [];
@@ -30,15 +75,69 @@ test('a non-materialized exhausted review writes a short-lived backoff event', a
   ]);
 });
 
-test('non-materialized exhausted reviews leave the head of the next recovery sweep', () => {
-  assert.equal((source.match(/EXHAUSTED_REVIEW_NOT_MATERIALIZED/g) || []).length, 2);
-  assert.match(source, /if \(review\.materialized\) exhaustedReviews \+= 1;\s*else \{\s*skipped \+= 1;\s*await recordClassificationResolutionBackoff/);
+test('the exhausted-review branch backs off a non-materialized review', async () => {
+  const { db, inserts } = fakeDb([candidate()]);
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => ({
+      materialized: false,
+      reason: 'CURRENT_PENDING_REVIEW_PRESERVED',
+      eligibilityDecisionId: 'decision-1',
+    }),
+    enqueueOperationalEnrichmentRecoveryJob: async () => false,
+    channelRowToRecord: async () => null,
+  } as any);
 
-  const candidateStart = source.indexOf('const result = await db.query(');
-  const candidateEnd = source.indexOf('const items:', candidateStart);
-  const candidate = source.slice(candidateStart, candidateEnd);
-  assert.ok(candidate.includes("recent_failure.event_key LIKE '${FAILURE_PREFIX}%'"));
-  assert.ok(candidate.includes("recent_failure.created_at>=now()-interval '15 minutes'"));
-  assert.ok(candidate.indexOf('recent_failure.event_key') < candidate.indexOf('ORDER BY recovery_cooldown_active'));
-  assert.ok(candidate.indexOf('recent_failure.created_at') < candidate.indexOf('LIMIT $4'));
+  assert.equal(result.exhaustedReviews, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.failures, 0);
+  assert.equal(inserts.length, 1);
+  assert.match(String(inserts[0][0]), /^classification-resolution-failure:UC1:/);
+  assert.deepEqual(JSON.parse(String(inserts[0][4])), [
+    'EXHAUSTED_REVIEW_NOT_MATERIALIZED',
+    'CURRENT_PENDING_REVIEW_PRESERVED',
+  ]);
+});
+
+test('the enqueue-blocked branch backs off a non-materialized review', async () => {
+  const { db, inserts } = fakeDb([
+    candidate({
+      channel_id: 'UC2',
+      scan_status: 'ENRICHMENT_PENDING',
+      latest_job_id: null,
+      latest_job_status: null,
+      terminal_failure_class: null,
+      latest_job_attempts: 0,
+      latest_job_updated_at: null,
+      recovery_cycles: 0,
+    }),
+  ]);
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => ({
+      materialized: false,
+      reason: 'STALE_ELIGIBILITY_PROJECTION',
+      eligibilityDecisionId: 'decision-2',
+    }),
+    enqueueOperationalEnrichmentRecoveryJob: async () => false,
+    channelRowToRecord: async () => ({ channel_id: 'UC2' }) as any,
+  } as any);
+
+  assert.equal(result.exhaustedReviews, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.failures, 0);
+  assert.equal(inserts.length, 1);
+  assert.match(String(inserts[0][0]), /^classification-resolution-failure:UC2:/);
+  assert.deepEqual(JSON.parse(String(inserts[0][4])), [
+    'EXHAUSTED_REVIEW_NOT_MATERIALIZED',
+    'STALE_ELIGIBILITY_PROJECTION',
+  ]);
 });
