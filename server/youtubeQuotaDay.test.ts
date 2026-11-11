@@ -13,7 +13,7 @@ test('YouTube quota day follows America/Los_Angeles rather than UTC', () => {
 });
 
 test('quota tracker reads and admissions use the same Pacific quota-day helper', () => {
-  assert.match(db, /import \{ getYouTubeQuotaDay \} from '\.\/youtubeQuotaDay';/);
+  assert.match(db, /import \{[^}]*getYouTubeQuotaDay[^}]*\} from '\.\/youtubeQuotaDay';/);
   assert.match(db, /getQuota\(\)[\s\S]*const today=getYouTubeQuotaDay\(\)/);
   assert.match(db, /tryReserveQuota[\s\S]*const quotaDay = getYouTubeQuotaDay\(\)/);
   assert.doesNotMatch(db, /const today=new Date\(\)\.toISOString\(\)\.split\('T'\)\[0\]/);
