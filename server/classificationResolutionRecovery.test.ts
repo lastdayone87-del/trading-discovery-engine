@@ -39,6 +39,18 @@ test('a permanent terminal failure is projected without retry or review', () => 
   assert.equal(resolveResolutionRecoveryAction({ ...base, terminalFailureClass: 'POLICY_TERMINAL' }).action, 'PROJECT_PERMANENT_FAILURE');
 });
 
+test('an unknown terminal failure is sent to human review instead of being retried', () => {
+  const decision = resolveResolutionRecoveryAction({ ...base, terminalFailureClass: 'UNKNOWN' });
+  assert.equal(decision.action, 'EXHAUSTED_REVIEW');
+  assert.deepEqual(decision.reasonCodes, ['UNKNOWN_TERMINAL_FAILURE_REQUIRES_REVIEW']);
+});
+
+test('unknown-age legacy rows never bypass the forward-only cutoff', () => {
+  assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: null, createdAt: null }).action, 'SKIP_LEGACY');
+  assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: null, createdAt: '2026-11-09T00:00:00.000Z' }).action, 'ENQUEUE_RECOVERY');
+  assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: null, createdAt: null, includeLegacy: true }).action, 'ENQUEUE_RECOVERY');
+});
+
 test('orphan ENRICHMENT_PENDING rows get one bounded recovery pass', () => {
   assert.equal(resolveResolutionRecoveryAction(base).action, 'ENQUEUE_RECOVERY');
   assert.deepEqual(resolveResolutionRecoveryAction(base).reasonCodes, ['ORPHAN_ENRICHMENT_PENDING']);

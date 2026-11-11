@@ -27,6 +27,7 @@ export interface ResolutionRecoveryDecisionInput {
   terminalFailureClass: string | null;
   recoveryCycles: number;
   lastChecked: string | null;
+  createdAt?: string | null;
   lastRecoveryAt?: string | null;
   terminalRecoveryMarker?: boolean;
   cutoff: string;
@@ -42,7 +43,8 @@ export interface ResolutionRecoveryDecision {
 export function resolveResolutionRecoveryAction(input: ResolutionRecoveryDecisionInput): ResolutionRecoveryDecision {
   if (input.tradingStatus !== 'UNCERTAIN') return { action: 'SKIP_TERMINAL', reasonCodes: ['NOT_UNCERTAIN'] };
   if (input.hasActiveJob) return { action: 'SKIP_ACTIVE', reasonCodes: ['ACTIVE_JOB_OWNS_CHANNEL'] };
-  if (!input.includeLegacy && input.lastChecked && new Date(input.lastChecked).getTime() < new Date(input.cutoff).getTime()) {
+  const observedAt = input.lastChecked || input.createdAt || null;
+  if (!input.includeLegacy && (!observedAt || new Date(observedAt).getTime() < new Date(input.cutoff).getTime())) {
     return { action: 'SKIP_LEGACY', reasonCodes: ['BEFORE_RECOVERY_CUTOFF'] };
   }
   const lastActivity = input.lastRecoveryAt || input.lastChecked;
@@ -53,6 +55,9 @@ export function resolveResolutionRecoveryAction(input: ResolutionRecoveryDecisio
   if (input.terminalRecoveryMarker) return { action: 'EXHAUSTED_REVIEW', reasonCodes: ['RECOVERY_BUDGET_TERMINAL_MARKER'] };
   if (input.terminalFailureClass === 'PERMANENT_INPUT' || input.terminalFailureClass === 'POLICY_TERMINAL') {
     return { action: 'PROJECT_PERMANENT_FAILURE', reasonCodes: ['PERMANENT_TERMINAL_FAILURE'] };
+  }
+  if (input.terminalFailureClass === 'UNKNOWN') {
+    return { action: 'EXHAUSTED_REVIEW', reasonCodes: ['UNKNOWN_TERMINAL_FAILURE_REQUIRES_REVIEW'] };
   }
   if (input.recoveryCycles >= CLASSIFICATION_RESOLUTION_RECOVERY_CYCLE_LIMIT) {
     return { action: 'EXHAUSTED_REVIEW', reasonCodes: ['RECOVERY_ATTEMPTS_EXHAUSTED'] };
@@ -145,7 +150,7 @@ export async function reconcileClassificationResolutionGaps(
     `SELECT c.channel_id,c.channel_name,c.trading_status,c.scan_status,c.last_checked,
             latest.id AS latest_job_id,latest.status AS latest_job_status,
             latest.terminal_failure_class,latest.attempts AS latest_job_attempts,
-            latest.updated_at AS latest_job_updated_at,
+            latest.updated_at AS latest_job_updated_at,c.created_at AS channel_created_at,
             (SELECT count(*)::int FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE '${CYCLE_PREFIX}%') AS recovery_cycles,
@@ -154,7 +159,13 @@ export async function reconcileClassificationResolutionGaps(
                 AND e.event_key LIKE '${CYCLE_PREFIX}%') AS last_recovery_at,
             EXISTS(SELECT 1 FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
-                AND e.event_key LIKE 'operational-enrichment-terminal:%') AS terminal_recovery_marker
+                AND e.event_key LIKE 'operational-enrichment-terminal:%') AS terminal_recovery_marker,
+            EXISTS(
+              SELECT 1 FROM jobs active
+               WHERE active.payload->>'channelId'=c.channel_id
+                 AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+                 AND active.status IN('PENDING','PROCESSING')
+            ) AS has_active_job
        FROM channels c
        LEFT JOIN LATERAL (
          SELECT job.id,job.status,job.terminal_failure_class,job.attempts,job.updated_at
@@ -188,6 +199,7 @@ export async function reconcileClassificationResolutionGaps(
       terminalFailureClass: row.terminal_failure_class ? String(row.terminal_failure_class) : null,
       recoveryCycles: Number(row.recovery_cycles) || 0,
       lastChecked: row.last_checked ? new Date(row.last_checked).toISOString() : null,
+      createdAt: row.channel_created_at ? new Date(row.channel_created_at).toISOString() : null,
       lastRecoveryAt: row.last_recovery_at ? new Date(row.last_recovery_at).toISOString() : (row.latest_job_updated_at ? new Date(row.latest_job_updated_at).toISOString() : null),
       terminalRecoveryMarker: row.terminal_recovery_marker === true,
       cutoff,
@@ -221,8 +233,9 @@ export async function reconcileClassificationResolutionGaps(
       continue;
     }
     if (decision.action === 'PROJECT_PERMANENT_FAILURE') {
-      await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN'`, [item.channelId]);
-      permanentFailures += 1;
+      const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND last_checked IS NOT DISTINCT FROM $2::timestamptz AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
+      if (projected.rowCount) permanentFailures += 1;
+      else skipped += 1;
       continue;
     }
     if (decision.action === 'EXHAUSTED_REVIEW') {
