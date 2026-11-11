@@ -327,12 +327,13 @@ test('a changed status snapshot blocks the recovery projection and enqueue', asy
     scope_eligibility: 'IN_SCOPE'
   };
   const upserts: any[] = [];
+  const snapshots: any[] = [];
   const enqueued: any[] = [];
 
   const recovered = await reconcileCommunityAcquisitionRecovery(
     async () => db,
     async () => channel,
-    async updated => { upserts.push(updated); return false; },
+    async (updated, options) => { upserts.push(updated); snapshots.push(options); return false; },
     20,
     Date.now() + 480_000,
     async (...args) => { enqueued.push(args); }
@@ -340,6 +341,12 @@ test('a changed status snapshot blocks the recovery projection and enqueue', asy
 
   assert.equal(recovered, 0);
   assert.equal(upserts.length, 1, 'the projection write is attempted with the snapshot guard');
+  assert.deepEqual(snapshots[0]?.requireStatusSnapshot, {
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    scan_status: 'FAILED',
+    trading_status: 'TRADING_CONFIRMED',
+  });
   assert.equal(enqueued.length, 0, 'a refused projection must not reopen the retry job');
 });
 
