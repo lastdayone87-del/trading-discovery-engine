@@ -36,6 +36,12 @@ test('exhausted review materialization records dashboard lineage and projection 
   assert.match(materializer, /STALE_ELIGIBILITY_PROJECTION/);
 });
 
+test('a stale exhaustion projection leaves a recoverable failed state', () => {
+  const pipeline = read('./ingestionPipeline.ts');
+  assert.match(pipeline, /review\.reason === 'STALE_ELIGIBILITY_PROJECTION'/);
+  assert.match(pipeline, /scan_status = 'FAILED'/);
+});
+
 test('the normal eligibility path preserves an exhausted pending review lineage', () => {
   const store = read('./reviewEligibility/store.ts');
   assert.match(store, /evidence_snapshot->>'reasonFamily'='EVIDENCE_EXHAUSTED'/);

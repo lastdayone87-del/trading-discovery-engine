@@ -1063,7 +1063,7 @@ async function processChannelThroughPipelineInContext(
       // review trigger project NEEDS_REVIEW. This replaces the previous race
       // between a direct NEEDS_REVIEW write and the eligibility reconciler.
       try {
-        await materializeExhaustedReview({
+        const review = await materializeExhaustedReview({
           channelId: candidate.channelId,
           classificationDiagnosticId,
           reasonCode: 'NO_INDEPENDENT_HYPOTHESIS_AFTER_ENRICHMENT',
@@ -1076,6 +1076,10 @@ async function processChannelThroughPipelineInContext(
           },
           decidedAt: productionClassification.decision.timestamp,
         });
+        if (!review.materialized && review.reason === 'STALE_ELIGIBILITY_PROJECTION') {
+          withheldChannel.scan_status = 'FAILED';
+          await upsertChannel(withheldChannel, { preserveDiscordOnUpdate: true });
+        }
       } catch (error) {
         console.error(`[ClassificationResolution] Exhausted review creation failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
         withheldChannel.scan_status = 'FAILED';
@@ -1153,7 +1157,7 @@ async function processChannelThroughPipelineInContext(
         // COMPLETED/UNCERTAIN row: create the bounded human-review fallback.
         if(authoritativeChannel.trading_status==='UNCERTAIN'){
           try{
-            await materializeExhaustedReview({
+            const review=await materializeExhaustedReview({
               channelId:candidate.channelId,classificationDiagnosticId,
               reasonCode:'ENRICHMENT_STAGE_EXHAUSTED',
               reasonCodes:['MACHINE_EXHAUSTED_UNCERTAIN'],
@@ -1165,8 +1169,13 @@ async function processChannelThroughPipelineInContext(
               },
               decidedAt:productionClassification.decision.timestamp,
             });
-            const refreshed=await getChannelById(candidate.channelId);
-            if(refreshed)Object.assign(authoritativeChannel,refreshed);
+            if(!review.materialized&&review.reason==='STALE_ELIGIBILITY_PROJECTION'){
+              const blocked=await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
+              if(blocked)Object.assign(authoritativeChannel,blocked);
+            }else{
+              const refreshed=await getChannelById(candidate.channelId);
+              if(refreshed)Object.assign(authoritativeChannel,refreshed);
+            }
           }catch(error){
             console.error(`[ClassificationResolution] Stage-exhausted review creation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error);
             const refreshed=await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
