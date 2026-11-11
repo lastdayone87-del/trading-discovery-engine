@@ -1,0 +1,58 @@
+export interface AdmissionOutcomeCounts {
+  admitted: number;
+  ambiguous: number;
+  rejected: number;
+  held: number;
+  total: number;
+}
+
+export interface QueryAdmissionGuardInput {
+  pageNumber: number;
+  outcomes: AdmissionOutcomeCounts;
+  tradingPrecision: number;
+  qualityChannels: number;
+  tradingConfirmed: number;
+  priorZeroQualityPages?: number;
+}
+
+export interface QueryAdmissionGuardDecision {
+  stop: boolean;
+  quarantine: boolean;
+  reasonCodes: string[];
+}
+
+/**
+ * Admission outcomes feed the query-quality loop. A query that keeps returning
+ * channels the gate rejects or holds is contaminated even when those channels
+ * are not explicit NON_TRADING. This is the blind spot that let query 711 run
+ * to ten pages.
+ */
+export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): QueryAdmissionGuardDecision {
+  const total = Math.max(0, input.outcomes.total);
+  if (input.pageNumber < 2 || total < 8) return { stop: false, quarantine: false, reasonCodes: [] };
+  const rejectedShare = input.outcomes.rejected / total;
+  const unresolvedShare = (input.outcomes.rejected + input.outcomes.held) / total;
+  const reasonCodes: string[] = [];
+  if (rejectedShare >= 0.6) {
+    reasonCodes.push('ADMISSION_REJECTED_SHARE_HIGH');
+    return { stop: true, quarantine: true, reasonCodes };
+  }
+  if (unresolvedShare >= 0.5 && input.tradingPrecision < 0.15) {
+    reasonCodes.push('ADMISSION_UNRESOLVED_SHARE_HIGH', 'TRADING_PRECISION_LOW');
+    return { stop: true, quarantine: true, reasonCodes };
+  }
+  if (input.qualityChannels === 0 && input.tradingConfirmed === 0 && (input.priorZeroQualityPages || 0) >= 1) {
+    reasonCodes.push('ZERO_QUALITY_AND_ZERO_CONFIRMED_PAGES');
+    return { stop: true, quarantine: true, reasonCodes };
+  }
+  return { stop: false, quarantine: false, reasonCodes: [] };
+}
+
+export function ambiguousAdmitRate(outcomes: AdmissionOutcomeCounts): number {
+  const admitted = outcomes.admitted + outcomes.ambiguous;
+  return admitted > 0 ? outcomes.ambiguous / admitted : 0;
+}
+
+export function ambiguousRateAboveCap(rate: number, cap: number): boolean {
+  return rate > cap;
+}

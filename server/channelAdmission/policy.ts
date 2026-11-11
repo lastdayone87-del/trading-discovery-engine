@@ -1,0 +1,297 @@
+import type {
+  AdmissionEvidence,
+  AdmissionPolicyResult,
+  SemanticCitation,
+  SemanticJudgment,
+} from './types';
+
+export const ADMISSION_POLICY_VERSION = 'semantic-admission-v1';
+
+export const DEFAULT_REJECT_TRADING_FOCUS = 25;
+export const DEFAULT_AMBIGUOUS_RATE_CAP = 0.35;
+
+/**
+ * High-specificity trading anchors. These are supporting features for the
+ * query guard and for citation validation. They never decide channel
+ * admission on their own.
+ */
+const TRADING_ANCHOR_PATTERNS: RegExp[] = [
+  /\b(?:technical\s*analysis|price\s*action|order\s*flow|market\s*structure|volume\s*profile|risk\s*management|trade\s*setup|trade\s*journal|back\s*test|backtest|live\s*trad(?:e|ing)|day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|scalp(?:ing)?|prop\s*firm|funded\s*trader|trading\s*(?:strategy|education|signals?|course|system)|stock\s*(?:market|trading)|share\s*market|equity\s*market|forex(?:\s*(?:trading|market))?|futures?\s*(?:trading|market)|options?\s*(?:trading|market)|crypto\s*trading)\b/iu,
+  /\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd|nifty|bank\s*nifty|sensex|dax|cac\s*40|ftse\s*100|nikkei|omx(?:c25|s30)?|aex|bel\s*20|smi|tsx|asx(?:\s*200)?|nasdaq|s&p\s*500|sp500|bitcoin|btc|ethereum|eth)\b/iu,
+  /\b(?:gold|silver|crude|natural\s*gas|copper)\s+(?:analysis|forecast|outlook|trading|market|price)\b/iu,
+  /(?:تداول|تحليل\s*فني|أسهم|الأسهم|بورصة|البورصة|فوركس|عملات\s*رقمية)/u,
+  /(?:トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/u,
+  /(?:ट्रेडिंग|शेयर\s*बाजार|शेयर\s*मार्केट|निफ्टी|सेंसेक्स|स्टॉक\s*मार्केट|तकनीकी\s*विश्लेषण|प्राइस\s*एक्शन)/u,
+  /(?:ટ્રેડિંગ|શેર\s*બજાર|નિફ્ટી|સેન્સેક્સ|સ્ટોક\s*માર્કેટ|ટેકનિકલ\s*વિશ્લેષણ)/u,
+  /(?:தங்கம்|பங்கு|வர்த்தகம்|பகுப்பாய்வு|சந்தை|விலை\s*நிலை)/u,
+  /(?:股票|期货|外汇|加密货币|技术分析)/u,
+  /(?:주식|트레이딩|선물|외환)/u,
+  /(?:трейдинг|акции|форекс|биржа|криптовалюта)/u,
+  /(?:teknik\s*analiz|borsa|hisse|döviz|kripto)/iu,
+];
+
+const GAMBLING_PATTERNS: RegExp[] = [
+  /\b(?:casino|roulette|blackjack|poker|sports?\s*betting|football\s*betting|betting\s*system|betting\s*strategy|martingale|anti-?martingale|d'?alembert|binary\s*options?|bookmaker|gambling|bet\s*champions|online\s*betting)\b/iu,
+  /(?:कैसीनो|रूलेट|सट्टा|जुआ|लॉटरी)/u,
+  /(?:カジノ|ルーレット|ギャンブル|競馬|パチンコ)/u,
+  /(?:كازينو|روليت|مراهنات|مقامرة)/u,
+];
+
+const TRADING_CONTEXT_WORDS = /\b(?:trading|trader|market|markets|forex|futures|options|stocks?|equities|crypto|technical\s*analysis|price\s*action|risk\s*management|backtest|broker|prop\s*firm)\b/iu;
+
+export function normalizeEvidenceText(value: string): string {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLocaleLowerCase('en');
+}
+
+export function hasTradingAnchor(text: string): boolean {
+  return TRADING_ANCHOR_PATTERNS.some(pattern => pattern.test(String(text || '')));
+}
+
+export function hasGamblingTerm(text: string): boolean {
+  return GAMBLING_PATTERNS.some(pattern => pattern.test(String(text || '')));
+}
+
+/**
+ * Query admission guard. An extracted query may enter the pool only when it
+ * has a concrete trading anchor. Gambling/betting phrases are blocked unless a
+ * concrete trading anchor is also present. A gambling source video can never
+ * become a trading query.
+ */
+export function assessExtractedQueryAdmission(input: {
+  candidateText: string;
+  sourceTitle?: string | null;
+  sourceKind?: string | null;
+}): { eligible: boolean; reasonCodes: string[] } {
+  const candidate = String(input.candidateText || '').trim();
+  const source = String(input.sourceTitle || '').trim();
+  const reasonCodes: string[] = [];
+  if (!candidate) return { eligible: false, reasonCodes: ['QUERY_EMPTY'] };
+
+  const candidateGambling = hasGamblingTerm(candidate);
+  const sourceGambling = hasGamblingTerm(source);
+  const candidateAnchor = hasTradingAnchor(candidate);
+  const sourceAnchor = hasTradingAnchor(source);
+
+  if (sourceGambling && !sourceAnchor) {
+    return { eligible: false, reasonCodes: ['GAMBLING_SOURCE_VIDEO', 'NO_TRADING_ANCHOR'] };
+  }
+  if (candidateGambling && !candidateAnchor) {
+    return { eligible: false, reasonCodes: ['GAMBLING_QUERY_WITHOUT_TRADING_ANCHOR'] };
+  }
+  if (!candidateAnchor) {
+    return { eligible: false, reasonCodes: ['NO_CONCRETE_TRADING_ANCHOR'] };
+  }
+  // A source video that is itself a gambling lesson cannot launder a trading
+  // word into a valid standalone query.
+  if (sourceGambling && sourceAnchor && !TRADING_CONTEXT_WORDS.test(candidate)) {
+    return { eligible: false, reasonCodes: ['GAMBLING_SOURCE_CONTEXT_MISMATCH'] };
+  }
+  return { eligible: true, reasonCodes: [] };
+}
+
+function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {
+  const quote = normalizeEvidenceText(citation.quote);
+  if (!quote) return null;
+  if (citation.field === 'channel_name') {
+    return normalizeEvidenceText(evidence.channelName).includes(quote) ? 'name' : null;
+  }
+  if (citation.field === 'bio') {
+    return normalizeEvidenceText(evidence.description).includes(quote) ? 'bio' : null;
+  }
+  if (citation.field === 'link') {
+    return evidence.links.some(link => normalizeEvidenceText(link).includes(quote)) ? `link:${quote}` : null;
+  }
+  if (citation.field === 'video_title' || citation.field === 'video_description') {
+    const candidates = citation.index == null
+      ? evidence.videos
+      : [evidence.videos[citation.index]].filter(Boolean);
+    for (let index = 0; index < candidates.length; index += 1) {
+      const video = candidates[index];
+      if (!video) continue;
+      const actualIndex = citation.index == null ? index : citation.index;
+      const text = citation.field === 'video_title' ? video.title : video.description;
+      if (normalizeEvidenceText(text).includes(quote)) {
+        // Title and description of the same video are one evidence source.
+        return `video:${actualIndex}`;
+      }
+    }
+  }
+  return null;
+}
+
+export function validCitations(evidence: AdmissionEvidence, judgment: SemanticJudgment): SemanticCitation[] {
+  return judgment.citations.filter(citation => citationKey(evidence, citation) !== null);
+}
+
+export function independentCitationCount(
+  evidence: AdmissionEvidence,
+  judgment: SemanticJudgment,
+  supports: 'TRADING' | 'UNRELATED' | 'FINANCE_ADJACENT',
+): number {
+  const keys = new Set<string>();
+  for (const citation of judgment.citations) {
+    if (citation.supports !== supports) continue;
+    const key = citationKey(evidence, citation);
+    if (key) keys.add(key);
+  }
+  return keys.size;
+}
+
+export function hasStrongTradingSupport(evidence: AdmissionEvidence, judgment: SemanticJudgment): boolean {
+  if (judgment.mainSubject === 'TRADING') {
+    return independentCitationCount(evidence, judgment, 'TRADING') >= 2
+      || (independentCitationCount(evidence, judgment, 'TRADING') >= 1 && hasTradingAnchor(evidence.description));
+  }
+  if (judgment.mainSubject === 'FINANCE_ADJACENT') {
+    return independentCitationCount(evidence, judgment, 'FINANCE_ADJACENT') >= 2
+      || (independentCitationCount(evidence, judgment, 'FINANCE_ADJACENT') >= 1 && hasTradingAnchor(`${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`));
+  }
+  return false;
+}
+
+/**
+ * The semantic judgment is primary. Lexical support is used only to validate
+ * citations and to flag single-mention risk; it never rejects on its own.
+ */
+export function decideAdmission(input: {
+  evidence: AdmissionEvidence;
+  judgment?: SemanticJudgment | null;
+  secondJudgment?: SemanticJudgment | null;
+  rejectTradingFocus?: number;
+}): AdmissionPolicyResult {
+  const { evidence, judgment, secondJudgment } = input;
+  const rejectThreshold = input.rejectTradingFocus ?? DEFAULT_REJECT_TRADING_FOCUS;
+  const reasonCodes: string[] = [];
+
+  if (evidence.evidenceCoverage !== 'COMPLETE') {
+    return {
+      decision: 'HOLD_MISSING_EVIDENCE',
+      status: 'WAITING_EVIDENCE',
+      reasonCodes: ['EVIDENCE_INCOMPLETE', ...(evidence.failureReason ? [evidence.failureReason] : [])],
+      rejected: false, admitted: false, hold: true, ambiguous: false,
+      citationsValid: false, independentUnrelatedCitations: 0, independentTradingCitations: 0,
+    };
+  }
+  if (!judgment) {
+    return {
+      decision: 'HOLD_MISSING_EVIDENCE',
+      status: 'WAITING_EVIDENCE',
+      reasonCodes: ['SEMANTIC_JUDGE_UNAVAILABLE'],
+      rejected: false, admitted: false, hold: true, ambiguous: false,
+      citationsValid: false, independentUnrelatedCitations: 0, independentTradingCitations: 0,
+    };
+  }
+
+  const primary = judgment;
+  const secondary = secondJudgment;
+  const primaryUnrelatedCitations = independentCitationCount(evidence, primary, 'UNRELATED');
+  const effective = secondary && (
+    primary.mainSubject === 'MIXED'
+    || primary.mainSubject === 'UNKNOWN'
+    || (primary.mainSubject === 'UNRELATED' && primaryUnrelatedCitations < 2)
+  ) ? secondary : primary;
+  const evidenceText = `${evidence.channelName} ${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`;
+  const tradingCitations = independentCitationCount(evidence, effective, 'TRADING');
+  const financeCitations = independentCitationCount(evidence, effective, 'FINANCE_ADJACENT');
+  const unrelatedCitations = independentCitationCount(evidence, effective, 'UNRELATED');
+  const valid = validCitations(evidence, effective).length;
+
+  // A rejection is only allowed with two independent, valid unrelated
+  // citations and a low semantic trading focus. Anything weaker is ambiguous,
+  // and ambiguous candidates are admitted.
+  const rejectable = effective.mainSubject === 'UNRELATED'
+    && Number(effective.tradingFocus) <= rejectThreshold
+    && unrelatedCitations >= 2
+    && valid >= 2
+    && !hasStrongTradingSupport(evidence, effective);
+
+  if (rejectable) {
+    reasonCodes.push('SEMANTIC_UNRELATED_WITH_INDEPENDENT_CITATIONS');
+    for (const item of effective.unrelatedDomains) reasonCodes.push(`DOMAIN_${item.domain}`);
+    return {
+      decision: 'REJECT_UNRELATED',
+      status: 'REJECTED_UNRELATED',
+      reasonCodes,
+      rejected: true, admitted: false, hold: false, ambiguous: false,
+      citationsValid: true, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+    };
+  }
+
+  const clearlyTrading = effective.mainSubject === 'TRADING' && hasStrongTradingSupport(evidence, effective);
+  const financeWithTrading = effective.mainSubject === 'FINANCE_ADJACENT'
+    && tradingCitations >= 1
+    && (financeCitations >= 1 || hasTradingAnchor(evidenceText));
+  if (clearlyTrading || financeWithTrading) {
+    reasonCodes.push(clearlyTrading ? 'SEMANTIC_TRADING_WITH_CITATIONS' : 'SEMANTIC_FINANCE_WITH_TRADING_ACTIVITY');
+    return {
+      decision: 'ADMIT',
+      status: 'ADMITTED',
+      reasonCodes,
+      rejected: false, admitted: true, hold: false, ambiguous: false,
+      citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+    };
+  }
+
+  if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0) {
+    return {
+      decision: 'REJECT_UNRELATED',
+      status: 'REJECTED_UNRELATED',
+      reasonCodes: ['FINANCE_ADJACENT_WITHOUT_TRADING_FOCUS', ...effective.unrelatedDomains.map(item => `DOMAIN_${item.domain}`)],
+      rejected: true, admitted: false, hold: false, ambiguous: false,
+      citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+    };
+  }
+
+  // Everything else after complete evidence is an ambiguous admit. This is the
+  // explicit policy: never create a permanent uncertain pile.
+  reasonCodes.push(
+    effective.mainSubject === 'UNRELATED' ? 'UNRELATED_BUT_CITATIONS_INSUFFICIENT' : 'AMBIGUOUS_AFTER_COMPLETE_EVIDENCE',
+    'ADMIT_FOR_DOWNSTREAM_CLASSIFICATION',
+  );
+  return {
+    decision: 'ADMIT_AMBIGUOUS',
+    status: 'ADMITTED_AMBIGUOUS',
+    reasonCodes,
+    rejected: false, admitted: true, hold: false, ambiguous: true,
+    citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+  };
+}
+
+export function normalizeSemanticJudgment(value: unknown, model?: string): SemanticJudgment | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, any>;
+  const mainSubject = String(raw.main_subject || raw.mainSubject || '').toUpperCase();
+  if (!['TRADING', 'FINANCE_ADJACENT', 'UNRELATED', 'MIXED', 'UNKNOWN'].includes(mainSubject)) return null;
+  const citations = Array.isArray(raw.evidence_citations) ? raw.evidence_citations : [];
+  return {
+    mainSubject: mainSubject as SemanticJudgment['mainSubject'],
+    tradingFocus: Math.max(0, Math.min(100, Number(raw.trading_focus ?? raw.tradingFocus ?? 0) || 0)),
+    unrelatedDomains: Array.isArray(raw.unrelated_domains)
+      ? raw.unrelated_domains.map((item: any) => ({
+        domain: String(item?.domain || item?.name || 'UNKNOWN').toUpperCase(),
+        confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
+      }))
+      : [],
+    incidentalTradingMentions: Array.isArray(raw.incidental_trading_mentions)
+      ? raw.incidental_trading_mentions.map((item: any) => ({
+        field: String(item?.field || 'unknown'),
+        index: Number.isInteger(item?.index) ? item.index : undefined,
+        quote: String(item?.quote || ''),
+      }))
+      : [],
+    citations: citations.map((item: any) => ({
+      field: String(item?.field || 'bio') as SemanticCitation['field'],
+      index: Number.isInteger(item?.index) ? item.index : undefined,
+      quote: String(item?.quote || ''),
+      supports: String(item?.supports || 'UNRELATED').toUpperCase() as SemanticCitation['supports'],
+    })).filter((item: SemanticCitation) => item.quote.trim().length > 0),
+    language: raw.language ? String(raw.language) : undefined,
+    explanation: String(raw.reasoning || raw.explanation || ''),
+    model,
+    raw: value,
+  };
+}

@@ -255,7 +255,7 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   // Classification is claimed by shared enrichment workers and dispatched.
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
-  assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers, \[CLASSIFICATION_JOB_TYPE\]/);
+  assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers, \[CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE\]/);
   // Phase 4 startup clamps through the measured gate and the approved hard
   // ceiling before splitting into the two pools.
   assert.match(queue, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);

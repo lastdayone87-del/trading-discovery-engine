@@ -253,6 +253,10 @@ export interface ChannelRecord {
   community_retry_job_reconciliation_reason?: string;
   scan_status: ScanStatus;
   scan_attempts: number;
+  /** Semantic-admission provenance. Null only for legacy rows awaiting revalidation. */
+  admitted_at?: string | null;
+  admission_status?: 'ADMITTED' | 'ADMITTED_AMBIGUOUS' | 'LEGACY_ADMITTED' | 'LEGACY_HOLD' | null;
+  admission_decision_id?: string | null;
   discovery_source: DiscoverySource;
   /** Sticky provenance marker for the official YouTube quota fence. */
   quota_origin?: QuotaOrigin;

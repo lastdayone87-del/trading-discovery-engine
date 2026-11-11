@@ -205,6 +205,12 @@ export interface DiscoveredChannelRaw {
   /** Page number within the autonomous run that produced this candidate. */
   queryPageNumber?: number;
   discoveryJobId?: string;
+  /** Semantic admission provenance carried into the classification pipeline. */
+  admissionDecisionId?: string;
+  admissionStatus?: 'ADMITTED' | 'ADMITTED_AMBIGUOUS';
+  admissionConfirmedTrading?: boolean;
+  admissionTradingConfidence?: number;
+  admissionCategory?: string;
 }
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
@@ -1355,6 +1361,57 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
   if(!acquiredResponse)throw new Error('Recent-video description API acquisition failed for every configured provider.');
   return [];
   } finally { acquisition.release(); }
+}
+
+/** Fetches full snippet fields for up to ten known video IDs (1 quota unit). */
+export async function fetchVideoSnippetsByIds(videoIds: string[]): Promise<Array<{
+  videoId: string;
+  title: string;
+  description: string;
+  publishedAt?: string;
+  language?: string;
+}>> {
+  const ids = [...new Set(videoIds.map(String).filter(Boolean))].slice(0, 10);
+  if (!ids.length) return [];
+  assertOfficialYouTubeQuotaOriginKnown('fetchVideoSnippetsByIds');
+  const keyPool = getYouTubeKeyPool();
+  if (keyPool.length === 0) throw new Error('Video snippet API is unavailable because no provider is configured.');
+  const acquisition = youtubePoolBackoff.beginAcquisition();
+  let quotaExceededCount = 0;
+  let accounted = false;
+  try {
+    const providerIndexes = await availableKeyIndexes(keyPool, 1);
+    for (let attempt = 0; attempt < providerIndexes.length; attempt += 1) {
+      const currentIndex = providerIndexes[attempt];
+      const apiKey = keyPool[currentIndex];
+      try {
+        const url = buildYouTubeApiUrl('videos', apiKey, { part: 'snippet', id: ids.join(',') });
+        const response = await youtubeFetch(url, 'video-details', 1, attempt + 1, acquisition, 'enrichment', apiKey);
+        await accountYouTubeQuotaResponse(response, 1);
+        accounted = true;
+        const data = await readYouTubeJsonObject(response, 'video-details');
+        return (data.items || []).map((item: any) => ({
+          videoId: String(item.id || ''),
+          title: String(item.snippet?.title || ''),
+          description: String(item.snippet?.description || ''),
+          publishedAt: item.snippet?.publishedAt ? String(item.snippet.publishedAt) : undefined,
+          language: snippetLanguage(item.snippet),
+        })).filter((item: { videoId: string; title: string }) => item.videoId && item.title);
+      } catch (error) {
+        if (isYouTubeQuotaAccountingError(error)) throw error;
+        if (isProbeQuotaControlError(error)) throw error;
+        if (isYouTubePermanentInputError(error)) throw error;
+        recordProviderFailure(apiKey, error);
+        if (isQuotaExceeded(error)) quotaExceededCount += 1;
+      }
+    }
+    acquisition.providerFailed(quotaExceededCount === keyPool.length ? 'QUOTA_EXHAUSTED' : 'INDETERMINATE');
+    throwIfAllProvidersCoolingDown(keyPool);
+    if (!accounted) throw new Error('Video snippet acquisition failed for every configured provider.');
+    return [];
+  } finally {
+    acquisition.release();
+  }
 }
 
 /** Accounts one successful provider response: the checkpoint that lets later

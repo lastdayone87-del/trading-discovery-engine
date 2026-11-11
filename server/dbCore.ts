@@ -1068,6 +1068,7 @@ export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC N
 export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
   AND scan_status <> 'SKIPPED_EXCLUDED'
   AND scan_status <> 'CLASSIFICATION_PENDING'
+  AND scan_status <> 'INTAKE_DEFERRED'
   AND trading_status <> 'NON_TRADING'
   AND NOT EXISTS (
     SELECT 1 FROM excluded_countries excluded
