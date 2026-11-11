@@ -539,10 +539,17 @@ export async function reconcileCommunityAcquisitionRecovery(
         if (enqueued === false) {
           // The reopen guard kept the retry job terminal. Restore the channel
           // projection so it does not claim an active retry that was never
-          // created. The guard is re-evaluated from current config and the
-          // rolling reopen window on the next sweep; a BLOCKED ledger row is
+          // created, but never write the pre-recovery snapshot over a newer
+          // OUT_OF_SCOPE classification (the enqueue scope guard uses false
+          // for both cases).
+          const current = await getChannelById(row.channel_id);
+          if (current
+              && String(current.scope_eligibility || '').trim().toUpperCase() !== 'OUT_OF_SCOPE') {
+            await upsertChannel(channelRecord);
+          }
+          // The guard is re-evaluated from current config and the rolling
+          // reopen window on the next sweep; a BLOCKED ledger row is
           // evidence, never a stale 30-day ban.
-          await upsertChannel(channelRecord);
           continue;
         }
       }

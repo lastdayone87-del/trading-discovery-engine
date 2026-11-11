@@ -342,3 +342,66 @@ test('a changed status snapshot blocks the recovery projection and enqueue', asy
   assert.equal(upserts.length, 1, 'the projection write is attempted with the snapshot guard');
   assert.equal(enqueued.length, 0, 'a refused projection must not reopen the retry job');
 });
+
+test('a scope-blocked enqueue does not restore the stale channel projection', async () => {
+  const db = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) {
+        return {
+          rows: [{
+            channel_id: 'UC_SCOPE_BLOCKED_ENQUEUE',
+            capacity_retry_job_id: 'job-scope-blocked-enqueue',
+            capacity_terminal: true,
+            retry_reason: 'BROWSER_RUNTIME_UNAVAILABLE'
+          }]
+        };
+      }
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  const base: any = {
+    channel_id: 'UC_SCOPE_BLOCKED_ENQUEUE',
+    channel_name: 'Scope Blocked Enqueue',
+    youtube_url: 'https://youtube.com/channel/UC_SCOPE_BLOCKED_ENQUEUE',
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    confidence_score: 100,
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_validation_status: 'RETRY_PENDING',
+    scan_status: 'FAILED',
+    scan_attempts: 1,
+    discovery_source: 'autonomous',
+    first_seen: new Date(0).toISOString(),
+    last_checked: new Date().toISOString(),
+    inspection_trail: [],
+    trading_status: 'TRADING_CONFIRMED',
+    trading_confidence_score: 100,
+    trading_category: 'General Trading',
+    activity_band: 'UNKNOWN',
+    activity_score: 50,
+    scope_eligibility: 'IN_SCOPE'
+  };
+  let reads = 0;
+  const upserts: any[] = [];
+  const enqueued: any[] = [];
+
+  const recovered = await reconcileCommunityAcquisitionRecovery(
+    async () => db,
+    async () => {
+      reads++;
+      // First selection and pre-mutation re-read are in scope; the enqueue
+      // scope guard then observes a concurrent OUT_OF_SCOPE decision.
+      return reads <= 2 ? base : { ...base, scope_eligibility: 'OUT_OF_SCOPE' };
+    },
+    async updated => { upserts.push(updated); },
+    20,
+    Date.now() + 600_000,
+    async (...args) => { enqueued.push(args); return false; }
+  );
+
+  assert.equal(reads, 3, 'the restore path must re-read the current channel');
+  assert.equal(recovered, 0);
+  assert.equal(upserts.length, 1, 'only the recovery projection is written');
+  assert.equal(enqueued.length, 1);
+});
