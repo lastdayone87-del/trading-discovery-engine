@@ -13,7 +13,11 @@ test('pipeline uses the deterministic routing decision for review and non-termin
 
 test('routing remains default-on with an explicit LEGACY rollback', async () => {
   const routing = await import('./deterministicFirst');
-  assert.equal(routing.resolveClassificationRoutingMode({} as NodeJS.ProcessEnv), 'ACTIVE');
+  assert.equal(routing.resolveClassificationRoutingMode({} as NodeJS.ProcessEnv), 'LEGACY');
+  assert.equal(
+    routing.resolveClassificationRoutingMode({ DETERMINISTIC_CLASSIFICATION_ROUTING: 'ACTIVE' } as NodeJS.ProcessEnv),
+    'ACTIVE',
+  );
   assert.equal(
     routing.resolveClassificationRoutingMode({ DETERMINISTIC_CLASSIFICATION_ROUTING: 'LEGACY' } as NodeJS.ProcessEnv),
     'LEGACY',
