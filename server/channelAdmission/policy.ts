@@ -19,6 +19,7 @@ const TRADING_ANCHOR_PATTERNS: RegExp[] = [
   /\b(?:technical\s*analysis|price\s*action|order\s*flow|market\s*structure|volume\s*profile|risk\s*management|trade\s*setup|trade\s*journal|trade\s*analysis|trading\s*analysis|market\s*analysis|back\s*test|backtest|live\s*trad(?:e|ing)|day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|scalp(?:ing)?|prop\s*firm|funded\s*trader|trading\s*(?:strategy|education|signals?|course|system)|stock\s*(?:market|trading)|share\s*market|equity\s*market|forex(?:\s*(?:trading|market))?|futures?\s*(?:trading|market)|options?\s*(?:trading|market)|crypto\s*trading)\b/iu,
   /\b(?:eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|xauusd|xagusd|nifty|bank\s*nifty|sensex|dax|cac\s*40|ftse\s*100|nikkei|omx(?:c25|s30)?|aex|bel\s*20|smi|tsx|asx(?:\s*200)?|nasdaq|s&p\s*500|sp500|bitcoin|btc|ethereum|eth)\b/iu,
   /\b(?:gold|silver|crude|natural\s*gas|copper)\s+(?:analysis|forecast|outlook|trading|market|price)\b/iu,
+  /\b(?:technische\s*analyse|analyse\s*(?:technique|boursi[eè]re)|analisi\s*tecnica|an[aá]lisis\s*t[eé]cnico|teknik\s*analiz|b[oö]rsenanalyse|beursanalyse)\b/iu,
   /(?:تداول|تحليل\s*فني|أسهم|الأسهم|بورصة|البورصة|فوركس|عملات\s*رقمية)/u,
   /(?:トレード|デイトレード|先物取引|テクニカル分析|板読み|オーダーフロー)/u,
   /(?:ट्रेडिंग|शेयर\s*बाजार|शेयर\s*मार्केट|निफ्टी|सेंसेक्स|स्टॉक\s*मार्केट|तकनीकी\s*विश्लेषण|प्राइस\s*एक्शन)/u,
@@ -141,6 +142,27 @@ export function independentCitationCount(
   return keys.size;
 }
 
+function domainFamily(domain: string): string {
+  const value = String(domain || '').toUpperCase();
+  if (/(NEWS|POLITIC|BUSINESS_NEWS|CURRENT_AFFAIRS)/.test(value)) return 'NEWS';
+  if (/(AI_RESEARCH|TECHNOLOGY|TECH_REVIEWS|CONSUMER_GOODS|SCIENCE|EDUCATION)/.test(value)) return 'TECH_EDUCATION';
+  if (/(HOME|GARDEN|INTERIOR|ARCHITECTURE|DESIGN)/.test(value)) return 'HOME_DESIGN';
+  if (/(GAMBL|BETTING|CASINO|ROULETTE)/.test(value)) return 'GAMBLING';
+  if (/(COOK|RECIPE|FOOD)/.test(value)) return 'COOKING';
+  if (/(ANIME|FICTION|MANHWA|ENTERTAINMENT|MUSIC|MOVIE)/.test(value)) return 'ENTERTAINMENT';
+  if (/(FINANCE|INVEST|PERSONAL_FINANCE|CRYPTO_NEWS)/.test(value)) return 'FINANCE';
+  return value;
+}
+
+export function hasCorroboratedUnrelatedDomain(judgment: SemanticJudgment): boolean {
+  const domains = judgment.unrelatedDomains
+    .filter(item => Number(item.confidence) >= 0.6)
+    .sort((a, b) => Number(b.confidence) - Number(a.confidence));
+  if (!domains.length) return false;
+  return new Set(domains.map(item => domainFamily(item.domain))).size === 1
+    || (Number(domains[0].confidence) >= 0.8 && Number(domains[1]?.confidence || 0) < 0.5);
+}
+
 export function hasStrongTradingSupport(evidence: AdmissionEvidence, judgment: SemanticJudgment): boolean {
   if (judgment.mainSubject === 'TRADING') {
     return independentCitationCount(evidence, judgment, 'TRADING') >= 2
@@ -208,6 +230,7 @@ export function decideAdmission(input: {
     && Number(effective.tradingFocus) <= rejectThreshold
     && unrelatedCitations >= 2
     && valid >= 2
+    && hasCorroboratedUnrelatedDomain(effective)
     && !hasStrongTradingSupport(evidence, effective);
 
   if (rejectable) {
@@ -259,7 +282,8 @@ export function decideAdmission(input: {
   if ((effective.mainSubject === 'MIXED' || effective.mainSubject === 'UNKNOWN')
     && tradingCitations === 0
     && unrelatedCitations >= 2
-    && valid >= 2) {
+    && valid >= 2
+    && hasCorroboratedUnrelatedDomain(effective)) {
     return {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
@@ -270,7 +294,7 @@ export function decideAdmission(input: {
     };
   }
 
-  if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0 && unrelatedCitations >= 2 && valid >= 2) {
+  if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0 && unrelatedCitations >= 2 && valid >= 2 && hasCorroboratedUnrelatedDomain(effective)) {
     return {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',

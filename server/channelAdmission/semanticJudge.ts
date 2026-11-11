@@ -141,7 +141,8 @@ async function writeAdmissionCache(cacheKey: string, checksum: string, model: st
 }
 
 async function reserveAdmissionModelCall(role: 'PRIMARY' | 'SECOND', provider: string, model: string): Promise<void> {
-  const cap = Math.max(1, Number(process.env.ADMISSION_SEMANTIC_DAILY_CALL_CAP || 5000));
+  const configuredCap = Number(process.env.ADMISSION_SEMANTIC_DAILY_CALL_CAP || 5000);
+  const cap = Number.isFinite(configuredCap) && configuredCap > 0 ? Math.floor(configuredCap) : 5000;
   let client: any;
   try {
     const db = await getDb();
@@ -163,7 +164,9 @@ async function reserveAdmissionModelCall(role: 'PRIMARY' | 'SECOND', provider: s
   } catch (error) {
     if (client) await client.query('ROLLBACK').catch(() => undefined);
     if (error instanceof Error && error.message === 'ADMISSION_SEMANTIC_BUDGET_EXHAUSTED') throw error;
-    // Budget ledger failure fails open; provider failover still protects spend.
+    // Budget enforcement must fail closed: an unavailable ledger cannot
+    // authorize unbounded paid calls. The candidate retries later.
+    throw new Error('ADMISSION_SEMANTIC_BUDGET_UNAVAILABLE');
   } finally {
     client?.release?.();
   }

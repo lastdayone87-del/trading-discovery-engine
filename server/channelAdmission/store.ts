@@ -46,13 +46,14 @@ export function admissionCandidateKey(channelId: string): string {
 
 export async function getAdmissionMode(): Promise<AdmissionMode> {
   const value = String(process.env.CHANNEL_ADMISSION_MODE || '').trim().toUpperCase();
-  if (value === 'OFF' || value === 'LEGACY') return 'OFF';
   if (value === 'ACTIVE' || value === 'ON') return 'ACTIVE';
+  if (value === 'OFF' || value === 'LEGACY') return 'OFF';
   try {
-    const setting = String(await getAppSetting('channel_admission_mode', 'ACTIVE')).trim().toUpperCase();
-    return setting === 'OFF' || setting === 'LEGACY' ? 'OFF' : 'ACTIVE';
+    const setting = String(await getAppSetting('channel_admission_mode', 'OFF')).trim().toUpperCase();
+    // Only an explicit enablement activates the gate. A typo or unknown value
+    // must not silently divert production discovery.
+    return setting === 'ACTIVE' || setting === 'ON' ? 'ACTIVE' : 'OFF';
   } catch {
-    // Fail safe to the known legacy path when the setting store is unavailable.
     return 'OFF';
   }
 }

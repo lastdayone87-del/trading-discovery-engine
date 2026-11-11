@@ -4,6 +4,7 @@ import { getDb, getChannelById, hasActiveClassificationJob, insertChannelIfAbsen
 import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQueryScopeKey } from '../classificationDecoupling';
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
+import { assertCountryAllowed } from '../countryExclusion';
 import { fetchAdmissionEvidence } from './evidence';
 import { ADMISSION_POLICY_VERSION, decideAdmission } from './policy';
 import { admissionEvidenceChecksum, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
@@ -122,6 +123,24 @@ async function enqueueClassificationAfterAdmission(input: {
   return job.status === 'PENDING' || job.status === 'PROCESSING' || job.status === 'COMPLETED';
 }
 
+export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, row: AdmissionCandidateRow): Promise<boolean> {
+  const channel = await getChannelById(row.channel_id);
+  if (!channel) return false;
+  const queued = await enqueueClassificationAfterAdmission({
+    candidate: input.candidate,
+    targetCountry: input.targetCountry,
+    source: input.source,
+    query: input.query,
+    queryId: input.queryId,
+    queryRunId: input.queryRunId,
+    discoveryJobId: input.discoveryJobId,
+    pageNumber: input.pageNumber,
+    admissionDecisionId: channel.admission_decision_id || undefined,
+  });
+  if (!queued) throw new Error('ADMISSION_CLASSIFICATION_ENQUEUE_FAILED');
+  return true;
+}
+
 export interface VerifyAdmissionOptions {
   judge?: AdmissionJudge;
   row?: AdmissionCandidateRow;
@@ -137,6 +156,7 @@ export async function verifyAdmissionCandidate(
 ): Promise<AdmissionVerificationResult> {
   const row = options.row || await findAdmissionCandidate(input.candidate.channelId);
   if (!row) throw new Error('ADMISSION_CANDIDATE_MISSING');
+  await assertCountryAllowed(input.targetCountry, `admission_worker:${input.candidate.channelId}`);
   const evidence = await fetchAdmissionEvidence({
     candidate: input.candidate,
     targetCountry: input.targetCountry,

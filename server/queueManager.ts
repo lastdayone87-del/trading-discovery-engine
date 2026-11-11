@@ -151,7 +151,7 @@ import {
 import { enqueueAdmissionVerification, getAdmissionMode, upsertAdmissionCandidate } from './channelAdmission/store';
 import { ADMISSION_VERIFICATION_JOB_TYPE, processAdmissionVerificationJob } from './channelAdmission/worker';
 import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
-import { getAdmissionPageOutcomes, quarantineQuery } from './channelAdmission/store';
+import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery } from './channelAdmission/store';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
@@ -2540,8 +2540,11 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      const admissionOutcomes = await getAdmissionPageOutcomes(queryRunId, pageNumber).catch(() => null);
-      const admissionGuard = admissionOutcomes
+      const [admissionOutcomes, admissionPageOutcomes] = await Promise.all([
+        getAdmissionRunOutcomes(queryRunId).catch(() => null),
+        getAdmissionPageOutcomes(queryRunId, pageNumber).catch(() => null),
+      ]);
+      const admissionGuard = admissionOutcomes && admissionPageOutcomes && Number(admissionPageOutcomes.pending || 0) === 0
         ? evaluateQueryAdmissionGuard({
             pageNumber,
             outcomes: admissionOutcomes,

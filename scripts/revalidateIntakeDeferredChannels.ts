@@ -14,8 +14,8 @@ import { randomUUID } from 'node:crypto';
 import { getChannelById, getDb } from '../server/db';
 import type { DiscoveredChannelRaw } from '../server/youtube';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { verifyAdmissionCandidate } from '../server/channelAdmission';
-import { enqueueAdmissionVerification, findAdmissionCandidate, upsertAdmissionCandidate, type AdmissionCandidateRow } from '../server/channelAdmission/store';
+import { resumeAdmittedCandidate, verifyAdmissionCandidate } from '../server/channelAdmission';
+import { enqueueAdmissionVerification, findAdmissionCandidate, getAdmissionMode, upsertAdmissionCandidate, type AdmissionCandidateRow } from '../server/channelAdmission/store';
 import type { AdmissionCandidateInput } from '../server/channelAdmission/types';
 
 interface DeferredRow {
@@ -90,6 +90,7 @@ async function main() {
   const explicitTarget = argValue('target-country')?.trim();
   const db = await getDb();
   if (apply) {
+    if ((await getAdmissionMode()) !== 'ACTIVE') throw new Error('CHANNEL_ADMISSION_OFF');
     const schema = await db.query(`SELECT to_regclass('public.semantic_admission_candidates') AS table_oid`);
     if (!schema.rows[0]?.table_oid) throw new Error('MIGRATION_178_REQUIRED: apply mode needs the semantic admission tables');
   }
@@ -169,6 +170,23 @@ async function main() {
       }));
     } catch (error) {
       counts.failed += 1;
+      if (apply) {
+        const refreshed = await findAdmissionCandidate(row.channel_id).catch(() => null);
+        if (refreshed) {
+          if (['ADMITTED', 'ADMITTED_AMBIGUOUS'].includes(refreshed.status)) {
+            await resumeAdmittedCandidate(input, refreshed).catch(retryError => {
+              console.error(JSON.stringify({ event: 'intake_deferred_classification_retry_failed', channelId: row.channel_id, error: retryError instanceof Error ? retryError.message : String(retryError) }));
+            });
+          } else {
+            await enqueueAdmissionVerification({
+              candidate: input,
+              attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+            }).catch(retryError => {
+              console.error(JSON.stringify({ event: 'intake_deferred_verification_retry_failed', channelId: row.channel_id, error: retryError instanceof Error ? retryError.message : String(retryError) }));
+            });
+          }
+        }
+      }
       console.error(JSON.stringify({
         event: 'intake_deferred_revalidation_failed',
         apply,

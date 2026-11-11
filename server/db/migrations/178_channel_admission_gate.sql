@@ -83,7 +83,7 @@ CREATE INDEX IF NOT EXISTS semantic_admission_decisions_channel_idx
   ON semantic_admission_decisions (channel_id, created_at DESC);
 
 INSERT INTO app_settings (setting_key, setting_value)
-VALUES ('channel_admission_mode', 'ACTIVE')
+VALUES ('channel_admission_mode', 'OFF')
 ON CONFLICT (setting_key) DO NOTHING;
 
 -- One-time quarantine of the contaminated extracted queries observed in

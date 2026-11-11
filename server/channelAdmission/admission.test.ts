@@ -230,6 +230,7 @@ test('clear unrelated with valid citations rejects; insufficient citations admit
     judgment: judgment({
       subject: 'UNRELATED', focus: 0,
       citations: [citation('bio', 'Cooking made SIMPLE'), citation('video_title', 'Sliced Bread Recipe', 0)],
+      domains: ['COOKING'],
     }),
   });
   assert.equal(clear.decision, 'REJECT_UNRELATED');
@@ -403,10 +404,12 @@ test('second judgment is marked effective when it supplies the decisive citation
     judgment: judgment({
       subject: 'UNRELATED', focus: 0,
       citations: [citation('bio', 'Cooking made SIMPLE')],
+      domains: ['COOKING'],
     }),
     secondJudgment: judgment({
       subject: 'UNRELATED', focus: 0,
       citations: [citation('bio', 'Cooking made SIMPLE'), citation('video_title', 'Sliced Bread Recipe', 0)],
+      domains: ['COOKING'],
     }),
   });
   assert.equal(result.decision, 'REJECT_UNRELATED');
