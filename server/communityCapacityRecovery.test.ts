@@ -225,3 +225,120 @@ test('clock-v2 capacity recovery renews leases without rewriting queue or failur
     delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
   }
 });
+
+test('a concurrent OUT_OF_SCOPE classification blocks the recovery write', async () => {
+  const db = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) {
+        return {
+          rows: [{
+            channel_id: 'UC_SCOPE_RACE',
+            capacity_retry_job_id: 'job-scope-race',
+            capacity_terminal: true,
+            retry_reason: 'BROWSER_RUNTIME_UNAVAILABLE'
+          }]
+        };
+      }
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  const base: any = {
+    channel_id: 'UC_SCOPE_RACE',
+    channel_name: 'Scope Race',
+    youtube_url: 'https://youtube.com/channel/UC_SCOPE_RACE',
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    confidence_score: 100,
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_validation_status: 'RETRY_PENDING',
+    scan_status: 'FAILED',
+    scan_attempts: 1,
+    discovery_source: 'autonomous',
+    first_seen: new Date(0).toISOString(),
+    last_checked: new Date().toISOString(),
+    inspection_trail: [],
+    trading_status: 'TRADING_CONFIRMED',
+    trading_confidence_score: 100,
+    trading_category: 'General Trading',
+    activity_band: 'UNKNOWN',
+    activity_score: 50,
+    scope_eligibility: 'IN_SCOPE'
+  };
+  let reads = 0;
+  const upserts: any[] = [];
+  const enqueued: any[] = [];
+
+  const recovered = await reconcileCommunityAcquisitionRecovery(
+    async () => db,
+    async () => {
+      reads++;
+      return reads === 1 ? base : { ...base, scope_eligibility: 'OUT_OF_SCOPE' };
+    },
+    async updated => { upserts.push(updated); },
+    20,
+    Date.now() + 360_000,
+    async (...args) => { enqueued.push(args); }
+  );
+
+  assert.equal(reads, 2, 'the channel must be re-read before the mutation');
+  assert.equal(recovered, 0);
+  assert.equal(upserts.length, 0, 'a now-out-of-scope channel must not be projected');
+  assert.equal(enqueued.length, 0, 'a now-out-of-scope channel must not be re-enqueued');
+});
+
+test('a changed status snapshot blocks the recovery projection and enqueue', async () => {
+  const db = {
+    async query(sql: string) {
+      if (sql.includes('SELECT c.channel_id')) {
+        return {
+          rows: [{
+            channel_id: 'UC_STATUS_RACE',
+            capacity_retry_job_id: 'job-status-race',
+            capacity_terminal: true,
+            retry_reason: 'BROWSER_RUNTIME_UNAVAILABLE'
+          }]
+        };
+      }
+      return { rows: [], rowCount: 1 };
+    }
+  };
+  const channel: any = {
+    channel_id: 'UC_STATUS_RACE',
+    channel_name: 'Status Race',
+    youtube_url: 'https://youtube.com/channel/UC_STATUS_RACE',
+    country: 'Germany',
+    country_status: 'CONFIRMED',
+    confidence_score: 100,
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    discord_validation_status: 'RETRY_PENDING',
+    scan_status: 'FAILED',
+    scan_attempts: 1,
+    discovery_source: 'autonomous',
+    first_seen: new Date(0).toISOString(),
+    last_checked: new Date().toISOString(),
+    inspection_trail: [],
+    trading_status: 'TRADING_CONFIRMED',
+    trading_confidence_score: 100,
+    trading_category: 'General Trading',
+    activity_band: 'UNKNOWN',
+    activity_score: 50,
+    scope_eligibility: 'IN_SCOPE'
+  };
+  const upserts: any[] = [];
+  const enqueued: any[] = [];
+
+  const recovered = await reconcileCommunityAcquisitionRecovery(
+    async () => db,
+    async () => channel,
+    async updated => { upserts.push(updated); return false; },
+    20,
+    Date.now() + 480_000,
+    async (...args) => { enqueued.push(args); }
+  );
+
+  assert.equal(recovered, 0);
+  assert.equal(upserts.length, 1, 'the projection write is attempted with the snapshot guard');
+  assert.equal(enqueued.length, 0, 'a refused projection must not reopen the retry job');
+});
