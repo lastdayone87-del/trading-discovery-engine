@@ -52,6 +52,7 @@ import {
   persistedQuotaOrigin,
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
+import { resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
 import { isYouTubeQuotaAccountingError } from './youtubeKeyHealth';
@@ -1142,6 +1143,9 @@ async function processChannelThroughPipelineInContext(
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
   const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
+  const classificationRouting = productionClassification.decision.deterministicRouting;
+  const routingActive = resolveClassificationRoutingMode() === 'ACTIVE';
+  const deterministicReview = routingActive && classificationRouting?.humanReview === true;
   const decisionReadyWithoutFailedProvider=hasDecisionGradeEvidenceWithoutFailedProviders(productionClassification.decision);
   const enrichmentProviderFailure=enrichmentOperationalFailure(
     productionClassification.decision.evidenceCollection,
@@ -1184,6 +1188,15 @@ async function processChannelThroughPipelineInContext(
       tradingVal={...tradingVal,status:governedDecision.status,confidenceScore:governedDecision.confidenceScore,category:governedDecision.category,breakdown:{...tradingVal.breakdown,reasoning:[...(tradingVal.breakdown.reasoning||[]),...governedDecision.mathematicalJustification.split(' | '),'GOVERNED ROLLOUT: evidence traversed the production staged classifier; no decision bypass was used.']}};
     }
   } catch(error) { console.warn(`[AdaptiveClassifier] Shadow evaluation failed for ${candidate.channelId}:`,error instanceof Error?error.message:error); }
+
+  if (routingActive && classificationRouting?.humanReview === true
+    && (classificationRouting.reasonCodes.includes('NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW')
+      || classificationRouting.reasonCodes.includes('NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW'))) {
+    // The evidence policy already refuses keyword-only rejection; this is the
+    // final pipeline guard so a malformed NON_TRADING decision, or a confirmed
+    // decision whose video sample contradicts its bio, cannot skip human review.
+    tradingVal = { ...tradingVal, status: 'UNCERTAIN' };
+  }
 
   if (tradingVal.status === 'NON_TRADING') {
     console.log(
@@ -1311,9 +1324,11 @@ async function processChannelThroughPipelineInContext(
     const legacyAction:EvidenceActionType=currentStage>=2?'HUMAN_REVIEW':currentStage===1?'VIDEO_PLAYLIST_CORROBORATION':'CHANNEL_RECENT_METADATA';
     let evidencePlan:EvidenceActionPlan|undefined;
     try {const quota=await getQuota();evidencePlan=await planAndRecordEvidenceAction({channelId:candidate.channelId,diagnosticId:classificationDiagnosticId,decision:productionClassification.decision,rawInput:productionClassification.input,legacyAction,providerQuotaRemaining:Math.max(0,quota.dailyLimit-quota.unitsUsed)});} catch(error){console.warn(`[VOI Evidence] Planning failed for ${candidate.channelId}; preserving legacy enrichment.`,error instanceof Error?error.message:error);}
-    const appliedAction=evidencePlan?.appliedAction||legacyAction,shouldReview=appliedAction==='HUMAN_REVIEW';
+    const appliedAction=evidencePlan?.appliedAction||legacyAction;
+    const shouldReview=appliedAction==='HUMAN_REVIEW'||deterministicReview;
+    if(deterministicReview)console.log(`[Unified Ingestion Pipeline - Routing] Channel '${candidate.channelName}' reached human review: ${classificationRouting?.fallbackReason||'DETERMINISTIC_AMBIGUITY'}.`);
     const corroboration=productionClassification.decision.stagedClassification?.stages.find(stage=>stage.stage==='CORROBORATION');
-    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:resolveReviewProviderDegraded(productionClassification.decision.evidenceCollection),unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
+    const reviewEligibilityInput={classificationStatus:'UNCERTAIN',investigationState:shouldReview?'UNRESOLVED':'ACTIVE',plausibleTradingHypothesis:independentHypothesis||deterministicReview,evidenceSufficient:productionClassification.decision.evidenceCollection.sufficiency==='SUFFICIENT',independentEvidence:corroboration?.disposition==='PASS',countryAllowed:true,operationalFailure:false,providerDegraded:resolveReviewProviderDegraded(productionClassification.decision.evidenceCollection),unsupportedLanguage:productionClassification.decision.evidenceCollection.providers.some(provider=>provider.outcome==='ABSTAINED_UNSUPPORTED_LANGUAGE'),terminalDecision:false};
     const reviewEligibility=evaluateReviewEligibilityV2(reviewEligibilityInput);
     const lifecycle = resolveUncertainLifecycle(shouldReview,reviewEligibility);
     // Preserve an evidence-complete human-ambiguity decision as NEEDS_REVIEW.

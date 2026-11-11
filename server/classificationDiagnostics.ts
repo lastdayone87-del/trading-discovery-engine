@@ -100,6 +100,7 @@ export async function recordProductionClassification(
         evidenceCollection: diagnostic.decision.evidenceCollection,
         stagedClassification: diagnostic.decision.stagedClassification,
         decisionPolicy: diagnostic.decision.decisionPolicy,
+        deterministicRouting: diagnostic.decision.deterministicRouting,
         // v3: retain the decisive C5/C6 state instead of forcing operators to
         // replay normalized_input to discover why a decision abstained.
         composition: compositionForDiagnostics || diagnostic.decision.composition,
