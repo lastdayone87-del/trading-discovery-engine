@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getDb } from '../db';
 import { REVIEW_ELIGIBILITY_POLICY_VERSION } from './policy';
 import { materializeEligibleReviewInTransaction } from '../release5/reviewMaterializer';
+import { recordDashboardCorpusShadow } from '../dashboardCorpus/store';
 
 export const CLASSIFICATION_EXHAUSTION_POLICY_VERSION = 'classification-exhaustion-review-v1';
 export const CLASSIFICATION_EXHAUSTION_REASON_FAMILY = 'EVIDENCE_EXHAUSTED';
@@ -39,6 +40,14 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+    // Normal eligibility writes lock the projection first, then the channel.
+    // Use the same order and a channel advisory lock to avoid deadlocks with
+    // concurrent evaluation/materialization transactions.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`review-eligibility:${input.channelId}`]);
+    const priorProjection = await client.query(
+      `SELECT version,decision_id,evidence_checksum,decided_at FROM review_eligibility_projection WHERE channel_id=$1 FOR UPDATE`,
+      [input.channelId],
+    );
     const channelResult = await client.query(
       `SELECT channel_id,trading_status,scan_status,country_status FROM channels WHERE channel_id=$1 FOR UPDATE`,
       [input.channelId],
@@ -56,7 +65,6 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
 
     const reasonCodes = [CLASSIFICATION_EXHAUSTION_REASON_FAMILY, input.reasonCode, ...(input.reasonCodes || [])]
       .filter((value, index, all) => value && all.indexOf(value) === index);
-    const decisionKey = `classification-exhaustion:${input.channelId}:${input.reasonCode}:${input.classificationDiagnosticId || 'none'}`;
     const inputSnapshot = {
       source: 'classification-exhaustion',
       reasonFamily: CLASSIFICATION_EXHAUSTION_REASON_FAMILY,
@@ -68,12 +76,11 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
       policyVersion: CLASSIFICATION_EXHAUSTION_POLICY_VERSION,
     };
     const checksum = createHash('sha256').update(JSON.stringify(inputSnapshot)).digest('hex');
+    // New evidence creates a new review decision instead of silently reusing
+    // an older exhaustion snapshot.
+    const decisionKey = `classification-exhaustion:${input.channelId}:${input.reasonCode}:${input.classificationDiagnosticId || 'none'}:${checksum}`;
     const decidedAt = input.decidedAt ? new Date(input.decidedAt).toISOString() : new Date().toISOString();
 
-    const priorProjection = await client.query(
-      `SELECT version,decision_id,evidence_checksum,decided_at FROM review_eligibility_projection WHERE channel_id=$1 FOR UPDATE`,
-      [input.channelId],
-    );
     let decisionId: string;
     const existingDecision = await client.query(
       `SELECT id FROM review_eligibility_decisions WHERE decision_key=$1`,
@@ -96,17 +103,6 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
         ],
       );
       decisionId = String(inserted.rows[0].id);
-      const version = Number(priorProjection.rows[0]?.version || 0) + 1;
-      await client.query(
-        `INSERT INTO review_eligibility_events(event_key,channel_id,decision_id,expected_projection_version,payload,policy_version)
-         VALUES($1,$2,$3,$4,$5,$6)`,
-        [
-          createHash('sha256').update(`classification-exhaustion-event:${decisionKey}:${version}`).digest('hex'),
-          input.channelId, decisionId, Number(priorProjection.rows[0]?.version || 0),
-          JSON.stringify({ status: 'ELIGIBLE', reasonCodes, reasonFamily: CLASSIFICATION_EXHAUSTION_REASON_FAMILY, evidenceChecksum: checksum }),
-          REVIEW_ELIGIBILITY_POLICY_VERSION,
-        ],
-      );
     }
 
     const decision = await client.query(
@@ -119,6 +115,16 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
     const projectionCurrent = priorProjection.rows[0]?.decision_id === decisionId;
     if (!projectionCurrent) {
       const version = Number(priorProjection.rows[0]?.version || 0) + 1;
+      await client.query(
+        `INSERT INTO review_eligibility_events(event_key,channel_id,decision_id,expected_projection_version,payload,policy_version)
+         VALUES($1,$2,$3,$4,$5,$6)`,
+        [
+          createHash('sha256').update(`classification-exhaustion-event:${decisionKey}:${version}`).digest('hex'),
+          input.channelId, decisionId, Number(priorProjection.rows[0]?.version || 0),
+          JSON.stringify({ status: 'ELIGIBLE', reasonCodes, reasonFamily: CLASSIFICATION_EXHAUSTION_REASON_FAMILY, evidenceChecksum: checksum }),
+          REVIEW_ELIGIBILITY_POLICY_VERSION,
+        ],
+      );
       await client.query(
         `INSERT INTO review_eligibility_projection(
            channel_id,status,version,decision_id,reason_codes,evidence_checksum,policy_version,decided_at
@@ -139,6 +145,10 @@ export async function materializeExhaustedReview(input: ExhaustedReviewInput): P
       eligibilityDecisionId: decisionId,
     });
     await client.query('COMMIT');
+    if (materialized.materialized || materialized.reason === 'CURRENT_PENDING_REVIEW_PRESERVED') {
+      await recordDashboardCorpusShadow({ channelId: input.channelId, admissionState: 'ADMITTED_REVIEW' })
+        .catch(error => console.warn(`[ClassificationResolution] Dashboard corpus observation failed for ${input.channelId}:`, error instanceof Error ? error.message : error));
+    }
     return {
       materialized: materialized.materialized === true,
       reason: materialized.reason,

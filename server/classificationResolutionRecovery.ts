@@ -1,17 +1,20 @@
 import { getDb } from './db';
 import type { ChannelRecord } from '../src/types';
 import { enqueueOperationalEnrichmentRecoveryJob } from './queueManager';
+import { OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES } from './operationalEnrichmentRecovery';
 import { materializeExhaustedReview } from './reviewEligibility/exhaustedReview';
 
 export const CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION = 'classification-resolution-recovery-v1';
-export const CLASSIFICATION_RESOLUTION_RECOVERY_CYCLE_LIMIT = 3;
+export const CLASSIFICATION_RESOLUTION_RECOVERY_CYCLE_LIMIT = OPERATIONAL_ENRICHMENT_MAX_RECOVERY_CYCLES;
+export const CLASSIFICATION_RESOLUTION_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 const CUTOFF_EVENT_KEY = 'classification-resolution-recovery:cutoff';
-const CYCLE_PREFIX = 'classification-resolution-recovery:cycle:';
+const CYCLE_PREFIX = 'operational-enrichment:';
 
 export type ResolutionRecoveryAction =
   | 'SKIP_TERMINAL'
   | 'SKIP_ACTIVE'
   | 'SKIP_LEGACY'
+  | 'SKIP_COOLDOWN'
   | 'ENQUEUE_RECOVERY'
   | 'EXHAUSTED_REVIEW'
   | 'PROJECT_PERMANENT_FAILURE';
@@ -24,7 +27,10 @@ export interface ResolutionRecoveryDecisionInput {
   terminalFailureClass: string | null;
   recoveryCycles: number;
   lastChecked: string | null;
+  lastRecoveryAt?: string | null;
+  terminalRecoveryMarker?: boolean;
   cutoff: string;
+  now?: number;
   includeLegacy?: boolean;
 }
 
@@ -39,6 +45,12 @@ export function resolveResolutionRecoveryAction(input: ResolutionRecoveryDecisio
   if (!input.includeLegacy && input.lastChecked && new Date(input.lastChecked).getTime() < new Date(input.cutoff).getTime()) {
     return { action: 'SKIP_LEGACY', reasonCodes: ['BEFORE_RECOVERY_CUTOFF'] };
   }
+  const lastActivity = input.lastRecoveryAt || input.lastChecked;
+  if (lastActivity) {
+    const age = (input.now ?? Date.now()) - new Date(lastActivity).getTime();
+    if (age < CLASSIFICATION_RESOLUTION_RECOVERY_COOLDOWN_MS) return { action: 'SKIP_COOLDOWN', reasonCodes: ['RECOVERY_COOLDOWN_ACTIVE'] };
+  }
+  if (input.terminalRecoveryMarker) return { action: 'EXHAUSTED_REVIEW', reasonCodes: ['RECOVERY_BUDGET_TERMINAL_MARKER'] };
   if (input.terminalFailureClass === 'PERMANENT_INPUT' || input.terminalFailureClass === 'POLICY_TERMINAL') {
     return { action: 'PROJECT_PERMANENT_FAILURE', reasonCodes: ['PERMANENT_TERMINAL_FAILURE'] };
   }
@@ -52,6 +64,12 @@ export function resolveResolutionRecoveryAction(input: ResolutionRecoveryDecisio
     return { action: 'EXHAUSTED_REVIEW', reasonCodes: ['COMPLETED_UNCERTAIN_WITHOUT_REVIEW'] };
   }
   return { action: 'ENQUEUE_RECOVERY', reasonCodes: ['GENERIC_TERMINAL_ENRICHMENT_FAILURE'] };
+}
+
+export async function readClassificationResolutionCutoff(): Promise<string | null> {
+  const db = await getDb();
+  const existing = await db.query('SELECT created_at FROM operational_enrichment_recovery_events WHERE event_key=$1', [CUTOFF_EVENT_KEY]);
+  return existing.rowCount ? new Date(existing.rows[0].created_at).toISOString() : null;
 }
 
 export async function ensureClassificationResolutionCutoff(): Promise<string> {
@@ -82,6 +100,7 @@ export interface ClassificationResolutionRecoveryItem {
   tradingStatus: string;
   latestJobStatus: string | null;
   latestJobId: string | null;
+  latestJobAttempts: number;
   terminalFailureClass: string | null;
   recoveryCycles: number;
   lastChecked: string | null;
@@ -119,25 +138,26 @@ export async function reconcileClassificationResolutionGaps(
   options: ClassificationResolutionRecoveryOptions = {},
 ): Promise<ClassificationResolutionRecoveryResult> {
   const db = await getDb();
-  const cutoff = options.cutoff || await ensureClassificationResolutionCutoff();
-  const limit = Math.min(200, Math.max(1, options.limit || 50));
   const dryRun = options.dryRun !== false;
+  const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
+  const limit = Math.min(200, Math.max(1, options.limit || 50));
   const result = await db.query(
     `SELECT c.channel_id,c.channel_name,c.trading_status,c.scan_status,c.last_checked,
             latest.id AS latest_job_id,latest.status AS latest_job_status,
-            latest.terminal_failure_class,
+            latest.terminal_failure_class,latest.attempts AS latest_job_attempts,
+            latest.updated_at AS latest_job_updated_at,
             (SELECT count(*)::int FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE '${CYCLE_PREFIX}%') AS recovery_cycles,
-            EXISTS(
-              SELECT 1 FROM jobs active
-               WHERE active.payload->>'channelId'=c.channel_id
-                 AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
-                 AND active.status IN('PENDING','PROCESSING')
-            ) AS has_active_job
+            (SELECT MAX(e.created_at) FROM operational_enrichment_recovery_events e
+              WHERE e.channel_id=c.channel_id
+                AND e.event_key LIKE '${CYCLE_PREFIX}%') AS last_recovery_at,
+            EXISTS(SELECT 1 FROM operational_enrichment_recovery_events e
+              WHERE e.channel_id=c.channel_id
+                AND e.event_key LIKE 'operational-enrichment-terminal:%') AS terminal_recovery_marker
        FROM channels c
        LEFT JOIN LATERAL (
-         SELECT job.id,job.status,job.terminal_failure_class
+         SELECT job.id,job.status,job.terminal_failure_class,job.attempts,job.updated_at
            FROM jobs job
           WHERE job.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
             AND job.payload->>'channelId'=c.channel_id
@@ -147,6 +167,12 @@ export async function reconcileClassificationResolutionGaps(
       WHERE c.trading_status='UNCERTAIN'
         AND c.scan_status IN('ENRICHMENT_PENDING','FAILED')
         AND ($1::boolean OR COALESCE(c.last_checked,c.created_at) >= $2::timestamptz)
+        AND NOT EXISTS(
+          SELECT 1 FROM jobs active
+           WHERE active.payload->>'channelId'=c.channel_id
+             AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+             AND active.status IN('PENDING','PROCESSING')
+        )
       ORDER BY c.last_checked ASC NULLS FIRST,c.channel_id
       LIMIT $3`,
     [Boolean(options.includeLegacy), cutoff, limit],
@@ -162,8 +188,11 @@ export async function reconcileClassificationResolutionGaps(
       terminalFailureClass: row.terminal_failure_class ? String(row.terminal_failure_class) : null,
       recoveryCycles: Number(row.recovery_cycles) || 0,
       lastChecked: row.last_checked ? new Date(row.last_checked).toISOString() : null,
+      lastRecoveryAt: row.last_recovery_at ? new Date(row.last_recovery_at).toISOString() : (row.latest_job_updated_at ? new Date(row.latest_job_updated_at).toISOString() : null),
+      terminalRecoveryMarker: row.terminal_recovery_marker === true,
       cutoff,
       includeLegacy: options.includeLegacy === true,
+      now: options.now || Date.now(),
     });
     const item: ClassificationResolutionRecoveryItem = {
       channelId: String(row.channel_id),
@@ -172,6 +201,7 @@ export async function reconcileClassificationResolutionGaps(
       tradingStatus: String(row.trading_status),
       latestJobStatus: row.latest_job_status ? String(row.latest_job_status) : null,
       latestJobId: row.latest_job_id ? String(row.latest_job_id) : null,
+      latestJobAttempts: Number(row.latest_job_attempts) || 0,
       terminalFailureClass: row.terminal_failure_class ? String(row.terminal_failure_class) : null,
       recoveryCycles: Number(row.recovery_cycles) || 0,
       lastChecked: row.last_checked ? new Date(row.last_checked).toISOString() : null,
@@ -207,7 +237,33 @@ export async function reconcileClassificationResolutionGaps(
     }
     const channel = await channelRowToRecord(db, item.channelId);
     if (!channel) { skipped += 1; continue; }
-    const accepted = await enqueueOperationalEnrichmentRecoveryJob(channel, decision.reasonCodes);
+    const cycle = item.recoveryCycles + 1;
+    let accepted = false;
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      accepted = await enqueueOperationalEnrichmentRecoveryJob(channel, decision.reasonCodes, client);
+      if (accepted) {
+        await client.query(
+          `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
+           VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
+          [
+            `${CYCLE_PREFIX}${item.channelId}:${item.latestJobId || 'none'}:attempt:${item.latestJobAttempts || 0}:cycle:${cycle}`,
+            item.channelId,
+            item.latestJobId || 'none',
+            item.scanStatus,
+            JSON.stringify(decision.reasonCodes),
+            CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
+          ],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
     if (!accepted) {
       await materializeExhaustedReview({
         channelId: item.channelId,
@@ -218,19 +274,6 @@ export async function reconcileClassificationResolutionGaps(
       exhaustedReviews += 1;
       continue;
     }
-    const cycle = item.recoveryCycles + 1;
-    await db.query(
-      `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
-       VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
-      [
-        `${CYCLE_PREFIX}${item.channelId}:${item.latestJobId || 'none'}:${cycle}`,
-        item.channelId,
-        item.latestJobId || 'none',
-        item.scanStatus,
-        JSON.stringify(decision.reasonCodes),
-        CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
-      ],
-    );
     enqueued += 1;
   }
   return { dryRun, cutoff, scanned: items.length, enqueued, exhaustedReviews, permanentFailures, skipped, items };

@@ -64,7 +64,10 @@ export const ClassificationResolution: React.FC = () => {
     setError(null);
     try {
       const response = await apiFetch('/api/classification/resolution');
-      if (!response.ok) throw new Error(await response.text() || 'Could not load classification resolution metrics.');
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error || `Could not load classification resolution metrics (${response.status}).`);
+      }
       setData(await response.json() as ResolutionOverview);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load classification resolution metrics.');
@@ -109,7 +112,7 @@ export const ClassificationResolution: React.FC = () => {
               {data.alerts.length === 0 && <div className="text-xs text-emerald-600">No resolution alerts.</div>}
               <div className="space-y-2">
                 {data.alerts.map(alert => (
-                  <div key={alert.code} className="flex items-start gap-2 rounded-lg border border-slate-100 dark:border-slate-800 p-2 text-[11px]">
+                  <div key={alert.code} role="status" aria-label={`${alert.severity}: ${alert.code}`} className="flex items-start gap-2 rounded-lg border border-slate-100 dark:border-slate-800 p-2 text-[11px]">
                     <SeverityIcon severity={alert.severity} />
                     <div>
                       <div className="font-semibold text-slate-800 dark:text-slate-100">{alert.code}</div>

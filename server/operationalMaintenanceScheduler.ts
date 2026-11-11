@@ -20,6 +20,7 @@ import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJ
  * run ahead of every claim on every pool.
  */
 export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
+export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
 
 export interface OperationalMaintenanceDependencies {
   recoverStaleChannelLocks(): Promise<unknown>;
@@ -100,6 +101,7 @@ export function createOperationalMaintenanceScheduler(
   let runStartedAtMs: number | null = null;
   let lastStaleChannelLockRecoveryMs: number | null = null;
   let lastClassificationSightingSweepMs: number | null = null;
+  let lastClassificationResolutionSweepMs: number | null = null;
   let ticks = 0;
   let failures = 0;
   let lastTickAt: string | null = null;
@@ -183,7 +185,17 @@ export function createOperationalMaintenanceScheduler(
     await isolate('legacy_community_retry_ownership', () => dependencies.reconcileLegacyCommunityRetryOwnership());
     await isolate('provider_deferred_projection', () => dependencies.projectProviderDeferredEnrichment());
     await isolate('operational_enrichment_recovery', () => dependencies.reconcileOperationalEnrichmentRecovery());
-    await isolate('classification_resolution_gaps', () => dependencies.reconcileClassificationResolutionGaps());
+    if (lastClassificationResolutionSweepMs === null
+      || nowMs - lastClassificationResolutionSweepMs >= CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS) {
+      lastClassificationResolutionSweepMs = nowMs;
+      await isolate('classification_resolution_gaps', async () => {
+        const result = await dependencies.reconcileClassificationResolutionGaps() as
+          { enqueued?: number; exhaustedReviews?: number; permanentFailures?: number } | undefined;
+        if ((result?.enqueued || 0) + (result?.exhaustedReviews || 0) + (result?.permanentFailures || 0) > 0) {
+          console.info('[Operational Maintenance] classification resolution recovery', result);
+        }
+      });
+    }
     await isolate('phase_b_observation_reconciliation', () => dependencies.triggerPhaseBObservationReconciliation());
     // The reconciler defaults its enqueue limit to the configured queue
     // headroom, so this maintenance sweep cannot exceed the producer

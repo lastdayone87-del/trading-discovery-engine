@@ -188,3 +188,10 @@ test('classification resolution monitoring is an explicit operator-only read rou
   assert.equal(matching[0].policy,'operator');
   assert.equal(matching[0].action,'classification.resolution.read');
 });
+
+test('request-rescan is an explicit operator action route',()=>{
+  const matching=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/reviews/UC123/request-rescan'));
+  assert.equal(matching.length,1);
+  assert.equal(matching[0].policy,'operator');
+  assert.equal(matching[0].action,'operation.execute');
+});

@@ -140,7 +140,13 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                 <div>
                   <span className="text-slate-500 block">Semantic:</span>
                   <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    {channel.trading_relevance_breakdown.semantic_used ? 'used' : 'not used'}
+                    {channel.trading_relevance_breakdown.semantic_used === true
+                      ? 'used'
+                      : channel.trading_relevance_breakdown.semantic_used === false
+                        ? 'not used'
+                        : channel.trading_relevance_breakdown.ai_reviewed
+                          ? 'used (legacy)'
+                          : 'not recorded'}
                     {channel.trading_relevance_breakdown.semantic_attempted ? ' · attempted' : ''}
                   </span>
                 </div>

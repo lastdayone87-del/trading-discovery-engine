@@ -1,5 +1,6 @@
 import { getDb } from './db';
 import { calculateEnrichmentQuotaReserve } from './dbCore';
+import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 
 export const CLASSIFICATION_RESOLUTION_MONITORING_VERSION = 'classification-resolution-monitoring-v1';
 
@@ -161,6 +162,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     eligibility,
     eligibleWithoutPending,
     quotaRow,
+    reservedQuota,
     dueStage,
     recentConsumption,
     recentProviderCalls,
@@ -170,13 +172,17 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     db.query(`SELECT trading_status AS key,count(*)::int AS count FROM channels GROUP BY trading_status`),
     db.query(`SELECT scan_status AS key,count(*)::int AS count FROM channels GROUP BY scan_status`),
     db.query(
-      `SELECT COALESCE(latest.decision->'deterministicRouting'->>'route','UNROUTED') AS key,count(*)::int AS count
+      `SELECT COALESCE(latest.decision->'deterministicRouting'->>'route','UNROUTED') AS key,
+              COALESCE(latest.decision->>'recognitionState',latest.decision->'recognition'->>'state','UNKNOWN') AS recognition,
+              COALESCE(latest.decision->'deterministicRouting'->>'semanticUsed','false') AS semantic_used,
+              COALESCE(latest.decision->'deterministicRouting'->>'semanticAttempted','false') AS semantic_attempted,
+              count(*)::int AS count
          FROM (
            SELECT DISTINCT ON (channel_id) decision
              FROM production_classification_diagnostics
             ORDER BY channel_id,created_at DESC,id DESC
          ) latest
-        GROUP BY 1`,
+        GROUP BY 1,2,3,4`,
     ),
     db.query(
       `SELECT status AS key,count(*)::int AS count,
@@ -208,9 +214,16 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     db.query(
       `SELECT count(*)::int AS count FROM review_eligibility_projection p
         WHERE p.status='ELIGIBLE'
-          AND NOT EXISTS(SELECT 1 FROM channel_reviews r WHERE r.channel_id=p.channel_id AND r.state='PENDING')`,
+          AND NOT EXISTS(SELECT 1 FROM channel_reviews r WHERE r.channel_id=p.channel_id AND r.state='PENDING')
+          AND NOT EXISTS(
+            SELECT 1 FROM channel_reviews r
+             WHERE r.channel_id=p.channel_id
+               AND r.state IN('APPROVED','REJECTED')
+               AND r.decided_at IS NOT NULL AND r.decided_at >= p.decided_at
+          )`,
     ),
     db.query(`SELECT units_used,daily_limit,last_reset FROM quota_tracker WHERE id='youtube'`),
+    db.query(`SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations WHERE status='RESERVED' AND expires_at>now()`),
     db.query(
       `SELECT
          count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)<=1 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage1,
@@ -223,7 +236,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     ),
     db.query(
       `SELECT count(*)::int AS count FROM provider_call_events
-        WHERE occurred_at>=now()-interval '15 minutes' AND provider IN('gemini','groq') AND status IN('RATE_LIMITED','TRANSIENT_ERROR')`,
+        WHERE occurred_at>=now()-interval '15 minutes' AND provider IN('gemini','groq','gemini-free') AND status IN('RATE_LIMITED','TRANSIENT_ERROR')`,
     ),
     db.query(
       `SELECT count(*)::int AS count FROM youtube_key_quota_usage
@@ -234,13 +247,16 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
   const jobsByStatus = countMap(enrichmentJobs.rows);
   const reviewsByState = countMap(reviewStates.rows);
   const recentByAllocation = new Map(recentConsumption.rows.map(row => [String(row.allocation), Number(row.units) || 0]));
-  const quota = quotaRow.rows[0] || { units_used: 0, daily_limit: 0 };
+  const quota = quotaRow.rows[0] || { units_used: 0, daily_limit: 0, last_reset: '' };
+  const quotaDay = getYouTubeQuotaDay();
+  const quotaUsed = String(quota.last_reset) === quotaDay ? Number(quota.units_used) || 0 : 0;
+  const keysAtCapCount = String(quota.last_reset) === quotaDay ? Number(keysAtCap.rows[0]?.count || 0) : 0;
   const dueStage1 = Number(dueStage.rows[0]?.stage1 || 0);
   const dueStage2 = Number(dueStage.rows[0]?.stage2 || 0);
   const protection = calculateEnrichmentQuotaReserve({
     dailyBudget: Number(quota.daily_limit) || 0,
-    actualUsed: Number(quota.units_used) || 0,
-    reservedTotal: 0,
+    actualUsed: quotaUsed,
+    reservedTotal: Number(reservedQuota.rows[0]?.reserved) || 0,
     dueStage1,
     dueStage2,
     recentAutonomousUnits: recentByAllocation.get('AUTONOMOUS') || 0,
@@ -250,22 +266,22 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
   const channelTrading = countMap(channelStatus.rows);
   const channelScan = countMap(scanStatus.rows);
   const totalChannels = Object.values(channelTrading).reduce((sum, value) => sum + value, 0);
-  const semanticUsed = Number(
-    (await db.query(`SELECT count(*)::int AS count FROM (SELECT DISTINCT ON (channel_id) decision FROM production_classification_diagnostics ORDER BY channel_id,created_at DESC,id DESC) latest WHERE latest.decision->'deterministicRouting'->>'semanticUsed'='true'`)).rows[0]?.count || 0,
-  );
-  const semanticAttempted = Number(
-    (await db.query(`SELECT count(*)::int AS count FROM (SELECT DISTINCT ON (channel_id) decision FROM production_classification_diagnostics ORDER BY channel_id,created_at DESC,id DESC) latest WHERE latest.decision->'deterministicRouting'->>'semanticAttempted'='true'`)).rows[0]?.count || 0,
-  );
-  const recognitionRows = await db.query(
-    `SELECT COALESCE(latest.decision->>'recognitionState',latest.decision->'recognition'->>'state','UNKNOWN') AS key,count(*)::int AS count
-       FROM (SELECT DISTINCT ON (channel_id) decision FROM production_classification_diagnostics ORDER BY channel_id,created_at DESC,id DESC) latest GROUP BY 1`,
-  );
-  const byRoute = countMap(routes.rows);
+  const byRoute: Record<string, number> = {};
+  const byRecognition: Record<string, number> = {};
+  let semanticUsed = 0;
+  let semanticAttempted = 0;
+  for (const row of routes.rows) {
+    const count = Number(row.count) || 0;
+    byRoute[String(row.key || 'UNROUTED')] = (byRoute[String(row.key || 'UNROUTED')] || 0) + count;
+    byRecognition[String(row.recognition || 'UNKNOWN')] = (byRecognition[String(row.recognition || 'UNKNOWN')] || 0) + count;
+    if (row.semantic_used === 'true') semanticUsed += count;
+    if (row.semantic_attempted === 'true') semanticAttempted += count;
+  }
   const unresolvedCompleted = Number(unresolvedCompletedRows.rows[0]?.count || 0);
   const pendingReviews = Number(reviewsByState.PENDING || 0);
   const oldestReviewDays = Math.max(0, ...reviewStates.rows.map(row => Number(row.oldest_days) || 0));
   const alerts = buildResolutionAlerts({
-    dueEnrichment: Number(jobsByStatus.PENDING || 0),
+    dueEnrichment: Number(dueStage.rows[0]?.total || 0),
     oldestDueHours,
     orphanPending: Number(orphanPending.rows[0]?.count || 0),
     genericFailures: Number(genericFailures.rows[0]?.count || 0),
@@ -274,7 +290,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     pendingReviews,
     oldestReviewDays,
     semanticRateLimitCalls15m: Number(recentProviderCalls.rows[0]?.count || 0),
-    youtubeKeysAtCap: Number(keysAtCap.rows[0]?.count || 0),
+    youtubeKeysAtCap: keysAtCapCount,
   });
   return {
     version: CLASSIFICATION_RESOLUTION_MONITORING_VERSION,
@@ -308,14 +324,14 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     },
     routes: {
       byRoute,
-      byRecognition: countMap(recognitionRows.rows),
+      byRecognition,
       semanticUsed,
       semanticAttempted,
       unclassified: Number(byRoute.UNROUTED || 0),
     },
     quota: {
       dailyLimit: Number(quota.daily_limit) || 0,
-      used: Number(quota.units_used) || 0,
+      used: quotaUsed,
       remaining: protection.remainingUnits,
       dueStage1,
       dueStage2,
