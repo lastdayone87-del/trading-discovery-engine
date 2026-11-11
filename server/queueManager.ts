@@ -1781,21 +1781,22 @@ async function processIntakeDeferredRecheckJob(
     }
     await (await getDb()).query(
       `INSERT INTO intake_deferred_reviews(
-         channel_id,review_version,state,system_snapshot,evidence_snapshot,metadata_quality,
+         channel_id,review_version,state,system_snapshot,evidence_snapshot,metadata_quality,language,
          recheck_attempts,last_checked_at,next_recheck_at,last_evidence_hash,updated_at
-       ) VALUES($1,1,$2,$3::jsonb,$4::jsonb,$5,$6,$7,$8,$9,now())
+       ) VALUES($1,1,$2,$3::jsonb,$4::jsonb,$5,$6,$7,$8,$9,$10,now())
        ON CONFLICT(channel_id) DO UPDATE SET
          system_snapshot=excluded.system_snapshot,evidence_snapshot=excluded.evidence_snapshot,
          metadata_quality=excluded.metadata_quality,
+         language=COALESCE(excluded.language,intake_deferred_reviews.language),
          recheck_attempts=excluded.recheck_attempts,last_checked_at=excluded.last_checked_at,
          next_recheck_at=excluded.next_recheck_at,last_evidence_hash=excluded.last_evidence_hash,
-         review_version=CASE WHEN $10::boolean THEN intake_deferred_reviews.review_version+1
+         review_version=CASE WHEN $11::boolean THEN intake_deferred_reviews.review_version+1
                              ELSE intake_deferred_reviews.review_version END,
          state=CASE WHEN excluded.state='SUPERSEDED' THEN 'SUPERSEDED'
                     WHEN intake_deferred_reviews.state='PENDING' THEN excluded.state
                     ELSE intake_deferred_reviews.state END,
          updated_at=now()`,
-      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), metadataQuality, snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash, evidenceChanged],
+      [channelId, snapshot.state, JSON.stringify(snapshot.system_snapshot), JSON.stringify(snapshot.evidence_snapshot), metadataQuality, enriched.detectedLanguages?.[0]?.language || null, snapshot.recheck_attempts, now, snapshot.next_recheck_at, evidenceHash, evidenceChanged],
     );
     if (focus.decision === 'DEFER' && priorHash && priorHash !== evidenceHash) {
       // A human AMBIGUOUS label is still actionable when the bounded recheck

@@ -152,11 +152,11 @@ LEFT JOIN LATERAL (
   SELECT country,declared_language,source_type,raw_observation,matched_document_locator
   FROM discovery_nominations
   WHERE channel_id=c.channel_id
-  ORDER BY observed_at DESC
+  ORDER BY observed_at DESC, id DESC
   LIMIT 1
 ) n ON true
 LEFT JOIN LATERAL (
-  SELECT COALESCE(NULLIF(j.payload->'candidate','{}'::jsonb), jsonb_build_object(
+  SELECT COALESCE(NULLIF(NULLIF(j.payload->'candidate','{}'::jsonb),'null'::jsonb), jsonb_build_object(
     'channelName',n.raw_observation->>'channelName',
     'youtubeUrl',n.raw_observation->>'youtubeUrl',
     'locationTag',n.raw_observation->>'locationTag',

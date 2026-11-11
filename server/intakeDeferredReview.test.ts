@@ -177,7 +177,7 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /units: 2/);
   assert.match(worker, /recheck_attempts: Number\(review\.rows\[0\]\?\.recheck_attempts \|\| 0\) \+ 1/);
   assert.match(worker, /last_evidence_hash/);
-  assert.match(worker, /review_version=CASE WHEN \$10::boolean/);
+  assert.match(worker, /review_version=CASE WHEN \$11::boolean/);
   const gate = worker.indexOf('const storedExclusion = await getCountryExclusion(channel.country)');
   const reserve = worker.indexOf("reserved = await tryReserveQuota({", gate);
   assert.ok(gate >= 0 && reserve > gate, 'country and low-audience gates must run before recheck quota reservation');
@@ -187,7 +187,8 @@ test('deferred recheck uses the durable ENRICH carrier with bounded stage-1 evid
   assert.match(worker, /clientOverride: admitClient/);
   assert.match(worker, /recheckCountry\?\.status === 'REJECTED'/);
   assert.match(worker, /metadata_quality=excluded\.metadata_quality/);
-  assert.match(worker, /\$10::boolean/);
+  assert.match(worker, /\$11::boolean/);
+  assert.match(worker, /language=COALESCE\(excluded\.language/);
   assert.match(worker, /deriveMetadataQuality\(/);
   const admitRelease = worker.indexOf('admitClient.release()');
   const admitSettlement = worker.indexOf('if (admitNeedsSettlement)', admitRelease);
