@@ -12,7 +12,7 @@ import {
 import { independentCitationCount, normalizeSemanticJudgment } from './policy';
 import type { AdmissionEvidence, SemanticJudgment } from './types';
 
-export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v1';
+export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v2';
 const ADMISSION_FEATURE_VERSION = 'semantic-admission-v1';
 const ADMISSION_PROVIDER = 'admission-semantic';
 
@@ -71,7 +71,8 @@ Critical rules:
 5. Gambling/betting (casino, roulette, martingale, sports betting, binary options) is not trading unless the creator explicitly applies it to financial-market trading with substantial market analysis.
 6. Rejection requires at least two independent, exact citations from different fields or different videos that support the same unrelated subject. If you cannot provide them, return MIXED or UNKNOWN.
 7. Do not infer from stereotypes, production quality, subscriber count, or country. Use only the evidence.
-8. If evidence is complete and still ambiguous, return UNKNOWN or MIXED. The caller will admit ambiguous candidates for downstream classification; do not force a rejection.
+8. General news, business news, politics, sports, weather, entertainment, lifestyle, and consumer channels are UNRELATED unless the creator’s main focus is market/trading analysis or execution. A business segment on a general news channel does not make the channel a trading channel.
+9. If evidence is complete and still ambiguous, return UNKNOWN or MIXED. The caller will admit ambiguous candidates for downstream classification; do not force a rejection.
 
 Return JSON only:
 {

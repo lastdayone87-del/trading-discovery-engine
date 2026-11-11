@@ -236,6 +236,22 @@ export function decideAdmission(input: {
     };
   }
 
+  // A mixed/news channel with no trading citations is not a trading creator;
+  // it is a general channel that happens to touch finance. This prevents
+  // general news/business channels from being admitted as "ambiguous".
+  if ((effective.mainSubject === 'MIXED' || effective.mainSubject === 'UNKNOWN')
+    && tradingCitations === 0
+    && unrelatedCitations >= 2
+    && valid >= 2) {
+    return {
+      decision: 'REJECT_UNRELATED',
+      status: 'REJECTED_UNRELATED',
+      reasonCodes: ['MIXED_WITHOUT_TRADING_EVIDENCE', ...effective.unrelatedDomains.map(item => `DOMAIN_${item.domain}`)],
+      rejected: true, admitted: false, hold: false, ambiguous: false,
+      citationsValid: true, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+    };
+  }
+
   if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0) {
     return {
       decision: 'REJECT_UNRELATED',
