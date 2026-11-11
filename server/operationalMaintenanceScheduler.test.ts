@@ -354,3 +354,19 @@ test('the resolution sweep is read-only unless apply is explicitly enabled', () 
   assert.equal(classificationResolutionRecoveryApplyEnabled({ CLASSIFICATION_RESOLUTION_RECOVERY_APPLY: 'false' }), false);
   assert.equal(classificationResolutionRecoveryApplyEnabled({ CLASSIFICATION_RESOLUTION_RECOVERY_APPLY: 'TRUE' }), true);
 });
+
+
+test('the resolution sweep is throttled independently of the maintenance tick', async () => {
+  const { calls, dependencies } = createDeps();
+  let now = 1_000_000;
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    now: () => now,
+    classificationResolutionSweepIntervalMs: 60_000,
+  });
+  await scheduler.run();
+  await scheduler.run();
+  assert.equal(calls.filter(call => call === 'resolution').length, 1);
+  now += 61_000;
+  await scheduler.run();
+  assert.equal(calls.filter(call => call === 'resolution').length, 2);
+});
