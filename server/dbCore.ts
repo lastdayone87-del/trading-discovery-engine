@@ -5681,22 +5681,38 @@ export function calculateEnrichmentQuotaReserve(input: EnrichmentQuotaProtection
   };
 }
 
-async function calculateProtectedEnrichmentUnitsForAutonomous(
-  client: any,
-  dailyBudget: number,
-  actualUsed: number,
-  reservedTotal: number,
-): Promise<number> {
+interface EnrichmentQuotaDemand {
+  dueStage1: number;
+  dueStage2: number;
+  recentAutonomousUnits: number;
+  recentEnrichmentUnits: number;
+}
+
+/**
+ * Read the demand estimate outside the quota_tracker row lock. The estimate is
+ * intentionally allowed to be a few milliseconds stale: holding the singleton
+ * admission lock while scanning the enrichment backlog serializes every quota
+ * reservation in the process.
+ */
+async function readEnrichmentQuotaDemand(runner: any): Promise<EnrichmentQuotaDemand> {
   const [dueEnrichment, recentConsumption] = await Promise.all([
-    client.query(
+    runner.query(
       `SELECT
-         count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)<=1
-           AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage1,
-         count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)>=2
-           AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage2
-       FROM jobs WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now()`,
+         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)<=1
+           AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage1,
+         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)>=2
+           AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage2
+       FROM jobs job
+      WHERE job.type='ENRICH_CHANNEL'
+        AND (
+          (job.status='PENDING' AND job.run_after<=now())
+          OR (job.status='PROCESSING' AND NOT EXISTS(
+            SELECT 1 FROM quota_reservations qr
+             WHERE qr.operation_type='ENRICH_CHANNEL' AND qr.operation_id=job.id::text AND qr.status='RESERVED'
+          ))
+        )`,
     ),
-    client.query(
+    runner.query(
       `SELECT allocation,COALESCE(SUM(units),0)::int AS units
          FROM quota_reservations
         WHERE status='CONSUMED' AND reserved_at>=now()-interval '7 days'
@@ -5704,14 +5720,25 @@ async function calculateProtectedEnrichmentUnitsForAutonomous(
     ),
   ]);
   const recentByAllocation = new Map<string, number>(recentConsumption.rows.map((item: any) => [String(item.allocation), Number(item.units) || 0]));
-  return calculateEnrichmentQuotaReserve({
-    dailyBudget,
-    actualUsed,
-    reservedTotal,
+  return {
     dueStage1: Number(dueEnrichment.rows[0]?.stage1) || 0,
     dueStage2: Number(dueEnrichment.rows[0]?.stage2) || 0,
     recentAutonomousUnits: recentByAllocation.get('AUTONOMOUS') || 0,
     recentEnrichmentUnits: recentByAllocation.get('ENRICHMENT') || 0,
+  };
+}
+
+function protectedEnrichmentUnitsForAutonomous(
+  dailyBudget: number,
+  actualUsed: number,
+  reservedTotal: number,
+  demand: EnrichmentQuotaDemand,
+): number {
+  return calculateEnrichmentQuotaReserve({
+    dailyBudget,
+    actualUsed,
+    reservedTotal,
+    ...demand,
   }).reserveUnits;
 }
 
@@ -5724,6 +5751,7 @@ export async function tryReserveQuota(args: {
   allocationPercent: number;
 }): Promise<boolean> {
   const db = await getDb();
+  const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -5756,12 +5784,12 @@ export async function tryReserveQuota(args: {
       [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
-    const protectedEnrichmentUnits = args.allocation === 'AUTONOMOUS'
-      ? await calculateProtectedEnrichmentUnitsForAutonomous(
-          client,
+    const protectedEnrichmentUnits = demand
+      ? protectedEnrichmentUnitsForAutonomous(
           args.dailyBudget,
           Number(row.actual_used) || 0,
           Number(row.reserved_total) || 0,
+          demand,
         )
       : 0;
     // Allocation percentages are scheduling preferences, not hard partitions.
@@ -5798,6 +5826,7 @@ export async function topUpQuotaReservation(args: {
   if (!Number.isFinite(args.additionalUnits) || args.additionalUnits <= 0) return false;
 
   const db = await getDb();
+  const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -5837,12 +5866,12 @@ export async function topUpQuotaReservation(args: {
     );
     const currentUnits = Number(existing.rows[0].units);
     const { actual_used: actualUsed, other_reserved_total: otherReservedTotal } = totals.rows[0];
-    const protectedEnrichmentUnits = args.allocation === 'AUTONOMOUS'
-      ? await calculateProtectedEnrichmentUnitsForAutonomous(
-          client,
+    const protectedEnrichmentUnits = demand
+      ? protectedEnrichmentUnitsForAutonomous(
           args.dailyBudget,
           Number(actualUsed) || 0,
           Number(otherReservedTotal) || 0,
+          demand,
         )
       : 0;
     if (Number(actualUsed) + Number(otherReservedTotal) + currentUnits + args.additionalUnits + protectedEnrichmentUnits > args.dailyBudget) {

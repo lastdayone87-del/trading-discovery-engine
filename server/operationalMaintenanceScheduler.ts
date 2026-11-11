@@ -22,6 +22,14 @@ import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJ
 export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
 export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
 
+/**
+ * The resolution sweep mutates channel/job state. It stays read-only unless an
+ * operator explicitly opts in after reviewing the dry-run report.
+ */
+export function classificationResolutionRecoveryApplyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return String(env.CLASSIFICATION_RESOLUTION_RECOVERY_APPLY || '').trim().toLowerCase() === 'true';
+}
+
 export interface OperationalMaintenanceDependencies {
   recoverStaleChannelLocks(): Promise<unknown>;
   recoverStaleInvestigationSteps(): Promise<unknown>;
@@ -319,7 +327,10 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       20,
       Date.now()
     ),
-    reconcileClassificationResolutionGaps: () => reconcileClassificationResolutionGaps({ dryRun: false, limit: 20 }),
+    reconcileClassificationResolutionGaps: () => reconcileClassificationResolutionGaps({
+      dryRun: !classificationResolutionRecoveryApplyEnabled(),
+      limit: 20,
+    }),
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
     reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)

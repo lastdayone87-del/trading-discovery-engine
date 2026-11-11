@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  classificationResolutionRecoveryApplyEnabled,
   createOperationalMaintenanceScheduler,
   type OperationalMaintenanceDependencies
 } from './operationalMaintenanceScheduler';
@@ -346,4 +347,10 @@ test('maintenance health is exposed on the queue status endpoint', () => {
   const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
   assert.match(server, /getOperationalMaintenanceSchedulerHealth/);
   assert.match(server, /operational: getOperationalMaintenanceSchedulerHealth\(\)/);
+});
+
+test('the resolution sweep is read-only unless apply is explicitly enabled', () => {
+  assert.equal(classificationResolutionRecoveryApplyEnabled({}), false);
+  assert.equal(classificationResolutionRecoveryApplyEnabled({ CLASSIFICATION_RESOLUTION_RECOVERY_APPLY: 'false' }), false);
+  assert.equal(classificationResolutionRecoveryApplyEnabled({ CLASSIFICATION_RESOLUTION_RECOVERY_APPLY: 'TRUE' }), true);
 });
