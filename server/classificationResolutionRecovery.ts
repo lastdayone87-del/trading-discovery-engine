@@ -162,6 +162,14 @@ export async function reconcileClassificationResolutionGaps(
             EXISTS(SELECT 1 FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE 'operational-enrichment-terminal:%') AS terminal_recovery_marker,
+            COALESCE(
+              (SELECT MAX(e.created_at) FROM operational_enrichment_recovery_events e
+                WHERE e.channel_id=c.channel_id
+                  AND e.event_key LIKE '${CYCLE_PREFIX}%'),
+              latest.updated_at,
+              c.last_checked,
+              c.created_at
+            ) > now()-interval '24 hours' AS recovery_cooldown_active
        FROM channels c
        LEFT JOIN LATERAL (
          SELECT job.id,job.status,job.terminal_failure_class,job.attempts,job.updated_at
@@ -187,9 +195,19 @@ export async function reconcileClassificationResolutionGaps(
              AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
              AND active.status IN('PENDING','PROCESSING')
         )
-      ORDER BY c.last_checked ASC NULLS FIRST,c.channel_id
-      LIMIT $3`,
-    [Boolean(options.includeLegacy), cutoff, limit],
+        AND ($3::boolean OR NOT (
+          COALESCE(
+            (SELECT MAX(e.created_at) FROM operational_enrichment_recovery_events e
+              WHERE e.channel_id=c.channel_id
+                AND e.event_key LIKE '${CYCLE_PREFIX}%'),
+            latest.updated_at,
+            c.last_checked,
+            c.created_at
+          ) > now()-interval '24 hours'
+        ))
+      ORDER BY recovery_cooldown_active ASC,c.last_checked ASC NULLS FIRST,c.channel_id
+      LIMIT $4`,
+    [Boolean(options.includeLegacy), cutoff, Boolean(dryRun), limit],
   );
   const items: ClassificationResolutionRecoveryItem[] = [];
   let enqueued = 0, exhaustedReviews = 0, permanentFailures = 0, skipped = 0, failures = 0;

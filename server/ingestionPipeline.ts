@@ -1077,13 +1077,13 @@ async function processChannelThroughPipelineInContext(
           decidedAt: productionClassification.decision.timestamp,
         });
         if (!review.materialized && review.reason === 'STALE_ELIGIBILITY_PROJECTION') {
-          withheldChannel.scan_status = 'FAILED';
-          await upsertChannel(withheldChannel, { preserveDiscordOnUpdate: true });
+          // A newer review projection may already own this channel. Only move
+          // a still-pending scan state and never overwrite the newer status.
+          await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
         }
       } catch (error) {
         console.error(`[ClassificationResolution] Exhausted review creation failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
-        withheldChannel.scan_status = 'FAILED';
-        await upsertChannel(withheldChannel, { preserveDiscordOnUpdate: true });
+        await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId);
       }
       const authoritativeWithheld=(await getChannelById(candidate.channelId))||withheldChannel;
       return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:authoritativeWithheld.trading_status,discordStatus:authoritativeWithheld.discord_status,discordInvite:authoritativeWithheld.discord_invite??null,channelRecord:authoritativeWithheld};

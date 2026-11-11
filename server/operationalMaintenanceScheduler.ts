@@ -337,7 +337,7 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
         limit: 20,
       });
       if (result.failures > 0) {
-        throw new Error(`Classification resolution sweep had ${result.failures} row failure(s).`);
+        throw new Error(`Classification resolution sweep had ${result.failures} row failure(s); enqueued=${result.enqueued}, exhaustedReviews=${result.exhaustedReviews}, permanentFailures=${result.permanentFailures}, skipped=${result.skipped}.`);
       }
       return result;
     },
