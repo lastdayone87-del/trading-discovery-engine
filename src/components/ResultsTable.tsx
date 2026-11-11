@@ -519,6 +519,15 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                             ✦ AI Verified
                           </span>
                         )}
+                        {c.trading_relevance_breakdown?.classification_route && (
+                          <span
+                            className="block text-[9px] text-slate-500 dark:text-slate-400 font-mono"
+                            title={c.trading_relevance_breakdown.routing_fallback_reason || c.trading_relevance_breakdown.classification_route}
+                          >
+                            {c.trading_relevance_breakdown.classification_route.replaceAll('_', ' ')}
+                            {c.trading_relevance_breakdown.human_review_candidate ? ' · review' : ''}
+                          </span>
+                        )}
                       </div>
                     </td>
 
