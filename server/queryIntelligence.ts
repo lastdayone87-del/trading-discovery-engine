@@ -87,6 +87,17 @@ import {
 } from './freeQuerySignals';
 import type { DemandSignalQueryCandidate } from './queryPlanner';
 
+/**
+ * Extracted-query discovery is paused while the semantic extractor is rebuilt.
+ * The flag is fail-closed: only the exact value `true` re-enables generation
+ * and serving. The ledger/schema stay in place for the future rewrite.
+ */
+export const EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY = 'extracted_query_discovery_enabled';
+
+export function isExtractedQueryDiscoveryEnabled(value: unknown): boolean {
+  return String(value ?? '').trim().toLowerCase() === 'true';
+}
+
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
 function getAIClient(): GoogleGenAI | null {
@@ -978,7 +989,11 @@ export async function extractVocabularyFromCreator(
   // Below-quality creators may contribute observations, but their text must
   // not become discovery queries. The same flag also keeps query-only provider
   // responses from suppressing Gemini fallback for an unusable bucket.
-  const queryCandidatesEligible = options?.promotionEligible !== false
+  const extractedQueryDiscoveryEnabled = isExtractedQueryDiscoveryEnabled(
+    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
+  );
+  const queryCandidatesEligible = extractedQueryDiscoveryEnabled
+    && options?.promotionEligible !== false
     && options?.persistLegacyTerm !== false;
   // Literal sources are built before any provider attempt. Playlist titles and
   // descriptions are first-class context candidates, never separate shadow
@@ -1888,16 +1903,23 @@ export async function generateCandidateQueriesForCountry(
   options: { scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' } = {}
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  await reconcileExtractedQueryCandidates(country).catch(error => {
-    console.warn('[Extracted Query] reconciliation failed', error instanceof Error ? error.message : String(error));
-  });
+  const extractedQueryDiscoveryEnabled = isExtractedQueryDiscoveryEnabled(
+    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
+  );
+  if (extractedQueryDiscoveryEnabled) {
+    await reconcileExtractedQueryCandidates(country).catch(error => {
+      console.warn('[Extracted Query] reconciliation failed', error instanceof Error ? error.message : String(error));
+    });
+  }
   const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates, standaloneExtractedCandidates] = await Promise.all([
     getCountryVocabularies(),
     getExtractedVocabulary(country),
     getQueriesByCountry(country),
     getPlannerTerminology(country),
     getPublishedOrganicQueryCandidates(country),
-    getStandaloneExtractedQueryCandidates(country)
+    extractedQueryDiscoveryEnabled
+      ? getStandaloneExtractedQueryCandidates(country)
+      : Promise.resolve([])
   ]);
   // Reconcile ledger rows against existing query text before planning. A
   // transient link failure then self-heals instead of stranding outcomes, and
