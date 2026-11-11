@@ -171,6 +171,7 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
     recentProviderCalls,
     keysAtCap,
     unresolvedCompletedRows,
+    demand,
   ] = await Promise.all([
     db.query(`SELECT trading_status AS key,count(*)::int AS count FROM channels GROUP BY trading_status`),
     db.query(`SELECT scan_status AS key,count(*)::int AS count FROM channels GROUP BY scan_status`),
@@ -259,8 +260,8 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
       [quotaDay, ENFORCED_CAP_UNITS],
     ),
     db.query(`SELECT count(*)::int AS count FROM channels WHERE trading_status='UNCERTAIN' AND scan_status='COMPLETED'`),
+    readEnrichmentQuotaDemand(db),
   ]);
-  const demand = await readEnrichmentQuotaDemand(db);
   const jobsByStatus = countMap(enrichmentJobs.rows);
   const reviewsByState = countMap(reviewStates.rows);
   const quota = quotaRow.rows[0] || { units_used: 0, daily_limit: 0, last_reset: '' };

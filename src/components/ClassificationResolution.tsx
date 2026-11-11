@@ -59,11 +59,13 @@ export const ClassificationResolution: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestId = useRef(0);
+  const inFlight = useRef(false);
 
   const load = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     const id = ++requestId.current;
     setLoading(true);
-    setError(null);
     try {
       const response = await apiFetch('/api/classification/resolution');
       if (!response.ok) {
@@ -71,11 +73,18 @@ export const ClassificationResolution: React.FC = () => {
         throw new Error(body.error || `Could not load classification resolution metrics (${response.status}).`);
       }
       const next = await response.json() as ResolutionOverview;
-      if (id === requestId.current) setData(next);
+      if (id === requestId.current) {
+        setData(next);
+        setError(null);
+      }
     } catch (err) {
-      if (id === requestId.current) setError(err instanceof Error ? err.message : 'Could not load classification resolution metrics.');
+      if (id === requestId.current) {
+        const message = err instanceof Error ? err.message : 'Could not load classification resolution metrics.';
+        setError(previous => previous === message ? previous : message);
+      }
     } finally {
       if (id === requestId.current) setLoading(false);
+      inFlight.current = false;
     }
   }, []);
 
