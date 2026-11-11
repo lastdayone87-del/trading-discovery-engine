@@ -45,7 +45,7 @@ test('an unknown terminal failure is sent to human review instead of being retri
   assert.deepEqual(decision.reasonCodes, ['UNKNOWN_TERMINAL_FAILURE_REQUIRES_REVIEW']);
 });
 
-test('unknown-age legacy rows never bypass the forward-only cutoff', () => {
+test('unknown-age legacy rows are skipped unless includeLegacy is set', () => {
   assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: null, createdAt: null }).action, 'SKIP_LEGACY');
   assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: null, createdAt: '2026-11-09T00:00:00.000Z' }).action, 'ENQUEUE_RECOVERY');
   assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: null, createdAt: null, includeLegacy: true }).action, 'ENQUEUE_RECOVERY');

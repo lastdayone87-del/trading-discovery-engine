@@ -198,8 +198,9 @@ export function createOperationalMaintenanceScheduler(
       lastClassificationResolutionSweepMs = nowMs;
       await isolate('classification_resolution_gaps', async () => {
         const result = await dependencies.reconcileClassificationResolutionGaps() as
-          { enqueued?: number; exhaustedReviews?: number; permanentFailures?: number } | undefined;
-        if ((result?.enqueued || 0) + (result?.exhaustedReviews || 0) + (result?.permanentFailures || 0) > 0) {
+          { dryRun?: boolean; enqueued?: number; exhaustedReviews?: number; permanentFailures?: number } | undefined;
+        if (result?.dryRun !== true
+          && (result?.enqueued || 0) + (result?.exhaustedReviews || 0) + (result?.permanentFailures || 0) > 0) {
           console.info('[Operational Maintenance] classification resolution recovery', result);
         }
       });
@@ -327,10 +328,16 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       20,
       Date.now()
     ),
-    reconcileClassificationResolutionGaps: () => reconcileClassificationResolutionGaps({
-      dryRun: !classificationResolutionRecoveryApplyEnabled(),
-      limit: 20,
-    }),
+    reconcileClassificationResolutionGaps: async () => {
+      const result = await reconcileClassificationResolutionGaps({
+        dryRun: !classificationResolutionRecoveryApplyEnabled(),
+        limit: 20,
+      });
+      if (result.failures > 0) {
+        throw new Error(`Classification resolution sweep had ${result.failures} row failure(s).`);
+      }
+      return result;
+    },
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
     reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)

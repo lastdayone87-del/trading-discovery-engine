@@ -5751,6 +5751,15 @@ export async function tryReserveQuota(args: {
   allocationPercent: number;
 }): Promise<boolean> {
   const db = await getDb();
+  // Retries of an already-funded operation should not repeat the backlog and
+  // seven-day consumption scans before the transaction's cheap re-check.
+  const alreadyReserved = await db.query(
+    `SELECT 1 FROM quota_reservations
+      WHERE operation_type=$1 AND operation_id=$2 AND status='RESERVED'
+        AND expires_at>now() AND units>=$3 LIMIT 1`,
+    [args.operationType, args.operationId, args.units],
+  );
+  if (alreadyReserved.rowCount) return true;
   const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {

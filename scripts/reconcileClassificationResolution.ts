@@ -24,6 +24,10 @@ async function main() {
       cutoff,
     });
     console.log(JSON.stringify(result, null, 2));
+    if (result.failures > 0) {
+      console.error(`Recovery completed with ${result.failures} row failure(s); inspect the warnings above.`);
+      process.exitCode = 1;
+    }
     if (!apply) {
       console.error('DRY RUN ONLY. Re-run with --apply after explicit production approval.');
     }
