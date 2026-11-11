@@ -17,3 +17,12 @@ test('classification remains gated while enrichment gets only the probe', () => 
   assert.match(source, /if \(enrichmentFullyClaimable && \(!claimableOverride/);
   assert.match(source, /stage-1\/2 evidence is persisted before the semantic attempt/);
 });
+
+test('probe-only claims are restricted to unhydrated stage-1/2 jobs', () => {
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(dbCore, /enrichProbeOnly=false/);
+  assert.match(dbCore, /NOT \$5::boolean OR type <> 'ENRICH_CHANNEL'/);
+  assert.match(queue, /enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable/);
+  assert.match(queue, /RESOLUTION_CLAIM_BUDGET_GUARDS\], enrichProbeOnly/);
+});

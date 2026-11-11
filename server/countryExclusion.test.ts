@@ -117,6 +117,8 @@ test('operational recovery with unknown channel country yields a claimable null-
   assert.equal(payload.targetCountry, null);
   assert.equal(payload.candidate.locationTag, null);
   assert.ok(!JSON.stringify(payload).includes('United States'), 'no default country may be invented anywhere in the payload');
+  assert.equal(payload.candidate.enrichmentStage, 0, 'recovery must force fresh metadata acquisition');
+  assert.equal(payload.enrichmentStage, 1);
   // The resulting payload must pass the same country gate the ENRICH worker enforces.
   await assertCountryAllowed(payload.targetCountry, 'enrichment_worker:recovery-regression');
 });
