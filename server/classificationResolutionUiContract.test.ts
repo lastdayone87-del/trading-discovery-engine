@@ -25,6 +25,11 @@ test('the resolution panel follows routing, enrichment, recovery, review and quo
   assert.match(ui, /Eligible without review/);
   assert.match(ui, /Quota protected/);
   assert.match(ui, /capped at/);
+  assert.match(ui, /value=\{n\(data\.channels\.total\)\}/);
+  assert.match(ui, /value=\{n\(data\.enrichment\.due\)\}/);
+  assert.match(ui, /value=\{n\(data\.reviews\.pending\)\}/);
+  assert.match(ui, /value=\{pct\(data\.quota\.protectedShare\)\}/);
+  assert.match(app, /activeTab === 'resolution'[\s\S]{0,120}<ClassificationResolution \/>/);
   assert.match(ui, /Routes/);
   assert.match(ui, /Alerts/);
 });

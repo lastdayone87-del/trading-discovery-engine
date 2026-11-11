@@ -67,5 +67,5 @@ No legacy row has a pending review. These rows predate the forward-recovery cuto
 
 - The dry-run script defaults to no writes; `--apply` requires explicit operator approval. A dry run never creates the cutoff row.
 - The maintenance sweep is forward-only until its cutoff; legacy rows are not mutated.
-- The maintenance sweep is read-only unless `CLASSIFICATION_RESOLUTION_RECOVERY_APPLY=true` is set. Absent or any other value keeps the scheduled sweep in dry-run mode.
+- The maintenance sweep is read-only unless `CLASSIFICATION_RESOLUTION_RECOVERY_APPLY` is set to `true` after trimming surrounding whitespace and comparing case-insensitively. Absent, false, or any other value keeps the scheduled sweep in dry-run mode.
 - No worker, provider, key, or evidence-threshold changes are part of this report.

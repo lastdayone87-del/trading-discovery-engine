@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { buildResolutionAlerts } from './classificationResolutionMonitoring';
-
-const source = readFileSync(new URL('./classificationResolutionMonitoring.ts', import.meta.url), 'utf8');
+import { buildResolutionAlerts, getClassificationResolutionOverview } from './classificationResolutionMonitoring';
+import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 
 const base = {
   dueEnrichment: 0,
@@ -57,19 +56,70 @@ test('an aged review queue is warned before it becomes critical', () => {
 });
 
 
-test('overview queries use the same job set and recovery ledger as the writers', () => {
-  assert.match(source, /j\.type IN\('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN'\)/);
-  assert.match(source, /event_key LIKE 'operational-enrichment:%'/);
-  assert.match(source, /now\(\)-run_after/);
-  assert.match(source, /dueStage1 \+ dueStage2/);
-  assert.match(source, /job\.status='PROCESSING'/);
-  assert.match(source, /job\.status='PENDING'/);
-});
+test('overview computes due work, routes, reviews and quota from query results', async () => {
+  const quotaDay = getYouTubeQuotaDay();
+  const results: any[][] = [
+    [{ key: 'UNCERTAIN', count: 10 }, { key: 'NEEDS_REVIEW', count: 2 }],
+    [{ key: 'FAILED', count: 3 }],
+    [{ key: 'ENRICH', recognition: 'AMBIGUOUS_THIN', semantic_used: 'false', semantic_attempted: 'true', count: 4 }],
+    [{ key: 'PENDING', count: 5, oldest_due_hours: 12 }, { key: 'PROCESSING', count: 1, oldest_due_hours: 0 }],
+    [{ count: 5 }],
+    [{ count: 2 }],
+    [{ count: 7 }],
+    [{ count: 4 }],
+    [{ key: 'PENDING', count: 4, oldest_days: 8 }],
+    [{ key: 'ELIGIBLE', count: 6 }],
+    [{ count: 1 }],
+    [{ units_used: 100, daily_limit: 1000, last_reset: quotaDay }],
+    [{ reserved: 50 }],
+    [{ setting_value: 'true' }],
+    [{ stage1: 10, stage2: 2 }],
+    [{ allocation: 'AUTONOMOUS', units: 100 }, { allocation: 'ENRICHMENT', units: 50 }],
+    [{ count: 25 }],
+    [{ count: 5 }],
+    [{ count: 3 }],
+  ];
+  let index = 0;
+  const overview = await getClassificationResolutionOverview({
+    query: async () => ({ rows: results[index++] || [] }),
+  });
 
-test('key-cap alert counts settled usage plus live leases and requires enforcement', () => {
-  assert.match(source, /youtube_key_daily_cap_enforced/);
-  assert.match(source, /youtube_key_cap_shadow_leases/);
-  assert.match(source, /hardCapEnforced && String\(quota\.last_reset\) === quotaDay/);
-  assert.match(source, /deterministicRouting' \? 'semanticUsed'/);
-  assert.match(source, /gemini_semantic','groq_semantic','gemini_free_semantic/);
+  assert.equal(overview.channels.total, 12);
+  assert.equal(overview.channels.uncertain, 10);
+  assert.equal(overview.channels.needsReview, 2);
+  assert.equal(overview.enrichment.due, 12);
+  assert.equal(overview.enrichment.pending, 5);
+  assert.equal(overview.enrichment.processing, 1);
+  assert.equal(overview.enrichment.oldestDueHours, 12);
+  assert.equal(overview.enrichment.orphanPending, 5);
+  assert.equal(overview.enrichment.genericFailures, 2);
+  assert.equal(overview.enrichment.recoveryCycles24h, 7);
+  assert.equal(overview.enrichment.exhaustionReviewsPending, 4);
+  assert.equal(overview.reviews.pending, 4);
+  assert.equal(overview.reviews.oldestPendingDays, 8);
+  assert.equal(overview.reviews.eligible, 6);
+  assert.equal(overview.reviews.eligibleWithoutPendingReview, 1);
+  assert.equal(overview.routes.byRoute.ENRICH, 4);
+  assert.equal(overview.routes.byRecognition.AMBIGUOUS_THIN, 4);
+  assert.equal(overview.routes.semanticUsed, 0);
+  assert.equal(overview.routes.semanticAttempted, 4);
+  assert.equal(overview.quota.dailyLimit, 1000);
+  assert.equal(overview.quota.used, 100);
+  assert.equal(overview.quota.dueStage1, 10);
+  assert.equal(overview.quota.dueStage2, 2);
+  assert.equal(overview.quota.recentAutonomousUnits, 100);
+  assert.equal(overview.quota.recentEnrichmentUnits, 50);
+  assert.deepEqual(
+    overview.alerts.map(alert => alert.code),
+    [
+      'ENRICHMENT_BACKLOG_AGED',
+      'ORPHAN_ENRICHMENT_PENDING',
+      'GENERIC_TERMINAL_FAILURES',
+      'UNRESOLVED_COMPLETED',
+      'ELIGIBLE_REVIEW_WITHOUT_PENDING',
+      'REVIEW_QUEUE_AGED',
+      'SEMANTIC_ROUTE_PRESSURE',
+      'YOUTUBE_KEYS_AT_CAP',
+    ],
+  );
 });

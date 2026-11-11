@@ -147,8 +147,8 @@ export function buildResolutionAlerts(input: {
   return alerts;
 }
 
-export async function getClassificationResolutionOverview(): Promise<ClassificationResolutionOverview> {
-  const db = await getDb();
+export async function getClassificationResolutionOverview(dbOverride?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: any[] }> }): Promise<ClassificationResolutionOverview> {
+  const db: any = dbOverride || await getDb();
   const quotaDay = getYouTubeQuotaDay();
   const [
     channelStatus,
@@ -278,13 +278,13 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
   ]);
   const jobsByStatus = countMap(enrichmentJobs.rows);
   const reviewsByState = countMap(reviewStates.rows);
-  const recentByAllocation = new Map(recentConsumption.rows.map(row => [String(row.allocation), Number(row.units) || 0]));
+  const recentByAllocation = new Map<string, number>(recentConsumption.rows.map((row: any) => [String(row.allocation), Number(row.units) || 0]));
   const quota = quotaRow.rows[0] || { units_used: 0, daily_limit: 0, last_reset: '' };
   const hardCapEnforced = String(hardCapSetting.rows[0]?.setting_value || '').toLowerCase() === 'true';
   const quotaUsed = String(quota.last_reset) === quotaDay ? Number(quota.units_used) || 0 : 0;
   const keysAtCapCount = hardCapEnforced && String(quota.last_reset) === quotaDay ? Number(keysAtCap.rows[0]?.count || 0) : 0;
-  const dueStage1 = Number(dueStage.rows[0]?.stage1 || 0);
-  const dueStage2 = Number(dueStage.rows[0]?.stage2 || 0);
+  const dueStage1: number = Number(dueStage.rows[0]?.stage1 || 0);
+  const dueStage2: number = Number(dueStage.rows[0]?.stage2 || 0);
   const protection = calculateEnrichmentQuotaReserve({
     dailyBudget: Number(quota.daily_limit) || 0,
     actualUsed: quotaUsed,
