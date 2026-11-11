@@ -71,6 +71,8 @@ export interface OperationalMaintenanceSchedulerOptions {
   clearTimer?: (timer: unknown) => void;
   /** Interval for the delayed classification-sighting sweep. */
   classificationSightingSweepIntervalMs?: number;
+  /** Interval for the classification-resolution sweep. */
+  classificationResolutionSweepIntervalMs?: number;
   /** Warn when a single sweep remains in flight longer than this. */
   watchdogMs?: number;
   setWatchdog?: (callback: () => void, delayMs: number) => unknown;
@@ -86,6 +88,7 @@ export function createOperationalMaintenanceScheduler(
   options: OperationalMaintenanceSchedulerOptions = {}
 ): OperationalMaintenanceScheduler {
   const intervalMs = options.intervalMs ?? OPERATIONAL_MAINTENANCE_INTERVAL_MS;
+  const classificationResolutionSweepIntervalMs = options.classificationResolutionSweepIntervalMs ?? CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS;
   const classificationSightingSweepIntervalMs = options.classificationSightingSweepIntervalMs ?? 60_000;
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback: () => void, delayMs: number) => {
@@ -194,7 +197,7 @@ export function createOperationalMaintenanceScheduler(
     await isolate('provider_deferred_projection', () => dependencies.projectProviderDeferredEnrichment());
     await isolate('operational_enrichment_recovery', () => dependencies.reconcileOperationalEnrichmentRecovery());
     if (lastClassificationResolutionSweepMs === null
-      || nowMs - lastClassificationResolutionSweepMs >= CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS) {
+      || nowMs - lastClassificationResolutionSweepMs >= classificationResolutionSweepIntervalMs) {
       lastClassificationResolutionSweepMs = nowMs;
       await isolate('classification_resolution_gaps', async () => {
         const result = await dependencies.reconcileClassificationResolutionGaps() as
