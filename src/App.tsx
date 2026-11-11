@@ -11,10 +11,11 @@ import { CountrySettings } from './components/CountrySettings';
 import { InspectionModal } from './components/InspectionModal';
 import { QueryIntelligenceEngine } from './components/QueryIntelligenceEngine';
 import { RegressionSuiteDashboard } from './components/RegressionSuiteDashboard';
+import IntakeDeferredReview from './components/IntakeDeferredReview';
 import { channelListingSearchParams } from './channelListingQuery';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'results' | 'pending' | 'queues' | 'settings'>('discovery');
+  const [activeTab, setActiveTab] = useState<'discovery' | 'intelligence' | 'regression' | 'deferred' | 'results' | 'pending' | 'queues' | 'settings'>('discovery');
 
 
   const [channels, setChannels] = useState<ChannelRecord[]>([]);
@@ -308,6 +309,8 @@ export default function App() {
         {activeTab === 'regression' && (
           <RegressionSuiteDashboard />
         )}
+
+        {activeTab === 'deferred' && <IntakeDeferredReview />}
 
 
         {activeTab === 'results' && (

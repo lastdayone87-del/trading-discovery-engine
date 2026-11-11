@@ -38,6 +38,7 @@ import {assignRelease5Serving} from './release5/rollout';
 import { deterministicUuid, entityChecksum, observeYouTubeChannelEntity, sourceFamilyIdentity } from './entityResolution';
 import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProviders, manualRecheckDegradedError } from './enrichmentOperationalFailure';
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
+import { deriveMetadataQuality, recordIntakeDeferredReview } from './intakeDeferredReview';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
@@ -688,6 +689,30 @@ async function processChannelThroughPipelineInContext(
       console.warn(`[Unified Ingestion Pipeline - Triage] Country validation failed for deferred '${candidate.channelName}'; preserving intake deferral:`, error instanceof Error ? error.message : error);
     }
     const deferredCreatorCountry = deferredCountry?.detectedCreatorCountry || existing?.country || '';
+    // A human TRADING approval hands the channel to ENRICHMENT_PENDING with a
+    // queued enrichment job. Preserve that handoff when rediscovery runs before
+    // the job starts; otherwise sparse evidence can send it back to deferred and
+    // the queued job will skip it.
+    const handoffChannel = existing ? await getChannelById(existing.channel_id) : null;
+    if (handoffChannel && handoffChannel.scan_status === 'ENRICHMENT_PENDING' && deferredCountry?.status !== 'REJECTED') {
+      const activeEnrichment = await hasActiveEnrichmentJob(handoffChannel.channel_id, options?.jobId).catch(() => true);
+      if (activeEnrichment) {
+        return {
+          channelId: candidate.channelId,
+          channelName: candidate.channelName,
+          isNew: false,
+          wasKnown: true,
+          persisted: true,
+          countryStatus: handoffChannel.country_status as IngestionPipelineOutcome['countryStatus'],
+          detectedCountry: handoffChannel.country || null,
+          tradingStatus: handoffChannel.trading_status || 'UNCERTAIN',
+          discordStatus: handoffChannel.discord_status,
+          discordInvite: handoffChannel.discord_invite || null,
+          channelRecord: handoffChannel,
+          skippedTerminalState: true,
+        };
+      }
+    }
     if (existing && (existing.trading_status === 'TRADING_CONFIRMED' || existing.scan_status === 'COMPLETED' || isTerminalState(existing))) {
       // Preserve the trading decision but never skip fresh country evidence.
       if (deferredCountry?.status === 'REJECTED' && deferredCreatorCountry) {
@@ -827,6 +852,34 @@ async function processChannelThroughPipelineInContext(
     }
     const deferredWrite = await upsertChannelWithResult(intakeChannel, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
     const deferred = deferredWrite ? intakeChannel : (await getChannelById(candidate.channelId) || intakeChannel);
+    if (deferredWrite && retrievalTriage.focus) {
+      const metadataQuality = deriveMetadataQuality({
+        description: candidate.description,
+        videoTitles: candidate.videoTitles,
+        videoDescriptions: candidate.videoDescriptions,
+      });
+      await recordIntakeDeferredReview({
+        channelId: candidate.channelId,
+        targetCountry,
+        source,
+        candidate: {
+          channelName: candidate.channelName,
+          youtubeUrl: candidate.youtubeUrl,
+          description: candidate.description,
+          videoTitles: candidate.videoTitles,
+          videoDescriptions: candidate.videoDescriptions,
+          matchedDocument: candidate.matchedDocument,
+          channelLinks: candidate.channelLinks,
+          subscriberCount: candidate.subscriberCount,
+          locationTag: candidate.locationTag,
+        },
+        focus: retrievalTriage.focus,
+        countryStatus: deferred.country_status,
+        country: deferred.country,
+        language: candidate.detectedLanguages?.[0]?.language || null,
+        metadataQuality,
+      });
+    }
     return {
       channelId: candidate.channelId,
       channelName: candidate.channelName,
