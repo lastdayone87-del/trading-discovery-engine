@@ -338,7 +338,7 @@ async function runOperationalEnrichmentReconciliation(
     }
     // A stored known-low count must not re-enter enrichment through recovery:
     // project the low-audience skip instead of re-enqueueing.
-    if (evaluateLowAudienceGate(channel.subscriber_count).shouldSkipDeepEnrichment) {
+    if (evaluateLowAudienceGate(channel.subscriber_count, 30, channel.subscriber_count_hidden === true).shouldSkipDeepEnrichment) {
       const skipNow = new Date(now).toISOString();
       await upsertChannel({...channel,subscriber_count:channel.subscriber_count,scan_status:'SKIPPED_LOW_AUDIENCE',last_checked:skipNow,inspection_trail:[...(channel.inspection_trail||[]),{step:'BIO',title:'Low-Audience Budget Gate',status:'SKIPPED',details:`Subscribers: ${channel.subscriber_count} (< 30). Stored and skipped deep enrichment.`,timestamp:skipNow}]});
       reconciled++;

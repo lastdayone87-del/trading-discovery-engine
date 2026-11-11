@@ -62,6 +62,8 @@ import {
   type DurableJob,
   insertChannelIfAbsent,
   deleteClassificationPlaceholder,
+  updateChannelSubscriberEvidence,
+  markChannelAudienceEvidenceFailed,
   getClassificationBackpressureState,
   hasActiveClassificationJob,
   hasActiveEnrichmentJob,
@@ -91,6 +93,7 @@ import { calculateQueryFunnel, countDeferredRawResults, manualSearchContinuation
 import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { ensureSubscriberEvidence, applyChannelSubscriberEvidenceToCandidate, applySubscriberEvidenceToChannel } from './subscriberEvidence';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { shouldEnqueueDiscordEvidenceReclassification, validatedDiscordEvidenceInvite } from './discordEvidence';
@@ -1186,8 +1189,54 @@ export async function admitDiscoveredChannel(input: {
   backpressure: ClassificationBackpressureState;
   existing?: ChannelRecord | null;
 }): Promise<{ outcome: ProcessDiscoveredChannelOutcome | null; pending: boolean }> {
-  const { raw, targetCountry, source, backpressure } = input;
-  const existing = input.existing === undefined ? await getChannelById(raw.channelId) : input.existing;
+  const { targetCountry, source, backpressure } = input;
+  const existing = input.existing === undefined ? await getChannelById(input.raw.channelId) : input.existing;
+  let raw = applyChannelSubscriberEvidenceToCandidate(input.raw, existing);
+  // Audience evidence is resolved once, before any provisional row or
+  // classification job exists. The same count then travels in the job payload
+  // and is reused by classification, defer/withhold, and enrichment.
+  const audience = await ensureSubscriberEvidence(raw, { allowPublicFallback: true });
+  raw = audience.candidate;
+  if (audience.state === 'FAILED') {
+    const failedAt = new Date().toISOString();
+    console.warn(JSON.stringify({
+      event: 'subscriber_evidence_failed',
+      channelId: raw.channelId,
+      source,
+      attempts: audience.attempts,
+      timestamp: failedAt,
+    }));
+    if (existing) {
+      const terminalized = await markChannelAudienceEvidenceFailed(existing.channel_id, audience.attempts, failedAt);
+      if (terminalized) {
+        existing.scan_status = 'FAILED_PERMANENT';
+        existing.last_checked = failedAt;
+      }
+    }
+    return {
+      outcome: {
+        channelId: raw.channelId,
+        channelName: raw.channelName,
+        isNew: !existing,
+        wasKnown: Boolean(existing),
+        persisted: Boolean(existing),
+        countryStatus: existing?.country_status || 'UNCERTAIN',
+        tradingStatus: existing?.trading_status || 'UNCERTAIN',
+        discordStatus: existing?.discord_status || 'NOT_FOUND',
+        discordInvite: existing?.discord_invite || null,
+        channelRecord: existing || undefined,
+      },
+      pending: false,
+    };
+  }
+  if (existing && (audience.state === 'HIDDEN'
+    || (raw.subscriberCount && raw.subscriberCount !== existing.subscriber_count))) {
+    await updateChannelSubscriberEvidence(existing.channel_id, {
+      subscriberCount: audience.state === 'KNOWN' ? raw.subscriberCount : undefined,
+      hidden: audience.state === 'HIDDEN',
+    });
+    applySubscriberEvidenceToChannel(existing, raw);
+  }
   // A confirmed trading row must not be classified again, but an unresolved
   // creator country still gets the deterministic Gate-1 pass through the
   // normal pipeline. This keeps country policy current without semantic spend.
@@ -1218,7 +1267,7 @@ export async function admitDiscoveredChannel(input: {
   if (
     existing
     && shouldPreserveExistingChannel(existing, source, false)
-    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount), existing.trading_status)
+    && !shouldReclassifyPreservedCompletedChannel(existing.scan_status, evaluateLowAudienceGate(raw.subscriberCount, 30, raw.subscriberCountHidden === true), existing.trading_status)
   ) {
     // Preserved rows still need the legacy repair pass: a retried search job
     // may be repairing vocabulary that failed after its observation committed,
@@ -1227,6 +1276,10 @@ export async function admitDiscoveredChannel(input: {
     let metadataUpdated = false;
     if (raw.subscriberCount && raw.subscriberCount !== existing.subscriber_count) {
       existing.subscriber_count = raw.subscriberCount;
+      metadataUpdated = true;
+    }
+    if (raw.subscriberCountHidden === true && existing.subscriber_count_hidden !== true) {
+      existing.subscriber_count_hidden = true;
       metadataUpdated = true;
     }
     if (raw.channelThumbnailUrl && raw.channelThumbnailUrl !== existing.channel_thumbnail_url) {
@@ -1736,8 +1789,8 @@ export async function processNextSearchJob(
       // A stale queued candidate must not override the stored row: skip when
       // EITHER the candidate or the stored count is known-low. Hydration runs
       // only when both are unavailable.
-      const claimCandidateGate = evaluateLowAudienceGate(candidate.subscriberCount ?? undefined);
-      const claimStoredGate = evaluateLowAudienceGate(channel.subscriber_count ?? undefined);
+      const claimCandidateGate = evaluateLowAudienceGate(candidate.subscriberCount ?? undefined, 30, candidate.subscriberCountHidden === true);
+      const claimStoredGate = evaluateLowAudienceGate(channel.subscriber_count ?? undefined, 30, channel.subscriber_count_hidden === true);
       let claimAudienceGate = claimCandidateGate.shouldSkipDeepEnrichment ? claimCandidateGate : claimStoredGate;
       let claimHydrationUnits = 0;
       let claimHydrationChanged = false;
@@ -1752,7 +1805,10 @@ export async function processNextSearchJob(
         const beforeLinks = [...(candidate.channelLinks || [])];
         try {
           const hydrated = await fetchYouTubeChannelCountryMetadata(channelId, candidate);
-          if (hydrated.subscriberCount && hydrated.subscriberCount !== candidate.subscriberCount) {
+          if (hydrated.subscriberCountHidden === true) {
+            candidate.subscriberCountHidden = true;
+            claimAudienceGate = evaluateLowAudienceGate(undefined, 30, true);
+          } else if (hydrated.subscriberCount && hydrated.subscriberCount !== candidate.subscriberCount) {
             candidate.subscriberCount = hydrated.subscriberCount;
             claimHydratedSubscriberCount = hydrated.subscriberCount;
             claimAudienceGate = evaluateLowAudienceGate(hydrated.subscriberCount);
@@ -1799,7 +1855,7 @@ export async function processNextSearchJob(
             (candidate as any).publicAboutAttempts = storedAttempts + 1;
             if (liveAbout && applyPublicAboutToCandidate(candidate, liveAbout)) {
               (candidate as any).publicAboutStatus = 'ATTEMPTED_SUCCEEDED';
-              claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+              claimAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount, 30, candidate.subscriberCountHidden === true);
               if (candidate.subscriberCount !== beforePublicSub) {
                 claimHydratedSubscriberCount = candidate.subscriberCount;
               }
@@ -1838,6 +1894,10 @@ export async function processNextSearchJob(
           channel.subscriber_count = subscriberCount;
           persistClaimHydration = true;
         }
+      }
+      if (candidate.subscriberCountHidden === true && channel.subscriber_count_hidden !== true) {
+        channel.subscriber_count_hidden = true;
+        persistClaimHydration = true;
       }
       if (persistClaimHydration) await upsertChannel(channel);
       // Hydration may have upgraded an UNCERTAIN creator into a CONFIRMED
@@ -3455,7 +3515,7 @@ export async function enqueueDiscordEvidenceReclassification(
   // channel below 30 subscribers. The pipeline gate enforces the same rule;
   // stop before creating even the classification job.
   const audienceCount = rawDetails?.subscriberCount ?? channel.subscriber_count;
-  if (evaluateLowAudienceGate(audienceCount == null ? undefined : String(audienceCount)).shouldSkipDeepEnrichment) {
+  if (evaluateLowAudienceGate(audienceCount == null ? undefined : String(audienceCount), 30, rawDetails?.subscriberCountHidden === true || channel.subscriber_count_hidden === true).shouldSkipDeepEnrichment) {
     return false;
   }
   const invite = validatedDiscordEvidenceInvite(channel);
@@ -4443,8 +4503,8 @@ export function operationalEnrichmentRecoveryKey(channelId:string):string{return
  * country is ever invented here. Extracted so the mapping is unit-testable
  * without a database; the enqueue path itself is unchanged.
  */
-export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'channel_thumbnail_url'>,reasonCodes:string[]){
-  return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:0},recoveryReasonCodes:reasonCodes};
+export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRecord,'channel_id'|'channel_name'|'youtube_url'|'country'|'discovery_source'|'subscriber_count'|'subscriber_count_hidden'|'channel_thumbnail_url'>,reasonCodes:string[]){
+  return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,subscriberCountHidden:channel.subscriber_count_hidden === true,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:0},recoveryReasonCodes:reasonCodes};
 }
 export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<boolean>{
   const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:30,maxAttempts:4,clientOverride});
@@ -4860,7 +4920,7 @@ export async function triggerManualRecheck(
 
   // A stored known-low audience count must not spend recheck quota: the
   // low-audience gate would skip this channel before any enrichment work.
-  if (evaluateLowAudienceGate(channel.subscriber_count).shouldSkipDeepEnrichment) {
+  if (evaluateLowAudienceGate(channel.subscriber_count, 30, channel.subscriber_count_hidden === true).shouldSkipDeepEnrichment) {
     return { success: false, message: `Manual re-scan skipped: ${channel.subscriber_count} subscribers is below the 30-subscriber budget gate.`, code: 'MANUAL_RESCAN_LOW_AUDIENCE_SKIP', retryable: false, channel };
   }
 
@@ -4958,7 +5018,7 @@ export async function triggerManualRecheck(
       if (canContinueCommunityInspectionAfterDegradedManualClassification({
         existingTradingStatus: preserved.trading_status,
         errorCode: code
-      }) && !evaluateLowAudienceGate(preserved.subscriber_count).shouldSkipDeepEnrichment) {
+      }) && !evaluateLowAudienceGate(preserved.subscriber_count, 30, preserved.subscriber_count_hidden === true).shouldSkipDeepEnrichment) {
         console.warn(`[Manual Recheck] Gemini classification coverage is degraded for already-confirmed trading creator ${channelId}; preserving TRADING_CONFIRMED and continuing fresh community inspection.`);
         try {
           preserved.trading_status = 'TRADING_CONFIRMED';

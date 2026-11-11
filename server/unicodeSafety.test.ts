@@ -153,9 +153,9 @@ test('insert-only writes use a contiguous parameter list', async () => {
   await writeChannelUpsert(client as never, channelWithSurrogates(), { insertOnly: true });
   const placeholders = [...sql.matchAll(/\$(\d+)/g)].map(match => Number(match[1]));
   const distinct = [...new Set(placeholders)].sort((a, b) => a - b);
-  assert.deepEqual(distinct, Array.from({ length: 49 }, (_, index) => index + 1), 'insert-only placeholders must be contiguous');
-  assert.equal(params.length, 49, 'insert-only mode omits the DO UPDATE-only preserve flag');
-  assert.doesNotMatch(sql, /\$50/, 'insert-only mode must not leave a placeholder gap');
+  assert.deepEqual(distinct, Array.from({ length: 50 }, (_, index) => index + 1), 'insert-only placeholders must be contiguous');
+  assert.equal(params.length, 50, 'insert-only mode omits the DO UPDATE-only preserve flag');
+  assert.doesNotMatch(sql, /\$51/, 'insert-only mode must not leave a placeholder gap');
   assert.match(sql, /ON CONFLICT\(channel_id\) DO NOTHING/);
 });
 
