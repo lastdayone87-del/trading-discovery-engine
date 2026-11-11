@@ -278,6 +278,21 @@ export async function runRetryBacklogTriageApply(
       });
     }
   } else {
+    // Acquire every channel lock in sorted order before processing the batch.
+    // Runs then share one global lock order, so two bounded applies cannot
+    // deadlock by locking the same channels in opposite job order.
+    const channelIds = [...new Set(
+      selected
+        .map(candidate => candidate.evidence.channelId)
+        .filter((channelId): channelId is string => Boolean(channelId)),
+    )].sort();
+    for (const channelId of channelIds) {
+      await db.query(
+        'SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE',
+        [channelId],
+      );
+    }
+
     for (const candidate of selected) {
       const evidence = candidate.evidence;
       if (candidate.bucket === 'TERMINAL') {
@@ -286,16 +301,8 @@ export async function runRetryBacklogTriageApply(
           closedAt,
           actor,
         }, closedAt);
-        // Lock the channel evidence row so it cannot change between the
-        // statement-time guard and commit.
-        if (evidence.channelId) {
-          await db.query(
-            'SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE',
-            [evidence.channelId],
-          );
-        }
         // Re-check the reason-specific channel/job evidence at statement time;
-        // the job row is locked, but a channel policy update is not.
+        // the job and channel rows are locked for the batch.
         const evidenceGuard = candidate.reason === 'OUT_OF_SCOPE'
           ? `AND EXISTS (
                SELECT 1 FROM channels c
@@ -361,10 +368,10 @@ export async function runRetryBacklogTriageApply(
       }
 
       // Human-review quarantine is only valid while the channel is still in
-      // that route. Lock and re-check the channel row before deferring.
+      // that route. The channel row is already locked for the batch.
       if (candidate.reason === 'HUMAN_REVIEW' && evidence.channelId) {
         const channel = await db.query(
-          `SELECT scan_status,trading_status FROM channels WHERE channel_id=$1 FOR UPDATE`,
+          `SELECT scan_status,trading_status FROM channels WHERE channel_id=$1`,
           [evidence.channelId],
         );
         const current = channel.rows?.[0];
@@ -374,11 +381,6 @@ export async function runRetryBacklogTriageApply(
           actionSkipped++;
           continue;
         }
-      } else if (evidence.channelId) {
-        await db.query(
-          'SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE',
-          [evidence.channelId],
-        );
       }
 
       const deferredUntil = new Date(
@@ -552,6 +554,10 @@ export async function runRetryBacklogTriageUndo(
        JOIN jobs j ON j.id=t.job_id
       WHERE t.bucket='QUARANTINE'
         AND t.undone_at IS NULL
+        AND t.original_run_after IS NOT NULL
+        AND t.deferred_until IS NOT NULL
+        AND j.status='PENDING'
+        AND j.run_after=t.deferred_until
         AND ($1::uuid[] IS NULL OR t.job_id=ANY($1))
       ORDER BY t.applied_at, t.job_id
       LIMIT $2
@@ -617,7 +623,10 @@ export async function runRetryBacklogTriageUndo(
     restored,
     skipped,
     ...(options.includeRows ? { actions } : {}),
-    warnings: rows.length >= maxActions ? ['undo_action_limit_reached'] : [],
+    warnings: [
+      ...(rows.length >= maxActions ? ['undo_action_limit_reached'] : []),
+      ...(skipped > 0 ? ['undo_skipped_changed_state'] : []),
+    ],
   };
 }
 

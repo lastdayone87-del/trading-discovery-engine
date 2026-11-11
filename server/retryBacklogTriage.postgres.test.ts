@@ -24,7 +24,7 @@ maybe('migration 177 and the bounded apply close an evidenced terminal scope', a
          channel_id,channel_name,youtube_url,country,country_status,discord_status,
          scan_status,discovery_source,first_seen,trading_status,discord_validation_status,
          scope_eligibility
-       ) VALUES($1,$2,$3,'Germany','CONFIRMED','UNCERTAIN','FAILED','automated_query',now(),
+       ) VALUES($1,$2,$3,'Atlantis','CONFIRMED','UNCERTAIN','FAILED','automated_query',now(),
                 'TRADING_CONFIRMED','RETRY_PENDING','OUT_OF_SCOPE')`,
       [channelId, `Channel ${channelId}`, `https://youtube.test/${channelId}`],
     );

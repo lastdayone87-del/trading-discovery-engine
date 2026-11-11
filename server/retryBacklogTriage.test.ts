@@ -387,6 +387,31 @@ test('apply pages past non-actionable rows but never past un-applied actions', a
   assert.ok(limited.warnings.includes('cursor_not_advanced_pending_actions'));
 });
 
+test('apply locks channels in one global order before mutating jobs', async () => {
+  const rows = [
+    rawRow({ first_enqueued_at: ANCIENT, channel_id: 'UCz' }),
+    rawRow({ first_enqueued_at: ANCIENT, channel_id: 'UCa' }),
+  ];
+  const db = applyDb(rows);
+  const report = await runRetryBacklogTriageApply(db, {
+    apply: true,
+    actor: 'operator@test',
+    buckets: ['QUARANTINE'],
+    maxActions: 10,
+    now: () => NOW,
+  });
+  assert.equal(report.summary.applied, 2);
+  const locks = db.calls
+    .filter(call => call.sql.includes('SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE'))
+    .map(call => call.values?.[0]);
+  assert.deepEqual(locks, ['UCa', 'UCz']);
+  const firstLockIndex = db.calls.findIndex(call => (
+    call.sql.includes('SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE')
+  ));
+  const firstJobMutation = db.calls.findIndex(call => call.sql.includes('UPDATE jobs'));
+  assert.ok(firstLockIndex >= 0 && firstJobMutation > firstLockIndex);
+});
+
 test('undo restores only the exact deferred queue state and records the actor', async () => {
   const calls: Array<{ sql: string; values?: unknown[] }> = [];
   const db = {
@@ -432,6 +457,42 @@ test('undo restores only the exact deferred queue state and records the actor', 
     runRetryBacklogTriageUndo(db, { actor: '', now: () => NOW }),
     /requires a non-empty actor/,
   );
+});
+
+test('undo skips a changed queue state without marking the triage row undone', async () => {
+  const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  const db = {
+    query: async (sql: string, values?: unknown[]) => {
+      calls.push({ sql, values });
+      if (sql.includes('SELECT t.job_id')) {
+        assert.match(sql, /j\.status='PENDING'/);
+        assert.match(sql, /j\.run_after=t\.deferred_until/);
+        return {
+          rows: [{
+            job_id: '00000000-0000-4000-8000-000000000003',
+            original_run_after: '2026-01-01T00:00:00.000Z',
+            deferred_until: '2026-12-10T12:00:00.000Z',
+            job_status: 'PENDING',
+            job_run_after: '2026-12-10T12:00:00.000Z',
+          }],
+        };
+      }
+      if (sql.includes('UPDATE jobs')) return { rows: [] };
+      if (sql.includes('UPDATE retry_backlog_triage')) return { rows: [] };
+      throw new Error(`unexpected SQL: ${sql.slice(0, 120)}`);
+    },
+  };
+  const report = await runRetryBacklogTriageUndo(db, {
+    actor: 'operator@test',
+    maxActions: 10,
+    includeRows: true,
+    now: () => NOW,
+  });
+  assert.equal(report.restored, 0);
+  assert.equal(report.skipped, 1);
+  assert.equal(report.actions?.[0].skippedReason, 'QUEUE_STATE_CHANGED');
+  assert.ok(report.warnings.includes('undo_skipped_changed_state'));
+  assert.ok(!calls.some(call => call.sql.includes('UPDATE retry_backlog_triage')));
 });
 
 test('apply rejects malformed job IDs on dry runs and overlong actors', async () => {

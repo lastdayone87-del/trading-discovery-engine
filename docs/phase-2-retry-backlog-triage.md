@@ -9,8 +9,8 @@ bounded undo, soak plan).
 Read-only production profile:
 
 - **2,526** pending `RETRY_COMMUNITY_ACQUISITION` jobs at the initial snapshot,
-  **2,516** at the latest classification snapshot; 2,526 distinct channels (no
-  duplicate channel jobs).
+  **2,516** at the latest classification snapshot; 2,526 distinct channels at
+  the initial snapshot (no duplicate channel jobs).
 - 2,024 had `attempts=0`; 1,996 were 7–30 days old and 205 were >30 days old by
   `first_enqueued_at`.
 - 1,070 had never been claimed; 1,371 had only claims older than 7 days.
@@ -45,8 +45,10 @@ Quarantine is a **reversible scheduling action**, not a deletion or a rewrite:
   and attempt history are untouched;
 - `retry_backlog_triage` records the reason, bounded evidence, original
   priority, original `run_after`, and the deferred-until timestamp;
-- the apply sets only `run_after=now()+30 days`; the existing claim query
-  (`run_after<=now()`) skips it; no claim-code change is needed;
+- the apply changes only queue scheduling fields: `run_after` and the
+  `updated_at` bookkeeping timestamp; the existing claim query
+  (`run_after<=now()`) skips it until the deferral expires, so no claim-code
+  change is needed;
 - the original priority is unchanged, so when the deferral expires the job
   returns at its normal priority (subject to the normal queue order);
 - the original values are preserved for a bounded undo.
@@ -118,8 +120,8 @@ existing Phase 0 zombie apply; otherwise review the job manually.
 After applying:
 
 - active (claimable) retry backlog: expected ~1,735 recoverable + any
-  unclassified rows; quarantine removes ~734 ancient/no-progress jobs from the
-  active prefix;
+  unclassified rows; quarantine removes ~734 jobs (727 ancient/no-progress + 7
+  human review) from the active prefix;
 - quarantined rows: recorded in `retry_backlog_triage` with `deferred_until`;
 - terminal closures: `jobs.status='COMPLETED'` with `closed_evidence`;
 - Phase 2 gates: rendered crawls/hour 40 nominal / 48 emergency, DISCOVERY
