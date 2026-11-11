@@ -81,6 +81,10 @@ async function main() {
   const offset = Math.max(0, Number(argValue('offset') || 0));
   const country = argValue('country')?.trim();
   const db = await getDb();
+  if (apply) {
+    const schema = await db.query(`SELECT to_regclass('public.semantic_admission_candidates') AS table_oid`);
+    if (!schema.rows[0]?.table_oid) throw new Error('MIGRATION_178_REQUIRED: apply mode needs the semantic admission tables');
+  }
   const waitingFilter = apply
     ? `AND NOT EXISTS (
          SELECT 1 FROM semantic_admission_candidates cac
