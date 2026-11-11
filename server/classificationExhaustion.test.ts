@@ -19,9 +19,9 @@ test('post-enrichment no-hypothesis path uses the single exhaustion reviewer', (
 });
 
 test('stage exhaustion and blocked completed reopens create review instead of COMPLETED/UNCERTAIN', () => {
-  assert.match(pipeline, /ENRICHMENT_STAGE_EXHAUSTED/);
-  assert.match(pipeline, /ENRICHMENT_REOPEN_BLOCKED_COMPLETED/);
-  assert.match(pipeline, /MACHINE_EXHAUSTED_UNCERTAIN/);
+  assert.match(pipeline, /reasonCode:'ENRICHMENT_STAGE_EXHAUSTED'/);
+  assert.match(pipeline, /reasonCode:'ENRICHMENT_REOPEN_BLOCKED_COMPLETED'/);
+  assert.match(pipeline, /reasonCodes:\['MACHINE_EXHAUSTED_UNCERTAIN'\]/);
 });
 
 test('the exhaustion materializer is review-only and keeps the existing serving lineage', () => {

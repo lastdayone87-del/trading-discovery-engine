@@ -5924,6 +5924,15 @@ export async function topUpQuotaReservation(args: {
   if (!Number.isFinite(args.additionalUnits) || args.additionalUnits <= 0) return false;
 
   const db = await getDb();
+  // A top-up for a missing/expired reservation cannot succeed. Check that
+  // cheaply before paying for the backlog and seven-day demand scans.
+  const reservationExists = await db.query(
+    `SELECT 1 FROM quota_reservations
+      WHERE operation_type=$1 AND operation_id=$2 AND allocation=$3
+        AND status='RESERVED' AND expires_at>now() LIMIT 1`,
+    [args.operationType, args.operationId, args.allocation],
+  );
+  if (!reservationExists.rowCount) return false;
   const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
   const client = await db.connect();
   try {

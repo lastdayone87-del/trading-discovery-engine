@@ -40,8 +40,7 @@ test('exhausted review materialization records dashboard lineage and projection 
 
 test('a stale exhaustion projection leaves a recoverable failed state', () => {
   const pipeline = read('./ingestionPipeline.ts');
-  assert.match(pipeline, /review\.reason === 'STALE_ELIGIBILITY_PROJECTION'/);
-  assert.match(pipeline, /projectBlockedEnrichmentScanStatus\(candidate\.channelId,'FAILED'/);
+  assert.match(pipeline, /review\.reason === 'STALE_ELIGIBILITY_PROJECTION'[\s\S]{0,400}projectBlockedEnrichmentScanStatus\(candidate\.channelId,'FAILED'/);
   assert.doesNotMatch(pipeline, /withheldChannel\.scan_status = 'FAILED'/);
 });
 
