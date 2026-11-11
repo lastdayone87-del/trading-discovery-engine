@@ -26,7 +26,8 @@ test('the resolution panel follows routing, enrichment, recovery, review and quo
   assert.match(ui, /Quota protected/);
   assert.match(ui, /capped at/);
   assert.match(ui, /setInterval/);
-  assert.match(ui, /inFlight\.current/);
+  assert.match(ui, /if \(inFlight\.current\) return;/);
+  assert.match(ui, /inFlight\.current = true;/);
   assert.match(ui, /visibilityState/);
   assert.match(ui, /byRecognition/);
   assert.match(ui, /oldestDueHours >= 6/);
@@ -54,7 +55,7 @@ test('the resolution endpoint is an explicit operator read route', () => {
 
 test('the resolution panel ignores superseded loads and announces failures', () => {
   assert.match(ui, /requestId\.current/);
-  assert.match(ui, /if \(id === requestId\.current\) \{[\s\S]{0,80}setData\(next\)/);
+  assert.match(ui, /if \(id === requestId\.current\) \{\s*setData\(next\);/);
   assert.match(ui, /role="alert"/);
 });
 
