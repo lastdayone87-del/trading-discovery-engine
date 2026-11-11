@@ -848,6 +848,7 @@ export function rowToChannel(row: any): ChannelRecord {
     last_checked: iso(row.last_checked),
     inspection_trail: parseJson(row.inspection_trail, []),
     subscriber_count: row.subscriber_count || undefined,
+    subscriber_count_hidden: row.subscriber_count_hidden === true,
     channel_thumbnail_url: row.channel_thumbnail_url || undefined,
     quality_score: row.quality_score || 0,
     quality_breakdown: parseJson(row.quality_breakdown, undefined),
@@ -1079,6 +1080,7 @@ export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
 // values intentionally do not match and therefore remain visible.
 export const KNOWN_LOW_AUDIENCE_SQL = `COALESCE((
   CASE
+    WHEN subscriber_count_hidden THEN NULL
     WHEN subscriber_count IS NULL OR btrim(subscriber_count)='' THEN NULL
     WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9]','','g')::numeric
     WHEN upper(btrim(subscriber_count)) ~ '^[0-9]+([.][0-9]+)?[[:space:]]*K([[:space:]]+SUBSCRIBERS?)?$' THEN regexp_replace(upper(btrim(subscriber_count)),'[^0-9.]','','g')::numeric*1000
@@ -1125,9 +1127,12 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   const viewingDiagnosticSlice = viewingRejectedSlice || viewingNonTradingSlice || viewingSkippedExcludedSlice || viewingClassificationPendingSlice;
   const clauses=[(args.diagnosticsOnly || viewingDiagnosticSlice)?`NOT (${defaultServing.predicate})`:args.includeRejected?'TRUE':`(${defaultServing.predicate})`]; const values:string[]=[];
   const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
+  const explicitlyViewingAudienceFailure=args.scanStatus==='FAILED_PERMANENT';
   // Diagnostic slices read the rejected corpus deliberately, so the audience
-  // filter (a normal-view concern) does not apply to them either.
-  if(!args.includeRejected&&!args.diagnosticsOnly&&!viewingDiagnosticSlice&&!explicitlyViewingLowAudience)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT ${KNOWN_LOW_AUDIENCE_SQL}`);
+  // filter (a normal-view concern) does not apply to them either. A failed
+  // audience fetch is terminal and stays out of the normal corpus until an
+  // operator explicitly selects FAILED_PERMANENT.
+  if(!args.includeRejected&&!args.diagnosticsOnly&&!viewingDiagnosticSlice&&!explicitlyViewingLowAudience&&!explicitlyViewingAudienceFailure)clauses.push(`scan_status <> 'SKIPPED_LOW_AUDIENCE' AND NOT ${KNOWN_LOW_AUDIENCE_SQL} AND NOT (scan_status='FAILED_PERMANENT' AND subscriber_count IS NULL AND subscriber_count_hidden=false)`);
   const add=(column:string,value:string|undefined)=>{if(value&&value!=='ALL'){values.push(value);clauses.push(`${column}=$${values.length}`);}};
   if(args.search){values.push(args.search);clauses.push(`(channel_name ILIKE '%'||$${values.length}||'%' OR youtube_url ILIKE '%'||$${values.length}||'%')`);}
   add('country',args.country); add('country_status',args.countryStatus); add('trading_status',args.tradingStatus);
@@ -1412,7 +1417,8 @@ export async function writeChannelUpsert(
   // branch. The insert-only statement must therefore use a contiguous
   // parameter list, or PostgreSQL cannot infer the type of the unused slot
   // and rejects every provisional insert.
-  const quotaOriginPlaceholder = insertOnly ? '$49' : '$50';
+  const hiddenPlaceholder = insertOnly ? '$49' : '$50';
+  const quotaOriginPlaceholder = insertOnly ? '$50' : '$51';
   const queryParams: unknown[] = [
   channel.channel_id, channel.channel_name, channel.youtube_url, channel.country, channel.country_status, channel.confidence_score || 0,
   channel.discord_status, channel.discord_invite || null, channel.scan_status, channel.scan_attempts || 0, channel.discovery_source,
@@ -1425,14 +1431,14 @@ export async function writeChannelUpsert(
   channel.public_about_status || 'NOT_ATTEMPTED', channel.public_about_checked_at || null, channel.public_about_attempts || 0,
   channel.latest_upload_at || null, channel.uploads_last_30_days || 0, channel.uploads_last_90_days || 0,
   channel.uploads_last_365_days || 0, channel.activity_band || 'UNKNOWN', channel.activity_score ?? 50,
-  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',stringifyWellFormedJson(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true,persistedOrigin
+  channel.activity_observed_at || null,channel.discord_discovery_status||'NOT_DISCOVERED',channel.discord_candidate_locator||null,channel.discord_candidate_id||null,channel.discord_candidate_raw_locator||null,channel.discord_candidate_type||null,channel.discord_resolution_status||'NOT_ATTEMPTED',channel.discord_liveness_status||'NOT_CHECKED',channel.discord_relevance_status||'NOT_CHECKED',channel.discord_validation_status||'NOT_STARTED',scopeEligibility,channel.community_discovery_status||'NONE',stringifyWellFormedJson(channel.community_intents||[]),channel.discord_duplicate_owner_channel_id||null,options?.preserveDiscordOnUpdate===true,channel.subscriber_count_hidden===true,persistedOrigin
   ];
   if (insertOnly) queryParams.splice(48, 1);
   const result = await client.query(`INSERT INTO channels (
-  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,quota_origin,updated_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,${quotaOriginPlaceholder},now())
+  channel_id,channel_name,youtube_url,country,country_status,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,first_seen,last_checked,next_check,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,quality_breakdown,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,public_about_status,public_about_checked_at,public_about_attempts,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,scope_eligibility,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,subscriber_count_hidden,quota_origin,updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,${hiddenPlaceholder},${quotaOriginPlaceholder},now())
 ${options?.insertOnly === true ? 'ON CONFLICT(channel_id) DO NOTHING' : `ON CONFLICT(channel_id) DO UPDATE SET
-  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=COALESCE(excluded.subscriber_count,channels.subscriber_count),channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},quota_origin=channels.quota_origin,updated_at=now()`}`, queryParams);
+  channel_name=excluded.channel_name,youtube_url=excluded.youtube_url,country=excluded.country,country_status=excluded.country_status,confidence_score=excluded.confidence_score,${preserveDiscordOnConflictSql('discord_status')},${preserveDiscordOnConflictSql('discord_invite')},scan_status=excluded.scan_status,scan_attempts=excluded.scan_attempts,discovery_source=excluded.discovery_source,last_checked=excluded.last_checked,next_check=excluded.next_check,inspection_trail=excluded.inspection_trail,subscriber_count=COALESCE(excluded.subscriber_count,channels.subscriber_count),subscriber_count_hidden=(channels.subscriber_count_hidden OR excluded.subscriber_count_hidden),channel_thumbnail_url=excluded.channel_thumbnail_url,quality_score=excluded.quality_score,quality_breakdown=excluded.quality_breakdown,trading_status=excluded.trading_status,trading_confidence_score=excluded.trading_confidence_score,trading_category=excluded.trading_category,trading_relevance_breakdown=excluded.trading_relevance_breakdown,country_metadata_status=excluded.country_metadata_status,country_metadata_checked_at=excluded.country_metadata_checked_at,public_about_status=excluded.public_about_status,public_about_checked_at=excluded.public_about_checked_at,public_about_attempts=excluded.public_about_attempts,latest_upload_at=excluded.latest_upload_at,uploads_last_30_days=excluded.uploads_last_30_days,uploads_last_90_days=excluded.uploads_last_90_days,uploads_last_365_days=excluded.uploads_last_365_days,activity_band=excluded.activity_band,activity_score=excluded.activity_score,activity_observed_at=excluded.activity_observed_at,${preserveDiscordOnConflictSql('discord_discovery_status')},${preserveDiscordOnConflictSql('discord_candidate_locator')},${preserveDiscordOnConflictSql('discord_candidate_id')},${preserveDiscordOnConflictSql('discord_candidate_raw_locator')},${preserveDiscordOnConflictSql('discord_candidate_type')},${preserveDiscordOnConflictSql('discord_resolution_status')},${preserveDiscordOnConflictSql('discord_liveness_status')},${preserveDiscordOnConflictSql('discord_relevance_status')},${preserveDiscordOnConflictSql('discord_validation_status')},scope_eligibility=excluded.scope_eligibility,community_discovery_status=excluded.community_discovery_status,community_intents=excluded.community_intents,${preserveDiscordOnConflictSql('discord_duplicate_owner_channel_id')},quota_origin=channels.quota_origin,updated_at=now()`}`, queryParams);
   return result.rowCount || 0;
 }
 
@@ -1453,6 +1459,48 @@ export async function insertChannelIfAbsent(channel: ChannelRecord): Promise<boo
   } finally {
     client.release();
   }
+}
+
+/**
+ * Targeted subscriber-evidence write. Keeps admission/backfill from
+ * re-persisting a whole stale channel row just to update audience evidence.
+ * Hidden is sticky; a count never clears it.
+ */
+export async function updateChannelSubscriberEvidence(
+  channelId: string,
+  evidence: {subscriberCount?: string; hidden?: boolean},
+): Promise<void> {
+  const db = await getDb();
+  await db.query(`UPDATE channels
+    SET subscriber_count=COALESCE($2,subscriber_count),
+        subscriber_count_hidden=(subscriber_count_hidden OR $3::boolean),
+        updated_at=now()
+    WHERE channel_id=$1`,
+  [channelId, sanitizeSubscriberCountText(evidence.subscriberCount) || null, evidence.hidden === true]);
+}
+
+/** Terminalize a non-confirmed channel whose audience fetch exhausted attempts. */
+export async function markChannelAudienceEvidenceFailed(
+  channelId: string,
+  attempts: number,
+  now = new Date().toISOString(),
+): Promise<boolean> {
+  const db = await getDb();
+  const res = await db.query(`UPDATE channels
+    SET scan_status='FAILED_PERMANENT',last_checked=$2,updated_at=now(),
+        inspection_trail=inspection_trail || $3::jsonb
+    WHERE channel_id=$1
+      AND trading_status <> 'TRADING_CONFIRMED'
+      AND scan_status NOT IN ('COMPLETED','SKIPPED_LOW_AUDIENCE')
+      AND country_status <> 'REJECTED'`,
+  [channelId, now, stringifyWellFormedJson([{
+    step: 'BIO',
+    title: 'Audience evidence unavailable',
+    status: 'ERROR',
+    details: `Subscriber count could not be fetched after ${attempts} attempt(s); channel held out of normal processing.`,
+    timestamp: now,
+  }])]);
+  return (res.rowCount || 0) > 0;
 }
 
 /**

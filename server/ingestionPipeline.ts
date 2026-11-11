@@ -14,6 +14,8 @@ import {
   getChannelById,
   upsertChannel,
   upsertChannelWithResult,
+  updateChannelSubscriberEvidence,
+  markChannelAudienceEvidenceFailed,
   enqueueJob,
   getJobByIdempotencyKey,
   getQuota,
@@ -42,7 +44,8 @@ import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
-import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { evaluateLowAudienceGate, parseSubscriberCountNumber, sanitizeSubscriberCountText, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
+import { ensureSubscriberEvidence, applyChannelSubscriberEvidenceToCandidate, applySubscriberEvidenceToChannel } from './subscriberEvidence';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
 import { maybeRunDiscoveryEvidenceExtraction } from './discovery/evidencePipeline';
@@ -236,14 +239,14 @@ async function validateCountryWithHydration(
   }, targetCountry);
   let countryVal = await build();
   const includeAudience = options.includeAudience === true;
-  const subscriberEvidenceMissing = includeAudience && evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
+  const subscriberEvidenceMissing = includeAudience && candidate.subscriberCountHidden !== true && evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
   const needsCountryHydration = countryVal.status === 'UNCERTAIN' && candidate.countryMetadataStatus !== 'AVAILABLE_NOT_DECLARED';
   if (needsCountryHydration || subscriberEvidenceMissing) {
     const hydrated = await fetchYouTubeChannelCountryMetadata(candidate.channelId, candidate);
     Object.assign(candidate, hydrated);
     countryVal = await build();
   }
-  const subscriberEvidenceMissingAfterOfficial = includeAudience && evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
+  const subscriberEvidenceMissingAfterOfficial = includeAudience && candidate.subscriberCountHidden !== true && evaluateLowAudienceGate(candidate.subscriberCount).reasonCode === 'SUBSCRIBER_COUNT_UNAVAILABLE';
   const publicAboutStatus = (candidate as any).publicAboutStatus || existing?.public_about_status || 'NOT_ATTEMPTED';
   const publicAboutAttempts = Number((candidate as any).publicAboutAttempts ?? existing?.public_about_attempts ?? 0);
   const publicAboutAttempted = Boolean(
@@ -492,6 +495,73 @@ async function processChannelThroughPipelineInContext(
 
   // Step 0: Terminal State & Existing Channel Check
   const existing = await getChannelById(candidate.channelId);
+  // Resolve audience once, before preservation/triage. The admission path
+  // already does this for search discoveries; this guard covers inline,
+  // legacy, enrichment, and preserved-row passes, and reuses the candidate
+  // count supplied by the future pre-admission evidence fetch.
+  applyChannelSubscriberEvidenceToCandidate(candidate, existing);
+  const audience = await ensureSubscriberEvidence(candidate, { allowPublicFallback: true });
+  Object.assign(candidate, audience.candidate);
+  if (audience.state === 'FAILED') {
+    const nowIso = new Date().toISOString();
+    console.warn(JSON.stringify({
+      event: 'subscriber_evidence_failed',
+      channelId: candidate.channelId,
+      context: 'pipeline',
+      attempts: audience.attempts,
+      timestamp: nowIso,
+    }));
+    if (existing) {
+      const terminalized = await markChannelAudienceEvidenceFailed(existing.channel_id, audience.attempts, nowIso);
+      if (terminalized) {
+        existing.scan_status = 'FAILED_PERMANENT';
+        existing.last_checked = nowIso;
+        existing.inspection_trail = [
+          ...(existing.inspection_trail || []),
+          {
+            step: 'BIO',
+            title: 'Audience evidence unavailable',
+            status: 'ERROR',
+            details: `Subscriber count could not be fetched after ${audience.attempts} attempt(s); channel held out of normal processing.`,
+            timestamp: nowIso,
+          },
+        ];
+      }
+      return {
+        channelId: candidate.channelId,
+        channelName: candidate.channelName,
+        isNew: false,
+        wasKnown: true,
+        persisted: true,
+        countryStatus: existing.country_status,
+        tradingStatus: existing.trading_status || 'UNCERTAIN',
+        discordStatus: existing.discord_status,
+        discordInvite: existing.discord_invite || null,
+        channelRecord: existing,
+        skippedTerminalState: true,
+      };
+    }
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: true,
+      wasKnown: false,
+      persisted: false,
+      countryStatus: 'UNCERTAIN',
+      tradingStatus: 'UNCERTAIN',
+      discordStatus: 'NOT_FOUND',
+      discordInvite: null,
+      channelRecord: undefined,
+    };
+  }
+  if (existing && (audience.state === 'HIDDEN'
+    || (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count))) {
+    await updateChannelSubscriberEvidence(existing.channel_id, {
+      subscriberCount: audience.state === 'KNOWN' ? candidate.subscriberCount : undefined,
+      hidden: audience.state === 'HIDDEN',
+    });
+    applySubscriberEvidenceToChannel(existing, candidate);
+  }
   const existingStatusSnapshot = existing ? {
     country: existing.country,
     country_status: existing.country_status,
@@ -555,7 +625,7 @@ async function processChannelThroughPipelineInContext(
         }
       }
 
-      const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+      const refreshedAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount, 30, candidate.subscriberCountHidden === true);
       if (shouldReclassifyPreservedCompletedChannel(existing.scan_status, refreshedAudienceGate, existing.trading_status)) {
         console.log(`[Unified Ingestion Pipeline] Refreshing preserved completed channel '${candidate.channelName}' as low-audience after fresh official subscriber metadata.`);
         existing.subscriber_count = candidate.subscriberCount;
@@ -597,6 +667,10 @@ async function processChannelThroughPipelineInContext(
       let updated = confirmedCountryChecked;
       if (candidate.subscriberCount && candidate.subscriberCount !== existing.subscriber_count) {
         existing.subscriber_count = candidate.subscriberCount;
+        updated = true;
+      }
+      if (candidate.subscriberCountHidden === true && existing.subscriber_count_hidden !== true) {
+        existing.subscriber_count_hidden = true;
         updated = true;
       }
       if (candidate.channelThumbnailUrl && candidate.channelThumbnailUrl !== existing.channel_thumbnail_url) {
@@ -1026,7 +1100,7 @@ async function processChannelThroughPipelineInContext(
       });
   }
 
-  const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);
+  const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount, 30, candidate.subscriberCountHidden === true);
   if (lowAudienceGate.shouldSkipDeepEnrichment) {
     console.log(`[Unified Ingestion Pipeline - Phase 7] Channel '${candidate.channelName}' (${candidate.channelId}) has ${candidate.subscriberCount} subscribers (< 30 threshold). Storing and marking low-audience skip.`);
     const lowAudienceChannel: ChannelRecord = existing || {
@@ -1721,6 +1795,9 @@ async function projectBlockedEnrichmentScanStatus(
 }
 
 function applyCandidateObservability(channel: ChannelRecord, candidate: IngestionCandidate): void {
+  if (candidate.subscriberCountHidden === true) channel.subscriber_count_hidden = true;
+  const subscriberCount = sanitizeSubscriberCountText(candidate.subscriberCount);
+  if (subscriberCount !== undefined) channel.subscriber_count = subscriberCount;
   channel.quota_origin = persistedQuotaOrigin(
     channel.quota_origin,
     candidate.quotaOrigin,

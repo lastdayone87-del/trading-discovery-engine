@@ -164,6 +164,10 @@ export interface DiscoveredChannelRaw {
    */
   videoDescriptionsAuthoritative?: boolean;
   subscriberCount?: string;
+  /** Official API says the owner hid the count. Sticky; do not re-fetch. */
+  subscriberCountHidden?: boolean;
+  /** When subscriberCount was observed; drives the 30-day reuse window. */
+  subscriberCountCheckedAt?: string;
   channelThumbnailUrl?: string;
   countryMetadataStatus?: CountryMetadataStatus;
   countryMetadataCheckedAt?: string;
@@ -1813,7 +1817,16 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       const channel = data.items?.[0];
       if (!channel) throw new Error(`YouTube channel '${channelId}' was not found.`);
       const officialCountry = channel.brandingSettings?.channel?.country;
-      const subscriberCount = channel.statistics?.hiddenSubscriberCount === true ? fallback.subscriberCount : (channel.statistics?.subscriberCount || fallback.subscriberCount);
+      const hiddenSubscriberCount = channel.statistics?.hiddenSubscriberCount === true;
+      const officialSubscriberCount = hiddenSubscriberCount
+        ? undefined
+        : channel.statistics?.subscriberCount;
+      const subscriberCount = hiddenSubscriberCount
+        ? undefined
+        : (officialSubscriberCount || fallback.subscriberCount);
+      const subscriberCountCheckedAt = hiddenSubscriberCount || officialSubscriberCount !== undefined
+        ? checkedAt
+        : fallback.subscriberCountCheckedAt;
       // Same validated fallback rules as enrichment: already-fetched
       // snippet/branding language is retained so later extraction passes
       // without a full enrichment round. A transcript veto additionally
@@ -1831,6 +1844,8 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
       return { ...fallback, description: channel.snippet?.description || fallback.description,
         locationTag: officialCountry || fallback.locationTag,
         subscriberCount,
+        subscriberCountHidden: hiddenSubscriberCount || fallback.subscriberCountHidden === true,
+        subscriberCountCheckedAt,
         detectedLanguages: metadataLanguage.detectedLanguages,
         providerDeclaredLanguage: metadataProviderLanguage,
         transcriptExcerpts: metadataLanguage.dissented && fallback.transcriptExcerpts

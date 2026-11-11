@@ -1,7 +1,7 @@
 export interface LowAudienceGateResult {
   shouldSkipDeepEnrichment: boolean;
   subscriberCountNumber?: number;
-  reasonCode: 'LOW_AUDIENCE_SKIP' | 'SUFFICIENT_AUDIENCE_PROCEED' | 'SUBSCRIBER_COUNT_UNAVAILABLE';
+  reasonCode: 'LOW_AUDIENCE_SKIP' | 'SUFFICIENT_AUDIENCE_PROCEED' | 'SUBSCRIBER_COUNT_UNAVAILABLE' | 'SUBSCRIBER_COUNT_HIDDEN';
 }
 
 export function parseSubscriberCountNumber(raw?: string): number | undefined {
@@ -42,9 +42,14 @@ export function sanitizeSubscriberCountText(value: unknown): string | undefined 
  * Low-Audience Budget Gate (Phase 7):
  * Configurable subscriber threshold gate (default: 30 subscribers).
  * 0-29 known subscribers: stored and marked low-audience skip; deep crawl/enrichment is skipped.
- * 30+ subscribers or hidden/unavailable: proceeds normally.
+ * 30+ subscribers or an explicitly hidden count: proceeds normally.
+ * Missing/unavailable counts are not treated as passing evidence by callers that
+ * resolve audience before admission; the reason code remains distinguishable.
  */
-export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold = 30): LowAudienceGateResult {
+export function evaluateLowAudienceGate(rawSubscriberCount?: string, threshold = 30, hidden = false): LowAudienceGateResult {
+  if (hidden) {
+    return { shouldSkipDeepEnrichment: false, reasonCode: 'SUBSCRIBER_COUNT_HIDDEN' };
+  }
   const count = parseSubscriberCountNumber(rawSubscriberCount);
   if (count === undefined) {
     return { shouldSkipDeepEnrichment: false, reasonCode: 'SUBSCRIBER_COUNT_UNAVAILABLE' };

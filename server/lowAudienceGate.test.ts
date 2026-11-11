@@ -56,13 +56,13 @@ test('ingestionPipeline refreshes preserved completed rows without hiding unknow
   const source = read('server/ingestionPipeline.ts');
   assert.match(source, /shouldReclassifyPreservedCompletedChannel\(existing\.scan_status, refreshedAudienceGate, existing\.trading_status\)/);
   assert.match(source, /existing\.scan_status = 'SKIPPED_LOW_AUDIENCE'/);
-  assert.match(source, /const refreshedAudienceGate = evaluateLowAudienceGate\(candidate\.subscriberCount\)/);
+  assert.match(source, /const refreshedAudienceGate = evaluateLowAudienceGate\(candidate\.subscriberCount, 30, candidate\.subscriberCountHidden === true\)/);
 });
 
 test('ingestionPipeline enforces country hard-rejection before low-audience budget gate', () => {
   const source = read('server/ingestionPipeline.ts');
   const countryRejectedIndex = source.indexOf("countryVal.status === 'REJECTED'");
-  const lowAudienceGateIndex = source.indexOf('const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount);');
+  const lowAudienceGateIndex = source.indexOf('const lowAudienceGate = evaluateLowAudienceGate(candidate.subscriberCount, 30, candidate.subscriberCountHidden === true);');
   assert.ok(countryRejectedIndex >= 0 && lowAudienceGateIndex >= 0);
   assert.ok(countryRejectedIndex < lowAudienceGateIndex, 'Country hard-rejection must precede low-audience budget gate in ingestion pipeline');
 });
@@ -148,11 +148,11 @@ test('ENRICH claim reserves quota before hydrating and releases it on audience s
 
 test('re-enqueue paths cannot bypass the low-audience gate on known-low counts', () => {
   const qm = read('server/queueManager.ts');
-  assert.match(qm, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  assert.match(qm, /evaluateLowAudienceGate\(channel\.subscriber_count, 30, channel\.subscriber_count_hidden === true\)\.shouldSkipDeepEnrichment/);
   const iw = read('server/investigationWorkflow.ts');
-  assert.match(iw, /evaluateLowAudienceGate\(row\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  assert.match(iw, /evaluateLowAudienceGate\(row\.subscriber_count, 30, row\.subscriber_count_hidden === true\)\.shouldSkipDeepEnrichment/);
   const recovery = read('server/operationalEnrichmentRecovery.ts');
-  assert.match(recovery, /evaluateLowAudienceGate\(channel\.subscriber_count\)\.shouldSkipDeepEnrichment/);
+  assert.match(recovery, /evaluateLowAudienceGate\(channel\.subscriber_count, 30, channel\.subscriber_count_hidden === true\)\.shouldSkipDeepEnrichment/);
 });
 
 test('orphan skip-projection cannot regress rows that left ENRICHMENT_PENDING', () => {

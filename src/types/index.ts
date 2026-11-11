@@ -260,6 +260,8 @@ export interface ChannelRecord {
   last_checked?: string | null;
   inspection_trail?: InspectionStep[];
   subscriber_count?: string;
+  /** Official API reports the owner hid the subscriber count. Sticky. */
+  subscriber_count_hidden?: boolean;
   channel_thumbnail_url?: string;
   quality_score?: number;
   quality_breakdown?: QualityScoreBreakdown;

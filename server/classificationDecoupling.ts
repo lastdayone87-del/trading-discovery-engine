@@ -297,7 +297,7 @@ export function buildClassificationJobPayload(input: {
  * creator-attributed country before any eligibility decision.
  */
 export function buildProvisionalClassificationChannel(
-  candidate: Pick<DiscoveredChannelRaw, 'channelId' | 'channelName' | 'youtubeUrl' | 'subscriberCount' | 'channelThumbnailUrl'>,
+  candidate: Pick<DiscoveredChannelRaw, 'channelId' | 'channelName' | 'youtubeUrl' | 'subscriberCount' | 'subscriberCountHidden' | 'channelThumbnailUrl'>,
   source: DiscoverySource,
   now: string = new Date().toISOString(),
 ): ChannelRecord {
@@ -326,6 +326,7 @@ export function buildProvisionalClassificationChannel(
       timestamp: now,
     }],
     subscriber_count: candidate.subscriberCount,
+    subscriber_count_hidden: candidate.subscriberCountHidden === true,
     channel_thumbnail_url: candidate.channelThumbnailUrl
       || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
     trading_status: 'UNCERTAIN',

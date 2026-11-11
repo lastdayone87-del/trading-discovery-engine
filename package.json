@@ -20,6 +20,7 @@
     "phase2:crawl-throughput": "tsx scripts/phase2CrawlThroughputReport.ts",
     "phase2:retry-triage": "tsx scripts/phase2RetryBacklogTriage.ts",
     "phase2:retry-apply": "tsx scripts/phase2RetryBacklogApply.ts",
+    "audience:backfill": "tsx scripts/backfillSubscriberEvidence.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts",
     "admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts",
     "phaseb:admission-v2-poc": "tsx scripts/phaseBAdmissionV2Poc.ts",
