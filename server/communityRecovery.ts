@@ -13,6 +13,18 @@ export type EnqueueCommunityRecoveryJob = (
   priorRetryReason?: string
 ) => Promise<boolean | void>;
 
+type CommunityChannelWriter = (
+  channel: ChannelRecord,
+  options?: {
+    requireStatusSnapshot?: {
+      country?: string | null;
+      country_status?: string | null;
+      scan_status?: string | null;
+      trading_status?: string | null;
+    };
+  },
+) => Promise<void | boolean>;
+
 const COMMUNITY_RETRY_SURFACES = new Set([
   'CHANNEL_LINKS', 'CHANNEL_EXTERNAL_LINKS', 'EXTERNAL_LINKS', 'LINKED_WEBSITES', 'CUSTOM_DOMAINS',
   'SOCIAL_PROFILES', 'SOCIAL_BIO'
@@ -316,7 +328,7 @@ export async function reconcileLegacyCommunityRetryOwnership(
 export async function reconcileCommunityAcquisitionRecovery(
   getDb: () => Promise<any>,
   getChannelById: (id: string) => Promise<ChannelRecord | null>,
-  upsertChannel: (channel: ChannelRecord) => Promise<void>,
+  upsertChannel: CommunityChannelWriter,
   limit = 20,
   now = Date.now(),
   enqueueRecoveryJob?: EnqueueCommunityRecoveryJob
@@ -442,6 +454,10 @@ export async function reconcileCommunityAcquisitionRecovery(
         AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')
         AND c.country_status <> 'REJECTED'
         AND c.country <> 'UNKNOWN'
+        -- A channel ruled out of scope must not be automatically reacquired.
+        -- Without this, the recovery sweep re-enqueues the channel after a
+        -- RETRY_TRIAGE_TERMINAL closure and reopens the just-closed job.
+        AND COALESCE(c.scope_eligibility,'') <> 'OUT_OF_SCOPE'
         AND (
           c.last_checked IS NULL
           OR c.last_checked < now() - interval '30 days'
@@ -469,16 +485,37 @@ export async function reconcileCommunityAcquisitionRecovery(
 
   let reactivatedCount = 0;
   for (const row of rows.rows) {
-    const channelRecord = await getChannelById(row.channel_id);
+    let channelRecord = await getChannelById(row.channel_id);
     if (!channelRecord) continue;
+    if (String(channelRecord.scope_eligibility || '').trim().toUpperCase() === 'OUT_OF_SCOPE') continue;
     const capacityTerminal = row.capacity_terminal === true;
-    const triggerCheck = capacityTerminal
+    let triggerCheck = capacityTerminal
+      ? { reactivate: true, reasonCodes: ['ATTEMPT_FREE_CAPACITY_RETRY_REOPENED'] }
+      : shouldReactivateCommunityRecovery(channelRecord, undefined, false, now);
+    if (!triggerCheck.reactivate) continue;
+
+    // The candidate query and the first channel read are not a transaction.
+    // Re-read immediately before the projection/write and revalidate scope so
+    // a concurrent OUT_OF_SCOPE classification cannot be overwritten or turn
+    // into a reopened terminal retry.
+    channelRecord = await getChannelById(row.channel_id);
+    if (!channelRecord) continue;
+    if (String(channelRecord.scope_eligibility || '').trim().toUpperCase() === 'OUT_OF_SCOPE') continue;
+    triggerCheck = capacityTerminal
       ? { reactivate: true, reasonCodes: ['ATTEMPT_FREE_CAPACITY_RETRY_REOPENED'] }
       : shouldReactivateCommunityRecovery(channelRecord, undefined, false, now);
     if (!triggerCheck.reactivate) continue;
 
     const updated = reactivateCommunityRecovery(channelRecord, triggerCheck.reasonCodes, new Date(now).toISOString());
-    await upsertChannel(updated);
+    const projected = await upsertChannel(updated, {
+      requireStatusSnapshot: {
+        country: channelRecord.country,
+        country_status: channelRecord.country_status,
+        scan_status: channelRecord.scan_status,
+        trading_status: channelRecord.trading_status,
+      },
+    });
+    if (projected === false) continue;
     try {
       if (capacityTerminal && row.capacity_retry_job_id) {
         if (clockV2) {
@@ -502,10 +539,17 @@ export async function reconcileCommunityAcquisitionRecovery(
         if (enqueued === false) {
           // The reopen guard kept the retry job terminal. Restore the channel
           // projection so it does not claim an active retry that was never
-          // created. The guard is re-evaluated from current config and the
-          // rolling reopen window on the next sweep; a BLOCKED ledger row is
+          // created, but never write the pre-recovery snapshot over a newer
+          // OUT_OF_SCOPE classification (the enqueue scope guard uses false
+          // for both cases).
+          const current = await getChannelById(row.channel_id);
+          if (current
+              && String(current.scope_eligibility || '').trim().toUpperCase() !== 'OUT_OF_SCOPE') {
+            await upsertChannel(channelRecord);
+          }
+          // The guard is re-evaluated from current config and the rolling
+          // reopen window on the next sweep; a BLOCKED ledger row is
           // evidence, never a stale 30-day ban.
-          await upsertChannel(channelRecord);
           continue;
         }
       }

@@ -323,7 +323,7 @@ test('production ingestion and manual recheck entry points invoke community reco
 
   assert.match(pipeSource, /shouldReactivateCommunityRecovery\(existing, candidate, isManualScan\)/);
   assert.match(queueSource, /shouldReactivateCommunityRecovery\(channel, undefined, true\)/);
-  assert.match(schedulerSource, /reconcileCommunityAcquisitionRecovery\(\s*getDb,\s*getChannelById,\s*upsertChannel,\s*20,\s*Date\.now\(\),/);
+  assert.match(schedulerSource, /reconcileCommunityAcquisitionRecovery\(\s*getDb,\s*getChannelById,\s*upsertChannelWithResult,\s*20,\s*Date\.now\(\),/);
   assert.match(schedulerSource, /reconcileLegacyCommunityRetryOwnership\(getDb, 250\)/);
   assert.doesNotMatch(queueSource, /reconcilePendingCommunityRetryJobs\(getDb, 100\)/);
   assert.doesNotMatch(queueSource, /reconcileCommunityAcquisitionRecovery\(/);

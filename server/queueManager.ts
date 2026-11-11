@@ -4342,6 +4342,14 @@ export function shouldCompleteSuppressedRetryJob(inspection:{
 }
 
 export async function enqueueCommunityAcquisitionRetry(channelId:string,directive?:CommunityRetryDirective,source:'INSPECTION'|'RECOVERY'|'LEGACY'='INSPECTION',clientOverride?:{query:(sql:string,params?:unknown[])=>Promise<{rows:unknown[];rowCount:number}>}):Promise<boolean>{
+  // A recovery sweep may have selected this channel before a concurrent
+  // classification ruled it out of scope. Re-check at the enqueue boundary so
+  // an OUT_OF_SCOPE terminal closure cannot be reopened by that stale sweep.
+  if(source==='RECOVERY'){
+    const runner:{query:(sql:string,params?:unknown[])=>Promise<{rows:any[]}>}=clientOverride||await getDb();
+    const scope=await runner.query(`SELECT scope_eligibility FROM channels WHERE channel_id=$1`,[channelId]);
+    if(String(scope.rows?.[0]?.scope_eligibility||'').trim().toUpperCase()==='OUT_OF_SCOPE')return false;
+  }
   const metadata=buildCommunityRetryJobMetadata({
     code:directive?.code||COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
     retryReason:directive?.retryReason||'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
