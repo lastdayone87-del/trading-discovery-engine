@@ -1,0 +1,15 @@
+/** A review decision is only valid for the currently selected pending review. */
+/** A pinned lineage that could not be loaded must not be silently decided. */
+export { reviewEvidenceIsDecidable, reviewEvidenceWarningsBlockDecision } from './reviewEvidencePolicy';
+
+export function canSubmitReviewForSelection(
+  bundle: { review?: { channelId?: string; state?: string } } | null,
+  selectedChannelId: string | null,
+): boolean {
+  return Boolean(
+    bundle?.review?.channelId
+    && selectedChannelId
+    && bundle.review.channelId === selectedChannelId
+    && bundle.review.state === 'PENDING',
+  );
+}

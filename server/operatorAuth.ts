@@ -50,6 +50,7 @@ const ROUTES: Array<{ method: string; pattern: RegExp; policy: RoutePolicy; acti
   { method:'POST', pattern:/^\/api\/(country-vocabularies|excluded-countries)$/, policy:'admin', action:'configuration.write' },
   { method:'DELETE', pattern:/^\/api\/excluded-countries\/[^/]+$/, policy:'admin', action:'configuration.write' },
   { method:'POST', pattern:/^\/api\/(reviews\/[^/]+\/(approve|reject|force-rescan)|relevance\/(verify|report)|search\/manual|search\/manual\/sessions\/[^/]+\/cancel|search\/automated|channels\/[^/]+\/recheck|reconciliation\/nonexcluded-boundary-cohort|query-intelligence\/(generate-candidates|queries\/[^/]+\/collection))$/, policy:'operator', action:'operation.execute' },
+  { method:'GET', pattern:/^\/api\/reviews\/[^/]+\/evidence$/, policy:'operator', action:'review.evidence.read' },
   { method:'GET', pattern:/^\/api\/(reviewer-credentials|review-reasons|reviews|reviews\/[^/]+|channels|channels-revision|channels\/diagnostics\/rejected|channels\/[^/]+|channels\/[^/]+\/report|dashboard\/summary|search\/manual\/sessions|search\/manual\/sessions\/[^/]+|execution-traces\/[^/]+|country-vocabularies|excluded-countries|queues\/status|database\/schema-info|reconciliation\/legacy-community-retries|query-intelligence\/(summary|library|vocabulary|terminology|extracted-candidates|quality-dashboard|logs|status|scope)|regression\/(runs|latest))$/, policy:'operator', action:'administration.read' }
 ];
 

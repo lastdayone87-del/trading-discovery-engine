@@ -34,12 +34,39 @@ export async function listReviewQueue(filters:{country?:string;search?:string;li
   return r.rows.map(map);
 }
 
+/** Paginated review queue with a durable count for the operator console. */
+export async function listReviewQueuePage(filters:{country?:string;search?:string;limit?:number;offset?:number}={}) {
+  const [items,count]=await Promise.all([
+    listReviewQueue(filters),
+    (async()=>{const db=await getDb();const r=await db.query(`SELECT COUNT(*)::int AS total
+      FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.state='PENDING'
+        AND ($1::text IS NULL OR c.country=$1) AND ($2::text IS NULL OR c.channel_name ILIKE '%'||$2||'%' OR c.channel_id ILIKE '%'||$2||'%')`,
+      [filters.country||null,filters.search||null]);return Number(r.rows[0]?.total||0);})(),
+  ]);
+  return {items,total:count};
+}
+
 export async function getReviewDetails(channelId:string) {
   const db=await getDb(); const [item,history]=await Promise.all([
     db.query(`SELECT r.*,c.channel_name,c.youtube_url,c.country,c.trading_status,c.scan_status,c.quality_score,c.discord_status FROM channel_reviews r JOIN channels c USING(channel_id) WHERE r.channel_id=$1`,[channelId]),
     db.query(`SELECT id,decision,previous_status,resulting_status,reviewer,decided_at,reason,reason_code,reason_catalog_version,reason_other_text,notes,review_version,evidence_snapshot,idempotency_key FROM channel_review_decisions WHERE channel_id=$1 ORDER BY review_version DESC`,[channelId])
   ]); if(!item.rowCount) throw new ReviewNotFoundError('Review item not found.');
   return {...map(item.rows[0]),history:history.rows};
+}
+
+/** A retry of an already-committed decision must not be re-blocked by a new guard. */
+export async function hasReviewDecisionIdempotencyKey(
+  idempotencyKey: string,
+  channelId: string,
+  action: string,
+): Promise<boolean> {
+  if (!idempotencyKey.trim()) return false;
+  const db = await getDb();
+  const result = await db.query(
+    'SELECT 1 FROM channel_review_decisions WHERE idempotency_key=$1 AND channel_id=$2 AND decision=$3 LIMIT 1',
+    [idempotencyKey, channelId, action],
+  );
+  return (result.rowCount || 0) > 0;
 }
 
 export interface DecideInput { channelId:string; action:ReviewAction; expectedVersion:number; reviewer:string; reason?:string; reviewReasonCode?:string; reviewReasonVersion?:string; reviewReasonOther?:string; notes?:string; idempotencyKey:string; creatorType?:CreatorType; reasonCodes?:string[]; }
@@ -53,8 +80,10 @@ export async function decideReview(input:DecideInput) {
     await client.query('BEGIN');
     const prior=await client.query(`SELECT d.*,r.state,r.review_version current_review_version,c.trading_status,c.scan_status,c.discord_status
       FROM channel_review_decisions d JOIN channel_reviews r USING(channel_id) JOIN channels c USING(channel_id)
-      WHERE d.idempotency_key=$1`,[input.idempotencyKey]);
+      WHERE d.idempotency_key=$1 AND d.channel_id=$2`,[input.idempotencyKey,input.channelId]);
     if(prior.rowCount){const saved=prior.rows[0];await client.query('COMMIT');return {decision:saved,review:{state:saved.state,reviewVersion:saved.current_review_version},channel:{channelId:saved.channel_id,tradingStatus:saved.trading_status,scanStatus:saved.scan_status,discordStatus:saved.discord_status},queuePending:saved.state==='PENDING',idempotent:true};}
+    const keyOwner=await client.query('SELECT channel_id FROM channel_review_decisions WHERE idempotency_key=$1 LIMIT 1',[input.idempotencyKey]);
+    if(keyOwner.rowCount&&keyOwner.rows[0].channel_id!==input.channelId)throw new ReviewConflictError('Idempotency key belongs to another review.');
     // Canonical lock order is jobs -> channel. The migration 153 terminal-job
     // trigger already holds the job row before it touches the channel. Taking
     // the channel first here (the old order) let a worker hold the job while
