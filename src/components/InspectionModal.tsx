@@ -134,7 +134,7 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                 <div>
                   <span className="text-slate-500 block">Classification Route:</span>
                   <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    {channel.trading_relevance_breakdown.classification_route || 'Legacy / not recorded'}
+                    {channel.trading_relevance_breakdown.classification_route?.replaceAll('_', ' ') || 'Legacy / not recorded'}
                   </span>
                 </div>
                 <div>

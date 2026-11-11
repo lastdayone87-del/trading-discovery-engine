@@ -79,7 +79,13 @@ export const ClassificationResolution: React.FC = () => {
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void load();
+    }, 30_000);
+    return () => window.clearInterval(interval);
+  }, [load]);
 
   return (
     <div className="space-y-4">
@@ -101,7 +107,7 @@ export const ClassificationResolution: React.FC = () => {
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <Card label="Stored channels" value={n(data.channels.total)} detail={`${n(data.channels.needsReview)} in review`} />
             <Card label="Uncertain" value={n(data.channels.uncertain)} detail={`${n(data.enrichment.orphanPending)} orphan pending`} tone={data.enrichment.orphanPending > 0 ? 'amber' : 'slate'} />
-            <Card label="Due enrichment" value={n(data.enrichment.due)} detail={`${n(data.enrichment.processing)} processing · ${data.enrichment.oldestDueHours}h oldest`} tone={data.enrichment.due > 100 ? 'amber' : 'slate'} />
+            <Card label="Due enrichment" value={n(data.enrichment.due)} detail={`${n(data.enrichment.processing)} processing · ${data.enrichment.oldestDueHours}h oldest`} tone={data.enrichment.due > 100 || data.enrichment.oldestDueHours >= 6 ? 'amber' : 'slate'} />
             <Card label="Pending reviews" value={n(data.reviews.pending)} detail={`${data.reviews.oldestPendingDays}d oldest · ${n(data.enrichment.exhaustionReviewsPending)} exhausted`} tone={data.reviews.oldestPendingDays >= 7 ? 'amber' : 'slate'} />
             <Card label="Enrichment 24h" value={`${n(data.enrichment.completed24h)} completed`} detail={`${n(data.enrichment.failed24h)} failed · ${n(data.enrichment.recoveryCycles24h)} recovery cycles`} />
             <Card label="Generic failures" value={n(data.enrichment.genericFailures)} detail="eligible for bounded recovery" tone={data.enrichment.genericFailures > 0 ? 'amber' : 'emerald'} />
@@ -148,6 +154,13 @@ export const ClassificationResolution: React.FC = () => {
                 ))}
                 {Object.keys(data.routes.byRoute).length === 0 && <div className="text-slate-400">No routing diagnostics yet.</div>}
                 <div className="border-t border-slate-100 dark:border-slate-800 mt-2 pt-2 flex justify-between"><span>Semantic used / attempted</span><b>{n(data.routes.semanticUsed)} / {n(data.routes.semanticAttempted)}</b></div>
+                <div className="border-t border-slate-100 dark:border-slate-800 mt-2 pt-2 space-y-1">
+                  <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Recognition</div>
+                  {Object.entries(data.routes.byRecognition).sort((a, b) => b[1] - a[1]).map(([state, count]) => (
+                    <div key={state} className="flex justify-between text-[10px] text-slate-500"><span>{state.replaceAll('_', ' ')}</span><b>{n(count)}</b></div>
+                  ))}
+                  <div className="flex justify-between text-[10px] text-slate-500"><span>Unclassified</span><b>{n(data.routes.unclassified)}</b></div>
+                </div>
               </div>
             </section>
             <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4">

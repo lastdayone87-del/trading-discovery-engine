@@ -1147,7 +1147,7 @@ async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelList
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
-  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,quota_origin,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,quota_origin,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown - 'reasoning' - 'ai_prompt_payload' - 'ai_raw_response' AS trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=channels.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,
@@ -5783,7 +5783,7 @@ interface EnrichmentQuotaDemand {
  * admission lock while scanning the enrichment backlog serializes every quota
  * reservation in the process.
  */
-async function readEnrichmentQuotaDemand(runner: any): Promise<EnrichmentQuotaDemand> {
+export async function readEnrichmentQuotaDemand(runner: any): Promise<EnrichmentQuotaDemand> {
   const [dueEnrichment, recentConsumption] = await Promise.all([
     runner.query(
       `SELECT

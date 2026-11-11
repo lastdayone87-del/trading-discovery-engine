@@ -20,11 +20,15 @@ test('classification resolution is reachable from the dashboard', () => {
 test('the resolution panel follows routing, enrichment, recovery, review and quota', () => {
   assert.match(ui, /\/api\/classification\/resolution/);
   assert.match(ui, /Due enrichment/);
-  assert.match(ui, /Orphan|orphanPending/);
+  assert.match(ui, /orphan pending/i);
   assert.match(ui, /Generic failures/);
   assert.match(ui, /Eligible without review/);
   assert.match(ui, /Quota protected/);
   assert.match(ui, /capped at/);
+  assert.match(ui, /setInterval/);
+  assert.match(ui, /visibilityState/);
+  assert.match(ui, /byRecognition/);
+  assert.match(ui, /oldestDueHours >= 6/);
   assert.match(ui, /value=\{n\(data\.channels\.total\)\}/);
   assert.match(ui, /value=\{n\(data\.enrichment\.due\)\}/);
   assert.match(ui, /value=\{n\(data\.reviews\.pending\)\}/);
@@ -36,6 +40,7 @@ test('the resolution panel follows routing, enrichment, recovery, review and quo
 
 test('the existing channel views expose route, fallback and semantic attempt details', () => {
   assert.match(inspection, /Classification Route/);
+  assert.match(inspection, /classification_route\?\.replaceAll/);
   assert.match(inspection, /routing_fallback_reason/);
   assert.match(inspection, /semantic_attempted/);
   assert.match(results, /classification_route/);
@@ -55,7 +60,7 @@ test('the resolution panel ignores superseded loads and announces failures', () 
 test('the channel listing actually selects the route metadata the table renders', () => {
   const listingStart = dbCore.indexOf('export async function listChannelsPage');
   const listing = dbCore.slice(listingStart, dbCore.indexOf('export async function getLegacyCommunityRetryDiagnostics', listingStart));
-  assert.match(listing, /trading_relevance_breakdown/);
+  assert.match(listing, /trading_relevance_breakdown - 'reasoning' - 'ai_prompt_payload' - 'ai_raw_response'/);
 });
 
 test('the channel table shows semantic and fallback state without hover', () => {

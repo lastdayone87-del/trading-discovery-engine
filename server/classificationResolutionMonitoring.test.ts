@@ -73,15 +73,19 @@ test('overview computes due work, routes, reviews and quota from query results',
     [{ units_used: 100, daily_limit: 1000, last_reset: quotaDay }],
     [{ reserved: 50 }],
     [{ setting_value: 'true' }],
-    [{ stage1: 10, stage2: 2 }],
-    [{ allocation: 'AUTONOMOUS', units: 100 }, { allocation: 'ENRICHMENT', units: 50 }],
     [{ count: 25 }],
     [{ count: 5 }],
     [{ count: 3 }],
+    [{ stage1: 10, stage2: 2 }],
+    [{ allocation: 'AUTONOMOUS', units: 100 }, { allocation: 'ENRICHMENT', units: 50 }],
   ];
   let index = 0;
+  const queries: Array<{ sql: string; params?: unknown[] }> = [];
   const overview = await getClassificationResolutionOverview({
-    query: async () => ({ rows: results[index++] || [] }),
+    query: async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params });
+      return { rows: results[index++] || [] };
+    },
   });
 
   assert.equal(overview.channels.total, 12);
@@ -109,6 +113,11 @@ test('overview computes due work, routes, reviews and quota from query results',
   assert.equal(overview.quota.dueStage2, 2);
   assert.equal(overview.quota.recentAutonomousUnits, 100);
   assert.equal(overview.quota.recentEnrichmentUnits, 50);
+  assert.match(queries[2].sql, /stage2-postfix-shadow-v1:/);
+  assert.match(queries[14].sql, /operation='multilingual-semantic-classification'/);
+  assert.deepEqual(queries[15].params, [quotaDay, 9000]);
+  assert.match(queries[17].sql, /stage1/);
+  assert.match(queries[17].sql, /PROCESSING/);
   assert.deepEqual(
     overview.alerts.map(alert => alert.code),
     [
@@ -122,4 +131,12 @@ test('overview computes due work, routes, reviews and quota from query results',
       'YOUTUBE_KEYS_AT_CAP',
     ],
   );
+
+  const uppercaseResults = results.slice();
+  uppercaseResults[13] = [{ setting_value: 'TRUE' }];
+  let uppercaseIndex = 0;
+  const uppercase = await getClassificationResolutionOverview({
+    query: async () => ({ rows: uppercaseResults[uppercaseIndex++] || [] }),
+  });
+  assert.equal(uppercase.alerts.some(alert => alert.code === 'YOUTUBE_KEYS_AT_CAP'), false);
 });

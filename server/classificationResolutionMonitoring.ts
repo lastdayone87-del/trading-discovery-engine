@@ -1,6 +1,9 @@
 import { getDb } from './db';
-import { calculateEnrichmentQuotaReserve } from './dbCore';
+import { calculateEnrichmentQuotaReserve, readEnrichmentQuotaDemand } from './dbCore';
 import { getYouTubeQuotaDay } from './youtubeQuotaDay';
+import { ENFORCED_CAP_UNITS } from './quotaKeyCapShadow';
+
+const STAGE2_POSTFIX_SHADOW_OBSERVATION_PREFIX = 'stage2-postfix-shadow-v1:';
 
 export const CLASSIFICATION_RESOLUTION_MONITORING_VERSION = 'classification-resolution-monitoring-v1';
 
@@ -165,8 +168,6 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
     quotaRow,
     reservedQuota,
     hardCapSetting,
-    dueStage,
-    recentConsumption,
     recentProviderCalls,
     keysAtCap,
     unresolvedCompletedRows,
@@ -197,6 +198,7 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
          FROM (
            SELECT DISTINCT ON (channel_id) decision
              FROM production_classification_diagnostics
+            WHERE observation_key IS NULL OR observation_key NOT LIKE '${STAGE2_POSTFIX_SHADOW_OBSERVATION_PREFIX}%'
             ORDER BY channel_id,created_at DESC,id DESC
          ) latest
         GROUP BY 1,2,3,4`,
@@ -243,26 +245,8 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
     db.query(`SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations WHERE status='RESERVED' AND expires_at>now()`),
     db.query(`SELECT setting_value FROM app_settings WHERE setting_key='youtube_key_daily_cap_enforced'`),
     db.query(
-      `SELECT
-         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)<=1 AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage1,
-         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)>=2 AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage2
-       FROM jobs job
-      WHERE job.type='ENRICH_CHANNEL'
-        AND (
-          (job.status='PENDING' AND job.run_after<=now())
-          OR (job.status='PROCESSING' AND NOT EXISTS(
-            SELECT 1 FROM quota_reservations qr
-             WHERE qr.operation_type='ENRICH_CHANNEL' AND qr.operation_id=job.id::text AND qr.status='RESERVED'
-          ))
-        )`,
-    ),
-    db.query(
-      `SELECT allocation,COALESCE(SUM(units),0)::int AS units
-         FROM quota_reservations WHERE status='CONSUMED' AND reserved_at>=now()-interval '7 days' GROUP BY allocation`,
-    ),
-    db.query(
       `SELECT count(*)::int AS count FROM provider_call_events
-        WHERE occurred_at>=now()-interval '15 minutes' AND provider IN('gemini','groq','gemini-free') AND status IN('RATE_LIMITED','TRANSIENT_ERROR')`,
+        WHERE occurred_at>=now()-interval '15 minutes' AND provider IN('gemini','groq','gemini-free') AND operation='multilingual-semantic-classification' AND status IN('RATE_LIMITED','TRANSIENT_ERROR')`,
     ),
     db.query(
       `SELECT count(*)::int AS count
@@ -271,28 +255,28 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
           AND u.units_used + COALESCE((
             SELECT SUM(l.reserved_units) FROM youtube_key_cap_shadow_leases l
              WHERE l.quota_day=u.quota_day AND l.key_fingerprint=u.key_fingerprint AND l.expires_at>now()
-          ),0) >= 9000`,
-      [quotaDay],
+          ),0) >= $2`,
+      [quotaDay, ENFORCED_CAP_UNITS],
     ),
     db.query(`SELECT count(*)::int AS count FROM channels WHERE trading_status='UNCERTAIN' AND scan_status='COMPLETED'`),
   ]);
+  const demand = await readEnrichmentQuotaDemand(db);
   const jobsByStatus = countMap(enrichmentJobs.rows);
   const reviewsByState = countMap(reviewStates.rows);
-  const recentByAllocation = new Map<string, number>(recentConsumption.rows.map((row: any) => [String(row.allocation), Number(row.units) || 0]));
   const quota = quotaRow.rows[0] || { units_used: 0, daily_limit: 0, last_reset: '' };
-  const hardCapEnforced = String(hardCapSetting.rows[0]?.setting_value || '').toLowerCase() === 'true';
+  const hardCapEnforced = String(hardCapSetting.rows[0]?.setting_value || '') === 'true';
   const quotaUsed = String(quota.last_reset) === quotaDay ? Number(quota.units_used) || 0 : 0;
   const keysAtCapCount = hardCapEnforced && String(quota.last_reset) === quotaDay ? Number(keysAtCap.rows[0]?.count || 0) : 0;
-  const dueStage1: number = Number(dueStage.rows[0]?.stage1 || 0);
-  const dueStage2: number = Number(dueStage.rows[0]?.stage2 || 0);
+  const dueStage1: number = demand.dueStage1;
+  const dueStage2: number = demand.dueStage2;
   const protection = calculateEnrichmentQuotaReserve({
     dailyBudget: Number(quota.daily_limit) || 0,
     actualUsed: quotaUsed,
     reservedTotal: Number(reservedQuota.rows[0]?.reserved) || 0,
     dueStage1,
     dueStage2,
-    recentAutonomousUnits: recentByAllocation.get('AUTONOMOUS') || 0,
-    recentEnrichmentUnits: recentByAllocation.get('ENRICHMENT') || 0,
+    recentAutonomousUnits: demand.recentAutonomousUnits,
+    recentEnrichmentUnits: demand.recentEnrichmentUnits,
   });
   const oldestDueHours = Math.max(0, ...enrichmentJobs.rows.map(row => Number(row.oldest_due_hours) || 0));
   const channelTrading = countMap(channelStatus.rows);
@@ -370,8 +354,8 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
       reserveUnits: protection.reserveUnits,
       protectedShare: protection.protectedShare,
       discoveryAvailable: protection.discoveryAvailableUnits,
-      recentAutonomousUnits: recentByAllocation.get('AUTONOMOUS') || 0,
-      recentEnrichmentUnits: recentByAllocation.get('ENRICHMENT') || 0,
+      recentAutonomousUnits: demand.recentAutonomousUnits,
+      recentEnrichmentUnits: demand.recentEnrichmentUnits,
     },
     alerts,
   };
