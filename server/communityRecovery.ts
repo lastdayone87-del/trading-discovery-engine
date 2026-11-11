@@ -442,6 +442,10 @@ export async function reconcileCommunityAcquisitionRecovery(
         AND c.trading_status NOT IN('NON_TRADING','HUMAN_REJECTED')
         AND c.country_status <> 'REJECTED'
         AND c.country <> 'UNKNOWN'
+        -- A channel ruled out of scope must not be automatically reacquired.
+        -- Without this, the recovery sweep re-enqueues the channel after a
+        -- RETRY_TRIAGE_TERMINAL closure and reopens the just-closed job.
+        AND COALESCE(c.scope_eligibility,'') <> 'OUT_OF_SCOPE'
         AND (
           c.last_checked IS NULL
           OR c.last_checked < now() - interval '30 days'

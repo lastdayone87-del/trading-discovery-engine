@@ -216,6 +216,11 @@ test('clock-v2 capacity recovery renews leases without rewriting queue or failur
 
     const selection = queries.find(query => query.sql.includes('SELECT c.channel_id'))?.sql || '';
     assert.match(selection, /ORDER BY COALESCE\(j\.last_reopened_at, j\.created_at\) DESC/);
+    assert.match(
+      selection,
+      /COALESCE\(c\.scope_eligibility,''\) <> 'OUT_OF_SCOPE'/,
+      'automatic recovery must skip channels ruled out of scope',
+    );
   } finally {
     delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
   }
