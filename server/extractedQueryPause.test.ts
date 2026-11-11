@@ -27,11 +27,14 @@ test('paused extracted rows are filtered from every selection path', () => {
 
 test('pause migration quarantines only extracted queries and clears only the candidate ledger', () => {
   const sql = readFileSync(new URL('./db/migrations/181_pause_extracted_query_discovery.sql', import.meta.url), 'utf8');
-  assert.match(sql, /extracted_query_discovery_enabled/);
+  assert.match(sql, /'extracted_query_discovery_enabled', 'false'/);
+  assert.match(sql, /SET\s+collection\s*=\s*'REJECTED'/i);
+  assert.match(sql, /extractedQueryPaused/);
   assert.match(sql, /generation_metadata->>'queryTemplate' = 'EXTRACTED_STANDALONE'/);
   assert.match(sql, /DELETE FROM extracted_query_candidates/);
   // The user-facing query library must not be deleted or truncated.
   assert.doesNotMatch(sql, /DELETE\s+FROM\s+query_library/i);
-  assert.doesNotMatch(sql, /TRUNCATE\s+query_library/i);
+  assert.doesNotMatch(sql, /TRUNCATE(?:\s+TABLE)?\s+query_library/i);
   assert.doesNotMatch(sql, /DELETE\s+FROM\s+query_runs/i);
+  assert.doesNotMatch(sql, /TRUNCATE(?:\s+TABLE)?\s+query_runs/i);
 });

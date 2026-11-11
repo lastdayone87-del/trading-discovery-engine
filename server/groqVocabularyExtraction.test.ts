@@ -17,7 +17,7 @@ import {
 import { ProviderCallError, type ProviderCallEvent } from './providerResilience';
 import { isAdmissibleParsed, extractVocabularyFromCreator } from './queryIntelligence';
 import { buildNoveltyBaseline } from './terminologyIntelligence';
-import { getDb } from './db';
+import { getDb, setAppSetting } from './db';
 
 const GROQ_ENV_PATTERN = /^GROQ_/;
 
@@ -1219,4 +1219,64 @@ test('absurd timeout configs clamp instead of firing immediately', async () => {
   // Sane values pass through untouched.
   assert.equal(groqVocabularyAggregateMs({}), 120000);
   assert.equal(groqVocabularyMinIntervalMs({}), 2500);
+});
+
+test('paused extracted query discovery writes no candidate ledger rows', {
+  skip: e2eDatabaseUrl ? false : 'PHASE10_POSTGRES_URL is required for extraction e2e coverage'
+}, async () => {
+  process.env.DATABASE_URL = e2eDatabaseUrl!;
+  configureE2eTls(e2eDatabaseUrl!);
+  const db = await getDb();
+  const saved = saveGroqEnv();
+  const savedGemini = process.env.GEMINI_API_KEY;
+  const realFetch = globalThis.fetch;
+  const suffix = `pause${Date.now().toString(36)}${process.pid}`;
+  const channelId = `GROQ_PAUSE_${suffix}`;
+  try {
+    await setAppSetting('extracted_query_discovery_enabled', 'false');
+    withEnv({ GROQ_API_KEY: 'test-paused-key' }, 'org-paused');
+    delete process.env.GEMINI_API_KEY;
+    globalThis.fetch = stubFetch(async () =>
+      envelope(JSON.stringify({
+        terminology: [`Saisonalität ${suffix}`],
+        instruments: [],
+        phrases: [],
+        formats: [],
+        queries: ['DAX Analyse'],
+      }))
+    ) as typeof fetch;
+    await db.query(
+      `INSERT INTO channels(channel_id,channel_name,youtube_url,country,country_status,discord_status,scan_status,discovery_source,first_seen,quality_score,trading_status)
+       VALUES($1,'Paused Probe Kanal',$2,'Germany','CONFIRMED','UNKNOWN','PENDING','groq-pause-e2e',now(),90,'TRADING_CONFIRMED')`,
+      [channelId, `https://youtube.com/channel/${channelId}`]
+    );
+    const channel = await db.query('SELECT * FROM channels WHERE channel_id=$1', [channelId]).then(r => r.rows[0]);
+    await extractVocabularyFromCreator(
+      channel,
+      [`Saisonalität ${suffix} Heute`, 'DAX Analyse'],
+      '',
+      false,
+      undefined,
+      undefined,
+      undefined,
+      { isKillSwitchActive: async () => false },
+    );
+    const observations = await db.query(
+      'SELECT count(*)::int n FROM terminology_observations WHERE source_channel_id=$1',
+      [channelId],
+    );
+    assert.ok(Number(observations.rows[0]?.n) > 0, 'canonical terminology extraction should still run');
+    const candidates = await db.query(
+      'SELECT count(*)::int n FROM extracted_query_candidates WHERE source_channel_id=$1',
+      [channelId],
+    );
+    assert.equal(Number(candidates.rows[0]?.n), 0, 'paused discovery must not write candidates');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedGemini === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = savedGemini;
+    restoreGroqEnv(saved);
+    resetGroqCooldownForTests();
+    resetGroqVocabularyPacingForTests();
+  }
 });
