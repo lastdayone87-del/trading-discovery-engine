@@ -1386,7 +1386,11 @@ export async function processNextSearchJob(
     }
     const enrichmentFullyClaimable = enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive });
     const nowMs = Date.now();
-    const enrichmentProbe = !enrichmentFullyClaimable && semanticCooldownProbeAllowed(lastSemanticCooldownEnrichProbeAt, nowMs);
+    const probeTimeAllowed = !enrichmentFullyClaimable && semanticCooldownProbeAllowed(lastSemanticCooldownEnrichProbeAt, nowMs);
+    const probeStagesAvailable = probeTimeAllowed
+      ? (await (await getDb()).query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now() AND COALESCE((payload->>'enrichmentStage')::int,1)<=2 LIMIT 1`)).rowCount
+      : 0;
+    const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
     if (enrichmentFullyClaimable || enrichmentProbe) {
       if (enrichmentProbe) lastSemanticCooldownEnrichProbeAt = nowMs;
       claimableTypes.push('ENRICH_CHANNEL');

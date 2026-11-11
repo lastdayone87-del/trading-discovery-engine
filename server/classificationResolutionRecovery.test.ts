@@ -13,8 +13,9 @@ const base = {
   latestJobStatus: null as string | null,
   terminalFailureClass: null as string | null,
   recoveryCycles: 0,
-  lastChecked: '2026-11-11T00:00:00.000Z',
-  cutoff: '2026-11-10T00:00:00.000Z',
+  lastChecked: '2026-11-09T00:00:00.000Z',
+  cutoff: '2026-11-01T00:00:00.000Z',
+  now: Date.parse('2026-11-11T00:00:00.000Z'),
 };
 
 test('an active job always owns the channel', () => {
@@ -30,6 +31,7 @@ test('terminal semantic decisions are never reopened', () => {
 test('rows before the forward-recovery cutoff are reported but not mutated', () => {
   assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: '2026-01-01T00:00:00.000Z' }).action, 'SKIP_LEGACY');
   assert.equal(resolveResolutionRecoveryAction({ ...base, lastChecked: '2026-01-01T00:00:00.000Z', includeLegacy: true }).action, 'ENQUEUE_RECOVERY');
+  assert.equal(resolveResolutionRecoveryAction({ ...base, lastRecoveryAt: '2026-11-10T12:00:00.000Z' }).action, 'SKIP_COOLDOWN');
 });
 
 test('a permanent terminal failure is projected without retry or review', () => {
@@ -49,6 +51,10 @@ test('generic failed enrichment is retryable until the cycle ceiling', () => {
     resolveResolutionRecoveryAction({ ...failed, recoveryCycles: CLASSIFICATION_RESOLUTION_RECOVERY_CYCLE_LIMIT }).action,
     'EXHAUSTED_REVIEW',
   );
+});
+
+test('a terminal recovery marker becomes human review, not another retry', () => {
+  assert.equal(resolveResolutionRecoveryAction({ ...base, terminalRecoveryMarker: true }).action, 'EXHAUSTED_REVIEW');
 });
 
 test('a completed-but-UNCERTAIN row is exhausted, not successfully resolved', () => {

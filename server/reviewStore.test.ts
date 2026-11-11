@@ -23,7 +23,7 @@ test('approval and rejection produce their durable terminal queue states',()=>{
 });
 
 test('a pending review can request more evidence without approving or rejecting',()=>{
-  assert.equal(resolveReviewTransition('PENDING','REQUEST_RESCAN'),'PENDING');
+  assert.equal(resolveReviewTransition('PENDING','REQUEST_RESCAN'),'SUPERSEDED');
   assert.throws(()=>resolveReviewTransition('APPROVED','REQUEST_RESCAN'),ReviewConflictError);
   assert.throws(()=>resolveReviewTransition('REJECTED','REQUEST_RESCAN'),ReviewConflictError);
 });

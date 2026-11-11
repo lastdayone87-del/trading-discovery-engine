@@ -22,6 +22,7 @@ export async function recordReviewEligibilityShadow(input:ReviewEligibilityInput
   let decisionId:string|undefined;
   try{
     await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`review-eligibility:${input.channelId}`]);
     const prior=await client.query('SELECT version,decision_id,status FROM review_eligibility_projection WHERE channel_id=$1 FOR UPDATE',[input.channelId]),version=Number(prior.rows[0]?.version||0);
     const decisionTime=input.decidedAt ? new Date(input.decidedAt).toISOString() : undefined;
     const decision=await client.query(`INSERT INTO review_eligibility_decisions(decision_key,channel_id,classification_diagnostic_id,investigation_id,creator_focus_snapshot_id,status,reason_codes,input_snapshot,input_checksum,policy_version,mode,assignment_basis_points,randomization_value,assigned,serving_authority,decided_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,true,COALESCE($15::timestamptz,now())) ON CONFLICT(decision_key) DO NOTHING RETURNING id,decided_at`,[key,input.channelId,input.classificationDiagnosticId||null,input.investigationId||null,input.creatorFocusSnapshotId||null,evaluation.status,JSON.stringify(evaluation.reasonCodes),JSON.stringify(snapshot),checksum,REVIEW_ELIGIBILITY_POLICY_VERSION,mode,basis,assignment.randomizationValue,configured==='CANARY'&&assignment.assigned,decisionTime||null]);
