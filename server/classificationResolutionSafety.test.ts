@@ -23,6 +23,8 @@ test('recovery reuses the existing cooldown, cycle ceiling and active-job exclus
   assert.match(recovery, /date_trunc\('milliseconds', last_checked\)/);
   assert.match(recovery, /CLASSIFY_DISCOVERED_CHANNEL/);
   assert.match(recovery, /classification-resolution-failure:/);
+  assert.doesNotMatch(recovery, /terminal_recovery_marker,\s*FROM channels/);
+  assert.match(recovery, /AND \(\$3::boolean OR NOT \(/);
   assert.match(recovery, /await client\.query\('BEGIN'\)[\s\S]*?enqueueOperationalEnrichmentRecoveryJob[\s\S]*?INSERT INTO operational_enrichment_recovery_events/);
 });
 
@@ -39,7 +41,8 @@ test('exhausted review materialization records dashboard lineage and projection 
 test('a stale exhaustion projection leaves a recoverable failed state', () => {
   const pipeline = read('./ingestionPipeline.ts');
   assert.match(pipeline, /review\.reason === 'STALE_ELIGIBILITY_PROJECTION'/);
-  assert.match(pipeline, /scan_status = 'FAILED'/);
+  assert.match(pipeline, /projectBlockedEnrichmentScanStatus\(candidate\.channelId,'FAILED'/);
+  assert.doesNotMatch(pipeline, /withheldChannel\.scan_status = 'FAILED'/);
 });
 
 test('the normal eligibility path preserves an exhausted pending review lineage', () => {
