@@ -81,6 +81,15 @@ async function main() {
   const offset = Math.max(0, Number(argValue('offset') || 0));
   const country = argValue('country')?.trim();
   const db = await getDb();
+  const waitingFilter = apply
+    ? `AND NOT EXISTS (
+         SELECT 1 FROM semantic_admission_candidates cac
+          WHERE cac.channel_id=c.channel_id
+            AND cac.status='WAITING_EVIDENCE'
+            AND cac.next_check_at IS NOT NULL
+            AND cac.next_check_at > now()
+       )`
+    : '';
   const result = await db.query(
     `SELECT c.channel_id,c.channel_name,c.youtube_url,c.country,c.country_status,c.scan_status,c.trading_status,
             c.discovery_source,c.subscriber_count,c.channel_thumbnail_url,c.inspection_trail,
@@ -92,13 +101,7 @@ async function main() {
        ) j ON true
       WHERE c.scan_status='INTAKE_DEFERRED'
         AND ($2::text IS NULL OR LOWER(c.country)=LOWER($2))
-        AND NOT EXISTS (
-          SELECT 1 FROM semantic_admission_candidates cac
-           WHERE cac.channel_id=c.channel_id
-             AND cac.status='WAITING_EVIDENCE'
-             AND cac.next_check_at IS NOT NULL
-             AND cac.next_check_at > now()
-        )
+        ${waitingFilter}
       ORDER BY c.first_seen, c.channel_id
       LIMIT $1 OFFSET $3`,
     [limit, country || null, offset],
