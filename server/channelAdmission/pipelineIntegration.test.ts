@@ -31,7 +31,7 @@ test('confident admission produces a first-class TRADING_CONFIRMED result withou
   assert.equal(built.decision.confidenceScore, 93);
 });
 
-test('pipeline skips legacy intake triage and #618 for a confirmed admission', () => {
+test('pipeline source wires a confirmed admission to the synthetic classifier', () => {
   assert.match(pipeline, /candidate\.admissionDecisionId/);
   assert.match(pipeline, /candidate\.admissionConfirmedTrading === true && candidate\.admissionDecisionId/);
   assert.match(pipeline, /buildAdmissionConfirmedClassification/);
@@ -43,7 +43,7 @@ test('legacy dashboard predicate hides pre-admission rows', () => {
   assert.match(dbCore, /scan_status <> 'CLASSIFICATION_PENDING'/);
 });
 
-test('search worker enqueues admission before classification and stores matched document', () => {
+test('search-worker source contract wires admission before classification and stores matched document', () => {
   assert.match(queue, /upsertAdmissionCandidate/);
   assert.match(queue, /enqueueAdmissionVerification/);
   assert.match(queue, /VERIFY_CHANNEL_ADMISSION/);
