@@ -89,8 +89,8 @@ import type { DemandSignalQueryCandidate } from './queryPlanner';
 
 /**
  * Extracted-query discovery is paused while the semantic extractor is rebuilt.
- * The flag is fail-closed: only the exact value `true` re-enables generation
- * and serving. The ledger/schema stay in place for the future rewrite.
+ * The flag is fail-closed: only a trimmed, case-insensitive `true` re-enables
+ * generation and serving. The ledger/schema stay in place for the future rewrite.
  */
 export const EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY = 'extracted_query_discovery_enabled';
 
@@ -1053,6 +1053,12 @@ export async function extractVocabularyFromCreator(
     // misreported as Gemini errors or silently swallowed.
     let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown; queries?: unknown } | undefined;
     let parsedSource: 'GROQ' | 'GEMINI' = 'GEMINI';
+    const queryPromptSection = extractedQueryDiscoveryEnabled
+      ? '- "queries": clean native-language discovery queries. Use 2-6 words. Split composite titles into useful independent candidates. Remove promotional suffixes, CTAs, clickbait, dates, episode labels, hashtags, emoji, metadata and incomplete fragments. Preserve the original language; do not translate. Only include phrases with genuine trading intent.'
+      : '';
+    const queryJsonField = extractedQueryDiscoveryEnabled
+      ? ',\n  "queries": ["native search phrase"]'
+      : '';
     const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
 Description: "${effDesc}"
@@ -1068,7 +1074,7 @@ Identify localized trading vocabulary used by traders in ${channel.country}. Eac
 - "instruments": tradeable instruments, exchanges or contracts (for example "NQ Futures", "XAUUSD", "DAX").
 - "phrases": multiword phrases with a genuine market/trading meaning (for example "live trading", "trade review", "risk management").
 - "formats": trading-specific content formats only (for example "live trading", "trade review"), never generic packaging.
-- "queries": clean native-language discovery queries. Use 2-6 words. Split composite titles into useful independent candidates. Remove promotional suffixes, CTAs, clickbait, dates, episode labels, hashtags, emoji, metadata and incomplete fragments. Preserve the original language; do not translate. Only include phrases with genuine trading intent.
+${queryPromptSection}
 Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
 Exclude calls to action (subscribe, like, comment, notification), channel boilerplate, episode/part/volume labels, emoji-only or symbol-only surfaces, hashtags, URLs, handles, and generic words such as "free", "video", "channel", "interview", "live" or "session" without a trading qualifier. Do not return "Subscribe and Like button", "Free Interviews", "Épisode 6", "🔴" or "#trading".
 Return ONLY a valid JSON object with format:
@@ -1076,8 +1082,7 @@ Return ONLY a valid JSON object with format:
   "terminology": ["term1", "term2"],
   "instruments": ["inst1"],
   "phrases": ["phrase1"],
-  "formats": ["format1"],
-  "queries": ["native search phrase"]
+  "formats": ["format1"]${queryJsonField}
 }`;
 
     // Literal sources were built before any provider attempt; the novelty
