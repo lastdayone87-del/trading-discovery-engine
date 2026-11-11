@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { buildResolutionAlerts } from './classificationResolutionMonitoring';
+
+const source = readFileSync(new URL('./classificationResolutionMonitoring.ts', import.meta.url), 'utf8');
 
 const base = {
   dueEnrichment: 0,
@@ -51,4 +54,22 @@ test('an aged review queue is warned before it becomes critical', () => {
   assert.equal(warn[0].severity, 'WARN');
   const critical = buildResolutionAlerts({ ...base, pendingReviews: 10, oldestReviewDays: 38 });
   assert.equal(critical[0].severity, 'CRITICAL');
+});
+
+
+test('overview queries use the same job set and recovery ledger as the writers', () => {
+  assert.match(source, /j\.type IN\('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN'\)/);
+  assert.match(source, /event_key LIKE 'operational-enrichment:%'/);
+  assert.match(source, /now\(\)-run_after/);
+  assert.match(source, /dueStage1 \+ dueStage2/);
+  assert.match(source, /job\.status='PROCESSING'/);
+  assert.match(source, /job\.status='PENDING'/);
+});
+
+test('key-cap alert counts settled usage plus live leases and requires enforcement', () => {
+  assert.match(source, /youtube_key_daily_cap_enforced/);
+  assert.match(source, /youtube_key_cap_shadow_leases/);
+  assert.match(source, /hardCapEnforced && String\(quota\.last_reset\) === quotaDay/);
+  assert.match(source, /deterministicRouting' \? 'semanticUsed'/);
+  assert.match(source, /gemini_semantic','groq_semantic/);
 });

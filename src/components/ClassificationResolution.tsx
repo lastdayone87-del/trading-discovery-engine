@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, AlertTriangle, CheckCircle2, Loader2, RefreshCw, ShieldAlert } from 'lucide-react';
 import { apiFetch } from '../apiClient';
 
@@ -58,8 +58,10 @@ export const ClassificationResolution: React.FC = () => {
   const [data, setData] = useState<ResolutionOverview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(async () => {
+    const id = ++requestId.current;
     setLoading(true);
     setError(null);
     try {
@@ -68,11 +70,12 @@ export const ClassificationResolution: React.FC = () => {
         const body = await response.json().catch(() => ({})) as { error?: string };
         throw new Error(body.error || `Could not load classification resolution metrics (${response.status}).`);
       }
-      setData(await response.json() as ResolutionOverview);
+      const next = await response.json() as ResolutionOverview;
+      if (id === requestId.current) setData(next);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not load classification resolution metrics.');
+      if (id === requestId.current) setError(err instanceof Error ? err.message : 'Could not load classification resolution metrics.');
     } finally {
-      setLoading(false);
+      if (id === requestId.current) setLoading(false);
     }
   }, []);
 
@@ -91,7 +94,7 @@ export const ClassificationResolution: React.FC = () => {
         </button>
       </div>
 
-      {error && <div className="rounded-xl border border-rose-200 bg-rose-50 text-rose-700 p-3 text-xs flex items-start gap-2"><AlertTriangle className="w-4 h-4 mt-0.5" />{error}</div>}
+      {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 text-rose-700 p-3 text-xs flex items-start gap-2"><AlertTriangle className="w-4 h-4 mt-0.5" />{error}</div>}
       {loading && !data && <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-8 flex justify-center"><Loader2 className="w-5 h-5 animate-spin" /></div>}
       {data && (
         <>
@@ -129,7 +132,7 @@ export const ClassificationResolution: React.FC = () => {
                 <div>Daily limit: <b>{n(data.quota.dailyLimit)}</b></div>
                 <div>Used: <b>{n(data.quota.used)}</b> · Remaining: <b>{n(data.quota.remaining)}</b></div>
                 <div>Due stage 1/2: <b>{n(data.quota.dueStage1)}</b> / <b>{n(data.quota.dueStage2)}</b></div>
-                <div>Reserved for enrichment: <b>{n(data.quota.reserveUnits)}</b> ({pct(data.quota.protectedShare)})</div>
+                <div>Reserved for enrichment: <b>{n(data.quota.reserveUnits)}</b> <span>(demand-driven; protected-share floor {pct(data.quota.protectedShare)})</span></div>
                 <div>Recent 7-day consumption: autonomous <b>{n(data.quota.recentAutonomousUnits)}</b> · enrichment <b>{n(data.quota.recentEnrichmentUnits)}</b></div>
                 <div className="text-[10px] text-slate-400 pt-1">Reserve is demand-driven and released as the due backlog clears.</div>
               </div>

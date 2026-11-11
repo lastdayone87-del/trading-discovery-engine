@@ -59,12 +59,13 @@ No legacy row has a pending review. These rows predate the forward-recovery cuto
 - Recent 7-day consumption: autonomous **793,500**; enrichment **54,808**.
 - Due enrichment: 5,885 stage 1 and 19 stage 2.
 - Estimated due demand: 13,727 units.
-- Dynamic protected reserve: **13,727 units (10%)**, released as the backlog falls.
+- Dynamic protected reserve: **13,727 units** (demand-driven; protected-share floor 10%), released as the backlog falls.
 - Available to autonomous discovery: **456,962 units**.
 - No fixed quota partition was introduced.
 
 ## Safety notes
 
-- The dry-run script defaults to no writes; `--apply` requires explicit operator approval.
+- The dry-run script defaults to no writes; `--apply` requires explicit operator approval. A dry run never creates the cutoff row.
 - The maintenance sweep is forward-only until its cutoff; legacy rows are not mutated.
+- The maintenance sweep is read-only unless `CLASSIFICATION_RESOLUTION_RECOVERY_APPLY=true` is set. Absent or any other value keeps the scheduled sweep in dry-run mode.
 - No worker, provider, key, or evidence-threshold changes are part of this report.

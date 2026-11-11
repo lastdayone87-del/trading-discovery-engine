@@ -8,6 +8,7 @@ const ui = readFileSync(new URL('../src/components/ClassificationResolution.tsx'
 const inspection = readFileSync(new URL('../src/components/InspectionModal.tsx', import.meta.url), 'utf8');
 const results = readFileSync(new URL('../src/components/ResultsTable.tsx', import.meta.url), 'utf8');
 const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
 
 test('classification resolution is reachable from the dashboard', () => {
   assert.match(app, /ClassificationResolution/);
@@ -35,5 +36,23 @@ test('the existing channel views expose route, fallback and semantic attempt det
 });
 
 test('the resolution endpoint is an explicit operator read route', () => {
-  assert.match(server, /\/api\/classification\/resolution/);
+  assert.match(server, /app\.get\('\/api\/classification\/resolution', requireReviewer/);
+});
+
+
+test('the resolution panel ignores superseded loads and announces failures', () => {
+  assert.match(ui, /requestId\.current/);
+  assert.match(ui, /if \(id === requestId\.current\) setData/);
+  assert.match(ui, /role="alert"/);
+});
+
+test('the channel listing actually selects the route metadata the table renders', () => {
+  const listingStart = dbCore.indexOf('export async function listChannelsPage');
+  const listing = dbCore.slice(listingStart, dbCore.indexOf('export async function getLegacyCommunityRetryDiagnostics', listingStart));
+  assert.match(listing, /trading_relevance_breakdown/);
+});
+
+test('the channel table shows semantic and fallback state without hover', () => {
+  assert.match(results, /semantic used/);
+  assert.match(results, /routing_fallback_reason\.replaceAll/);
 });

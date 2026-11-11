@@ -149,6 +149,7 @@ export function buildResolutionAlerts(input: {
 
 export async function getClassificationResolutionOverview(): Promise<ClassificationResolutionOverview> {
   const db = await getDb();
+  const quotaDay = getYouTubeQuotaDay();
   const [
     channelStatus,
     scanStatus,
@@ -163,6 +164,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     eligibleWithoutPending,
     quotaRow,
     reservedQuota,
+    hardCapSetting,
     dueStage,
     recentConsumption,
     recentProviderCalls,
@@ -174,8 +176,23 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     db.query(
       `SELECT COALESCE(latest.decision->'deterministicRouting'->>'route','UNROUTED') AS key,
               COALESCE(latest.decision->>'recognitionState',latest.decision->'recognition'->>'state','UNKNOWN') AS recognition,
-              COALESCE(latest.decision->'deterministicRouting'->>'semanticUsed','false') AS semantic_used,
-              COALESCE(latest.decision->'deterministicRouting'->>'semanticAttempted','false') AS semantic_attempted,
+              CASE WHEN latest.decision->'deterministicRouting' ? 'semanticUsed'
+                THEN COALESCE(latest.decision->'deterministicRouting'->>'semanticUsed','false')
+                ELSE CASE WHEN EXISTS(
+                  SELECT 1 FROM jsonb_array_elements(COALESCE(latest.decision->'evidenceCollection'->'providers','[]'::jsonb)) p
+                   WHERE p->>'provider' IN('gemini_semantic','groq_semantic')
+                     AND p->>'outcome'='EXECUTED_WITH_EVIDENCE'
+                ) THEN 'true' ELSE 'false' END
+              END AS semantic_used,
+              CASE WHEN latest.decision->'deterministicRouting' ? 'semanticAttempted'
+                THEN COALESCE(latest.decision->'deterministicRouting'->>'semanticAttempted','false')
+                ELSE CASE WHEN EXISTS(
+                  SELECT 1 FROM jsonb_array_elements(COALESCE(latest.decision->'evidenceCollection'->'providers','[]'::jsonb)) p
+                   WHERE p->>'provider' IN('gemini_semantic','groq_semantic')
+                     AND p->>'availability' IN('AVAILABLE','FAILED')
+                     AND p->>'outcome' NOT IN('SUPPRESSED_BY_POLICY','NOT_APPLICABLE','UNAVAILABLE_CONFIGURATION')
+                ) THEN 'true' ELSE 'false' END
+              END AS semantic_attempted,
               count(*)::int AS count
          FROM (
            SELECT DISTINCT ON (channel_id) decision
@@ -186,7 +203,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     ),
     db.query(
       `SELECT status AS key,count(*)::int AS count,
-              COALESCE(MAX(EXTRACT(EPOCH FROM(now()-created_at))/3600) FILTER (WHERE status='PENDING' AND run_after<=now()),0) AS oldest_due_hours
+              COALESCE(MAX(EXTRACT(EPOCH FROM(now()-run_after))/3600) FILTER (WHERE status='PENDING' AND run_after<=now()),0) AS oldest_due_hours
          FROM jobs WHERE type='ENRICH_CHANNEL' AND (status IN('PENDING','PROCESSING') OR updated_at>=now()-interval '24 hours')
         GROUP BY status`,
     ),
@@ -201,13 +218,13 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
          FROM channels c
          JOIN LATERAL (
            SELECT j.status,j.terminal_failure_class FROM jobs j
-            WHERE j.type='ENRICH_CHANNEL' AND j.payload->>'channelId'=c.channel_id
+            WHERE j.type IN('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN') AND j.payload->>'channelId'=c.channel_id
             ORDER BY j.updated_at DESC NULLS LAST,j.id DESC LIMIT 1
          ) j ON true
         WHERE c.trading_status='UNCERTAIN' AND c.scan_status='FAILED'
           AND j.status='FAILED' AND COALESCE(j.terminal_failure_class,'UNKNOWN') IN('RETRYABLE','UNKNOWN')`,
     ),
-    db.query(`SELECT count(*)::int AS count FROM operational_enrichment_recovery_events WHERE event_key LIKE 'classification-resolution-recovery:cycle:%' AND created_at>=now()-interval '24 hours'`),
+    db.query(`SELECT count(*)::int AS count FROM operational_enrichment_recovery_events WHERE event_key LIKE 'operational-enrichment:%' AND created_at>=now()-interval '24 hours'`),
     db.query(`SELECT count(*)::int AS count FROM channel_reviews WHERE state='PENDING' AND evidence_snapshot->>'reasonFamily'='EVIDENCE_EXHAUSTED'`),
     db.query(`SELECT state AS key,count(*)::int AS count,COALESCE(MAX(EXTRACT(EPOCH FROM(now()-pending_since))/86400) FILTER (WHERE state='PENDING'),0) AS oldest_days FROM channel_reviews GROUP BY state`),
     db.query(`SELECT status AS key,count(*)::int AS count FROM review_eligibility_projection GROUP BY status`),
@@ -224,11 +241,20 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     ),
     db.query(`SELECT units_used,daily_limit,last_reset FROM quota_tracker WHERE id='youtube'`),
     db.query(`SELECT COALESCE(SUM(units),0)::int AS reserved FROM quota_reservations WHERE status='RESERVED' AND expires_at>now()`),
+    db.query(`SELECT setting_value FROM app_settings WHERE setting_key='youtube_key_daily_cap_enforced'`),
     db.query(
       `SELECT
-         count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)<=1 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage1,
-         count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)>=2 AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage2
-       FROM jobs WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now()`,
+         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)<=1 AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage1,
+         count(*) FILTER (WHERE COALESCE((job.payload->>'enrichmentStage')::int,1)>=2 AND NOT (COALESCE((job.payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((job.payload->>'enrichmentStage')::int,1)))::int AS stage2
+       FROM jobs job
+      WHERE job.type='ENRICH_CHANNEL'
+        AND (
+          (job.status='PENDING' AND job.run_after<=now())
+          OR (job.status='PROCESSING' AND NOT EXISTS(
+            SELECT 1 FROM quota_reservations qr
+             WHERE qr.operation_type='ENRICH_CHANNEL' AND qr.operation_id=job.id::text AND qr.status='RESERVED'
+          ))
+        )`,
     ),
     db.query(
       `SELECT allocation,COALESCE(SUM(units),0)::int AS units
@@ -239,8 +265,14 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
         WHERE occurred_at>=now()-interval '15 minutes' AND provider IN('gemini','groq','gemini-free') AND status IN('RATE_LIMITED','TRANSIENT_ERROR')`,
     ),
     db.query(
-      `SELECT count(*)::int AS count FROM youtube_key_quota_usage
-        WHERE quota_day=(SELECT last_reset FROM quota_tracker WHERE id='youtube') AND units_used>=9000`,
+      `SELECT count(*)::int AS count
+         FROM youtube_key_quota_usage u
+        WHERE u.quota_day=$1
+          AND u.units_used + COALESCE((
+            SELECT SUM(l.reserved_units) FROM youtube_key_cap_shadow_leases l
+             WHERE l.quota_day=u.quota_day AND l.key_fingerprint=u.key_fingerprint AND l.expires_at>now()
+          ),0) >= 9000`,
+      [quotaDay],
     ),
     db.query(`SELECT count(*)::int AS count FROM channels WHERE trading_status='UNCERTAIN' AND scan_status='COMPLETED'`),
   ]);
@@ -248,9 +280,9 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
   const reviewsByState = countMap(reviewStates.rows);
   const recentByAllocation = new Map(recentConsumption.rows.map(row => [String(row.allocation), Number(row.units) || 0]));
   const quota = quotaRow.rows[0] || { units_used: 0, daily_limit: 0, last_reset: '' };
-  const quotaDay = getYouTubeQuotaDay();
+  const hardCapEnforced = String(hardCapSetting.rows[0]?.setting_value || '').toLowerCase() === 'true';
   const quotaUsed = String(quota.last_reset) === quotaDay ? Number(quota.units_used) || 0 : 0;
-  const keysAtCapCount = String(quota.last_reset) === quotaDay ? Number(keysAtCap.rows[0]?.count || 0) : 0;
+  const keysAtCapCount = hardCapEnforced && String(quota.last_reset) === quotaDay ? Number(keysAtCap.rows[0]?.count || 0) : 0;
   const dueStage1 = Number(dueStage.rows[0]?.stage1 || 0);
   const dueStage2 = Number(dueStage.rows[0]?.stage2 || 0);
   const protection = calculateEnrichmentQuotaReserve({
@@ -281,7 +313,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
   const pendingReviews = Number(reviewsByState.PENDING || 0);
   const oldestReviewDays = Math.max(0, ...reviewStates.rows.map(row => Number(row.oldest_days) || 0));
   const alerts = buildResolutionAlerts({
-    dueEnrichment: Number(dueStage.rows[0]?.total || 0),
+    dueEnrichment: dueStage1 + dueStage2,
     oldestDueHours,
     orphanPending: Number(orphanPending.rows[0]?.count || 0),
     genericFailures: Number(genericFailures.rows[0]?.count || 0),
@@ -304,7 +336,7 @@ export async function getClassificationResolutionOverview(): Promise<Classificat
     },
     enrichment: {
       pending: Number(jobsByStatus.PENDING || 0),
-      due: Number(dueStage.rows[0]?.total || 0),
+      due: dueStage1 + dueStage2,
       processing: Number(jobsByStatus.PROCESSING || 0),
       oldestDueHours: Math.round(oldestDueHours * 10) / 10,
       completed24h: Number(jobsByStatus.COMPLETED || 0),
