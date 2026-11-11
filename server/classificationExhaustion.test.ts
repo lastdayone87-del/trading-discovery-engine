@@ -34,8 +34,7 @@ test('the exhaustion materializer is review-only and keeps the existing serving 
 });
 
 test('normal eligibility reconciliation cannot retire an exhausted review', () => {
-  assert.match(eligibilityStore, /reasonFamily==='EVIDENCE_EXHAUSTED'/);
-  assert.match(eligibilityStore, /return;/);
+  assert.match(eligibilityStore, /if\(pending\.rows\[0\]\?\.evidence_snapshot\?\.reasonFamily==='EVIDENCE_EXHAUSTED'\)return;/);
 });
 
 test('the migration and reviewer surface expose the request-rescan path', () => {

@@ -1387,12 +1387,18 @@ export async function processNextSearchJob(
     const enrichmentFullyClaimable = enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive });
     const nowMs = Date.now();
     const probeTimeAllowed = !enrichmentFullyClaimable && semanticCooldownProbeAllowed(lastSemanticCooldownEnrichProbeAt, nowMs);
+    // Reserve the interval before awaiting the scan. Empty results and
+    // concurrent workers must not re-run the probe query on every tick.
+    if (probeTimeAllowed) lastSemanticCooldownEnrichProbeAt = nowMs;
     const probeStagesAvailable = probeTimeAllowed
-      ? (await (await getDb()).query(`SELECT 1 FROM jobs WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now() AND COALESCE((payload->>'enrichmentStage')::int,1)<=2 LIMIT 1`)).rowCount
+      ? (await (await getDb()).query(`SELECT 1 FROM jobs
+           WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now()
+             AND COALESCE((payload->>'enrichmentStage')::int,1)<=2
+             AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1))
+           LIMIT 1`)).rowCount
       : 0;
     const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
     if (enrichmentFullyClaimable || enrichmentProbe) {
-      if (enrichmentProbe) lastSemanticCooldownEnrichProbeAt = nowMs;
       claimableTypes.push('ENRICH_CHANNEL');
       // Classification jobs require the semantic decision and remain gated
       // while every semantic route is cooling. ENRICH is allowed as a bounded

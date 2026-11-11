@@ -21,6 +21,8 @@ test('post-enrichment no-independent-hypothesis path is reviewable, never silent
   assert.match(block,/materializeExhaustedReview\(/);
   assert.match(block,/NO_INDEPENDENT_HYPOTHESIS_AFTER_ENRICHMENT/);
   assert.doesNotMatch(block,/trading_status='NEEDS_REVIEW'/);
+  assert.doesNotMatch(block,/scan_status='NEEDS_REVIEW'/);
+  assert.doesNotMatch(block,/tradingStatus:\s*'NEEDS_REVIEW'/);
   assert.doesNotMatch(block,/scan_status='COMPLETED'/);
 });
 

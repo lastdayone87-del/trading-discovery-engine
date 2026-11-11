@@ -121,6 +121,7 @@ export interface ClassificationResolutionRecoveryResult {
   exhaustedReviews: number;
   permanentFailures: number;
   skipped: number;
+  failures: number;
   items: ClassificationResolutionRecoveryItem[];
 }
 
@@ -178,6 +179,7 @@ export async function reconcileClassificationResolutionGaps(
       WHERE c.trading_status='UNCERTAIN'
         AND c.scan_status IN('ENRICHMENT_PENDING','FAILED')
         AND ($1::boolean OR COALESCE(c.last_checked,c.created_at) >= $2::timestamptz)
+        AND COALESCE(c.country_status,'') <> 'REJECTED'
         AND NOT EXISTS(
           SELECT 1 FROM jobs active
            WHERE active.payload->>'channelId'=c.channel_id
@@ -189,7 +191,7 @@ export async function reconcileClassificationResolutionGaps(
     [Boolean(options.includeLegacy), cutoff, limit],
   );
   const items: ClassificationResolutionRecoveryItem[] = [];
-  let enqueued = 0, exhaustedReviews = 0, permanentFailures = 0, skipped = 0;
+  let enqueued = 0, exhaustedReviews = 0, permanentFailures = 0, skipped = 0, failures = 0;
   for (const row of result.rows) {
     const decision = resolveResolutionRecoveryAction({
       tradingStatus: String(row.trading_status),
@@ -228,66 +230,82 @@ export async function reconcileClassificationResolutionGaps(
       else skipped += 1;
       continue;
     }
-    if (decision.action === 'SKIP_TERMINAL' || decision.action === 'SKIP_ACTIVE' || decision.action === 'SKIP_LEGACY') {
-      skipped += 1;
-      continue;
-    }
-    if (decision.action === 'PROJECT_PERMANENT_FAILURE') {
-      const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND last_checked IS NOT DISTINCT FROM $2::timestamptz AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
-      if (projected.rowCount) permanentFailures += 1;
-      else skipped += 1;
-      continue;
-    }
-    if (decision.action === 'EXHAUSTED_REVIEW') {
-      await materializeExhaustedReview({
-        channelId: item.channelId,
-        reasonCode: decision.reasonCodes[0] || 'ENRICHMENT_EXHAUSTED',
-        reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
-        evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles, policyVersion: CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION },
-      });
-      exhaustedReviews += 1;
-      continue;
-    }
-    const channel = await channelRowToRecord(db, item.channelId);
-    if (!channel) { skipped += 1; continue; }
-    const cycle = item.recoveryCycles + 1;
-    let accepted = false;
-    const client = await db.connect();
+    // One poisoned row must not starve the rest of the batch. Rows are ordered
+    // by last_checked, so a repeated failure at the head would otherwise block
+    // every later channel on every sweep.
     try {
-      await client.query('BEGIN');
-      accepted = await enqueueOperationalEnrichmentRecoveryJob(channel, decision.reasonCodes, client);
-      if (accepted) {
-        await client.query(
-          `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
-           VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
-          [
-            `${CYCLE_PREFIX}${item.channelId}:${item.latestJobId || 'none'}:attempt:${item.latestJobAttempts || 0}:cycle:${cycle}`,
-            item.channelId,
-            item.latestJobId || 'none',
-            item.scanStatus,
-            JSON.stringify(decision.reasonCodes),
-            CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
-          ],
-        );
+      if (decision.action === 'SKIP_TERMINAL' || decision.action === 'SKIP_ACTIVE' || decision.action === 'SKIP_LEGACY' || decision.action === 'SKIP_COOLDOWN') {
+        skipped += 1;
+        continue;
       }
-      await client.query('COMMIT');
+      if (decision.action === 'PROJECT_PERMANENT_FAILURE') {
+        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND last_checked IS NOT DISTINCT FROM $2::timestamptz AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
+        if (projected.rowCount) permanentFailures += 1;
+        else skipped += 1;
+        continue;
+      }
+      if (decision.action === 'EXHAUSTED_REVIEW') {
+        const review = await materializeExhaustedReview({
+          channelId: item.channelId,
+          reasonCode: decision.reasonCodes[0] || 'ENRICHMENT_EXHAUSTED',
+          reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
+          evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles, policyVersion: CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION },
+        });
+        if (review.materialized) exhaustedReviews += 1;
+        else skipped += 1;
+        continue;
+      }
+      const channel = await channelRowToRecord(db, item.channelId);
+      if (!channel) { skipped += 1; continue; }
+      const cycle = item.recoveryCycles + 1;
+      let accepted = false;
+      const client = await db.connect();
+      try {
+        await client.query('BEGIN');
+        accepted = await enqueueOperationalEnrichmentRecoveryJob(channel, decision.reasonCodes, client);
+        if (accepted) {
+          await client.query(
+            `INSERT INTO operational_enrichment_recovery_events(event_key,channel_id,job_id,prior_scan_status,reason_codes,policy_version)
+             VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key) DO NOTHING`,
+            [
+              `${CYCLE_PREFIX}${item.channelId}:${item.latestJobId || 'none'}:attempt:${item.latestJobAttempts || 0}:cycle:${cycle}`,
+              item.channelId,
+              item.latestJobId || 'none',
+              item.scanStatus,
+              JSON.stringify(decision.reasonCodes),
+              CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
+            ],
+          );
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+      if (!accepted) {
+        const review = await materializeExhaustedReview({
+          channelId: item.channelId,
+          reasonCode: 'RECOVERY_ENQUEUE_BLOCKED',
+          reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
+          evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles },
+        });
+        if (review.materialized) exhaustedReviews += 1;
+        else skipped += 1;
+        continue;
+      }
+      enqueued += 1;
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
-    if (!accepted) {
-      await materializeExhaustedReview({
+      failures += 1;
+      console.warn(JSON.stringify({
+        event: 'classification_resolution_recovery_item_failed',
         channelId: item.channelId,
-        reasonCode: 'RECOVERY_ENQUEUE_BLOCKED',
-        reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN', ...decision.reasonCodes],
-        evidenceSummary: { latestJobStatus: item.latestJobStatus, recoveryCycles: item.recoveryCycles },
-      });
-      exhaustedReviews += 1;
-      continue;
+        action: item.action,
+        reason: String(error instanceof Error ? error.message : error).slice(0, 300),
+        timestamp: new Date().toISOString(),
+      }));
     }
-    enqueued += 1;
   }
-  return { dryRun, cutoff, scanned: items.length, enqueued, exhaustedReviews, permanentFailures, skipped, items };
+  return { dryRun, cutoff, scanned: items.length, enqueued, exhaustedReviews, permanentFailures, skipped, failures, items };
 }
