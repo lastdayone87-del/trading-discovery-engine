@@ -63,8 +63,7 @@ const semanticProvider = (outcome: string) => ({
 });
 
 test('default routing is active and LEGACY is an explicit rollback', () => {
-  assert.equal(resolveClassificationRoutingMode({} as NodeJS.ProcessEnv), 'LEGACY');
-  assert.equal(resolveClassificationRoutingMode({ DETERMINISTIC_CLASSIFICATION_ROUTING: 'ACTIVE' } as NodeJS.ProcessEnv), 'ACTIVE');
+  assert.equal(resolveClassificationRoutingMode({} as NodeJS.ProcessEnv), 'ACTIVE');
   assert.equal(resolveClassificationRoutingMode({ DETERMINISTIC_CLASSIFICATION_ROUTING: 'legacy' } as NodeJS.ProcessEnv), 'LEGACY');
 });
 

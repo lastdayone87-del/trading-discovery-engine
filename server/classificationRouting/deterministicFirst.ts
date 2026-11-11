@@ -3,16 +3,15 @@ import type { EvidenceSufficiency, VerificationDecision } from '../evidenceEngin
 export const DETERMINISTIC_FIRST_ROUTING_VERSION = 'deterministic-first-routing-v1';
 
 /**
- * Activation-gated integrated routing. The new deterministic-first path stays
- * dormant until an operator explicitly sets ACTIVE. Any missing, malformed or
- * legacy value restores the pre-v2 pipeline behavior.
+ * Default-on integrated routing. A process-level LEGACY switch restores the
+ * pre-v2 pipeline behavior without a database migration or restart race.
  */
 export function resolveClassificationRoutingMode(
   env: NodeJS.ProcessEnv = process.env,
 ): 'ACTIVE' | 'LEGACY' {
-  return String(env.DETERMINISTIC_CLASSIFICATION_ROUTING || 'LEGACY').trim().toUpperCase() === 'ACTIVE'
-    ? 'ACTIVE'
-    : 'LEGACY';
+  return String(env.DETERMINISTIC_CLASSIFICATION_ROUTING || 'ACTIVE').trim().toUpperCase() === 'LEGACY'
+    ? 'LEGACY'
+    : 'ACTIVE';
 }
 
 export type ClassificationRoute =
