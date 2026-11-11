@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getDb, enqueueJob } from './db';
 import { findCountryExclusion } from './countryExclusion';
+import { resolveScopeEligibility } from './scopeEligibility';
 import type { ChannelRecord } from '../src/types';
 import type { IntakeTradingFocusAssessment } from './intakeTradingFocus';
 
@@ -32,6 +33,31 @@ export interface IntakeDeferredReview {
   nextRecheckAt: string | null;
   decidedAt: string | null;
   createdAt: string;
+}
+
+/**
+ * Canonical evidence hash shared by intake persistence and recheck. Both paths
+ * must hash the same candidate fields so unchanged evidence does not look new.
+ */
+export function computeIntakeEvidenceHash(input: {
+  candidate: Record<string, unknown>;
+  targetCountry?: string | null;
+  source?: string | null;
+  policyVersion?: string | null;
+}): string {
+  const candidate = input.candidate || {};
+  return checksum({
+    targetCountry: input.targetCountry || null,
+    source: input.source || null,
+    policyVersion: input.policyVersion || null,
+    channelName: candidate.channelName || null,
+    description: candidate.description || null,
+    matchedDocument: candidate.matchedDocument || null,
+    videoTitles: candidate.videoTitles || [],
+    videoDescriptions: candidate.videoDescriptions || [],
+    channelLinks: candidate.channelLinks || [],
+    locationTag: candidate.locationTag || null,
+  });
 }
 
 export function deriveMetadataQuality(input: {
@@ -110,7 +136,12 @@ export async function recordIntakeDeferredReview(input: IntakeDeferredReviewInpu
     countryStatus: input.countryStatus || null,
     country: input.country || null,
   };
-  const evidenceHash = checksum({ system, evidence });
+  const evidenceHash = computeIntakeEvidenceHash({
+    candidate: input.candidate,
+    targetCountry: input.targetCountry,
+    source: input.source,
+    policyVersion: input.focus.policyVersion,
+  });
   await db.query(
     `INSERT INTO intake_deferred_reviews(
        channel_id,review_version,state,system_snapshot,evidence_snapshot,language,country,
@@ -313,6 +344,7 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
     const correctedCountry = typeof corrections.country === 'string' ? corrections.country.trim() : '';
     const correctedLanguage = typeof corrections.language === 'string' ? corrections.language.trim() : '';
     const countryToCheck = correctedCountry || channel.country || '';
+    const effectiveScope = resolveScopeEligibility(countryToCheck);
     if (input.decision === 'TRADING') {
       // A caller-supplied correction must not erase an independently confirmed
       // excluded country. Check both the confirmed stored finding and the
@@ -364,8 +396,8 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
         `UPDATE channels SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',
            country=COALESCE(NULLIF($2,''),country),
            country_status=CASE WHEN NULLIF($2,'') IS NULL THEN country_status ELSE 'LIKELY' END,
-           updated_at=now() WHERE channel_id=$1`,
-        [input.channelId, correctedCountry],
+           scope_eligibility=$3,updated_at=now() WHERE channel_id=$1`,
+        [input.channelId, correctedCountry, effectiveScope],
       );
       const candidate = (evidence.candidate || {}) as Record<string, unknown>;
       await enqueueJob('ENRICH_CHANNEL', {
@@ -390,14 +422,16 @@ export async function decideIntakeDeferredReview(input: DecideIntakeDeferredInpu
     } else if (input.decision === 'NON_TRADING') {
       await client.query(
         `UPDATE channels SET trading_status='HUMAN_REJECTED',scan_status='SKIPPED_NON_TRADING',
-           country=COALESCE(NULLIF($2,''),country),updated_at=now() WHERE channel_id=$1`,
-        [input.channelId, correctedCountry],
+           country=COALESCE(NULLIF($2,''),country),scope_eligibility=$3,updated_at=now()
+         WHERE channel_id=$1`,
+        [input.channelId, correctedCountry, effectiveScope],
       );
     } else {
       await client.query(
         `UPDATE channels SET scan_status='INTAKE_DEFERRED',
-           country=COALESCE(NULLIF($2,''),country),updated_at=now() WHERE channel_id=$1`,
-        [input.channelId, correctedCountry],
+           country=COALESCE(NULLIF($2,''),country),scope_eligibility=$3,updated_at=now()
+         WHERE channel_id=$1`,
+        [input.channelId, correctedCountry, effectiveScope],
       );
     }
     await client.query(

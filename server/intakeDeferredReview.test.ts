@@ -258,7 +258,8 @@ test('review UI preserves system reasoning separately from human decisions', () 
 
 test('LIKELY excluded-country recheck never feeds the weak stored country back as proof', () => {
   const source = readFileSync(new URL('./intakeDeferredSweep.ts', import.meta.url), 'utf8');
-  assert.match(source, /locationTag: candidate\.locationTag \|\| undefined/);
+  assert.match(source, /locationTag: independentLocationTag/);
+  assert.match(source, /candidate\.locationTag \|\| ''/);
   assert.doesNotMatch(source, /locationTag: candidate\.locationTag \|\| row\.country/);
   assert.match(source, /CLASSIFY_DISCOVERED_CHANNEL/);
   assert.match(source, /'COMPLETED','FAILED','FAILED_PERMANENT','SKIPPED_LOW_AUDIENCE'/);
@@ -278,10 +279,13 @@ test('recheck protects scope, retries, aliases, snapshots and sweep concurrency'
   assert.match(worker, /evidence_snapshot=\$2::jsonb,[\s\S]{0,80}metadata_quality=\$3,last_evidence_hash=\$4,recheck_attempts=recheck_attempts\+1/);
   assert.match(worker, /jsonb_set\(payload,'\{candidate\}'/);
   assert.match(worker, /cachedEvidence/);
+  assert.match(worker, /computeIntakeEvidenceHash/);
+  assert.match(worker, /subscriber_count=\$4/);
   assert.match(worker, /evaluateLowAudienceGate\(channel\.subscriber_count/);
   assert.match(worker, /subscriber_count=\$8/);
   const module = readFileSync(new URL('./intakeDeferredReview.ts', import.meta.url), 'utf8');
   assert.match(module, /findCountryExclusion/);
+  assert.match(module, /scope_eligibility=\$3/);
   assert.match(module, /pg_advisory_xact_lock/);
   assert.match(module, /last_evidence_hash IS DISTINCT FROM/);
   assert.match(module, /channel\.scan_status !== 'INTAKE_DEFERRED'/);
@@ -291,6 +295,12 @@ test('recheck protects scope, retries, aliases, snapshots and sweep concurrency'
   assert.match(sweep, /dueNow/);
   assert.match(sweep, /activeJob/);
   assert.match(sweep, /pg_advisory_xact_lock/);
+  assert.match(sweep, /countryIdentitySql/);
+  assert.match(sweep, /independentLocationTag/);
   const migration = readFileSync(new URL('./db/migrations/177_intake_deferred_review.sql', import.meta.url), 'utf8');
-  assert.match(migration, /\) >= 3\s+AND COALESCE\(length/);
+  assert.match(migration, /\) >= 3\s+AND COALESCE\(length\(trim/);
+  const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+  assert.match(server, /notes: typeof req\.body\.notes === 'string'/);
+  const ui = readFileSync(new URL('../src/components/IntakeDeferredReview.tsx', import.meta.url), 'utf8');
+  assert.match(ui, /listRequest/);
 });

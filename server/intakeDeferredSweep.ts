@@ -1,6 +1,7 @@
 import { getDb, enqueueJob } from './db';
 import { validateChannelCountry } from './countryValidator';
 import { resolveScopeEligibility } from './scopeEligibility';
+import { countryIdentitySql } from './countryExclusionRules';
 
 export interface IntakeDeferredSweepResult {
   scanned: number;
@@ -360,7 +361,7 @@ export async function reconcileLikelyExcludedCountryCandidates(options: {
     `SELECT c.channel_id,c.channel_name,c.country,c.country_status,c.confidence_score,
             c.scan_status,c.last_checked,c.inspection_trail,r.review_version AS review_version
      FROM channels c
-     JOIN excluded_countries e ON LOWER(c.country)=LOWER(e.country_name)
+     JOIN excluded_countries e ON ${countryIdentitySql('c.country')}=${countryIdentitySql('e.country_name')}
      LEFT JOIN intake_deferred_reviews r ON r.channel_id=c.channel_id
      WHERE c.country_status='LIKELY'
        AND c.scan_status IN (
@@ -392,15 +393,21 @@ export async function reconcileLikelyExcludedCountryCandidates(options: {
     const payload = latest.rows[0]?.payload || {};
     const candidate = payload.candidate || {};
     const targetCountry = String(payload.targetCountry || 'GLOBAL');
+    const storedCountry = String(row.country || '').trim().toLowerCase();
+    const candidateLocation = String(candidate.locationTag || '').trim();
+    const independentLocationTag = candidateLocation && candidateLocation.toLowerCase() !== storedCountry
+      ? candidateLocation
+      : undefined;
     let result;
     try {
       result = await validateChannelCountry({
         channelName: candidate.channelName || row.channel_name,
         description: candidate.description || '',
         videoTitles: candidate.videoTitles || [],
-        // Never feed the stored LIKELY country back in as official metadata:
-        // that would launder the weak hypothesis into its own proof.
-        locationTag: candidate.locationTag || undefined,
+        // Never feed the stored LIKELY country back in as official metadata.
+        // Operational-recovery jobs can copy channel.country into locationTag;
+        // discard it when it merely repeats the stored hypothesis.
+        locationTag: independentLocationTag,
         externalLinks: candidate.channelLinks || [],
         metadataStatus: candidate.countryMetadataStatus,
         videoDescriptions: candidate.videoDescriptions || [],

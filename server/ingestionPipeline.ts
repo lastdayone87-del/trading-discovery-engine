@@ -694,7 +694,7 @@ async function processChannelThroughPipelineInContext(
     // the job starts; otherwise sparse evidence can send it back to deferred and
     // the queued job will skip it.
     const handoffChannel = existing ? await getChannelById(existing.channel_id) : null;
-    if (handoffChannel && handoffChannel.scan_status === 'ENRICHMENT_PENDING') {
+    if (handoffChannel && handoffChannel.scan_status === 'ENRICHMENT_PENDING' && deferredCountry?.status !== 'REJECTED') {
       const activeEnrichment = await hasActiveEnrichmentJob(handoffChannel.channel_id, options?.jobId).catch(() => true);
       if (activeEnrichment) {
         return {
@@ -852,7 +852,7 @@ async function processChannelThroughPipelineInContext(
     }
     const deferredWrite = await upsertChannelWithResult(intakeChannel, existingStatusSnapshot ? { requireStatusSnapshot: existingStatusSnapshot } : undefined);
     const deferred = deferredWrite ? intakeChannel : (await getChannelById(candidate.channelId) || intakeChannel);
-    if (retrievalTriage.focus) {
+    if (deferredWrite && retrievalTriage.focus) {
       const metadataQuality = deriveMetadataQuality({
         description: candidate.description,
         videoTitles: candidate.videoTitles,

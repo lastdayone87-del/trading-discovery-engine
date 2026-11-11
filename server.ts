@@ -333,7 +333,7 @@ async function startServer() {
         reviewer,
         decision: req.body.decision,
         reason: String(req.body.reason || ''),
-        notes: req.body.notes,
+        notes: typeof req.body.notes === 'string' ? req.body.notes : undefined,
         corrections,
         idempotencyKey: req.header('idempotency-key') || String(req.body.idempotencyKey || ''),
       });

@@ -112,29 +112,29 @@ SELECT
   'PENDING',
   jsonb_build_object('backfilled',true,'reasonCodes','[]'::jsonb),
   jsonb_build_object(
-    'targetCountry',COALESCE(j.payload->>'targetCountry','GLOBAL'),
-    'source',COALESCE(j.payload->>'source','automated_query'),
-    'candidate',COALESCE(j.payload->'candidate','{}'::jsonb)
+    'targetCountry',COALESCE(j.payload->>'targetCountry',n.country,'GLOBAL'),
+    'source',COALESCE(j.payload->>'source',n.source_type,'automated_query'),
+    'candidate',x.candidate
   ),
-  NULL,
+  COALESCE(NULLIF(x.candidate->'detectedLanguages'->0->>'language',''),n.declared_language),
   c.country,
   CASE
     WHEN GREATEST(
       COALESCE(jsonb_array_length(
-        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoTitles')='array'
-             THEN j.payload->'candidate'->'videoTitles' ELSE '[]'::jsonb END),0),
+        CASE WHEN jsonb_typeof(x.candidate->'videoTitles')='array'
+             THEN x.candidate->'videoTitles' ELSE '[]'::jsonb END),0),
       COALESCE(jsonb_array_length(
-        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoDescriptions')='array'
-             THEN j.payload->'candidate'->'videoDescriptions' ELSE '[]'::jsonb END),0)
+        CASE WHEN jsonb_typeof(x.candidate->'videoDescriptions')='array'
+             THEN x.candidate->'videoDescriptions' ELSE '[]'::jsonb END),0)
     ) >= 3
-    AND COALESCE(length(j.payload->'candidate'->>'description'),0) >= 80 THEN 'RICH'
+    AND COALESCE(length(trim(x.candidate->>'description')),0) >= 80 THEN 'RICH'
     WHEN GREATEST(
       COALESCE(jsonb_array_length(
-        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoTitles')='array'
-             THEN j.payload->'candidate'->'videoTitles' ELSE '[]'::jsonb END),0),
+        CASE WHEN jsonb_typeof(x.candidate->'videoTitles')='array'
+             THEN x.candidate->'videoTitles' ELSE '[]'::jsonb END),0),
       COALESCE(jsonb_array_length(
-        CASE WHEN jsonb_typeof(j.payload->'candidate'->'videoDescriptions')='array'
-             THEN j.payload->'candidate'->'videoDescriptions' ELSE '[]'::jsonb END),0)
+        CASE WHEN jsonb_typeof(x.candidate->'videoDescriptions')='array'
+             THEN x.candidate->'videoDescriptions' ELSE '[]'::jsonb END),0)
     ) > 0 THEN 'LIMITED'
     ELSE 'SPARSE'
   END,
@@ -148,5 +148,20 @@ LEFT JOIN LATERAL (
   ORDER BY created_at DESC
   LIMIT 1
 ) j ON true
+LEFT JOIN LATERAL (
+  SELECT country,declared_language,source_type,raw_observation,matched_document_locator
+  FROM discovery_nominations
+  WHERE channel_id=c.channel_id
+  ORDER BY observed_at DESC
+  LIMIT 1
+) n ON true
+LEFT JOIN LATERAL (
+  SELECT COALESCE(NULLIF(j.payload->'candidate','{}'::jsonb), jsonb_build_object(
+    'channelName',n.raw_observation->>'channelName',
+    'youtubeUrl',n.raw_observation->>'youtubeUrl',
+    'locationTag',n.raw_observation->>'locationTag',
+    'matchedDocument',n.matched_document_locator
+  )) AS candidate
+) x ON true
 WHERE c.scan_status='INTAKE_DEFERRED'
 ON CONFLICT(channel_id) DO NOTHING;

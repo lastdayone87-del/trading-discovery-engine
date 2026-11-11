@@ -159,7 +159,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { assessIntakeTradingFocus } from './intakeTradingFocus';
-import { deriveMetadataQuality } from './intakeDeferredReview';
+import { computeIntakeEvidenceHash, deriveMetadataQuality } from './intakeDeferredReview';
 import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -1403,9 +1403,10 @@ async function processIntakeDeferredRecheckJob(
       );
       const projected = await audienceClient.query(
         `UPDATE channels
-         SET scan_status='SKIPPED_LOW_AUDIENCE',last_checked=$2,inspection_trail=$3::jsonb,updated_at=now()
+         SET scan_status='SKIPPED_LOW_AUDIENCE',subscriber_count=$4,last_checked=$2,
+             inspection_trail=$3::jsonb,updated_at=now()
          WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
-        [channelId, skippedAt, JSON.stringify(channel.inspection_trail)],
+        [channelId, skippedAt, JSON.stringify(channel.inspection_trail), channel.subscriber_count ?? null],
       );
       if (projected.rowCount) {
         await audienceClient.query(
@@ -1545,7 +1546,6 @@ async function processIntakeDeferredRecheckJob(
         details: recheckCountry.decisionLogs,
         timestamp: rejectedAt,
       }];
-      await upsertChannel(channel);
       const rejectionEvidence = {
         candidate: {
           channelName: enriched.channelName,
@@ -1573,14 +1573,47 @@ async function processIntakeDeferredRecheckJob(
         videoTitles: enriched.videoTitles,
         videoDescriptions: enriched.videoDescriptions,
       });
-      await (await getDb()).query(
-        `UPDATE intake_deferred_reviews
-         SET state='SUPERSEDED',next_recheck_at=NULL,evidence_snapshot=$2::jsonb,
-             metadata_quality=$3,last_evidence_hash=$4,recheck_attempts=recheck_attempts+1,
-             last_checked_at=$5,updated_at=now()
-         WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
-        [channelId, JSON.stringify(rejectionEvidence), rejectionQuality, rejectionHash, rejectedAt],
-      );
+      const rejectionDb = await getDb();
+      const rejectionClient = await rejectionDb.connect();
+      let rejectionTransaction = false;
+      try {
+        await rejectionClient.query('BEGIN');
+        rejectionTransaction = true;
+        await rejectionClient.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`intake-review:${channelId}`]);
+        const projected = await rejectionClient.query(
+          `UPDATE channels
+           SET country_status='REJECTED',country=$2,confidence_score=$3,
+               scope_eligibility=$4,scan_status='COMPLETED',subscriber_count=$5,
+               last_checked=$6,inspection_trail=$7::jsonb,updated_at=now()
+           WHERE channel_id=$1 AND scan_status='INTAKE_DEFERRED'`,
+          [
+            channelId,
+            channel.country,
+            channel.confidence_score,
+            resolveScopeEligibility(channel.country),
+            channel.subscriber_count ?? null,
+            rejectedAt,
+            JSON.stringify(channel.inspection_trail),
+          ],
+        );
+        if (projected.rowCount) {
+          await rejectionClient.query(
+            `UPDATE intake_deferred_reviews
+             SET state='SUPERSEDED',next_recheck_at=NULL,evidence_snapshot=$2::jsonb,
+                 metadata_quality=$3,last_evidence_hash=$4,recheck_attempts=recheck_attempts+1,
+                 last_checked_at=$5,updated_at=now()
+             WHERE channel_id=$1 AND state IN ('PENDING','DECIDED')`,
+            [channelId, JSON.stringify(rejectionEvidence), rejectionQuality, rejectionHash, rejectedAt],
+          );
+        }
+        await rejectionClient.query('COMMIT');
+        rejectionTransaction = false;
+      } catch (error) {
+        if (rejectionTransaction) await rejectionClient.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        rejectionClient.release();
+      }
       if (reserved) {
         await finishQuotaReservation('ENRICH_CHANNEL', job.id, true);
         reserved = false;
@@ -1601,15 +1634,12 @@ async function processIntakeDeferredRecheckJob(
       videoTitles: enriched.videoTitles,
       videoDescriptions: enriched.videoDescriptions,
     });
-    const evidenceHash = createHash('sha256').update(JSON.stringify({
-      channelName: enriched.channelName || null,
-      description: enriched.description || null,
-      matchedDocument: enriched.matchedDocument || null,
-      titles: enriched.videoTitles || [],
-      descriptions: enriched.videoDescriptions || [],
-      channelLinks: enriched.channelLinks || [],
-      locationTag: enriched.locationTag || null,
-    })).digest('hex');
+    const evidenceHash = computeIntakeEvidenceHash({
+      candidate: enriched as unknown as Record<string, unknown>,
+      targetCountry,
+      source,
+      policyVersion: focus.policyVersion,
+    });
     const review = await (await getDb()).query(
       `SELECT review_version,last_evidence_hash,recheck_attempts FROM intake_deferred_reviews WHERE channel_id=$1`,
       [channelId],

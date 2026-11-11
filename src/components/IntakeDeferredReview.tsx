@@ -51,6 +51,7 @@ function asRecord(value: unknown): Record<string, any> {
 
 const IntakeDeferredReview: React.FC = () => {
   const selectionRequest = useRef(0);
+  const listRequest = useRef(0);
   const [items, setItems] = useState<DeferredItem[]>([]);
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -70,6 +71,8 @@ const IntakeDeferredReview: React.FC = () => {
   const [busy, setBusy] = useState(false);
 
   const loadList = useCallback(async (nextOffset = 0) => {
+    const requestId = listRequest.current + 1;
+    listRequest.current = requestId;
     setLoading(true); setError('');
     try {
       const params = new URLSearchParams();
@@ -82,12 +85,17 @@ const IntakeDeferredReview: React.FC = () => {
       const response = await apiFetch(`/api/intake-deferred?${params}`, { headers: reviewerHeaders() });
       if (!response.ok) throw new Error(await responseError(response));
       const page = await response.json() as DeferredItem[];
+      if (listRequest.current !== requestId) return;
       setItems(page);
       setOffset(nextOffset);
       setHasMore(page.length === 100);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to load deferred intake channels.');
-    } finally { setLoading(false); }
+      if (listRequest.current === requestId) {
+        setError(e instanceof Error ? e.message : 'Unable to load deferred intake channels.');
+      }
+    } finally {
+      if (listRequest.current === requestId) setLoading(false);
+    }
   }, [search, country, language, stateFilter]);
 
   const loadDetails = async (channelId: string) => {
@@ -144,11 +152,11 @@ const IntakeDeferredReview: React.FC = () => {
       });
       if (!response.ok) throw new Error(await responseError(response));
       const result = await response.json();
-      setSuccess(`Decision saved at version ${result.reviewVersion || selected.reviewVersion + 1}.`);
       if (selectionRequest.current === submittedToken) {
         await loadDetails(submittedChannelId);
       }
       await loadList(offset);
+      setSuccess(`Decision saved at version ${result.reviewVersion || selected.reviewVersion + 1}.`);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to save the intake decision.');
     } finally { setBusy(false); }
