@@ -10,11 +10,9 @@ VALUES ('extracted_query_discovery_enabled', 'false')
 ON CONFLICT (setting_key) DO UPDATE SET setting_value = 'false';
 
 UPDATE query_library
-SET status = 'INACTIVE',
-    collection = 'REJECTED',
+SET collection = 'REJECTED',
     generation_metadata = COALESCE(generation_metadata, '{}'::jsonb)
       || jsonb_build_object('extractedQueryPaused', true)
-WHERE generation_metadata->>'queryTemplate' = 'EXTRACTED_STANDALONE'
-  AND status IS DISTINCT FROM 'INACTIVE';
+WHERE generation_metadata->>'queryTemplate' = 'EXTRACTED_STANDALONE';
 
 DELETE FROM extracted_query_candidates;
