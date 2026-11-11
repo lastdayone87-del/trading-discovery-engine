@@ -5,6 +5,8 @@ import test from 'node:test';
 import {
   buildRetryBacklogTriageReport,
   classifyRetryBacklogJob,
+  decodeRetryBacklogTriageCursor,
+  encodeRetryBacklogTriageCursor,
   parseRetryBacklogTriageArgs,
   retryBacklogTriageCandidateSql,
   type RetryBacklogTriageEvidence,
@@ -12,6 +14,7 @@ import {
 import {
   parseRetryBacklogApplyArgs,
   runRetryBacklogTriageApply,
+  runRetryBacklogTriageUndo,
 } from './retryBacklogTriageApply';
 
 const NOW = new Date('2026-11-10T12:00:00.000Z');
@@ -29,6 +32,7 @@ function evidence(overrides: Partial<RetryBacklogTriageEvidence> = {}): RetryBac
     priority: 100,
     runAfter: RECENT,
     firstEnqueuedAt: RECENT,
+    lastReopenedAt: null,
     retryObservedAt: RECENT,
     scopeEligibility: 'IN_SCOPE',
     scanStatus: 'FAILED',
@@ -55,6 +59,7 @@ function rawRow(overrides: Record<string, unknown> = {}): Record<string, unknown
     priority: 100,
     run_after: RECENT,
     first_enqueued_at: ANCIENT,
+    last_reopened_at: null,
     retry_observed_at: ANCIENT,
     channel_present: true,
     scope_eligibility: 'IN_SCOPE',
@@ -79,6 +84,31 @@ test('classifier keeps terminal evidence ahead of quarantine', () => {
   assert.equal(classifyRetryBacklogJob(evidence({ countryStatus: 'REJECTED' }), NOW.getTime()).bucket, 'TERMINAL');
   assert.equal(classifyRetryBacklogJob(evidence({ tradingStatus: 'HUMAN_REJECTED' }), NOW.getTime()).bucket, 'TERMINAL');
   assert.equal(classifyRetryBacklogJob(evidence({ scanStatus: 'NEEDS_REVIEW' }), NOW.getTime()).bucket, 'QUARANTINE');
+});
+
+test('classifier treats a reopen as a fresh epoch and unknown limits as non-terminal', () => {
+  assert.deepEqual(
+    classifyRetryBacklogJob(evidence({
+      firstEnqueuedAt: ANCIENT,
+      lastReopenedAt: RECENT,
+    }), NOW.getTime()),
+    { bucket: 'RECOVERABLE', reason: 'RECENT' },
+  );
+  assert.deepEqual(
+    classifyRetryBacklogJob(evidence({
+      attempts: 0,
+      maxAttempts: 0,
+      firstEnqueuedAt: RECENT,
+    }), NOW.getTime()),
+    { bucket: 'RECOVERABLE', reason: 'RECENT' },
+  );
+  assert.deepEqual(
+    classifyRetryBacklogJob(evidence({
+      tradingStatus: 'NEEDS_REVIEW',
+      firstEnqueuedAt: RECENT,
+    }), NOW.getTime()),
+    { bucket: 'QUARANTINE', reason: 'HUMAN_REVIEW' },
+  );
 });
 
 test('classifier quarantines only ancient jobs without recent/started work', () => {
@@ -139,7 +169,7 @@ test('report partitions buckets and preserves terminal/quarantine evidence', asy
       if (sql.includes('to_regclass')) {
         return { rows: [{ present: true, pending_retries: rows.length }] };
       }
-      assert.match(sql, /WITH claim_stats/);
+      assert.match(sql, /WITH candidate_jobs/);
       return { rows: rows.slice(0, Number(values?.[0] || rows.length)) };
     },
   };
@@ -176,15 +206,40 @@ test('report tolerates a pre-migration database and detects truncation', async (
   assert.ok(report.warnings.includes('candidate_limit_reached'));
 });
 
-test('candidate SQL locks only jobs and can restrict/exclude applied rows', () => {
+test('candidate SQL locks only jobs, bounds claim history, and supports a cursor', () => {
   const sql = retryBacklogTriageCandidateSql(true, {
     lock: true,
-    restrictJobIds: true,
     excludeApplied: true,
   });
   assert.match(sql, /FOR UPDATE OF j SKIP LOCKED/);
   assert.match(sql, /j\.id=ANY\(\$2\)/);
-  assert.match(sql, /t\.applied_at IS NULL/);
+  assert.match(sql, /tf\.applied_at IS NULL/);
+  assert.match(sql, /\(j\.first_enqueued_at, j\.id\) > \(\$3::timestamptz, \$4::uuid\)/);
+  assert.match(sql, /job_id IN \(SELECT id FROM candidate_jobs\)/);
+  assert.match(sql, /logs \? 'communityInspectionStarted'/);
+  assert.match(sql, /LIMIT \$1/);
+
+  const encoded = encodeRetryBacklogTriageCursor({
+    firstEnqueuedAt: '2026-10-01T00:00:00.000Z',
+    jobId: '00000000-0000-4000-8000-000000000001',
+  });
+  assert.ok(encoded);
+  assert.deepEqual(decodeRetryBacklogTriageCursor(encoded), {
+    firstEnqueuedAt: '2026-10-01T00:00:00.000Z',
+    jobId: '00000000-0000-4000-8000-000000000001',
+  });
+  assert.equal(decodeRetryBacklogTriageCursor('not-a-cursor'), null);
+
+  // PostgreSQL timestamps can carry microseconds; preserve the exact text so
+  // the keyset boundary does not re-include the last examined row.
+  const micros = encodeRetryBacklogTriageCursor({
+    firstEnqueuedAt: '2026-10-01 00:00:00.123456+00',
+    jobId: '00000000-0000-4000-8000-000000000002',
+  });
+  assert.deepEqual(decodeRetryBacklogTriageCursor(micros), {
+    firstEnqueuedAt: '2026-10-01 00:00:00.123456+00',
+    jobId: '00000000-0000-4000-8000-000000000002',
+  });
 });
 
 test('triage argument parser is strict and bounded', () => {
@@ -192,6 +247,7 @@ test('triage argument parser is strict and bounded', () => {
     maxJobs: 5000,
     includeRows: false,
     check: false,
+    cursor: null,
     out: null,
     help: false,
   });
@@ -199,8 +255,13 @@ test('triage argument parser is strict and bounded', () => {
   assert.throws(() => parseRetryBacklogTriageArgs(['--check=true']), /unknown argument/);
 });
 
-function applyDb(rows: Array<Record<string, unknown>>, present = true) {
+function applyDb(
+  rows: Array<Record<string, unknown>>,
+  options: { present?: boolean; moreRows?: boolean } = {},
+) {
+  const { present = true, moreRows = false } = options;
   const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  let candidateScans = 0;
   return {
     calls,
     query: async (sql: string, values?: unknown[]) => {
@@ -208,12 +269,21 @@ function applyDb(rows: Array<Record<string, unknown>>, present = true) {
       if (sql.includes('to_regclass')) {
         return { rows: [{ present, pending_retries: rows.length }] };
       }
-      if (sql.includes('WITH claim_stats')) {
+      if (sql.includes('WITH candidate_jobs')) {
+        candidateScans++;
+        // The apply path probes for more rows without locking after a full
+        // page; the probe is the second candidate query.
+        if (candidateScans > 1) return { rows: moreRows ? [rows[0]] : [] };
         return { rows: rows.slice(0, Number(values?.[0] || rows.length)) };
       }
-      if (sql.includes(`closed_reason='CHANNEL_TERMINAL'`)) return { rows: [{ id: values?.[0] }] };
-      if (sql.includes('UPDATE job_attempts')) return { rows: [] };
-      if (sql.includes('SET priority=$2')) return { rows: [{ id: values?.[0] }] };
+      if (sql.includes('SELECT 1 FROM channels WHERE channel_id=$1 FOR UPDATE')) {
+        return { rows: [{ scan_status: 'FAILED', trading_status: 'TRADING_CONFIRMED' }] };
+      }
+      if (sql.includes('SELECT scan_status,trading_status FROM channels')) {
+        return { rows: [{ scan_status: 'FAILED', trading_status: 'TRADING_CONFIRMED' }] };
+      }
+      if (sql.includes(`closed_reason='RETRY_TRIAGE_TERMINAL'`)) return { rows: [{ id: values?.[0] }] };
+      if (sql.includes('SET run_after=$2')) return { rows: [{ id: values?.[0] }] };
       if (sql.includes('INSERT INTO retry_backlog_triage')) return { rows: [] };
       throw new Error(`unexpected SQL: ${sql.slice(0, 120)}`);
     },
@@ -248,21 +318,135 @@ test('apply closes terminal and quarantines ancient rows with original queue sta
     maxActions: 10,
   });
   assert.equal(report.summary.applied, 2);
-  const terminalUpdate = db.calls.find(call => call.sql.includes(`closed_reason='CHANNEL_TERMINAL'`));
+  const terminalUpdate = db.calls.find(call => call.sql.includes(`closed_reason='RETRY_TRIAGE_TERMINAL'`));
   assert.ok(terminalUpdate);
   assert.equal(terminalUpdate?.values?.[0], terminal.id);
   assert.equal(terminalUpdate?.values?.[2], 'operator@test');
   assert.match(terminalUpdate!.sql, /scope_eligibility='OUT_OF_SCOPE'/);
-  const quarantineUpdate = db.calls.find(call => call.sql.includes('SET priority=$2'));
+  const quarantineUpdate = db.calls.find(call => call.sql.includes('SET run_after=$2'));
   assert.ok(quarantineUpdate);
-  assert.equal(quarantineUpdate?.values?.[1], -1000);
-  assert.equal(quarantineUpdate?.values?.[2], '2026-12-10T12:00:00.000Z');
+  assert.equal(quarantineUpdate?.values?.[1], '2026-12-10T12:00:00.000Z');
   const triageInsert = db.calls.filter(call => call.sql.includes('INSERT INTO retry_backlog_triage'));
   assert.equal(triageInsert.length, 2);
   const quarantineInsert = triageInsert.find(call => call.sql.includes("'QUARANTINE'"));
   assert.ok(quarantineInsert);
   assert.equal(quarantineInsert?.values?.[3], 42);
   assert.equal(quarantineInsert?.values?.[4], '2026-01-01T00:00:00.000Z');
+});
+
+test('apply reports an action limit when more eligible quarantine rows remain', async () => {
+  const rows = [
+    rawRow({ first_enqueued_at: ANCIENT }),
+    rawRow({ first_enqueued_at: ANCIENT }),
+  ];
+  const db = applyDb(rows);
+  const report = await runRetryBacklogTriageApply(db, {
+    apply: true,
+    actor: 'operator@test',
+    buckets: ['QUARANTINE'],
+    maxActions: 1,
+    now: () => NOW,
+  });
+  assert.equal(report.summary.applied, 1);
+  assert.ok(report.warnings.includes('action_limit_reached'));
+});
+
+test('apply pages past non-actionable rows but never past un-applied actions', async () => {
+  const recoverable = [
+    rawRow({ first_enqueued_at: RECENT }),
+    rawRow({ first_enqueued_at: RECENT }),
+  ];
+  const clean = await runRetryBacklogTriageApply(
+    applyDb([...recoverable, rawRow({ first_enqueued_at: RECENT })]),
+    { maxScan: 2, now: () => NOW },
+  );
+  assert.equal(clean.population.truncated, true);
+  assert.ok(clean.scan.nextCursor);
+
+  const noMore = await runRetryBacklogTriageApply(applyDb(recoverable), {
+    maxScan: 2,
+    now: () => NOW,
+  });
+  assert.equal(noMore.population.truncated, false);
+  assert.equal(noMore.scan.nextCursor, null);
+
+  const actionable = [
+    rawRow({ first_enqueued_at: ANCIENT }),
+    rawRow({ first_enqueued_at: ANCIENT }),
+  ];
+  const limited = await runRetryBacklogTriageApply(applyDb(actionable, { moreRows: true }), {
+    apply: true,
+    actor: 'operator@test',
+    buckets: ['QUARANTINE'],
+    maxScan: 2,
+    maxActions: 1,
+    now: () => NOW,
+  });
+  assert.equal(limited.population.truncated, true);
+  assert.equal(limited.scan.nextCursor, null);
+  assert.ok(limited.warnings.includes('cursor_not_advanced_pending_actions'));
+});
+
+test('undo restores only the exact deferred queue state and records the actor', async () => {
+  const calls: Array<{ sql: string; values?: unknown[] }> = [];
+  const db = {
+    query: async (sql: string, values?: unknown[]) => {
+      calls.push({ sql, values });
+      if (sql.includes('SELECT t.job_id')) {
+        return {
+          rows: [{
+            job_id: '00000000-0000-4000-8000-000000000001',
+            original_run_after: '2026-01-01T00:00:00.000Z',
+            deferred_until: '2026-12-10T12:00:00.000Z',
+            job_status: 'PENDING',
+            job_run_after: '2026-12-10T12:00:00.000Z',
+          }],
+        };
+      }
+      if (sql.includes('UPDATE jobs')) return { rows: [{ id: values?.[0] }] };
+      if (sql.includes('UPDATE retry_backlog_triage')) return { rows: [] };
+      throw new Error(`unexpected SQL: ${sql.slice(0, 120)}`);
+    },
+  };
+  const report = await runRetryBacklogTriageUndo(db, {
+    actor: 'operator@test',
+    maxActions: 10,
+    includeRows: true,
+    now: () => NOW,
+  });
+  assert.equal(report.restored, 1);
+  assert.equal(report.skipped, 0);
+  assert.deepEqual(report.actions, [{
+    jobId: '00000000-0000-4000-8000-000000000001',
+    restored: true,
+    restoredRunAfter: '2026-01-01T00:00:00.000Z',
+  }]);
+  const jobUpdate = calls.find(call => call.sql.includes('UPDATE jobs'));
+  assert.equal(jobUpdate?.values?.[1], '2026-01-01T00:00:00.000Z');
+  assert.equal(jobUpdate?.values?.[2], '2026-12-10T12:00:00.000Z');
+  const triageUpdate = calls.find(call => call.sql.includes('UPDATE retry_backlog_triage'));
+  assert.equal(triageUpdate?.values?.[1], NOW.toISOString());
+  assert.equal(triageUpdate?.values?.[2], 'operator@test');
+
+  await assert.rejects(
+    runRetryBacklogTriageUndo(db, { actor: '', now: () => NOW }),
+    /requires a non-empty actor/,
+  );
+});
+
+test('apply rejects malformed job IDs on dry runs and overlong actors', async () => {
+  await assert.rejects(
+    runRetryBacklogTriageApply(applyDb([]), {
+      apply: false,
+      jobIds: ['not-a-uuid'],
+      now: () => NOW,
+    }),
+    /invalid job id/,
+  );
+  assert.throws(
+    () => parseRetryBacklogApplyArgs(['--apply', `--actor=${'x'.repeat(201)}`]),
+    /at most 200 characters/,
+  );
 });
 
 test('apply requires an actor and honors bucket/action bounds', async () => {
@@ -282,7 +466,7 @@ test('apply requires an actor and honors bucket/action bounds', async () => {
   });
   assert.equal(report.summary.applied, 1);
   assert.equal(report.summary.quarantine, 1);
-  assert.ok(!db.calls.some(call => call.sql.includes(`closed_reason='CHANNEL_TERMINAL'`)));
+  assert.ok(!db.calls.some(call => call.sql.includes(`closed_reason='RETRY_TRIAGE_TERMINAL'`)));
   assert.ok(!report.warnings.includes('action_limit_reached'));
 });
 
@@ -293,6 +477,10 @@ test('migration 176 is additive and enforces the triage contract', () => {
   assert.match(sql, /original_priority/);
   assert.match(sql, /original_run_after/);
   assert.match(sql, /deferred_until/);
+  assert.match(sql, /ON DELETE RESTRICT/);
+  assert.match(sql, /RETRY_TRIAGE_TERMINAL/);
+  assert.match(sql, /guard_retry_backlog_triage_mutation/);
+  assert.match(sql, /BEFORE UPDATE OR DELETE/);
   assert.doesNotMatch(sql, /^\s*(DELETE\s+FROM|TRUNCATE\s+TABLE)/im);
 });
 

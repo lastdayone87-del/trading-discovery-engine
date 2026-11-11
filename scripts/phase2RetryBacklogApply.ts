@@ -19,6 +19,7 @@ import {
   parseRetryBacklogApplyArgs,
   RETRY_BACKLOG_APPLY_USAGE,
   runRetryBacklogTriageApply,
+  runRetryBacklogTriageUndo,
 } from '../server/retryBacklogTriageApply';
 
 async function writeStdout(text: string): Promise<void> {
@@ -42,16 +43,27 @@ async function main(): Promise<void> {
     let report;
     let committed = false;
     try {
-      report = await runRetryBacklogTriageApply(client, {
-        apply: args.apply,
-        actor: args.actor,
-        maxScan: args.maxScan,
-        maxActions: args.maxActions,
-        buckets: args.buckets,
-        ...(args.jobIds ? { jobIds: args.jobIds } : {}),
-        includeRows: args.includeRows,
-      });
-      if (args.apply && report.summary.applied > 0) {
+      report = args.undo
+        ? await runRetryBacklogTriageUndo(client, {
+          actor: args.actor!,
+          maxActions: args.maxActions,
+          ...(args.jobIds ? { jobIds: args.jobIds } : {}),
+          includeRows: args.includeRows,
+        })
+        : await runRetryBacklogTriageApply(client, {
+          apply: args.apply,
+          actor: args.actor,
+          maxScan: args.maxScan,
+          maxActions: args.maxActions,
+          buckets: args.buckets,
+          ...(args.jobIds ? { jobIds: args.jobIds } : {}),
+          cursor: args.cursor,
+          includeRows: args.includeRows,
+        });
+      const changed = args.undo
+        ? (report as Awaited<ReturnType<typeof runRetryBacklogTriageUndo>>).restored > 0
+        : (report as Awaited<ReturnType<typeof runRetryBacklogTriageApply>>).summary.applied > 0;
+      if ((args.apply || args.undo) && changed) {
         await client.query('COMMIT');
         committed = true;
       } else {
@@ -67,8 +79,10 @@ async function main(): Promise<void> {
       transaction: committed ? 'COMMITTED' : 'ROLLED_BACK',
     };
     const json = JSON.stringify(output, null, 2);
-    if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');
+    // Print before writing the optional file: a write failure after COMMIT must
+    // not hide the persisted batch or make the run look rolled back.
     await writeStdout(`${json}\n`);
+    if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');
   } finally {
     client?.release();
     await pool.end();

@@ -38,6 +38,7 @@ async function main(): Promise<void> {
       report = await buildRetryBacklogTriageReport(client, {
         maxJobs: args.maxJobs,
         includeRows: args.includeRows,
+        cursor: args.cursor,
       });
       await client.query('COMMIT');
     } catch (error) {
@@ -46,8 +47,8 @@ async function main(): Promise<void> {
     }
 
     const json = JSON.stringify(report, null, 2);
-    if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');
     await writeStdout(`${json}\n`);
+    if (args.out) writeFileSync(args.out, `${json}\n`, 'utf8');
 
     if (args.check) {
       const failures = retryBacklogTriageCheckFailures(report);

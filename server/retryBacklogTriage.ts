@@ -30,6 +30,56 @@ export const RETRY_BACKLOG_TRIAGE_MAX_JOBS = 5_000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+export interface RetryBacklogTriageCursor {
+  firstEnqueuedAt: string;
+  jobId: string;
+}
+
+/**
+ * Keep the database timestamp text (microsecond precision) when available.
+ * Converting through a JS Date would truncate to milliseconds and make the
+ * keyset boundary re-include the last examined row.
+ */
+function cursorTimestamp(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed && Number.isFinite(Date.parse(trimmed)) ? trimmed : null;
+  }
+  return iso(value);
+}
+
+export function encodeRetryBacklogTriageCursor(input: {
+  firstEnqueuedAt: unknown;
+  jobId: unknown;
+}): string | null {
+  const firstEnqueuedAt = cursorTimestamp(input.firstEnqueuedAt);
+  const jobId = String(input.jobId || '').trim();
+  if (!firstEnqueuedAt || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(jobId)) {
+    return null;
+  }
+  return Buffer.from(JSON.stringify({ t: firstEnqueuedAt, id: jobId }), 'utf8')
+    .toString('base64url');
+}
+
+export function decodeRetryBacklogTriageCursor(value: unknown): RetryBacklogTriageCursor | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as {
+      t?: unknown;
+      id?: unknown;
+    };
+    const firstEnqueuedAt = cursorTimestamp(parsed.t);
+    const jobId = String(parsed.id || '').trim();
+    if (!firstEnqueuedAt
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(jobId)) {
+      return null;
+    }
+    return { firstEnqueuedAt, jobId };
+  } catch {
+    return null;
+  }
+}
+
 export type RetryBacklogBucket = 'TERMINAL' | 'QUARANTINE' | 'RECOVERABLE';
 
 export type RetryBacklogReason =
@@ -57,6 +107,7 @@ export interface RetryBacklogTriageEvidence {
   priority: number;
   runAfter: string | null;
   firstEnqueuedAt: string | null;
+  lastReopenedAt: string | null;
   retryObservedAt: string | null;
   scopeEligibility: string | null;
   scanStatus: string | null;
@@ -116,12 +167,21 @@ export function classifyRetryBacklogJob(
   if (country === 'REJECTED' || trading === 'NON_TRADING' || trading === 'HUMAN_REJECTED') {
     return { bucket: 'TERMINAL', reason: 'CHANNEL_TERMINAL' };
   }
-  if (evidence.attempts >= evidence.maxAttempts) {
+  // A missing/zero maxAttempts is unknown, not exhausted. Never close a job
+  // merely because the limit metadata is absent.
+  if (evidence.maxAttempts > 0 && evidence.attempts >= evidence.maxAttempts) {
     return { bucket: 'TERMINAL', reason: 'ATTEMPTS_EXHAUSTED' };
   }
-  if (scan === 'NEEDS_REVIEW') return { bucket: 'QUARANTINE', reason: 'HUMAN_REVIEW' };
+  if (scan === 'NEEDS_REVIEW' || trading === 'NEEDS_REVIEW') {
+    return { bucket: 'QUARANTINE', reason: 'HUMAN_REVIEW' };
+  }
 
-  const ancient = ageDays(evidence.firstEnqueuedAt, nowMs) > RETRY_BACKLOG_ANCIENT_DAYS;
+  // A reopen starts a fresh retry epoch even though first_enqueued_at is
+  // immutable. Use the latest reopen timestamp as the age anchor.
+  const ancient = ageDays(
+    evidence.lastReopenedAt || evidence.firstEnqueuedAt,
+    nowMs,
+  ) > RETRY_BACKLOG_ANCIENT_DAYS;
   const lastClaimMs = timestampMs(evidence.lastClaimAt);
   const recentClaim = lastClaimMs !== null && nowMs - lastClaimMs <= RETRY_BACKLOG_ANCIENT_DAYS * DAY_MS;
   if (!ancient) return { bucket: 'RECOVERABLE', reason: 'RECENT' };
@@ -147,6 +207,7 @@ export interface RetryBacklogTriageRow {
   priority: number;
   runAfter: string | null;
   firstEnqueuedAt: string | null;
+  lastReopenedAt: string | null;
   retryObservedAt: string | null;
   scopeEligibility: string | null;
   scanStatus: string | null;
@@ -163,6 +224,7 @@ export interface RetryBacklogTriageReport {
   maxJobs: number;
   schema: { triageTablePresent: boolean };
   population: { pendingRetries: number; examined: number; truncated: boolean };
+  scan: { cursor: string | null; nextCursor: string | null };
   summary: {
     terminal: number;
     quarantine: number;
@@ -181,6 +243,7 @@ export interface RetryBacklogTriageDb {
 export interface RetryBacklogTriageReportOptions {
   maxJobs?: number;
   includeRows?: boolean;
+  cursor?: RetryBacklogTriageCursor | null;
   now?: () => Date;
 }
 
@@ -188,13 +251,14 @@ export interface RetryBacklogTriageArgs {
   maxJobs: number;
   includeRows: boolean;
   check: boolean;
+  cursor: RetryBacklogTriageCursor | null;
   out: string | null;
   help: boolean;
 }
 
 export const RETRY_BACKLOG_TRIAGE_USAGE =
   'Usage: npx tsx scripts/phase2RetryBacklogTriage.ts '
-  + '[--max-jobs=5000] [--include-rows] [--check] [--out=path]';
+  + '[--max-jobs=5000] [--cursor=cursor] [--include-rows] [--check] [--out=path]';
 
 function parseBoundedInteger(rawValue: string, flag: string, min: number, max: number): number {
   if (!/^\d+$/.test(rawValue)) {
@@ -214,6 +278,7 @@ export function parseRetryBacklogTriageArgs(
     maxJobs: RETRY_BACKLOG_TRIAGE_DEFAULT_MAX_JOBS,
     includeRows: false,
     check: false,
+    cursor: null,
     out: null,
     help: false,
   };
@@ -228,6 +293,10 @@ export function parseRetryBacklogTriageArgs(
         1,
         RETRY_BACKLOG_TRIAGE_MAX_JOBS,
       );
+    } else if (raw.startsWith('--cursor=')) {
+      const cursor = decodeRetryBacklogTriageCursor(raw.slice('--cursor='.length));
+      if (!cursor) throw new Error('--cursor is not a valid triage cursor');
+      args.cursor = cursor;
     } else if (raw.startsWith('--out=')) {
       const out = raw.slice('--out='.length);
       if (!out.trim()) throw new Error('--out must name a non-empty file path');
@@ -263,8 +332,6 @@ function count(value: unknown): number {
 export interface RetryBacklogTriageCandidateSqlOptions {
   /** Lock candidate job rows for an operator apply. */
   lock?: boolean;
-  /** Add `$2::uuid[]` job-id restriction (test isolation or a reviewed batch). */
-  restrictJobIds?: boolean;
   /** Exclude rows already carrying applied triage evidence. */
   excludeApplied?: boolean;
 }
@@ -273,25 +340,41 @@ export function retryBacklogTriageCandidateSql(
   triageTablePresent: boolean,
   options: RetryBacklogTriageCandidateSqlOptions = {},
 ): string {
-  const triageJoin = triageTablePresent
+  const triageFilterJoin = options.excludeApplied && triageTablePresent
+    ? 'LEFT JOIN public.retry_backlog_triage tf ON tf.job_id=j.id'
+    : '';
+  const excludeApplied = options.excludeApplied && triageTablePresent
+    ? 'AND tf.applied_at IS NULL'
+    : '';
+  const triageSelectJoin = triageTablePresent
     ? 'LEFT JOIN public.retry_backlog_triage t ON t.job_id=j.id'
     : '';
   const appliedBucket = triageTablePresent ? 't.bucket' : 'NULL::text';
   const appliedAt = triageTablePresent ? 't.applied_at' : 'NULL::timestamptz';
-  const restrict = options.restrictJobIds
-    ? "AND ($2::uuid[] IS NULL OR j.id=ANY($2))"
-    : '';
-  const excludeApplied = options.excludeApplied && triageTablePresent
-    ? 'AND t.applied_at IS NULL'
-    : '';
   const lock = options.lock ? 'FOR UPDATE OF j SKIP LOCKED' : '';
   return `
-    WITH claim_stats AS (
+    WITH candidate_jobs AS (
+      SELECT j.id
+        FROM jobs j
+        ${triageFilterJoin}
+       WHERE j.type='${RETRY_BACKLOG_TRIAGE_JOB_TYPE}'
+         AND j.status='PENDING'
+         AND j.closed_at IS NULL
+         AND ($2::uuid[] IS NULL OR j.id=ANY($2))
+         AND ($3::timestamptz IS NULL OR (j.first_enqueued_at, j.id) > ($3::timestamptz, $4::uuid))
+         ${excludeApplied}
+       ORDER BY j.first_enqueued_at, j.id
+       LIMIT $1
+    ), claim_stats AS (
       SELECT job_id,
              count(*)::int AS claims,
              max(started_at) AS last_claim_at,
-             count(*) FILTER (WHERE failure_work_started_evidence='PROVEN_STARTED')::int AS started_claims
+             count(*) FILTER (
+               WHERE failure_work_started_evidence='PROVEN_STARTED'
+                  OR logs ? 'communityInspectionStarted'
+             )::int AS started_claims
         FROM job_attempts
+       WHERE job_id IN (SELECT id FROM candidate_jobs)
        GROUP BY job_id
     )
     SELECT j.id,
@@ -302,6 +385,8 @@ export function retryBacklogTriageCandidateSql(
            j.priority,
            j.run_after,
            j.first_enqueued_at,
+           j.first_enqueued_at::text AS first_enqueued_at_cursor,
+           j.last_reopened_at,
            j.payload->>'retryObservedAt' AS retry_observed_at,
            c.channel_id IS NOT NULL AS channel_present,
            c.scope_eligibility,
@@ -316,16 +401,11 @@ export function retryBacklogTriageCandidateSql(
            ${appliedBucket} AS applied_bucket,
            ${appliedAt} AS applied_at
       FROM jobs j
+      JOIN candidate_jobs cj ON cj.id=j.id
       LEFT JOIN channels c ON c.channel_id=j.payload->>'channelId'
       LEFT JOIN claim_stats cs ON cs.job_id=j.id
-      ${triageJoin}
-     WHERE j.type='${RETRY_BACKLOG_TRIAGE_JOB_TYPE}'
-       AND j.status='PENDING'
-       AND j.closed_at IS NULL
-       ${restrict}
-       ${excludeApplied}
+      ${triageSelectJoin}
      ORDER BY j.first_enqueued_at, j.id
-     LIMIT $1
      ${lock}
   `;
 }
@@ -341,6 +421,7 @@ export function retryBacklogTriageEvidenceFromRawRow(raw: any): RetryBacklogTria
     priority: Number.isFinite(Number(raw.priority)) ? Number(raw.priority) : 0,
     runAfter: iso(raw.run_after),
     firstEnqueuedAt: iso(raw.first_enqueued_at),
+    lastReopenedAt: iso(raw.last_reopened_at),
     retryObservedAt: iso(raw.retry_observed_at),
     scopeEligibility: raw.scope_eligibility ? String(raw.scope_eligibility) : null,
     scanStatus: raw.scan_status ? String(raw.scan_status) : null,
@@ -378,10 +459,23 @@ export async function buildRetryBacklogTriageReport(
   const triageTablePresent = schemaRow.present === true;
   const pendingRetries = count(schemaRow.pending_retries);
 
-  const result = await db.query(retryBacklogTriageCandidateSql(triageTablePresent), [maxJobs + 1]);
+  const cursor = options.cursor || null;
+  const result = await db.query(retryBacklogTriageCandidateSql(triageTablePresent), [
+    maxJobs + 1,
+    null,
+    cursor?.firstEnqueuedAt ?? null,
+    cursor?.jobId ?? null,
+  ]);
   const rawRows = Array.isArray(result.rows) ? result.rows : [];
   const truncated = rawRows.length > maxJobs;
   const limited = truncated ? rawRows.slice(0, maxJobs) : rawRows;
+  const nextCursor = truncated && limited.length > 0
+    ? encodeRetryBacklogTriageCursor({
+      firstEnqueuedAt: limited[limited.length - 1].first_enqueued_at_cursor
+        ?? limited[limited.length - 1].first_enqueued_at,
+      jobId: limited[limited.length - 1].id,
+    })
+    : null;
 
   const rows: RetryBacklogTriageRow[] = [];
   const byReason: Record<string, number> = {};
@@ -405,7 +499,10 @@ export async function buildRetryBacklogTriageReport(
         channelId: evidence.channelId,
         bucket: decision.bucket,
         reason: decision.reason as RetryBacklogReason,
-        ageDays: Math.round(ageDays(evidence.firstEnqueuedAt, nowMs) * 10) / 10,
+        ageDays: Math.round(ageDays(
+          evidence.lastReopenedAt || evidence.firstEnqueuedAt,
+          nowMs,
+        ) * 10) / 10,
         attempts: evidence.attempts,
         maxAttempts: evidence.maxAttempts,
         claims: evidence.claims,
@@ -414,6 +511,7 @@ export async function buildRetryBacklogTriageReport(
         priority: evidence.priority,
         runAfter: evidence.runAfter,
         firstEnqueuedAt: evidence.firstEnqueuedAt,
+        lastReopenedAt: evidence.lastReopenedAt,
         retryObservedAt: evidence.retryObservedAt,
         scopeEligibility: evidence.scopeEligibility,
         scanStatus: evidence.scanStatus,
@@ -431,6 +529,7 @@ export async function buildRetryBacklogTriageReport(
           startedClaims: evidence.startedClaims,
           lastClaimAt: evidence.lastClaimAt,
           firstEnqueuedAt: evidence.firstEnqueuedAt,
+          lastReopenedAt: evidence.lastReopenedAt,
           retryObservedAt: evidence.retryObservedAt,
           scopeEligibility: evidence.scopeEligibility,
           scanStatus: evidence.scanStatus,
@@ -453,6 +552,10 @@ export async function buildRetryBacklogTriageReport(
     maxJobs,
     schema: { triageTablePresent },
     population: { pendingRetries, examined: limited.length, truncated },
+    scan: {
+      cursor: cursor ? encodeRetryBacklogTriageCursor(cursor) : null,
+      nextCursor,
+    },
     summary: { terminal, quarantine, recoverable, skipped, byReason },
     ...(options.includeRows ? { rows } : {}),
     warnings,

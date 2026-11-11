@@ -3,7 +3,7 @@ name: Phase 2 retry backlog triage
 on:
   pull_request:
     paths:
-      - 'server/db/migrations/176_retry_backlog_triage.sql'
+      - 'server/db/migrations/**'
       - 'server/retryBacklogTriage.ts'
       - 'server/retryBacklogTriage.test.ts'
       - 'server/retryBacklogTriageApply.ts'
