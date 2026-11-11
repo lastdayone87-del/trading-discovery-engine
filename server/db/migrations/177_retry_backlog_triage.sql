@@ -1,4 +1,4 @@
--- Migration 176: Phase 2 retry backlog triage evidence and reversible quarantine.
+-- Migration 177: Phase 2 retry backlog triage evidence and reversible quarantine.
 --
 -- Unit 4 classifies ancient RETRY_COMMUNITY_ACQUISITION jobs into terminal,
 -- quarantine, and recoverable buckets. Terminal jobs keep their append-only

@@ -191,7 +191,7 @@ export async function runRetryBacklogTriageApply(
   const triageTablePresent = schema.rows[0]?.present === true;
   const pendingRetries = count(schema.rows[0]?.pending_retries);
   if (apply && !triageTablePresent) {
-    throw new Error('retry_backlog_triage table is missing; apply migration 176 first');
+    throw new Error('retry_backlog_triage table is missing; apply migration 177 first');
   }
 
   const sql = retryBacklogTriageCandidateSql(triageTablePresent, {

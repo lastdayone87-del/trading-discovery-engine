@@ -11,7 +11,7 @@ if (dedicatedDatabaseUrl) process.env.DATABASE_URL = dedicatedDatabaseUrl;
 const enabled = Boolean(dedicatedDatabaseUrl);
 const maybe = enabled ? test : test.skip;
 
-maybe('migration 176 and the bounded apply close an evidenced terminal scope', async () => {
+maybe('migration 177 and the bounded apply close an evidenced terminal scope', async () => {
   const db = await getDb();
   const client = await db.connect();
   const jobId = randomUUID();
@@ -73,7 +73,7 @@ maybe('migration 176 and the bounded apply close an evidenced terminal scope', a
   }
 });
 
-maybe('migration 176 and the bounded apply support reversible quarantine', async () => {
+maybe('migration 177 and the bounded apply support reversible quarantine', async () => {
   const db = await getDb();
   const client = await db.connect();
   const jobId = randomUUID();

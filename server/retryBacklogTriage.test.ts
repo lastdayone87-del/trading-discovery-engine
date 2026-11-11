@@ -470,8 +470,8 @@ test('apply requires an actor and honors bucket/action bounds', async () => {
   assert.ok(!report.warnings.includes('action_limit_reached'));
 });
 
-test('migration 176 is additive and enforces the triage contract', () => {
-  const sql = readFileSync(new URL('./db/migrations/176_retry_backlog_triage.sql', import.meta.url), 'utf8');
+test('migration 177 is additive and enforces the triage contract', () => {
+  const sql = readFileSync(new URL('./db/migrations/177_retry_backlog_triage.sql', import.meta.url), 'utf8');
   assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.retry_backlog_triage/);
   assert.match(sql, /bucket IN \('TERMINAL','QUARANTINE','RECOVERABLE'\)/);
   assert.match(sql, /original_priority/);
