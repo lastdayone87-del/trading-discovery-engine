@@ -7,18 +7,7 @@ import {
 } from './operationalMaintenanceScheduler';
 import { STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS } from './staleChannelLockRecovery';
 
-const ALL_TASKS = [
-  'locks',
-  'investigations',
-  'orphans',
-  'community',
-  'legacy',
-  'projection',
-  'enrichment',
-  'phaseb',
-  'resume',
-  'classification'
-];
+const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'phaseb', 'resume', 'classification'];
 
 function createDeps(failAt?: string) {
   const calls: string[] = [];
@@ -34,6 +23,7 @@ function createDeps(failAt?: string) {
     reconcileLegacyCommunityRetryOwnership: make('legacy'),
     projectProviderDeferredEnrichment: make('projection'),
     reconcileOperationalEnrichmentRecovery: make('enrichment'),
+    reconcileClassificationResolutionGaps: make('resolution'),
     triggerPhaseBObservationReconciliation: make('phaseb'),
     resumeOrphanedAutonomousPages: make('resume'),
     reconcileStaleClassificationSightings: make('classification')

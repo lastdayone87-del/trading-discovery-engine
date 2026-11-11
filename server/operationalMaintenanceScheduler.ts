@@ -10,6 +10,7 @@ import { reconcileOrphanInvestigations, recoverStaleInvestigationSteps } from '.
 import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership } from './communityRecovery';
 import { COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON } from './communityRetryPolicy';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
+import { reconcileClassificationResolutionGaps } from './classificationResolutionRecovery';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
 
@@ -28,6 +29,7 @@ export interface OperationalMaintenanceDependencies {
   reconcileLegacyCommunityRetryOwnership(): Promise<unknown>;
   projectProviderDeferredEnrichment(): Promise<unknown>;
   reconcileOperationalEnrichmentRecovery(): Promise<unknown>;
+  reconcileClassificationResolutionGaps(): Promise<unknown>;
   triggerPhaseBObservationReconciliation(): unknown;
   resumeOrphanedAutonomousPages(): Promise<unknown>;
   /** Delayed repair of pending classification sightings; runs at minute scale. */
@@ -181,6 +183,7 @@ export function createOperationalMaintenanceScheduler(
     await isolate('legacy_community_retry_ownership', () => dependencies.reconcileLegacyCommunityRetryOwnership());
     await isolate('provider_deferred_projection', () => dependencies.projectProviderDeferredEnrichment());
     await isolate('operational_enrichment_recovery', () => dependencies.reconcileOperationalEnrichmentRecovery());
+    await isolate('classification_resolution_gaps', () => dependencies.reconcileClassificationResolutionGaps());
     await isolate('phase_b_observation_reconciliation', () => dependencies.triggerPhaseBObservationReconciliation());
     // The reconciler defaults its enqueue limit to the configured queue
     // headroom, so this maintenance sweep cannot exceed the producer
@@ -304,6 +307,7 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       20,
       Date.now()
     ),
+    reconcileClassificationResolutionGaps: () => reconcileClassificationResolutionGaps({ dryRun: false, limit: 20 }),
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
     reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)

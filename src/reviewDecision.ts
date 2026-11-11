@@ -1,6 +1,6 @@
 import { newRequestId } from './apiClient';
 
-export type ReviewDecisionAction = 'approve' | 'reject' | 'force-rescan';
+export type ReviewDecisionAction = 'approve' | 'reject' | 'force-rescan' | 'request-rescan';
 
 export interface ReviewDecisionRequest {
   channelId: string;

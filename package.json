@@ -51,7 +51,9 @@
     "stage0:operator-visible": "tsx scripts/stage0OperatorVisibleCounterfactual.ts",
     "stage0:operator-visible-assertion-replay": "tsx scripts/stage0OperatorVisibleAssertionReplay.ts",
     "stage0:promotion-readiness": "tsx scripts/stage0PromotionReadiness.ts",
-    "classification:validate-routing": "tsx scripts/validateDeterministicRouting.ts"
+    "classification:validate-routing": "tsx scripts/validateDeterministicRouting.ts",
+    "classification:resolution-recovery": "tsx scripts/reconcileClassificationResolution.ts",
+    "classification:resolution-recovery:dry-run": "tsx scripts/reconcileClassificationResolution.ts --dry-run"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

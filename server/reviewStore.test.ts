@@ -21,3 +21,9 @@ test('approval and rejection produce their durable terminal queue states',()=>{
   assert.notEqual(resolveReviewTransition('PENDING','APPROVE'),'PENDING');
   assert.notEqual(resolveReviewTransition('PENDING','REJECT'),'PENDING');
 });
+
+test('a pending review can request more evidence without approving or rejecting',()=>{
+  assert.equal(resolveReviewTransition('PENDING','REQUEST_RESCAN'),'PENDING');
+  assert.throws(()=>resolveReviewTransition('APPROVED','REQUEST_RESCAN'),ReviewConflictError);
+  assert.throws(()=>resolveReviewTransition('REJECTED','REQUEST_RESCAN'),ReviewConflictError);
+});

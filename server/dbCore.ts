@@ -3476,7 +3476,7 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   try{
   db=opts.clientOverride||await getDb();
   const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
-  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
+  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,terminal_failure_class=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.terminal_failure_class END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
   // Three explicit conflict policies:
   //  - preventReopen: never reopen any terminal row (explicit recovery only).
   //  - preventCompletedReopen: keep a completed job terminal, but still let a
@@ -3559,7 +3559,7 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
   const traceId=String(claimed?.payload?.traceId||'');
   if(traceId){try{await db.query(`INSERT INTO discovery_execution_trace(trace_id,stage,outcome,detail) VALUES($1,'WORKER_POLLING','REACHED',$2),($1,'QUEUE_CLAIM','REACHED',$3)`,[traceId,JSON.stringify({workerId,claimableTypes:types||null}),JSON.stringify({workerId,jobId:claimed!.id,type:claimed!.type})]);}catch(error){console.warn('[Execution Trace] Claim trace unavailable; discovery claim remains committed.',error instanceof Error?error.message:error);}}
   return claimed;}
-export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
+export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 
 /**
  * Durable affirmative proof that community inspection genuinely began for one
@@ -5620,6 +5620,67 @@ export async function failQueryRun(runId: string, error: unknown, terminal: bool
   }
 }
 
+export interface EnrichmentQuotaProtectionInput {
+  dailyBudget: number;
+  actualUsed: number;
+  reservedTotal: number;
+  dueStage1: number;
+  dueStage2: number;
+  recentAutonomousUnits: number;
+  recentEnrichmentUnits: number;
+}
+
+export interface EnrichmentQuotaProtection {
+  remainingUnits: number;
+  dueDemandUnits: number;
+  reserveUnits: number;
+  protectedShare: number;
+  discoveryAvailableUnits: number;
+  reasonCodes: string[];
+}
+
+/**
+ * Backlog-aware, demand-driven enrichment quota protection.
+ *
+ * The reserve is not a fixed partition. It is the smaller of:
+ *   - the actual estimated units needed by due stage-1/stage-2 enrichment;
+ *   - a fairness share derived from recent actual consumption (10%-50%).
+ *
+ * Stage 1 costs 2 units; stage 2 costs 103 units. Already-hydrated jobs cost 0
+ * and are excluded by the caller's due counts. When the backlog falls, the
+ * reserve falls with it; when demand rises, the reserve rises up to the
+ * fairness ceiling while discovery keeps at least half of the remaining pool.
+ */
+export function calculateEnrichmentQuotaReserve(input: EnrichmentQuotaProtectionInput): EnrichmentQuotaProtection {
+  const dailyBudget = Math.max(0, Number(input.dailyBudget) || 0);
+  const actualUsed = Math.max(0, Number(input.actualUsed) || 0);
+  const reservedTotal = Math.max(0, Number(input.reservedTotal) || 0);
+  const remainingUnits = Math.max(0, dailyBudget - actualUsed - reservedTotal);
+  const dueDemandUnits = Math.max(0, Math.floor(
+    Math.max(0, input.dueStage1) * 2
+    + Math.max(0, input.dueStage2) * 103
+  ));
+  const recentAutonomous = Math.max(0, Number(input.recentAutonomousUnits) || 0);
+  const recentEnrichment = Math.max(0, Number(input.recentEnrichmentUnits) || 0);
+  const recentTotal = recentAutonomous + recentEnrichment;
+  const recentEnrichmentShare = recentTotal > 0 ? recentEnrichment / recentTotal : 0.10;
+  const protectedShare = Math.min(0.50, Math.max(0.10, recentEnrichmentShare));
+  const reserveUnits = dueDemandUnits <= 0
+    ? 0
+    : Math.min(remainingUnits, dueDemandUnits, Math.floor(remainingUnits * protectedShare));
+  return {
+    remainingUnits,
+    dueDemandUnits,
+    reserveUnits,
+    protectedShare,
+    discoveryAvailableUnits: Math.max(0, remainingUnits - reserveUnits),
+    reasonCodes: [
+      dueDemandUnits > 0 ? 'ENRICHMENT_BACKLOG_DEMAND' : 'NO_DUE_ENRICHMENT',
+      recentTotal > 0 ? 'RECENT_CONSUMPTION_SHARE' : 'NO_RECENT_CONSUMPTION_HISTORY',
+    ],
+  };
+}
+
 export async function tryReserveQuota(args: {
   operationType: string;
   operationId: string;
@@ -5661,10 +5722,40 @@ export async function tryReserveQuota(args: {
       [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
+    let protectedEnrichmentUnits = 0;
+    if (args.allocation === 'AUTONOMOUS') {
+      const [dueEnrichment, recentConsumption] = await Promise.all([
+        client.query(
+          `SELECT
+             count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)<=1
+               AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage1,
+             count(*) FILTER (WHERE COALESCE((payload->>'enrichmentStage')::int,1)>=2
+               AND NOT (COALESCE((payload->'candidate'->>'enrichmentStage')::int,0) >= COALESCE((payload->>'enrichmentStage')::int,1)))::int AS stage2
+           FROM jobs WHERE type='ENRICH_CHANNEL' AND status='PENDING' AND run_after<=now()`,
+        ),
+        client.query(
+          `SELECT allocation,COALESCE(SUM(units),0)::int AS units
+             FROM quota_reservations
+            WHERE status='CONSUMED' AND reserved_at>=now()-interval '7 days'
+            GROUP BY allocation`,
+        ),
+      ]);
+      const recentByAllocation = new Map(recentConsumption.rows.map(item => [String(item.allocation), Number(item.units) || 0]));
+      const protection = calculateEnrichmentQuotaReserve({
+        dailyBudget: args.dailyBudget,
+        actualUsed: Number(row.actual_used) || 0,
+        reservedTotal: Number(row.reserved_total) || 0,
+        dueStage1: Number(dueEnrichment.rows[0]?.stage1) || 0,
+        dueStage2: Number(dueEnrichment.rows[0]?.stage2) || 0,
+        recentAutonomousUnits: recentByAllocation.get('AUTONOMOUS') || 0,
+        recentEnrichmentUnits: recentByAllocation.get('ENRICHMENT') || 0,
+      });
+      protectedEnrichmentUnits = protection.reserveUnits;
+    }
     // Allocation percentages are scheduling preferences, not hard partitions.
-    // Hard partitions strand usable provider capacity and can defer executable
-    // work until the next YouTube Pacific quota day while the shared pool still has quota.
-    if (row.actual_used + row.reserved_total + args.units > args.dailyBudget) {
+    // The dynamic reserve protects only the actual demand of the due enrichment
+    // backlog; it is released as the backlog falls. Discovery keeps the rest.
+    if (row.actual_used + row.reserved_total + args.units + protectedEnrichmentUnits > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
     }
