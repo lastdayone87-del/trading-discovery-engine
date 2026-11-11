@@ -86,12 +86,23 @@ Return JSON only:
 }
 
 ${UNTRUSTED_START}
-${JSON.stringify(pack)}
+${JSON.stringify(pack).replace(/</g, '\\u003c')}
 ${UNTRUSTED_END}`;
 }
 
 export function admissionEvidenceChecksum(evidence: AdmissionEvidence): string {
-  const { fetchedAt: _fetchedAt, failureReason: _failureReason, ...stable } = evidence;
+  // Discovery provenance and fetch timestamps must not break the semantic
+  // cache: the same creator found through another query has the same subject.
+  const stable = {
+    channelId: evidence.channelId,
+    channelName: evidence.channelName,
+    description: evidence.description,
+    links: evidence.links,
+    declaredLanguage: evidence.declaredLanguage,
+    country: evidence.country,
+    subscriberCount: evidence.subscriberCount,
+    videos: evidence.videos,
+  };
   return createHash('sha256').update(JSON.stringify(stable)).digest('hex');
 }
 
@@ -134,15 +145,26 @@ async function assertAdmissionModelBudget(): Promise<void> {
   try {
     const db = await getDb();
     const result = await db.query(
-      `SELECT COUNT(*)::int AS used FROM semantic_classification_cache
-        WHERE provider=$1 AND created_at >= date_trunc('day', now())`,
-      [ADMISSION_PROVIDER],
+      `SELECT COUNT(*)::int AS used FROM semantic_admission_model_calls
+        WHERE created_at >= date_trunc('day', now())`,
     );
     if (Number(result.rows[0]?.used || 0) >= cap) {
       throw new Error('ADMISSION_SEMANTIC_BUDGET_EXHAUSTED');
     }
   } catch (error) {
     if (error instanceof Error && error.message === 'ADMISSION_SEMANTIC_BUDGET_EXHAUSTED') throw error;
+    // Budget ledger failure fails open; provider failover still protects spend.
+  }
+}
+
+async function recordAdmissionModelCall(role: 'PRIMARY' | 'SECOND', provider: string, model: string): Promise<void> {
+  try {
+    const db = await getDb();
+    await db.query(
+      `INSERT INTO semantic_admission_model_calls(role,provider,model) VALUES($1,$2,$3)`,
+      [role, provider, model],
+    );
+  } catch {
     // Budget ledger failure fails open; provider failover still protects spend.
   }
 }
@@ -156,6 +178,7 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
       secondaryModel?: string;
       jobId?: string;
       runId?: string;
+      readOnly?: boolean;
     } = {},
   ) {}
 
@@ -166,7 +189,8 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
           { client: this.options.secondaryClient ?? groqDefaultClient(), model: this.options.secondaryModel || process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL },
         ]
       : [
-          { client: this.options.secondaryClient ?? groqDefaultClient() ?? geminiDefaultClient(), model: this.options.secondaryModel || process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL },
+          { client: this.options.secondaryClient ?? groqDefaultClient(), model: this.options.secondaryModel || process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL },
+          { client: geminiDefaultClient(), model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL },
         ];
     const checksum = admissionEvidenceChecksum(evidence);
     let lastError: unknown;
@@ -174,10 +198,11 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
       const attempt = attempts[attemptIndex];
       if (!attempt.client) continue;
       const cacheKey = admissionCacheKey(role, attempt.model, checksum);
-      const cached = await readAdmissionCache(cacheKey);
+      const cached = this.options.readOnly ? null : await readAdmissionCache(cacheKey);
       if (cached) return cached;
       await assertAdmissionModelBudget();
       try {
+        if (!this.options.readOnly) await recordAdmissionModelCall(role, attempt.client.batchGroup || 'unknown', attempt.model);
         const raw = await attempt.client.classify(
           buildAdmissionPrompt(evidence, role),
           attempt.model,
@@ -191,10 +216,10 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         // provider instead.
         if (role === 'PRIMARY' && attemptIndex > 0
           && (normalized.mainSubject === 'MIXED' || normalized.mainSubject === 'UNKNOWN'
-            || (normalized.mainSubject === 'UNRELATED' && normalized.citations.filter(citation => citation.supports === 'UNRELATED').length < 2))) {
+            || (normalized.mainSubject === 'UNRELATED' && independentCitationCount(evidence, normalized, 'UNRELATED') < 2))) {
           throw new Error('ADMISSION_SEMANTIC_FALLBACK_AMBIGUOUS');
         }
-        await writeAdmissionCache(cacheKey, checksum, attempt.model, normalized);
+        if (!this.options.readOnly) await writeAdmissionCache(cacheKey, checksum, attempt.model, normalized);
         return normalized;
       } catch (error) {
         lastError = error;

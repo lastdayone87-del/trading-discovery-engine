@@ -1401,6 +1401,10 @@ export async function fetchVideoSnippetsByIds(videoIds: string[]): Promise<Array
         if (isYouTubeQuotaAccountingError(error)) throw error;
         if (isProbeQuotaControlError(error)) throw error;
         if (isYouTubePermanentInputError(error)) throw error;
+        // The response was already charged; a parse failure must surface as a
+        // provider failure, not be retried on another key and reported as an
+        // empty video list.
+        if (accounted) throw error;
         recordProviderFailure(apiKey, error);
         if (isQuotaExceeded(error)) quotaExceededCount += 1;
       }

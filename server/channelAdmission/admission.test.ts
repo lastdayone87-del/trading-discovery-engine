@@ -334,3 +334,65 @@ test('a general news channel with no trading citations is not admitted as ambigu
   assert.equal(result.decision, 'REJECT_UNRELATED');
   assert.ok(result.reasonCodes.includes('MIXED_WITHOUT_TRADING_EVIDENCE'));
 });
+
+test('cached normalized judgments retain citations and domains', async () => {
+  const { normalizeSemanticJudgment } = await import('./policy');
+  const cached = normalizeSemanticJudgment({
+    mainSubject: 'UNRELATED',
+    tradingFocus: 0,
+    unrelatedDomains: [{ domain: 'COOKING', confidence: 0.9 }],
+    citations: [{ field: 'bio', quote: 'Cooking made SIMPLE', supports: 'UNRELATED' }],
+    explanation: 'cached',
+  }, 'cache');
+  assert.equal(cached?.citations.length, 1);
+  assert.equal(cached?.unrelatedDomains[0].domain, 'COOKING');
+});
+
+test('finance-adjacent rejection requires independent citation proof', () => {
+  const finance = evidence({
+    name: 'General Business Channel',
+    bio: 'Business ideas, banking apps and money tips.',
+    videos: [{ title: 'How to open a bank account' }, { title: 'Business ideas for beginners' }],
+  });
+  const withoutProof = decideAdmission({
+    evidence: finance,
+    judgment: judgment({ subject: 'FINANCE_ADJACENT', focus: 0, citations: [], domains: ['BUSINESS'] }),
+  });
+  assert.equal(withoutProof.decision, 'ADMIT_AMBIGUOUS');
+
+  const withProof = decideAdmission({
+    evidence: finance,
+    judgment: judgment({
+      subject: 'FINANCE_ADJACENT', focus: 0,
+      citations: [
+        citation('bio', 'Business ideas', undefined, 'UNRELATED'),
+        citation('video_title', 'bank account', 0, 'UNRELATED'),
+      ],
+      domains: ['BUSINESS'],
+    }),
+  });
+  assert.equal(withProof.decision, 'REJECT_UNRELATED');
+});
+
+test('pending admissions do not trip the contamination guard', () => {
+  const decision = evaluateQueryAdmissionGuard({
+    pageNumber: 2,
+    outcomes: { admitted: 0, ambiguous: 0, rejected: 0, held: 0, pending: 10, total: 0 },
+    tradingPrecision: 0,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    priorZeroQualityPages: 2,
+  });
+  assert.equal(decision.stop, false);
+});
+
+test('admission jobs resolve quota provenance before a channels row exists', async () => {
+  const { resolveJobQuotaOrigin } = await import('../quotaOrigin');
+  const origin = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-not-yet-admitted' },
+  }, {
+    query: async () => ({ rows: [], rowCount: 0 }),
+  });
+  assert.equal(origin, 'NORMAL');
+});

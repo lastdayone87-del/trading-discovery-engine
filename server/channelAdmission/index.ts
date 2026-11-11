@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelRecord, DiscoverySource } from '../../src/types';
-import { getDb, getChannelById, insertChannelIfAbsent, upsertChannel } from '../db';
+import { getDb, getChannelById, hasActiveClassificationJob, insertChannelIfAbsent, upsertChannel } from '../db';
 import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQueryScopeKey } from '../classificationDecoupling';
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
@@ -115,7 +115,8 @@ async function enqueueClassificationAfterAdmission(input: {
     idempotencyKey: `admission-classify:${input.candidate.channelId}:v1`,
     preventCompletedReopen: true,
   });
-  return job != null && (job.status === 'PENDING' || job.status === 'PROCESSING');
+  if (job == null) return await hasActiveClassificationJob(input.candidate.channelId);
+  return job.status === 'PENDING' || job.status === 'PROCESSING';
 }
 
 export interface VerifyAdmissionOptions {
@@ -225,6 +226,7 @@ export async function verifyAdmissionCandidate(
   const judge = options.judge || new ProviderAdmissionJudge({
     jobId: input.discoveryJobId,
     runId: input.queryRunId,
+    readOnly: options.dryRun === true,
   });
   let judgment: SemanticJudgment;
   try {
@@ -268,6 +270,7 @@ export async function verifyAdmissionCandidate(
   }
 
   const policy = decideAdmission({ evidence, judgment, secondJudgment });
+  let recordedDecisionId: string | null = null;
   if (policy.ambiguous) {
     const health = await getAdmissionAmbiguousRate().catch(() => null);
     const cap = Math.max(0, Math.min(1, Number(process.env.ADMISSION_AMBIGUOUS_RATE_CAP || 0.35)));
@@ -297,7 +300,7 @@ export async function verifyAdmissionCandidate(
       nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
       expiresAt: row.expires_at || (policy.hold ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString() : null),
     });
-    await recordAdmissionDecision({
+    recordedDecisionId = await recordAdmissionDecision({
       candidateId: row.id,
       channelId: evidence.channelId,
       decision: policy.decision,
@@ -332,7 +335,7 @@ export async function verifyAdmissionCandidate(
     if (!options.dryRun) {
       const now = new Date().toISOString();
       const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
-      const decisionId = randomUUID();
+      const decisionId = recordedDecisionId || randomUUID();
       if (!existing) {
         await insertChannelIfAbsent(admittedChannel({
           evidence,

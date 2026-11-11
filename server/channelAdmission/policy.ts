@@ -37,7 +37,6 @@ const GAMBLING_PATTERNS: RegExp[] = [
   /(?:كازينو|روليت|مراهنات|مقامرة)/u,
 ];
 
-const TRADING_CONTEXT_WORDS = /\b(?:trading|trader|market|markets|forex|futures|options|stocks?|equities|crypto|technical\s*analysis|price\s*action|risk\s*management|backtest|broker|prop\s*firm)\b/iu;
 
 export function normalizeEvidenceText(value: string): string {
   return String(value || '')
@@ -74,21 +73,17 @@ export function assessExtractedQueryAdmission(input: {
   const candidateGambling = hasGamblingTerm(candidate);
   const sourceGambling = hasGamblingTerm(source);
   const candidateAnchor = hasTradingAnchor(candidate);
-  const sourceAnchor = hasTradingAnchor(source);
 
-  if (sourceGambling && !sourceAnchor) {
-    return { eligible: false, reasonCodes: ['GAMBLING_SOURCE_VIDEO', 'NO_TRADING_ANCHOR'] };
+  // A gambling/betting source video never becomes a trading query, even if
+  // its title also contains a trading word or anchor.
+  if (sourceGambling) {
+    return { eligible: false, reasonCodes: ['GAMBLING_SOURCE_VIDEO'] };
   }
   if (candidateGambling && !candidateAnchor) {
     return { eligible: false, reasonCodes: ['GAMBLING_QUERY_WITHOUT_TRADING_ANCHOR'] };
   }
   if (!candidateAnchor) {
     return { eligible: false, reasonCodes: ['NO_CONCRETE_TRADING_ANCHOR'] };
-  }
-  // A source video that is itself a gambling lesson cannot launder a trading
-  // word into a valid standalone query.
-  if (sourceGambling && sourceAnchor && !TRADING_CONTEXT_WORDS.test(candidate)) {
-    return { eligible: false, reasonCodes: ['GAMBLING_SOURCE_CONTEXT_MISMATCH'] };
   }
   return { eligible: true, reasonCodes: [] };
 }
@@ -252,7 +247,7 @@ export function decideAdmission(input: {
     };
   }
 
-  if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0) {
+  if (effective.mainSubject === 'FINANCE_ADJACENT' && tradingCitations === 0 && unrelatedCitations >= 2 && valid >= 2) {
     return {
       decision: 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
@@ -282,18 +277,18 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
   const raw = value as Record<string, any>;
   const mainSubject = String(raw.main_subject || raw.mainSubject || '').toUpperCase();
   if (!['TRADING', 'FINANCE_ADJACENT', 'UNRELATED', 'MIXED', 'UNKNOWN'].includes(mainSubject)) return null;
-  const citations = Array.isArray(raw.evidence_citations) ? raw.evidence_citations : [];
+  const citations = Array.isArray(raw.evidence_citations) ? raw.evidence_citations : Array.isArray(raw.citations) ? raw.citations : [];
   return {
     mainSubject: mainSubject as SemanticJudgment['mainSubject'],
     tradingFocus: Math.max(0, Math.min(100, Number(raw.trading_focus ?? raw.tradingFocus ?? 0) || 0)),
-    unrelatedDomains: Array.isArray(raw.unrelated_domains)
-      ? raw.unrelated_domains.map((item: any) => ({
+    unrelatedDomains: Array.isArray(raw.unrelated_domains) || Array.isArray(raw.unrelatedDomains)
+      ? (raw.unrelated_domains || raw.unrelatedDomains).map((item: any) => ({
         domain: String(item?.domain || item?.name || 'UNKNOWN').toUpperCase(),
         confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
       }))
       : [],
-    incidentalTradingMentions: Array.isArray(raw.incidental_trading_mentions)
-      ? raw.incidental_trading_mentions.map((item: any) => ({
+    incidentalTradingMentions: Array.isArray(raw.incidental_trading_mentions) || Array.isArray(raw.incidentalTradingMentions)
+      ? (raw.incidental_trading_mentions || raw.incidentalTradingMentions).map((item: any) => ({
         field: String(item?.field || 'unknown'),
         index: Number.isInteger(item?.index) ? item.index : undefined,
         quote: String(item?.quote || ''),

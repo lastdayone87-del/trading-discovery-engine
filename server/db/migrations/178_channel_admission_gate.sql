@@ -105,3 +105,14 @@ UPDATE extracted_query_candidates
    'systems keep showing up in trading',
    'martingale betting system in trading'
  );
+
+CREATE TABLE IF NOT EXISTS semantic_admission_model_calls (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  role text NOT NULL,
+  provider text NOT NULL,
+  model text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS semantic_admission_model_calls_day_idx
+  ON semantic_admission_model_calls (created_at);

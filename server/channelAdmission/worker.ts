@@ -13,7 +13,7 @@ export async function processAdmissionVerificationJob(job: DurableJob): Promise<
   if (!channelId) throw new Error('ADMISSION_JOB_CHANNEL_ID_REQUIRED');
   const row = await findAdmissionCandidate(channelId);
   if (!row) return;
-  if (['ADMITTED', 'ADMITTED_AMBIGUOUS', 'REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE'].includes(row.status)) {
+  if (['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE'].includes(row.status)) {
     return;
   }
   const candidate = (payload.candidate || {

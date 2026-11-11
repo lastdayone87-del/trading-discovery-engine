@@ -3,6 +3,7 @@ export interface AdmissionOutcomeCounts {
   ambiguous: number;
   rejected: number;
   held: number;
+  pending?: number;
   total: number;
 }
 

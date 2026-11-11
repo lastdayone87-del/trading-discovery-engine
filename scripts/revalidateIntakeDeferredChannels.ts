@@ -11,11 +11,11 @@
  *   npx tsx scripts/revalidateIntakeDeferredChannels.ts --limit=50 --apply
  */
 import { randomUUID } from 'node:crypto';
-import { getDb } from '../server/db';
+import { getChannelById, getDb } from '../server/db';
 import type { DiscoveredChannelRaw } from '../server/youtube';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
 import { verifyAdmissionCandidate } from '../server/channelAdmission';
-import { findAdmissionCandidate, upsertAdmissionCandidate, type AdmissionCandidateRow } from '../server/channelAdmission/store';
+import { enqueueAdmissionVerification, findAdmissionCandidate, upsertAdmissionCandidate, type AdmissionCandidateRow } from '../server/channelAdmission/store';
 import type { AdmissionCandidateInput } from '../server/channelAdmission/types';
 
 interface DeferredRow {
@@ -124,12 +124,23 @@ async function main() {
       } else {
         candidateRow = fakeRow(row);
       }
+      const existingChannel = apply ? await getChannelById(row.channel_id) : (row as unknown as ChannelRecord);
       const outcome = await verifyAdmissionCandidate(input, {
         row: candidateRow,
-        existingChannel: row as unknown as ChannelRecord,
+        existingChannel,
         dryRun: !apply,
         archiveRejectedExistingChannel: apply,
       });
+      if (apply && outcome.status === 'WAITING_EVIDENCE') {
+        const refreshed = await findAdmissionCandidate(row.channel_id);
+        if (refreshed?.next_check_at) {
+          await enqueueAdmissionVerification({
+            candidate: input,
+            runAfter: refreshed.next_check_at,
+            attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+          });
+        }
+      }
       if (outcome.decision === 'ADMIT') counts.admitted += 1;
       else if (outcome.decision === 'ADMIT_AMBIGUOUS') counts.ambiguous += 1;
       else if (outcome.decision === 'REJECT_UNRELATED') counts.rejected += 1;

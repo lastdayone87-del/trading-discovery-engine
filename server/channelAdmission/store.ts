@@ -114,7 +114,13 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
            THEN semantic_admission_candidates.status
          ELSE 'PENDING'
        END,
-       next_check_at=NULL,
+       next_check_at=CASE
+         WHEN semantic_admission_candidates.status='WAITING_EVIDENCE'
+           AND semantic_admission_candidates.next_check_at IS NOT NULL
+           AND semantic_admission_candidates.next_check_at > now()
+           THEN semantic_admission_candidates.next_check_at
+         ELSE NULL
+       END,
        updated_at=now()
      RETURNING *`,
     [
@@ -206,17 +212,19 @@ export async function recordAdmissionDecision(input: {
   reasonCodes: string[];
   evidenceHash?: string;
   judgment?: SemanticJudgment;
-}): Promise<void> {
+}): Promise<string | null> {
   const db = await getDb();
-  await db.query(
+  const result = await db.query(
     `INSERT INTO semantic_admission_decisions(candidate_id,channel_id,decision,reason_codes,evidence_hash,semantic_output,policy_version)
-     VALUES($1,$2,$3,$4::jsonb,$5,$6::jsonb,$7)`,
+     VALUES($1,$2,$3,$4::jsonb,$5,$6::jsonb,$7)
+     RETURNING id`,
     [
       input.candidateId, input.channelId, input.decision, JSON.stringify(input.reasonCodes || []),
       input.evidenceHash || null, input.judgment ? JSON.stringify(input.judgment) : null,
       ADMISSION_POLICY_VERSION,
     ],
   );
+  return result.rows[0]?.id ? String(result.rows[0].id) : null;
 }
 
 export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
@@ -224,6 +232,7 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
   ambiguous: number;
   rejected: number;
   held: number;
+  pending: number;
   total: number;
 }> {
   const db = await getDb();
@@ -233,7 +242,8 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
        COUNT(*) FILTER (WHERE status='ADMITTED_AMBIGUOUS')::int ambiguous,
        COUNT(*) FILTER (WHERE status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY'))::int rejected,
        COUNT(*) FILTER (WHERE status IN ('WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int held,
-       COUNT(*)::int total
+       COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
+       COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int total
      FROM semantic_admission_candidates WHERE query_run_id=$1`,
     [queryRunId],
   );
@@ -243,6 +253,7 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
     ambiguous: Number(row.ambiguous || 0),
     rejected: Number(row.rejected || 0),
     held: Number(row.held || 0),
+    pending: Number(row.pending || 0),
     total: Number(row.total || 0),
   };
 }
@@ -252,6 +263,7 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
   ambiguous: number;
   rejected: number;
   held: number;
+  pending: number;
   total: number;
 }> {
   const db = await getDb();
@@ -261,7 +273,8 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
        COUNT(*) FILTER (WHERE status='ADMITTED_AMBIGUOUS')::int ambiguous,
        COUNT(*) FILTER (WHERE status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY'))::int rejected,
        COUNT(*) FILTER (WHERE status IN ('WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int held,
-       COUNT(*)::int total
+       COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
+       COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int total
      FROM semantic_admission_candidates WHERE query_run_id=$1 AND page_number=$2`,
     [queryRunId, pageNumber],
   );
@@ -271,6 +284,7 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
     ambiguous: Number(row.ambiguous || 0),
     rejected: Number(row.rejected || 0),
     held: Number(row.held || 0),
+    pending: Number(row.pending || 0),
     total: Number(row.total || 0),
   };
 }
