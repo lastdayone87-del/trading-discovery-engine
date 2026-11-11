@@ -82,7 +82,7 @@ test('fixture metadata quality follows the same rule as persisted reviews', () =
 });
 
 test('deferred review migration and decision path preserve human evidence and labels', () => {
-  const migration = readFileSync(new URL('./db/migrations/177_intake_deferred_review.sql', import.meta.url), 'utf8');
+  const migration = readFileSync(new URL('./db/migrations/178_intake_deferred_review.sql', import.meta.url), 'utf8');
   assert.match(migration, /CREATE TABLE IF NOT EXISTS intake_deferred_reviews/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS intake_deferred_review_decisions/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS human_evaluation_samples/);
@@ -297,7 +297,7 @@ test('recheck protects scope, retries, aliases, snapshots and sweep concurrency'
   assert.match(sweep, /pg_advisory_xact_lock/);
   assert.match(sweep, /countryIdentitySql/);
   assert.match(sweep, /independentLocationTag/);
-  const migration = readFileSync(new URL('./db/migrations/177_intake_deferred_review.sql', import.meta.url), 'utf8');
+  const migration = readFileSync(new URL('./db/migrations/178_intake_deferred_review.sql', import.meta.url), 'utf8');
   assert.match(migration, /\) >= 3\s+AND COALESCE\(length\(trim/);
   const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
   assert.match(server, /notes: typeof req\.body\.notes === 'string'/);
