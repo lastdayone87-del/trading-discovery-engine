@@ -98,6 +98,22 @@ export function isExtractedQueryDiscoveryEnabled(value: unknown): boolean {
   return String(value ?? '').trim().toLowerCase() === 'true';
 }
 
+/** True for rows owned by the paused feature, including its quarantine marker. */
+export function isExtractedStandaloneQueryRow(row: { generation_metadata?: unknown }): boolean {
+  const metadata = row.generation_metadata;
+  if (!metadata || typeof metadata !== 'object') return false;
+  const value = metadata as Record<string, unknown>;
+  return value.queryTemplate === 'EXTRACTED_STANDALONE' || value.extractedQueryPaused === true;
+}
+
+/** Keep the paused feature out of every selection path while disabled. */
+export function filterPausedExtractedQueryRows<T extends { generation_metadata?: unknown }>(
+  rows: T[],
+  enabled: boolean,
+): T[] {
+  return enabled ? rows : rows.filter(row => !isExtractedStandaloneQueryRow(row));
+}
+
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
 function getAIClient(): GoogleGenAI | null {
@@ -1247,7 +1263,11 @@ Return ONLY a valid JSON object with format:
           if (aiRun) {
             aiRun.responseChars += resText.length;
           }
-          parsed = parseNativeVocabularyResponse(resText);
+          const geminiParsed = parseNativeVocabularyResponse(resText);
+          // Apply the same admissibility boundary as Groq. A query-only
+          // response must not be recorded as a successful extraction while
+          // extracted-query discovery is paused.
+          if (isAdmissible(geminiParsed)) parsed = geminiParsed;
         } catch (e: any) {
           const msg = e?.message || String(e);
           const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
@@ -1419,7 +1439,11 @@ export async function selectNextQueryForCountry(
   const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
   const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
 
-  const loadQueries = async (): Promise<QueryRecord[]> => getQueriesByCountry(country);
+  const extractedQueryDiscoveryEnabled = isExtractedQueryDiscoveryEnabled(
+    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
+  );
+  const loadQueries = async (): Promise<QueryRecord[]> =>
+    filterPausedExtractedQueryRows(await getQueriesByCountry(country), extractedQueryDiscoveryEnabled);
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
     buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, scopePromotionBasis: options.scopePromotionBasis });
 
