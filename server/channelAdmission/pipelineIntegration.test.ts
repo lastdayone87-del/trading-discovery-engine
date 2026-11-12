@@ -125,7 +125,8 @@ test('confirmed admission carries citations and flags missing confidence for rev
       admissionConfirmedTrading: true,
       admissionTradingConfidence: 88,
       admissionCategory: 'General Trading',
-      admissionModel: 'groq/openai-gpt-oss-120b',
+      admissionModel: 'openai/gpt-oss-120b',
+      admissionProvider: 'groq_semantic',
       admissionCitations: [
         { field: 'bio', quote: 'technical analysis', supports: 'TRADING' },
         { field: 'video_title', index: 0, quote: 'Gold analysis', supports: 'TRADING' },

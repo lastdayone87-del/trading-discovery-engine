@@ -233,6 +233,8 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         );
         const normalized = normalizeSemanticJudgment(raw, attempt.model);
         if (!normalized) throw new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT');
+        if (attempt.client.batchGroup === 'groq-semantic') normalized.provider = 'groq_semantic';
+        else if (attempt.client.batchGroup === 'gemini-semantic') normalized.provider = 'gemini_semantic';
         // A fallback provider is a capacity bridge. Its decisive answers are
         // used directly; its ambiguity is returned to policy after complete
         // evidence so ambiguous creators are admitted for downstream

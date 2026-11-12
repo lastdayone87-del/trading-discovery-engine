@@ -365,7 +365,12 @@ function isMissingAdmissionSchemaError(error: unknown): boolean {
 async function admissionSemanticRouteHealthy(): Promise<boolean> {
   const geminiRoutes = configuredGeminiRoutes();
   const groqRoutes = configuredGroqRoutes();
-  const [geminiCooling, groqCooling, geminiFreeCooling] = await Promise.all([
+  // ProviderAdmissionJudge uses paid Gemini and Groq only. A healthy free
+  // Gemini route must not keep an admission job claimable when both judge
+  // routes are cooling, because that job would spend evidence/budget and
+  // consume attempts without a usable judge.
+  if (geminiRoutes.length === 0 && groqRoutes.length === 0) return false;
+  const [geminiCooling, groqCooling] = await Promise.all([
     geminiRoutes.length > 0
       ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
       : isGeminiSemanticCooldownActive(),
@@ -375,10 +380,8 @@ async function admissionSemanticRouteHealthy(): Promise<boolean> {
           groqOrgCooldownRemainingMs(groqRouteOrg(route)),
         ))))
       : isGroqSemanticCooldownActive(),
-    isGeminiFreeSemanticCooldownActive(),
   ]);
-  const configured = geminiRoutes.length > 0 || groqRoutes.length > 0 || shouldUseGeminiFreeSemantic();
-  return configured && !(geminiCooling && groqCooling && geminiFreeCooling);
+  return !(geminiCooling && groqCooling);
 }
 
 /**

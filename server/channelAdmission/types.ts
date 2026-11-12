@@ -66,6 +66,8 @@ export interface SemanticJudgment {
   language?: string;
   explanation: string;
   model?: string;
+  /** Provider that produced the decisive judgment (not inferred from the model name). */
+  provider?: 'gemini_semantic' | 'groq_semantic';
   raw?: unknown;
 }
 

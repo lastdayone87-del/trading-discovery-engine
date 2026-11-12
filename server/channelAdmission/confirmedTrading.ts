@@ -16,9 +16,10 @@ export function buildAdmissionConfirmedClassification(
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
-  const provider = /groq/i.test(String(candidate.admissionModel || ''))
-    ? 'groq_semantic' as const
-    : 'gemini_semantic' as const;
+  const provider = candidate.admissionProvider
+    || (/(?:gpt-oss|llama|mixtral|qwen)/i.test(String(candidate.admissionModel || ''))
+      ? 'groq_semantic' as const
+      : 'gemini_semantic' as const);
   const timestamp = new Date().toISOString();
   const positiveEvidence: EvidenceItem[] = citations.map((citation, index) => ({
     id: `semantic-admission-${index + 1}`,

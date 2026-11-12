@@ -403,6 +403,7 @@ export async function verifyAdmissionCandidate(
       input.candidate.admissionTradingConfidence = effectiveJudgment.tradingFocus;
       input.candidate.admissionCitations = effectiveJudgment.citations;
       input.candidate.admissionModel = effectiveJudgment.model;
+      input.candidate.admissionProvider = effectiveJudgment.provider;
       input.candidate.admissionEvidenceHash = hash;
       input.candidate.admissionCategory = judgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
