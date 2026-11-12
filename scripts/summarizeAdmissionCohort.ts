@@ -66,19 +66,33 @@ const report = {
     },
     ambiguousByGroundTruth: tally(rows.filter(row => row.deterministic?.outcome === 'AMBIGUOUS').map(row => label(row.channel.channelId))),
   },
-  final: {
-    decisions: tally(finalDecisions),
-    decided: finalDecided.length,
-    correct: finalCorrect.length,
-    wrong: finalDecided.length - finalCorrect.length,
-    precision: finalDecided.length ? finalCorrect.length / finalDecided.length : null,
-    fetchFailed: rows.filter(row => row.final?.decision === 'COHORT_FETCH_FAILED').length,
-    aiUnavailable: rows.filter(row => row.final?.decision === 'AI_UNAVAILABLE').length,
-    providerDeferred: rows.filter(row => row.final?.decision === 'PROVIDER_DEFERRED').length,
-    needsReview: rows.filter(row => row.final?.decision === 'NEEDS_REVIEW').length,
-    unsafeRejects: rows.filter(row => row.final?.decision === 'REJECT_UNRELATED' && expectedAdmit.has(label(row.channel.channelId))).map(row => row.channel.channelName),
-    unsafeAdmits: rows.filter(row => (row.final?.decision === 'ADMIT' || row.final?.decision === 'ADMIT_AMBIGUOUS') && !expectedAdmit.has(label(row.channel.channelId))).map(row => row.channel.channelName),
-  },
+  final: (() => {
+    const admitted = rows.filter(row => row.final?.decision === 'ADMIT' || row.final?.decision === 'ADMIT_AMBIGUOUS');
+    const rejected = rows.filter(row => row.final?.decision === 'REJECT_UNRELATED');
+    const review = rows.filter(row => row.final?.decision === 'NEEDS_REVIEW');
+    const expectedAdmitRows = rows.filter(row => expectedAdmit.has(label(row.channel.channelId)));
+    const expectedRejectRows = rows.filter(row => !expectedAdmit.has(label(row.channel.channelId)));
+    const admittedExpected = admitted.filter(row => expectedAdmit.has(label(row.channel.channelId)));
+    const rejectedExpected = rejected.filter(row => !expectedAdmit.has(label(row.channel.channelId)));
+    return {
+      decisions: tally(finalDecisions),
+      decided: finalDecided.length,
+      correct: finalCorrect.length,
+      wrong: finalDecided.length - finalCorrect.length,
+      precision: finalDecided.length ? finalCorrect.length / finalDecided.length : null,
+      admitPrecision: admitted.length ? admittedExpected.length / admitted.length : null,
+      rejectPrecision: rejected.length ? rejectedExpected.length / rejected.length : null,
+      admitRecall: expectedAdmitRows.length ? admittedExpected.length / expectedAdmitRows.length : null,
+      rejectRecall: expectedRejectRows.length ? rejectedExpected.length / expectedRejectRows.length : null,
+      pendingReviewByLabel: tally(review.map(row => label(row.channel.channelId))),
+      fetchFailed: rows.filter(row => row.final?.decision === 'COHORT_FETCH_FAILED').length,
+      aiUnavailable: rows.filter(row => row.final?.decision === 'AI_UNAVAILABLE').length,
+      providerDeferred: rows.filter(row => row.final?.decision === 'PROVIDER_DEFERRED').length,
+      needsReview: review.length,
+      unsafeRejects: rejected.filter(row => expectedAdmit.has(label(row.channel.channelId))).map(row => row.channel.channelName),
+      unsafeAdmits: admitted.filter(row => !expectedAdmit.has(label(row.channel.channelId))).map(row => row.channel.channelName),
+    };
+  })(),
   unsafeTransitions: {
     priorAdmitToDeterministicReject: rows.filter(row => (row.prior?.decision === 'ADMIT' || row.prior?.decision === 'ADMIT_AMBIGUOUS') && row.deterministic?.outcome === 'REJECT').map(row => row.channel.channelName),
     priorRejectToDeterministicPass: rows.filter(row => row.prior?.decision === 'REJECT_UNRELATED' && row.deterministic?.outcome === 'PASS').map(row => row.channel.channelName),

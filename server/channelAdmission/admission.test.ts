@@ -816,3 +816,24 @@ test('finance-adjacent evidence is held back from deterministic fast-pass withou
   ];
   for (const text of activeTexts) assert.equal(isFinanceAdjacentWithoutActiveTrading(text), false, text);
 });
+
+
+test('one valid trading citation is enough when the video evidence contains a trading anchor', () => {
+  const evidenceWithWeakBio = evidence({
+    name: 'Live Markets Channel',
+    bio: 'Accès à ma formation et à mes trades gratuitement',
+    videos: [
+      { title: 'TRADING EN LIVE : GOLD, BITCOIN & NASDAQ !', description: 'Analyse et trades en direct.' },
+      { title: 'Market recap', description: 'Weekly review.' },
+    ],
+  });
+  const result = decideAdmission({
+    evidence: evidenceWithWeakBio,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 1,
+      citations: [citation('video_title', 'TRADING EN LIVE : GOLD, BITCOIN & NASDAQ !', 0, 'TRADING')],
+    }),
+  });
+  assert.equal(result.decision, 'ADMIT');
+});

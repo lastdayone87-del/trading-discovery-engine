@@ -180,13 +180,14 @@ export function hasCorroboratedUnrelatedDomain(judgment: SemanticJudgment): bool
 }
 
 export function hasStrongTradingSupport(evidence: AdmissionEvidence, judgment: SemanticJudgment): boolean {
+  const evidenceText = `${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`;
   if (judgment.mainSubject === 'TRADING') {
     return independentCitationCount(evidence, judgment, 'TRADING') >= 2
-      || (independentCitationCount(evidence, judgment, 'TRADING') >= 1 && hasTradingAnchor(evidence.description));
+      || (independentCitationCount(evidence, judgment, 'TRADING') >= 1 && hasTradingAnchor(evidenceText));
   }
   if (judgment.mainSubject === 'FINANCE_ADJACENT') {
     return independentCitationCount(evidence, judgment, 'FINANCE_ADJACENT') >= 2
-      || (independentCitationCount(evidence, judgment, 'FINANCE_ADJACENT') >= 1 && hasTradingAnchor(`${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`));
+      || (independentCitationCount(evidence, judgment, 'FINANCE_ADJACENT') >= 1 && hasTradingAnchor(evidenceText));
   }
   return false;
 }
