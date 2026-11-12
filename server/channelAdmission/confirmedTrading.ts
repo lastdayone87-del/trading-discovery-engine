@@ -59,7 +59,7 @@ export function buildAdmissionConfirmedClassification(
   })) : [];
   const providerMissing = !nonSemantic && citations.length > 0 && !provider;
   const evidenceSufficiency = nonSemantic || positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
-  const degraded = confidence < 80 || (!nonSemantic && positiveEvidence.length === 0);
+  const degraded = human ? false : confidence < 80 || (!nonSemantic && positiveEvidence.length === 0);
   const humanReview = degraded;
   const reasonCode = human ? 'HUMAN_REVIEW_ADMISSION_CONFIRMED' : deterministic ? 'DETERMINISTIC_ADMISSION_CONFIRMED' : 'SEMANTIC_ADMISSION_CONFIRMED';
   const decision: VerificationDecision = {
@@ -119,7 +119,7 @@ export function buildAdmissionConfirmedClassification(
         : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
     classificationMethod: human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_EVIDENCE' : 'SEMANTIC_ADMISSION',
-    recognitionState: confidence >= 80 && evidenceSufficiency === 'SUFFICIENT' ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+    recognitionState: human || (confidence >= 80 && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
     semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
     providerCoverage: 1,
     evidenceCount: positiveEvidence.length,
@@ -133,7 +133,7 @@ export function buildAdmissionConfirmedClassification(
       enrich: false,
       confidence,
       evidenceSufficiency,
-      recognitionState: confidence >= 80 && evidenceSufficiency === 'SUFFICIENT' ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+      recognitionState: human || (confidence >= 80 && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
       semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
       fallbackReason: evidenceSufficiency === 'SUFFICIENT'
         ? null

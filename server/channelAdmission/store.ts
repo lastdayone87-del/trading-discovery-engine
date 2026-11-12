@@ -176,6 +176,8 @@ export async function enqueueAdmissionVerification(input: {
   runAfter?: string;
   attempt?: number;
   priority?: number;
+  /** Explicit key for operator-initiated requeue work. */
+  idempotencyKey?: string;
 }): Promise<Awaited<ReturnType<typeof enqueueJob>>> {
   const attempt = Math.max(1, input.attempt || 1);
   const key = attempt === 1
@@ -198,7 +200,7 @@ export async function enqueueAdmissionVerification(input: {
   }, {
     priority: input.priority ?? 20,
     maxAttempts: 3,
-    idempotencyKey: key,
+    idempotencyKey: input.idempotencyKey || key,
     ...(input.runAfter ? { runAfter: input.runAfter } : {}),
     ...(attempt === 1 ? { preventCompletedReopen: true } : {}),
   });

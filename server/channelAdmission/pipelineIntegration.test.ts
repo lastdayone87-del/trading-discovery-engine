@@ -129,6 +129,25 @@ test('human review admission is a first-class confirmed classification', () => {
   assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
   assert.equal(built.decision.deterministicRouting?.semanticUsed, false);
   assert.equal(built.result.breakdown.ai_reviewed, false);
+
+  const lowScoreApproval = buildAdmissionConfirmedClassification(
+    { channel_name: 'Reviewed Unknown', description: 'short bio' },
+    {
+      channelId: 'UC-reviewed-low',
+      channelName: 'Reviewed Unknown',
+      youtubeUrl: 'https://youtube.com/channel/UC-reviewed-low',
+      description: 'short bio',
+      videoTitles: [],
+      admissionDecisionId: 'decision-human-2',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 40,
+      admissionDecisionSource: 'HUMAN',
+      admissionCitations: [],
+    },
+  );
+  assert.equal(lowScoreApproval.result.status, 'TRADING_CONFIRMED');
+  assert.equal(lowScoreApproval.decision.recognitionState, 'DECISIVE_TRADING');
 });
 
 test('admission dedupe and admitted preservation prevent duplicate classification/enrichment', () => {

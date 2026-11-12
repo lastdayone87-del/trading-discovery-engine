@@ -175,7 +175,7 @@ export async function resolveAdmissionReview(input: {
       expectedAttempts: row.attempts,
     });
     if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
-    await enqueueAdmissionVerification({
+    const queued = await enqueueAdmissionVerification({
       candidate: {
         candidate,
         targetCountry,
@@ -186,7 +186,11 @@ export async function resolveAdmissionReview(input: {
         pageNumber: row.page_number || undefined,
         resultRank: row.result_rank || undefined,
       },
+      idempotencyKey: `admission:${row.channel_id}:review:${Date.now()}`,
     });
+    if (!queued || queued.reopen_blocked || (queued.status !== 'PENDING' && queued.status !== 'PROCESSING')) {
+      throw new Error('REVIEW_REQUEUE_NOT_QUEUED');
+    }
     return { status: 'PENDING' };
   }
 
@@ -260,7 +264,7 @@ export async function resolveAdmissionReview(input: {
     candidate.admissionStatus = 'ADMITTED';
     candidate.admissionDecisionSource = 'HUMAN';
     candidate.admissionConfirmedTrading = true;
-    candidate.admissionTradingConfidence = Number(row.semantic_output?.tradingFocus) || 100;
+    candidate.admissionTradingConfidence = 100;
     candidate.admissionCitations = Array.isArray(row.semantic_output?.citations) ? row.semantic_output.citations : [];
     candidate.admissionEvidenceHash = row.evidence_hash || undefined;
     candidate.admissionCategory = 'General Trading';
