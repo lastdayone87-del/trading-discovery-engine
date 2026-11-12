@@ -25,7 +25,7 @@ test('recovery reuses the existing cooldown, cycle ceiling and active-job exclus
   assert.match(recovery, /classification-resolution-failure:/);
   assert.doesNotMatch(recovery, /terminal_recovery_marker,\s*FROM channels/);
   assert.match(recovery, /AND \(\$3::boolean OR NOT \(/);
-  assert.match(recovery, /await client\.query\('BEGIN'\)[\s\S]*?enqueueOperationalEnrichmentRecoveryJob[\s\S]*?INSERT INTO operational_enrichment_recovery_events/);
+  assert.match(recovery, /await client\.query\('BEGIN'\)[\s\S]*?enqueueRecovery\(channel[\s\S]*?INSERT INTO operational_enrichment_recovery_events/);
 });
 
 test('exhausted review materialization records dashboard lineage and projection events', () => {

@@ -182,6 +182,13 @@ test('research cycle trigger enforces admin authentication at the middleware lay
   assert.deepEqual(await run(undefined),{next:false,status:401});
 });
 
+test('classification resolution monitoring is an explicit operator-only read route',()=>{
+  const matching=routePolicyInventory.filter(item=>item.method==='GET'&&new RegExp(item.pattern).test('/api/classification/resolution'));
+  assert.equal(matching.length,1);
+  assert.equal(matching[0].policy,'operator');
+  assert.equal(matching[0].action,'classification.resolution.read');
+});
+
 test('request-rescan is an explicit operator action route',()=>{
   const matching=routePolicyInventory.filter(item=>item.method==='POST'&&new RegExp(item.pattern).test('/api/reviews/UC123/request-rescan'));
   assert.equal(matching.length,1);
