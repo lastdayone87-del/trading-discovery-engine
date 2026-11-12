@@ -5,7 +5,9 @@ on:
     paths:
       - '.github/workflows/admission-cohort-eval.yml'
       - 'scripts/runAdmissionCohort.ts'
+      - 'scripts/summarizeAdmissionCohort.ts'
       - 'scripts/fixtures/admission-cohort-60-preserved.jsonl'
+      - 'scripts/fixtures/admission-cohort-60-ground-truth.json'
   workflow_dispatch:
 
 permissions:
@@ -32,6 +34,12 @@ jobs:
           --out=admission-cohort-ai.jsonl
           --blind=admission-cohort-ai-blind.jsonl
           --concurrency=2
+      - name: Summarize against independent ground truth
+        run: >-
+          npx tsx scripts/summarizeAdmissionCohort.ts
+          --results=admission-cohort-ai.jsonl
+          --ground-truth=scripts/fixtures/admission-cohort-60-ground-truth.json
+          > admission-cohort-summary.json
       - name: Upload cohort evidence and results
         if: always()
         uses: actions/upload-artifact@v4
@@ -40,4 +48,5 @@ jobs:
           path: |
             admission-cohort-ai.jsonl
             admission-cohort-ai-blind.jsonl
+            admission-cohort-summary.json
           if-no-files-found: warn
