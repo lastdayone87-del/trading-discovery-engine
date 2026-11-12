@@ -423,7 +423,7 @@ async function main(): Promise<void> {
     // Never leave the disposable/staging database with the gate ACTIVE or a
     // setting it did not have before this destructive test.
     if (previousMode.rows.length) {
-      await db.query(`UPDATE app_settings SET setting_value=$1, updated_at=now() WHERE setting_key='channel_admission_mode'`, [String(previousMode.rows[0].setting_value)]);
+      await db.query(`UPDATE app_settings SET setting_value=$1 WHERE setting_key='channel_admission_mode'`, [String(previousMode.rows[0].setting_value)]);
     } else {
       await db.query(`DELETE FROM app_settings WHERE setting_key='channel_admission_mode'`);
     }
