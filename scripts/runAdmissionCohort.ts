@@ -237,13 +237,18 @@ function semanticClientsAllowedToWriteTelemetry(): boolean {
 
 function configuredJudge(): CohortJudge | null {
   if (!semanticClientsAllowedToWriteTelemetry()) return null;
+  const requested = String(process.env.COHORT_SEMANTIC_PROVIDER || 'auto').trim().toLowerCase();
   const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }> = [];
-  const gemini = geminiDefaultClient();
-  if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, provider: 'gemini_semantic' });
-  const geminiFree = geminiFreeDefaultClient();
-  if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL, provider: 'gemini_free_semantic' });
-  const groq = groqDefaultClient();
-  if (groq) clients.push({ client: groq, model: process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL, provider: 'groq_semantic' });
+  if (requested !== 'groq') {
+    const gemini = geminiDefaultClient();
+    if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, provider: 'gemini_semantic' });
+    const geminiFree = geminiFreeDefaultClient();
+    if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL, provider: 'gemini_free_semantic' });
+  }
+  if (requested !== 'gemini') {
+    const groq = groqDefaultClient();
+    if (groq) clients.push({ client: groq, model: process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL, provider: 'groq_semantic' });
+  }
   return clients.length ? new CohortJudge(clients) : null;
 }
 

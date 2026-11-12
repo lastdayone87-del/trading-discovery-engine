@@ -1,6 +1,13 @@
 name: Admission cohort evaluation
 
 on:
+  workflow_dispatch:
+    inputs:
+      semantic_provider:
+        description: Provider for the manual semantic cohort
+        type: choice
+        options: [auto, gemini, groq]
+        default: auto
   pull_request:
     paths:
       - '.github/workflows/admission-cohort-eval.yml'
@@ -12,8 +19,6 @@ on:
       - 'server/evidenceEngine/**'
       - 'server/classificationRouting/**'
       - 'server/youtube.ts'
-  workflow_dispatch:
-
 permissions:
   contents: read
 
@@ -79,9 +84,12 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/admission_cohort
       PGSSL: disable
       NODE_ENV: test
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
       GEMINI_ORG_ID_2: ${{ secrets.GEMINI_ORG_ID_2 }}
-      GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_API_KEY_2 }}
+      GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_FREE_API_KEY || secrets.GEMINI_API_KEY_2 }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      COHORT_SEMANTIC_PROVIDER: ${{ inputs.semantic_provider || 'auto' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
