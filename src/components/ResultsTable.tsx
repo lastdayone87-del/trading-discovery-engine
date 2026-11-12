@@ -519,6 +519,25 @@ export const ResultsTable: React.FC<Props> = ({ channels, onRecheck, onInspect, 
                             ✦ AI Verified
                           </span>
                         )}
+                        {c.trading_relevance_breakdown?.classification_route && (
+                          <>
+                            <span className="block text-[9px] text-slate-500 dark:text-slate-400 font-mono">
+                              {c.trading_relevance_breakdown.classification_route.replaceAll('_', ' ')}
+                              {c.trading_relevance_breakdown.semantic_used === true
+                                ? ' · semantic used'
+                                : c.trading_relevance_breakdown.semantic_used === false
+                                  ? ' · no semantic'
+                                  : ''}
+                              {c.trading_relevance_breakdown.semantic_attempted ? ' · attempted' : ''}
+                              {c.trading_relevance_breakdown.human_review_candidate ? ' · review' : ''}
+                            </span>
+                            {c.trading_relevance_breakdown.routing_fallback_reason && (
+                              <span className="block text-[9px] text-slate-400 dark:text-slate-500">
+                                {c.trading_relevance_breakdown.routing_fallback_reason.replaceAll('_', ' ')}
+                              </span>
+                            )}
+                          </>
+                        )}
                       </div>
                     </td>
 

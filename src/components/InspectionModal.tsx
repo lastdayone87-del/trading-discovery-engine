@@ -131,7 +131,31 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                     {channel.trading_category && channel.trading_category !== 'General Trading' ? channel.trading_category : 'Unclassified'}
                   </span>
                 </div>
+                <div>
+                  <span className="text-slate-500 block">Classification Route:</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {channel.trading_relevance_breakdown.classification_route?.replaceAll('_', ' ') || 'Legacy / not recorded'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Semantic:</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {channel.trading_relevance_breakdown.semantic_used === true
+                      ? 'used'
+                      : channel.trading_relevance_breakdown.semantic_used === false
+                        ? 'not used'
+                        : channel.trading_relevance_breakdown.ai_reviewed
+                          ? 'used (legacy)'
+                          : 'not recorded'}
+                    {channel.trading_relevance_breakdown.semantic_attempted ? ' · attempted' : ''}
+                  </span>
+                </div>
               </div>
+              {channel.trading_relevance_breakdown.routing_fallback_reason && (
+                <div className="text-[11px] text-amber-600 dark:text-amber-400">
+                  Fallback: {channel.trading_relevance_breakdown.routing_fallback_reason}
+                </div>
+              )}
 
               {channel.trading_relevance_breakdown.reasoning && channel.trading_relevance_breakdown.reasoning.length > 0 && (
                 <div className="space-y-1.5 pt-1">

@@ -1,10 +1,10 @@
 import React from 'react';
 import { DashboardOperationalSummary, QueueStatus, QuotaInfo } from '../types';
-import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain, ShieldAlert } from 'lucide-react';
+import { Radar, Table, Clock, Cpu, Settings, ShieldCheck, Database, Radio, Brain, ShieldAlert, Activity } from 'lucide-react';
 
 interface Props {
-  activeTab: 'discovery' | 'results' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression';
-  setActiveTab: (tab: 'discovery' | 'results' | 'pending' | 'queues' | 'settings' | 'intelligence' | 'regression') => void;
+  activeTab: 'discovery' | 'results' | 'pending' | 'resolution' | 'queues' | 'settings' | 'intelligence' | 'regression';
+  setActiveTab: (tab: 'discovery' | 'results' | 'pending' | 'resolution' | 'queues' | 'settings' | 'intelligence' | 'regression') => void;
   queueStatus: QueueStatus | null;
   quotaInfo: QuotaInfo | null;
   matchingResults: number;
@@ -18,6 +18,7 @@ export const Navbar: React.FC<Props> = ({ activeTab, setActiveTab, queueStatus, 
     { id: 'regression', label: 'Regression Suite', icon: ShieldCheck },
     { id: 'results', label: `Channels Table (${matchingResults})`, icon: Table },
     { id: 'pending', label: 'Pending & Re-checks', icon: Clock },
+    { id: 'resolution', label: 'Classification Resolution', icon: Activity },
     { id: 'queues', label: 'Queue Monitor', icon: Cpu },
     { id: 'settings', label: 'Country & Vocabulary', icon: Settings }
   ] as const;
