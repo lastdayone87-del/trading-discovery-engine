@@ -2,6 +2,8 @@ import { getDb } from '../server/db';
 import { getAdmissionMode } from '../server/channelAdmission/store';
 import { parseAdmissionReviewAction, resolveAdmissionReview } from '../server/channelAdmission';
 
+let openedDb: Awaited<ReturnType<typeof getDb>> | null = null;
+
 function argValue(name: string): string | undefined {
   const prefix = `--${name}=`;
   const direct = process.argv.find(value => value.startsWith(prefix));
@@ -16,6 +18,7 @@ function argFlag(name: string): boolean {
 
 async function listReviewCandidates(limit: number): Promise<void> {
   const db = await getDb();
+  openedDb = db;
   const result = await db.query(
     `SELECT channel_id,channel_name,youtube_url,reason_codes,attempts,evidence_hash,created_at,
             jsonb_array_length(COALESCE(evidence_snapshot->'videos','[]'::jsonb)) AS video_count,
@@ -72,6 +75,7 @@ async function main(): Promise<void> {
   const reviewer = String(argValue('reviewer') || '').trim();
   const reason = String(argValue('reason') || '').trim();
   if (!channelId || !reviewer || !reason) throw new Error('CHANNEL_ID_REVIEWER_REASON_REQUIRED');
+  openedDb = await getDb();
   const result = await resolveAdmissionReview({ channelId, action, reviewer, reason });
   console.log(JSON.stringify({
     event: 'admission_review_resolved',
@@ -90,9 +94,9 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
+    if (!openedDb) return;
     try {
-      const db = await getDb();
-      await db.end();
+      await openedDb.end();
     } catch {
       // The command already reported its outcome; pool shutdown is best-effort.
     }
