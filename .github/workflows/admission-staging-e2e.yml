@@ -1,6 +1,10 @@
 name: Admission staging E2E
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/admission-staging-e2e.yml'
+      - 'scripts/admissionStagingE2E.ts'
   workflow_dispatch:
 
 permissions:
