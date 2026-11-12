@@ -154,8 +154,8 @@ test('confirmed admission carries citations and flags missing confidence for rev
     },
   );
   assert.equal(missingConfidence.decision.confidenceScore, 0);
-  assert.equal(missingConfidence.decision.status, 'NEEDS_REVIEW');
-  assert.equal(missingConfidence.result.status, 'NEEDS_REVIEW');
+  assert.equal(missingConfidence.decision.status, 'UNCERTAIN');
+  assert.equal(missingConfidence.result.status, 'UNCERTAIN');
   assert.equal(missingConfidence.decision.evidenceCollection.sufficiency, 'INSUFFICIENT');
   assert.equal(missingConfidence.decision.deterministicRouting?.humanReview, true);
 });

@@ -56,7 +56,7 @@ export function buildAdmissionConfirmedClassification(
   const degraded = confidence < 80 || positiveEvidence.length === 0;
   const humanReview = degraded;
   const decision: VerificationDecision = {
-    status: degraded ? 'NEEDS_REVIEW' : 'TRADING_CONFIRMED',
+    status: degraded ? 'UNCERTAIN' : 'TRADING_CONFIRMED',
     confidenceScore: confidence,
     category,
     multiVideoConsistencyRatio: 1,
@@ -137,7 +137,7 @@ export function buildAdmissionConfirmedClassification(
     },
   };
   const result: TradingClassificationResult = {
-    status: degraded ? 'NEEDS_REVIEW' : 'TRADING_CONFIRMED',
+    status: degraded ? 'UNCERTAIN' : 'TRADING_CONFIRMED',
     confidenceScore: confidence,
     category,
     breakdown: {

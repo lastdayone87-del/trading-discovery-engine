@@ -127,6 +127,35 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
   const channel = await getChannelById(row.channel_id);
   if (!channel) return false;
+  // Repair the channel projection from the durable decision before resuming.
+  // A crash between the ledger commit and the channel write can otherwise leave
+  // a legacy row INTAKE_DEFERRED with no admission provenance while its
+  // classification job is already durable.
+  const db = await getDb();
+  const decision = await db.query(
+    `SELECT id FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
+    [row.id],
+  ).catch(() => null);
+  const decisionId = channel.admission_decision_id || decision?.rows[0]?.id || null;
+  if (decisionId) {
+    const admissionStatus = row.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
+    await db.query(
+      `UPDATE channels
+          SET admitted_at=COALESCE(admitted_at,now()),
+              admission_status=$2,
+              admission_decision_id=$3,
+              scan_status=CASE WHEN scan_status IN ('INTAKE_DEFERRED','CLASSIFICATION_PENDING')
+                               THEN 'CLASSIFICATION_PENDING' ELSE scan_status END,
+              updated_at=now()
+        WHERE channel_id=$1`,
+      [row.channel_id, admissionStatus, decisionId],
+    );
+    channel.admission_status = admissionStatus;
+    channel.admission_decision_id = decisionId;
+    if (channel.scan_status === 'INTAKE_DEFERRED' || channel.scan_status === 'CLASSIFICATION_PENDING') {
+      channel.scan_status = 'CLASSIFICATION_PENDING';
+    }
+  }
   const queued = await enqueueClassificationAfterAdmission({
     candidate: input.candidate,
     targetCountry: input.targetCountry,
