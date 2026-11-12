@@ -353,6 +353,7 @@ export function decideAdmission(input: {
     decision: 'NEEDS_REVIEW',
     status: 'NEEDS_REVIEW',
     reasonCodes,
+    effectiveRole,
     rejected: false, admitted: false, hold: false, ambiguous: false, review: true,
     citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
   };

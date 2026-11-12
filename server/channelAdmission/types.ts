@@ -55,6 +55,19 @@ export function isRetryableAdmissionStatus(status: AdmissionStatus | string): bo
 export function isWaitingAdmissionStatus(status: AdmissionStatus | string): boolean {
   return status === 'WAITING_EVIDENCE' || status === 'PROVIDER_DEFERRED';
 }
+/**
+ * Provider/budget waits are infrastructure, not evidence attempts. This shape
+ * is shared by every provider-deferred update so the invariant is directly
+ * testable: status changed, attempts unchanged, expiry cleared.
+ */
+export function providerDeferredCandidateFields(attempts: number): {
+  status: 'PROVIDER_DEFERRED';
+  attempts: number;
+  expiresAt: null;
+} {
+  return { status: 'PROVIDER_DEFERRED', attempts: Number(attempts || 0), expiresAt: null };
+}
+
 export type AdmissionRediscoveryDisposition =
   | 'TERMINAL'
   | 'ACTIVE_JOB'

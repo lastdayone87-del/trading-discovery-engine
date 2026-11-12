@@ -26,6 +26,7 @@ import type {
   AdmissionVerificationResult,
   SemanticJudgment,
 } from './types';
+import { providerDeferredCandidateFields } from './types';
 import type { DiscoveredChannelRaw } from '../youtube';
 
 function evidenceHash(evidence: AdmissionEvidence): string {
@@ -437,14 +438,12 @@ export async function verifyAdmissionCandidate(
       if (!options.dryRun) {
         const updated = await updateAdmissionCandidate({
           id: row.id,
-          status: 'PROVIDER_DEFERRED',
+          ...providerDeferredCandidateFields(row.attempts),
           decision: null,
           reasonCodes,
           evidence,
           evidenceHash: hash,
-          attempts: Number(row.attempts || 0),
           nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
-          expiresAt: null,
           expectedStatus: row.status,
           expectedAttempts: row.attempts,
         });
@@ -629,14 +628,12 @@ export async function verifyAdmissionCandidate(
       if (!options.dryRun) {
         const updated = await updateAdmissionCandidate({
           id: row.id,
-          status: 'PROVIDER_DEFERRED',
+          ...providerDeferredCandidateFields(attempts),
           decision: null,
           reasonCodes,
           evidence,
           evidenceHash: hash,
-          attempts,
           nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
-          expiresAt: null,
           expectedStatus: row.status,
           expectedAttempts: row.attempts,
         });

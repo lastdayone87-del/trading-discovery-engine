@@ -57,7 +57,9 @@ export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): Qu
   }
   if (unresolvedShare >= 0.5 && input.tradingPrecision < 0.15) {
     reasonCodes.push('ADMISSION_UNRESOLVED_SHARE_HIGH', 'TRADING_PRECISION_LOW');
-    return { stop: true, quarantine: true, reasonCodes };
+    // Missing evidence and provider waits are not proof that the query is
+    // contaminated. Stop this run, but keep the query selectable.
+    return { stop: true, quarantine: false, reasonCodes };
   }
   if (input.qualityChannels === 0
     && input.tradingConfirmed === 0

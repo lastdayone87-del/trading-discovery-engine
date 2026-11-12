@@ -7,7 +7,7 @@ import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
 import { admissionModeFromOverrides } from './store';
 import { candidateFromAdmissionRow } from './index';
-import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus } from './types';
+import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus, providerDeferredCandidateFields } from './types';
 import { ambiguousAdmitRate, evaluateQueryAdmissionGuard } from './queryGuard';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
 
@@ -254,6 +254,24 @@ test('clear unrelated with valid citations rejects; insufficient citations go to
   assert.equal(insufficient.status, 'NEEDS_REVIEW');
   assert.equal(insufficient.review, true);
   assert.equal(insufficient.admitted, false);
+});
+
+test('review and finance-adjacent outcomes report the effective second judgment', () => {
+  const review = decideAdmission({
+    evidence: kikifoodies,
+    judgment: judgment({ subject: 'MIXED', focus: 40, citations: [] }),
+    secondJudgment: judgment({ subject: 'UNKNOWN', focus: 30, citations: [] }),
+  });
+  assert.equal(review.decision, 'NEEDS_REVIEW');
+  assert.equal(review.effectiveRole, 'SECOND');
+
+  const finance = decideAdmission({
+    evidence: kikifoodies,
+    judgment: judgment({ subject: 'MIXED', focus: 40, citations: [] }),
+    secondJudgment: judgment({ subject: 'FINANCE_ADJACENT', focus: 35, citations: [] }),
+  });
+  assert.equal(finance.decision, 'ADMIT_AMBIGUOUS');
+  assert.equal(finance.effectiveRole, 'SECOND');
 });
 
 test('missing evidence holds; unknown after complete evidence goes to review', () => {
@@ -697,6 +715,25 @@ test('provider-deferred and review outcomes do not trip the contamination guard'
   assert.equal(decision.stop, false);
   assert.equal(decision.quarantine, false);
   assert.deepEqual(decision.reasonCodes, []);
+});
+
+test('missing-evidence holds stop a run without quarantining the query', () => {
+  const decision = evaluateQueryAdmissionGuard({
+    pageNumber: 2,
+    outcomes: { admitted: 0, ambiguous: 0, rejected: 0, held: 8, deferred: 0, review: 0, total: 8 },
+    tradingPrecision: 0,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    priorZeroQualityPages: 0,
+  });
+  assert.equal(decision.stop, true);
+  assert.equal(decision.quarantine, false);
+  assert.ok(decision.reasonCodes.includes('ADMISSION_UNRESOLVED_SHARE_HIGH'));
+});
+
+test('provider deferral update preserves attempts and clears expiry', () => {
+  assert.deepEqual(providerDeferredCandidateFields(0), { status: 'PROVIDER_DEFERRED', attempts: 0, expiresAt: null });
+  assert.deepEqual(providerDeferredCandidateFields(2), { status: 'PROVIDER_DEFERRED', attempts: 2, expiresAt: null });
 });
 
 
