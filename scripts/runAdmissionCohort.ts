@@ -20,6 +20,10 @@ import {
   defaultClient as geminiDefaultClient,
 } from '../server/evidenceEngine/providers/GeminiSemanticProvider';
 import {
+  DEFAULT_GEMINI_FREE_CANDIDATE_MODEL,
+  defaultClient as geminiFreeDefaultClient,
+} from '../server/evidenceEngine/providers/GeminiFreeSemanticProvider';
+import {
   DEFAULT_GROQ_CANDIDATE_MODEL,
   defaultClient as groqDefaultClient,
 } from '../server/evidenceEngine/providers/GroqSemanticProvider';
@@ -200,7 +204,7 @@ async function collectKeylessEvidence(input: {
 
 class CohortJudge implements AdmissionJudge {
   constructor(
-    private readonly clients: Array<{ client: SemanticModelClient; model: string; provider: 'gemini_semantic' | 'groq_semantic' }>,
+    private readonly clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'groq_semantic' }>,
   ) {}
 
   async judge(evidence: AdmissionEvidence, role: 'PRIMARY' | 'SECOND'): Promise<SemanticJudgment> {
@@ -222,9 +226,11 @@ class CohortJudge implements AdmissionJudge {
 }
 
 function configuredJudge(): CohortJudge | null {
-  const clients: Array<{ client: SemanticModelClient; model: string; provider: 'gemini_semantic' | 'groq_semantic' }> = [];
+  const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'groq_semantic' }> = [];
   const gemini = geminiDefaultClient();
   if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, provider: 'gemini_semantic' });
+  const geminiFree = geminiFreeDefaultClient();
+  if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL });
   const groq = groqDefaultClient();
   if (groq) clients.push({ client: groq, model: process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL, provider: 'groq_semantic' });
   return clients.length ? new CohortJudge(clients) : null;

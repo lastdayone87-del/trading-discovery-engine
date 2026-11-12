@@ -20,6 +20,7 @@ jobs:
     env:
       GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
       GEMINI_ORG_ID_2: ${{ secrets.GEMINI_ORG_ID_2 }}
+      GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_API_KEY_2 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
