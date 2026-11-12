@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { buildAdmissionConfirmedClassification } from './confirmedTrading';
+import { parseAdmissionReviewAction } from './index';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
 const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
@@ -125,9 +126,12 @@ test('human review admission is a first-class confirmed classification', () => {
     },
   );
   assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.status, 'TRADING_CONFIRMED');
   assert.equal(built.decision.classificationMethod, 'HUMAN_REVIEW_ADMISSION');
   assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
   assert.equal(built.decision.deterministicRouting?.semanticUsed, false);
+  assert.equal(built.decision.versions.geminiModelVersion, 'human-review-admission-v1');
+  assert.deepEqual(built.decision.countryContextUsed.matchedTerms, ['HUMAN_REVIEW_ADMISSION']);
   assert.equal(built.result.breakdown.ai_reviewed, false);
 
   const lowScoreApproval = buildAdmissionConfirmedClassification(
@@ -148,6 +152,15 @@ test('human review admission is a first-class confirmed classification', () => {
   );
   assert.equal(lowScoreApproval.result.status, 'TRADING_CONFIRMED');
   assert.equal(lowScoreApproval.decision.recognitionState, 'DECISIVE_TRADING');
+});
+
+test('review CLI rejects conflicting actions and maps each action explicitly', () => {
+  assert.equal(parseAdmissionReviewAction({ admit: true }), 'ADMIT');
+  assert.equal(parseAdmissionReviewAction({ reject: true }), 'REJECT');
+  assert.equal(parseAdmissionReviewAction({ requeue: true }), 'REQUEUE');
+  assert.equal(parseAdmissionReviewAction({}), null);
+  assert.throws(() => parseAdmissionReviewAction({ admit: true, reject: true }), /REVIEW_ACTION_CONFLICT/);
+  assert.throws(() => parseAdmissionReviewAction({ admit: true, requeue: true }), /REVIEW_ACTION_CONFLICT/);
 });
 
 test('admission dedupe and admitted preservation prevent duplicate classification/enrichment', () => {

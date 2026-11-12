@@ -1,6 +1,6 @@
 import { getDb } from '../server/db';
 import { getAdmissionMode } from '../server/channelAdmission/store';
-import { resolveAdmissionReview } from '../server/channelAdmission';
+import { parseAdmissionReviewAction, resolveAdmissionReview } from '../server/channelAdmission';
 
 function argValue(name: string): string | undefined {
   const prefix = `--${name}=`;
@@ -54,7 +54,11 @@ async function main(): Promise<void> {
     console.error('       npx tsx scripts/reviewAdmissionCandidates.ts --requeue --channel-id=UC... --reviewer=name --reason="..."');
     return;
   }
-  const action = argFlag('admit') ? 'ADMIT' : argFlag('reject') ? 'REJECT' : argFlag('requeue') ? 'REQUEUE' : null;
+  const action = parseAdmissionReviewAction({
+    admit: argFlag('admit'),
+    reject: argFlag('reject'),
+    requeue: argFlag('requeue'),
+  });
   if (!action) {
     const limit = Math.max(1, Math.min(500, Math.floor(Number(argValue('limit') || 100))));
     if (!Number.isFinite(limit)) throw new Error('INVALID_LIMIT');
@@ -80,7 +84,16 @@ async function main(): Promise<void> {
   }));
 }
 
-main().catch(error => {
-  console.error('Admission review failed:', error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+main()
+  .catch(error => {
+    console.error('Admission review failed:', error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    try {
+      const db = await getDb();
+      await db.end();
+    } catch {
+      // The command already reported its outcome; pool shutdown is best-effort.
+    }
+  });

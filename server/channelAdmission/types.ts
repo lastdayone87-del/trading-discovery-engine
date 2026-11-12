@@ -16,8 +16,9 @@ export type AdmissionStatus =
   | 'EXPIRED_MISSING_EVIDENCE';
 
 /**
- * Terminal admission outcomes. Their evidence and decisions stay available,
- * but rediscovery must not reopen verification or enrichment.
+ * Terminal admission outcomes. Rejected and review outcomes must not reopen
+ * verification or enrichment; admitted outcomes may be resumed only to repair
+ * an interrupted channel/classification side effect.
  */
 export const TERMINAL_ADMISSION_STATUSES: readonly AdmissionStatus[] = [
   'REJECTED_UNRELATED',

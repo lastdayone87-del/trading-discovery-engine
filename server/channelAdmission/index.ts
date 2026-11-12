@@ -140,6 +140,21 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
   };
 }
 
+export type AdmissionReviewAction = 'ADMIT' | 'REJECT' | 'REQUEUE';
+
+export function parseAdmissionReviewAction(flags: {
+  admit?: boolean;
+  reject?: boolean;
+  requeue?: boolean;
+}): AdmissionReviewAction | null {
+  const actions: AdmissionReviewAction[] = [];
+  if (flags.admit) actions.push('ADMIT');
+  if (flags.reject) actions.push('REJECT');
+  if (flags.requeue) actions.push('REQUEUE');
+  if (actions.length > 1) throw new Error('REVIEW_ACTION_CONFLICT');
+  return actions[0] || null;
+}
+
 /**
  * Operator resolution for a retained NEEDS_REVIEW candidate. Review never
  * silently admits or rejects: the operator must choose ADMIT, REJECT or
@@ -198,6 +213,20 @@ export async function resolveAdmissionReview(input: {
   if (!evidence) throw new Error('REVIEW_EVIDENCE_MISSING');
   const decision = input.action === 'ADMIT' ? 'ADMIT' as const : 'REJECT_UNRELATED' as const;
   const status = input.action === 'ADMIT' ? 'ADMITTED' as const : 'REJECTED_UNRELATED' as const;
+  if (input.action === 'REJECT') {
+    // Project the rejection first. If this fails, the candidate remains open
+    // and the operator can retry instead of losing the channel side effect.
+    const existing = await getChannelById(row.channel_id);
+    if (existing) {
+      existing.trading_status = 'NON_TRADING';
+      existing.trading_category = 'Unrelated';
+      existing.scan_status = 'SKIPPED_NON_TRADING';
+      existing.discord_status = 'UNCERTAIN';
+      existing.discord_invite = null;
+      existing.last_checked = new Date().toISOString();
+      await upsertChannel(existing, { allowDiscordClear: true });
+    }
+  }
   const recorded = await recordAdmissionOutcome({
     decision: {
       candidateId: row.id,
@@ -221,19 +250,7 @@ export async function resolveAdmissionReview(input: {
       expectedAttempts: row.attempts,
     },
   });
-  if (input.action === 'REJECT') {
-    const existing = await getChannelById(row.channel_id);
-    if (existing) {
-      existing.trading_status = 'NON_TRADING';
-      existing.trading_category = 'Unrelated';
-      existing.scan_status = 'SKIPPED_NON_TRADING';
-      existing.discord_status = 'UNCERTAIN';
-      existing.discord_invite = null;
-      existing.last_checked = new Date().toISOString();
-      await upsertChannel(existing, { allowDiscordClear: true });
-    }
-    return { status };
-  }
+  if (input.action === 'REJECT') return { status };
 
   const now = new Date().toISOString();
   const decisionId = recorded.decisionId || randomUUID();
