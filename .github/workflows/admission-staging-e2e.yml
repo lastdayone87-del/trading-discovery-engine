@@ -43,4 +43,11 @@ jobs:
       - name: Apply migrations to disposable PostgreSQL
         run: npx tsx scripts/runMigrations.ts
       - name: Admission database lifecycle E2E
-        run: npx tsx scripts/admissionStagingE2E.ts --confirm-staging
+        run: npx tsx scripts/admissionStagingE2E.ts --confirm-staging | tee admission-staging-e2e.log
+      - name: Upload staging E2E log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-staging-e2e
+          path: admission-staging-e2e.log
+          if-no-files-found: warn
