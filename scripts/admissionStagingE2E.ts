@@ -23,7 +23,7 @@ import {
   resumeAdmittedCandidate,
   verifyAdmissionCandidate,
 } from '../server/channelAdmission';
-import { nextAdmissionVerificationAttempt } from '../server/channelAdmission/worker';
+import { nextAdmissionVerificationAttempt, processAdmissionVerificationJob } from '../server/channelAdmission/worker';
 import type { AdmissionCandidateInput, AdmissionEvidence, SemanticJudgment } from '../server/channelAdmission/types';
 import type { ChannelRecord } from '../src/types';
 
@@ -342,6 +342,27 @@ async function main(): Promise<void> {
     assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':retry:2')));
     assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':retry:3')));
     return { attempts: candidate?.attempts, expiresAt: candidate?.expires_at, retryKeys: keys.rows.map((job: any) => job.idempotency_key) };
+  });
+
+  await check('worker schedules the next provider-deferred successor from the real job payload', async () => {
+    const evidence = fixtureEvidence({
+      channelId: `${PREFIX}WORKER_DEFER`,
+      channelName: 'Worker Deferred Candidate',
+      description: 'Short bio',
+      videos: [{ title: 'One video' }],
+    });
+    const input = candidateInput(evidence);
+    const row = await upsertAdmissionCandidate(input);
+    const job = await enqueueAdmissionVerification({ candidate: input, attempt: 2 });
+    await processAdmissionVerificationJob({ ...job, payload: { ...job.payload, attempt: 2 } } as any);
+    const candidate = await findAdmissionCandidate(evidence.channelId);
+    assert.equal(candidate?.status, 'PROVIDER_DEFERRED');
+    assert.equal(Number(candidate?.attempts), 0);
+    assert.equal(candidate?.expires_at, null);
+    const keys = await db.query(`SELECT idempotency_key FROM jobs WHERE payload->>'channelId'=$1 AND type='VERIFY_CHANNEL_ADMISSION' ORDER BY idempotency_key`, [evidence.channelId]);
+    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':retry:2')));
+    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':retry:3')));
+    return { attempts: candidate?.attempts, retryKeys: keys.rows.map((item: any) => item.idempotency_key) };
   });
 
   await check('duplicate admission enqueue is idempotent and active-job detection works', async () => {
