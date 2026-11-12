@@ -104,6 +104,33 @@ test('deterministic admission is a first-class classification without AI provena
   assert.equal(built.decision.positiveEvidence[0].source, 'channel_metadata');
 });
 
+test('human review admission is a first-class confirmed classification', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Reviewed Trader', description: 'technical analysis' },
+    {
+      channelId: 'UC-reviewed',
+      channelName: 'Reviewed Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-reviewed',
+      description: 'technical analysis',
+      videoTitles: ['Gold analysis'],
+      admissionDecisionId: 'decision-human-1',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 100,
+      admissionCategory: 'General Trading',
+      admissionDecisionSource: 'HUMAN',
+      admissionCitations: [
+        { field: 'bio', quote: 'technical analysis', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.classificationMethod, 'HUMAN_REVIEW_ADMISSION');
+  assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
+  assert.equal(built.decision.deterministicRouting?.semanticUsed, false);
+  assert.equal(built.result.breakdown.ai_reviewed, false);
+});
+
 test('admission dedupe and admitted preservation prevent duplicate classification/enrichment', () => {
   const admit = functionSource(queue, 'admitDiscoveredChannel');
   const shared = functionSource(queue, 'processDiscoveredChannel');
@@ -117,8 +144,16 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
   assert.ok(shared.indexOf('hasActiveAdmissionJob') < shared.indexOf('enqueueAdmissionVerification'),
     'shared discovery path must check the active job before enqueue');
   const worker = readFileSync(new URL('./worker.ts', import.meta.url), 'utf8');
-  assert.match(worker, /isRejectedAdmissionStatus/);
+  assert.match(worker, /nextAdmissionVerificationAttempt/);
   assert.match(worker, /resumeAdmittedCandidate/);
+  const index = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+  assert.match(index, /export async function resolveAdmissionReview/);
+  const reviewScript = readFileSync(new URL('../../scripts/reviewAdmissionCandidates.ts', import.meta.url), 'utf8');
+  assert.match(reviewScript, /resolveAdmissionReview/);
+  const verify = functionSource(index, 'verifyAdmissionCandidate');
+  assert.ok(verify.indexOf('options.archiveRejectedExistingChannel') > -1
+    && verify.indexOf('options.archiveRejectedExistingChannel') < verify.lastIndexOf('recordAdmissionOutcome'),
+  'rejection side effects must complete before the terminal decision commit');
   assert.ok(worker.indexOf('if (isRejectedAdmissionStatus(row.status))') > -1
     && worker.indexOf('if (isRejectedAdmissionStatus(row.status))') < worker.indexOf('verifyAdmissionCandidate(input'),
   'review/rejected rows must not re-enter verification');

@@ -2,6 +2,7 @@ import type { RawChannelInput } from '../evidenceEngine';
 import { verifyChannelTradingRelevance } from '../evidenceEngine';
 import type { VerificationDecision } from '../evidenceEngine/types';
 import { resolveClassificationRouting } from '../classificationRouting/deterministicFirst';
+import { hasTradingAnchor } from './policy';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
 
 export interface DeterministicAdmissionResult {
@@ -37,7 +38,9 @@ function evidenceToInput(evidence: AdmissionEvidence): RawChannelInput {
     channel_id: evidence.channelId,
     channel_name: evidence.channelName,
     description: evidence.description,
-    country: evidence.country || evidence.targetCountry || 'UNKNOWN',
+    // The target country is retrieval context, not creator evidence. Using it
+    // as the creator country would apply the wrong regional knowledge pack.
+    country: evidence.country || 'UNKNOWN',
     external_links: evidence.links,
     videos: evidence.videos.map(video => ({
       title: video.title,
@@ -171,7 +174,11 @@ export function evaluateStrictRejection(evidence: AdmissionEvidence): {
 } | null {
   const sources = rejectSources(evidence);
   const fullText = sources.map(source => source.text).join('\n');
-  if (TRADING_FINANCE_GUARD.test(fullText)) return null;
+  // Include the channel name and links, and use the shared multilingual
+  // trading-anchor detector so a native-language trading creator is never
+  // rejected because the English lexical guard missed its terminology.
+  const guardText = `${evidence.channelName}\n${evidence.links.join('\n')}\n${fullText}`;
+  if (TRADING_FINANCE_GUARD.test(guardText) || hasTradingAnchor(guardText)) return null;
 
   let best: { domain: string; total: number; matches: Array<{ source: RejectSource; quote: string }> } | null = null;
   for (const { domain, pattern } of REJECT_DOMAINS) {
@@ -223,28 +230,34 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     mode: 'ACTIVE',
   });
 
+  let passWithoutCitations = false;
   if (routing.route === 'DETERMINISTIC_TRADING'
     && decision.status === 'TRADING_CONFIRMED'
     && decision.evidenceCollection.sufficiency === 'SUFFICIENT') {
     const citations = tradingCitations(evidence, decision);
-    const judgment: SemanticJudgment = {
-      mainSubject: 'TRADING',
-      tradingFocus: decision.confidenceScore,
-      unrelatedDomains: [],
-      incidentalTradingMentions: [],
-      citations,
-      explanation: 'Deterministic #618 classifier found decisive trading evidence.',
-      model: 'deterministic-first-v1',
-    };
-    return {
-      outcome: 'PASS',
-      route: routing.route,
-      confidence: decision.confidenceScore,
-      reasonCodes: ['DETERMINISTIC_FAST_PASS', ...routing.reasonCodes],
-      citations,
-      judgment,
-      priority: 10,
-    };
+    if (citations.length > 0) {
+      const judgment: SemanticJudgment = {
+        mainSubject: 'TRADING',
+        tradingFocus: decision.confidenceScore,
+        unrelatedDomains: [],
+        incidentalTradingMentions: [],
+        citations,
+        explanation: 'Deterministic #618 classifier found decisive trading evidence.',
+        model: 'deterministic-first-v1',
+      };
+      return {
+        outcome: 'PASS',
+        route: routing.route,
+        confidence: decision.confidenceScore,
+        reasonCodes: ['DETERMINISTIC_FAST_PASS', ...routing.reasonCodes],
+        citations,
+        judgment,
+        priority: 10,
+      };
+    }
+    // A decisive score without a source-anchored citation is not auditable
+    // enough for admission. Let the semantic judge review it instead.
+    passWithoutCitations = true;
   }
 
   const rejection = evaluateStrictRejection(evidence);
@@ -273,7 +286,11 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     outcome: 'AMBIGUOUS',
     route: routing.route,
     confidence: decision.confidenceScore,
-    reasonCodes: ['DETERMINISTIC_AMBIGUOUS', ...routing.reasonCodes],
+    reasonCodes: [
+      ...(passWithoutCitations ? ['DETERMINISTIC_PASS_WITHOUT_CITATIONS'] : []),
+      'DETERMINISTIC_AMBIGUOUS',
+      ...routing.reasonCodes,
+    ],
     citations: [],
     priority: decision.status === 'TRADING_CONFIRMED' ? 10 : 20,
   };

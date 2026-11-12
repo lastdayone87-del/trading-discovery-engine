@@ -55,6 +55,27 @@ export function isRetryableAdmissionStatus(status: AdmissionStatus | string): bo
 export function isWaitingAdmissionStatus(status: AdmissionStatus | string): boolean {
   return status === 'WAITING_EVIDENCE' || status === 'PROVIDER_DEFERRED';
 }
+export type AdmissionRediscoveryDisposition =
+  | 'TERMINAL'
+  | 'ACTIVE_JOB'
+  | 'RESUME_ADMITTED'
+  | 'ENQUEUE';
+
+/**
+ * Single decision point for rediscovering a channel that already has an
+ * admission candidate. Callers perform the side effect only for the returned
+ * disposition, so an active job or terminal outcome can never enqueue or
+ * re-verify the same creator.
+ */
+export function admissionRediscoveryDisposition(
+  status: AdmissionStatus | string,
+  hasActiveJob: boolean,
+): AdmissionRediscoveryDisposition {
+  if (isRejectedAdmissionStatus(status)) return 'TERMINAL';
+  if (hasActiveJob) return 'ACTIVE_JOB';
+  if (status === 'ADMITTED' || status === 'ADMITTED_AMBIGUOUS') return 'RESUME_ADMITTED';
+  return 'ENQUEUE';
+}
 
 export type AdmissionDecision =
   | 'ADMIT'

@@ -233,6 +233,9 @@ async function main() {
         counts,
         timestamp: new Date().toISOString(),
       }));
+      // Apply is fail-fast: do not continue mutating or spending after a row
+      // fails. The durable retry enqueued above owns recovery.
+      if (apply) break;
     }
   }
   console.log(JSON.stringify({

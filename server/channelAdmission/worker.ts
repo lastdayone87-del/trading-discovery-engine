@@ -9,6 +9,24 @@ import type { AdmissionCandidateInput } from './types';
 
 export const ADMISSION_VERIFICATION_JOB_TYPE = 'VERIFY_CHANNEL_ADMISSION';
 
+/**
+ * Provider deferrals deliberately do not advance the candidate's evidence
+ * attempt counter. Their retry key therefore follows the durable job's own
+ * attempt number; otherwise every deferral would reuse `retry:2` while that
+ * job is still PROCESSING and no successor would be scheduled. Evidence
+ * retries still follow the candidate attempt count.
+ */
+export function nextAdmissionVerificationAttempt(input: {
+  status: string;
+  jobAttempt?: number;
+  candidateAttempts?: number;
+}): number {
+  if (input.status === 'PROVIDER_DEFERRED') {
+    return Math.max(2, Number(input.jobAttempt || 1) + 1);
+  }
+  return Math.max(2, Number(input.candidateAttempts || 0) + 1);
+}
+
 export async function processAdmissionVerificationJob(job: DurableJob): Promise<void> {
   if ((await getAdmissionMode()) === 'OFF') throw new Error('ADMISSION_MODE_OFF');
   const payload = job.payload as Record<string, any>;
@@ -54,7 +72,11 @@ export async function processAdmissionVerificationJob(job: DurableJob): Promise<
       await enqueueAdmissionVerification({
         candidate: input,
         runAfter: refreshed.next_check_at,
-        attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+        attempt: nextAdmissionVerificationAttempt({
+          status: result.status,
+          jobAttempt: Number(payload.attempt || 1),
+          candidateAttempts: Number(refreshed.attempts || 0),
+        }),
         priority: result.priority,
       });
     }

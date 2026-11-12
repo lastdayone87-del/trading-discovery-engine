@@ -207,7 +207,7 @@ function providerForClient(client: SemanticModelClient): SemanticJudgment['provi
  */
 export function isSemanticDecisionFailure(error: unknown): boolean {
   const message = String((error as any)?.message || error || '');
-  return /ADMISSION_SEMANTIC_INVALID_OUTPUT|INVALID_JSON|SEMANTIC_(?:SCHEMA|PARSE)|MALFORMED_SEMANTIC/i.test(message);
+  return /ADMISSION_SEMANTIC_INVALID_OUTPUT|invalid[\s_-]?json|JSON\.parse|unexpected token|malformed JSON|SEMANTIC_(?:SCHEMA|PARSE)|MALFORMED_SEMANTIC/i.test(message);
 }
 
 export class ProviderAdmissionJudge implements AdmissionJudge {

@@ -18,6 +18,10 @@ export function isProviderEvidenceFailure(reason?: string): boolean {
   // local collection failure and must not consume attempts or expire a
   // valid candidate.
   if (/^(?:NO_CREATOR_TEXT_AVAILABLE|FULL_DESCRIPTIONS_UNAVAILABLE\b)/i.test(value)) return false;
+  // Deleted, private or invalid channels are permanent input failures, not
+  // provider outages. Let the normal bounded missing-evidence path settle
+  // them instead of deferring forever.
+  if (/\b(?:404|410)\b|not[ _-]?found|does not exist|invalid channel|permanent input|videoNotFound|channelNotFound/i.test(value)) return false;
   return true;
 }
 

@@ -10,6 +10,7 @@ import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP, decideAdmission }
 import { admissionEvidenceChecksum, isSemanticDecisionFailure, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
 import { evaluateDeterministicAdmission } from './deterministic';
 import {
+  enqueueAdmissionVerification,
   findAdmissionCandidate,
   getAdmissionAmbiguousRate,
   getAdmissionMode,
@@ -125,6 +126,174 @@ async function enqueueClassificationAfterAdmission(input: {
   return job.status === 'PENDING' || job.status === 'PROCESSING' || job.status === 'COMPLETED';
 }
 
+export function candidateFromAdmissionRow(row: AdmissionCandidateRow): DiscoveredChannelRaw {
+  return {
+    channelId: row.channel_id,
+    channelName: row.channel_name,
+    youtubeUrl: row.youtube_url,
+    description: String(row.raw_observation?.description || ''),
+    videoTitles: Array.isArray(row.raw_observation?.videoTitles) ? row.raw_observation.videoTitles : [],
+    videoDescriptions: Array.isArray(row.raw_observation?.videoDescriptions) ? row.raw_observation.videoDescriptions : [],
+    matchedDocument: row.matched_document as unknown as DiscoveredChannelRaw['matchedDocument'],
+    locationTag: typeof row.raw_observation?.locationTag === 'string' ? row.raw_observation.locationTag : undefined,
+  };
+}
+
+/**
+ * Operator resolution for a retained NEEDS_REVIEW candidate. Review never
+ * silently admits or rejects: the operator must choose ADMIT, REJECT or
+ * REQUEUE, and the choice is recorded with the reviewer and reason.
+ */
+export async function resolveAdmissionReview(input: {
+  channelId: string;
+  action: 'ADMIT' | 'REJECT' | 'REQUEUE';
+  reviewer: string;
+  reason: string;
+}): Promise<{ status: 'ADMITTED' | 'REJECTED_UNRELATED' | 'PENDING' }> {
+  if (!input.channelId.trim()) throw new Error('REVIEW_CHANNEL_ID_REQUIRED');
+  if (!input.reviewer.trim()) throw new Error('REVIEW_REVIEWER_REQUIRED');
+  if (!input.reason.trim()) throw new Error('REVIEW_REASON_REQUIRED');
+  const row = await findAdmissionCandidate(input.channelId);
+  if (!row) throw new Error('REVIEW_CANDIDATE_MISSING');
+  if (row.status !== 'NEEDS_REVIEW') throw new Error(`REVIEW_CANDIDATE_NOT_PENDING:${row.status}`);
+  const candidate = candidateFromAdmissionRow(row);
+  const targetCountry = row.target_country || '';
+  const source = String(row.source) as DiscoverySource;
+  const reasonCodes = [`HUMAN_REVIEW_${input.action}`, `REVIEWER_${input.reviewer}`, input.reason];
+
+  if (input.action === 'REQUEUE') {
+    const updated = await updateAdmissionCandidate({
+      id: row.id,
+      status: 'PENDING',
+      decision: null,
+      reasonCodes,
+      attempts: Number(row.attempts || 0),
+      nextCheckAt: null,
+      expiresAt: null,
+      expectedStatus: row.status,
+      expectedAttempts: row.attempts,
+    });
+    if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+    await enqueueAdmissionVerification({
+      candidate: {
+        candidate,
+        targetCountry,
+        source,
+        queryRunId: row.query_run_id || undefined,
+        queryId: row.query_id || undefined,
+        discoveryJobId: row.job_id || undefined,
+        pageNumber: row.page_number || undefined,
+        resultRank: row.result_rank || undefined,
+      },
+    });
+    return { status: 'PENDING' };
+  }
+
+  const evidence = (row.evidence_snapshot || null) as AdmissionEvidence | null;
+  if (!evidence) throw new Error('REVIEW_EVIDENCE_MISSING');
+  const decision = input.action === 'ADMIT' ? 'ADMIT' as const : 'REJECT_UNRELATED' as const;
+  const status = input.action === 'ADMIT' ? 'ADMITTED' as const : 'REJECTED_UNRELATED' as const;
+  const recorded = await recordAdmissionOutcome({
+    decision: {
+      candidateId: row.id,
+      decisionKey: `${row.id}:${decision}:HUMAN:${Date.now()}`,
+      channelId: row.channel_id,
+      decision,
+      reasonCodes,
+      evidenceHash: row.evidence_hash || undefined,
+    },
+    candidate: {
+      id: row.id,
+      status,
+      decision,
+      reasonCodes,
+      evidence,
+      evidenceHash: row.evidence_hash || undefined,
+      attempts: Number(row.attempts || 0),
+      nextCheckAt: null,
+      expiresAt: null,
+      expectedStatus: row.status,
+      expectedAttempts: row.attempts,
+    },
+  });
+  if (input.action === 'REJECT') {
+    const existing = await getChannelById(row.channel_id);
+    if (existing) {
+      existing.trading_status = 'NON_TRADING';
+      existing.trading_category = 'Unrelated';
+      existing.scan_status = 'SKIPPED_NON_TRADING';
+      existing.discord_status = 'UNCERTAIN';
+      existing.discord_invite = null;
+      existing.last_checked = new Date().toISOString();
+      await upsertChannel(existing, { allowDiscordClear: true });
+    }
+    return { status };
+  }
+
+  const now = new Date().toISOString();
+  const decisionId = recorded.decisionId || randomUUID();
+  try {
+    const existing = await getChannelById(row.channel_id);
+    if (!existing) {
+      candidate.admissionNewlyCreated = true;
+      await insertChannelIfAbsent(admittedChannel({
+        evidence,
+        decisionId,
+        status: 'ADMITTED',
+        source,
+        now,
+      }));
+      await markChannelAdmitted({ channelId: row.channel_id, decisionId, status: 'ADMITTED' });
+    } else {
+      existing.admitted_at = existing.admitted_at || now;
+      existing.admission_status = 'ADMITTED';
+      existing.admission_decision_id = decisionId;
+      if (existing.scan_status === 'INTAKE_DEFERRED' || existing.scan_status === 'CLASSIFICATION_PENDING') {
+        existing.scan_status = 'CLASSIFICATION_PENDING';
+        existing.trading_status = 'UNCERTAIN';
+      }
+      await upsertChannel(existing, { preserveDiscordOnUpdate: true });
+      await markChannelAdmitted({ channelId: row.channel_id, decisionId, status: 'ADMITTED' });
+    }
+    candidate.admissionDecisionId = decisionId;
+    candidate.admissionStatus = 'ADMITTED';
+    candidate.admissionDecisionSource = 'HUMAN';
+    candidate.admissionConfirmedTrading = true;
+    candidate.admissionTradingConfidence = Number(row.semantic_output?.tradingFocus) || 100;
+    candidate.admissionCitations = Array.isArray(row.semantic_output?.citations) ? row.semantic_output.citations : [];
+    candidate.admissionEvidenceHash = row.evidence_hash || undefined;
+    candidate.admissionCategory = 'General Trading';
+    const queued = await enqueueClassificationAfterAdmission({
+      candidate,
+      targetCountry,
+      source,
+      queryRunId: row.query_run_id || undefined,
+      queryId: row.query_id || undefined,
+      discoveryJobId: row.job_id || undefined,
+      pageNumber: row.page_number || undefined,
+      admissionDecisionId: decisionId,
+    });
+    if (!queued) throw new Error('ADMISSION_CLASSIFICATION_ENQUEUE_FAILED');
+    return { status };
+  } catch (error) {
+    // The ledger decision is already durable. Reopen the candidate rather than
+    // leaving a human admission whose channel/classification side effect never
+    // completed; the operator can safely retry.
+    await updateAdmissionCandidate({
+      id: row.id,
+      status: 'NEEDS_REVIEW',
+      decision: 'NEEDS_REVIEW',
+      reasonCodes: [...reasonCodes, 'HUMAN_ADMIT_SIDE_EFFECT_FAILED', error instanceof Error ? error.message : String(error)],
+      attempts: Number(row.attempts || 0),
+      nextCheckAt: null,
+      expiresAt: null,
+      expectedStatus: 'ADMITTED',
+      expectedAttempts: row.attempts,
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, row: AdmissionCandidateRow): Promise<boolean> {
   await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
   const channel = await getChannelById(row.channel_id);
@@ -213,6 +382,18 @@ export async function verifyAdmissionCandidate(
     if (country.status === 'REJECTED') {
       const reasonCodes = ['COUNTRY_POLICY_REJECTED', country.rejectionReason || 'COUNTRY_REJECTED'];
       if (!options.dryRun) {
+        // Apply the legacy channel side effect first. If it fails, the
+        // candidate stays retryable instead of becoming a terminal rejection
+        // that the worker will refuse to resume.
+        const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
+        if (existing) {
+          existing.country = country.detectedCreatorCountry || existing.country;
+          existing.country_status = 'REJECTED';
+          existing.scan_status = 'SKIPPED_EXCLUDED';
+          existing.trading_status = existing.trading_status || 'UNCERTAIN';
+          existing.last_checked = new Date().toISOString();
+          await upsertChannel(existing, { allowDiscordClear: true });
+        }
         await recordAdmissionOutcome({
           decision: {
             candidateId: row.id,
@@ -230,17 +411,10 @@ export async function verifyAdmissionCandidate(
             evidence,
             evidenceHash: hash,
             attempts: Number(row.attempts || 0) + 1,
+            expectedStatus: row.status,
+            expectedAttempts: row.attempts,
           },
         });
-        const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
-        if (existing) {
-          existing.country = country.detectedCreatorCountry || existing.country;
-          existing.country_status = 'REJECTED';
-          existing.scan_status = 'SKIPPED_EXCLUDED';
-          existing.trading_status = existing.trading_status || 'UNCERTAIN';
-          existing.last_checked = new Date().toISOString();
-          await upsertChannel(existing, { allowDiscordClear: true });
-        }
       }
       return {
         channelId: evidence.channelId,
@@ -302,6 +476,8 @@ export async function verifyAdmissionCandidate(
         attempts,
         nextCheckAt: expired ? null : new Date(Date.now() + retryDelayMs(attempts)).toISOString(),
         expiresAt: row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
+        expectedStatus: row.status,
+        expectedAttempts: row.attempts,
       });
     }
     return {
@@ -509,6 +685,30 @@ export async function verifyAdmissionCandidate(
       }));
     }
   }
+  // Legacy rejection projection must complete before the terminal decision is
+  // committed. Otherwise a failed upsert leaves a rejected candidate whose
+  // existing channel can never be resumed by the worker.
+  if (policy.rejected && options.archiveRejectedExistingChannel && !options.dryRun) {
+    const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
+    if (existing) {
+      existing.trading_status = 'NON_TRADING';
+      existing.trading_confidence_score = Math.max(0, Math.min(100, Number(effectiveJudgment.tradingFocus) || 0));
+      existing.trading_category = 'Unrelated';
+      existing.scan_status = 'SKIPPED_NON_TRADING';
+      existing.discord_status = 'UNCERTAIN';
+      existing.discord_invite = null;
+      existing.last_checked = new Date().toISOString();
+      existing.inspection_trail = [...(existing.inspection_trail || []), {
+        step: 'BIO',
+        title: 'Semantic admission rejected as unrelated',
+        status: 'REJECTED',
+        details: `Admission ${ADMISSION_POLICY_VERSION}: ${policy.reasonCodes.join(', ')}. Evidence hash ${hash}.`,
+        timestamp: existing.last_checked,
+      }];
+      await upsertChannel(existing, { allowDiscordClear: true });
+    }
+  }
+
   if (!options.dryRun) {
     const recorded = await recordAdmissionOutcome({
       decision: {
@@ -532,6 +732,8 @@ export async function verifyAdmissionCandidate(
         attempts: Number(row.attempts || 0) + 1,
         nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
         expiresAt: policy.hold ? (row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()) : null,
+        expectedStatus: row.status,
+        expectedAttempts: row.attempts,
       },
     });
     recordedDecisionId = recorded.decisionId;
@@ -552,27 +754,6 @@ export async function verifyAdmissionCandidate(
       decisionSource,
       deterministicRoute,
     };
-  }
-
-  if (policy.rejected && options.archiveRejectedExistingChannel && !options.dryRun) {
-    const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
-    if (existing) {
-      existing.trading_status = 'NON_TRADING';
-      existing.trading_confidence_score = Math.max(0, Math.min(100, Number(effectiveJudgment.tradingFocus) || 0));
-      existing.trading_category = 'Unrelated';
-      existing.scan_status = 'SKIPPED_NON_TRADING';
-      existing.discord_status = 'UNCERTAIN';
-      existing.discord_invite = null;
-      existing.last_checked = new Date().toISOString();
-      existing.inspection_trail = [...(existing.inspection_trail || []), {
-        step: 'BIO',
-        title: 'Semantic admission rejected as unrelated',
-        status: 'REJECTED',
-        details: `Admission ${ADMISSION_POLICY_VERSION}: ${policy.reasonCodes.join(', ')}. Evidence hash ${hash}.`,
-        timestamp: existing.last_checked,
-      }];
-      await upsertChannel(existing, { allowDiscordClear: true });
-    }
   }
 
   if (policy.admitted) {

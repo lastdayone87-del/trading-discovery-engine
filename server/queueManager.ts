@@ -149,7 +149,7 @@ import {
   type ClassificationJobPayload,
 } from './classificationDecoupling';
 import { enqueueAdmissionVerification, getAdmissionMode, hasActiveAdmissionJob, upsertAdmissionCandidate } from './channelAdmission/store';
-import { isRejectedAdmissionStatus, isWaitingAdmissionStatus } from './channelAdmission/types';
+import { admissionRediscoveryDisposition, isWaitingAdmissionStatus } from './channelAdmission/types';
 import { ADMISSION_VERIFICATION_JOB_TYPE, processAdmissionVerificationJob } from './channelAdmission/worker';
 import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
 import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery } from './channelAdmission/store';
@@ -1260,49 +1260,40 @@ export async function admitDiscoveredChannel(input: {
         pageNumber: input.pageNumber,
         resultRank: input.resultRank,
       });
-      if (isRejectedAdmissionStatus(row.status)) {
+      const disposition = admissionRediscoveryDisposition(row.status, await hasActiveAdmissionJob(raw.channelId));
+      if (disposition === 'TERMINAL') {
         return { outcome: admissionPendingOutcome(raw), pending: false };
       }
-      if (await hasActiveAdmissionJob(raw.channelId)) {
+      if (disposition === 'ACTIVE_JOB') {
         return { outcome: admissionPendingOutcome(raw), pending: true };
       }
-      if (['ADMITTED', 'ADMITTED_AMBIGUOUS'].includes(row.status) && !(await getChannelById(raw.channelId))) {
+      const candidateInput = {
+        candidate: raw,
+        targetCountry,
+        source,
+        query: input.query,
+        queryId: input.queryId,
+        queryRunId: input.queryRunId,
+        discoveryJobId: input.discoveryJobId,
+        pageNumber: input.pageNumber,
+        resultRank: input.resultRank,
+      };
+      if (disposition === 'RESUME_ADMITTED') {
         // The admission decision exists but the channel write was interrupted.
         // Resume the admission lifecycle; never fall through to the ungated
         // legacy path.
         await enqueueAdmissionVerification({
-          candidate: {
-            candidate: raw,
-            targetCountry,
-            source,
-            query: input.query,
-            queryId: input.queryId,
-            queryRunId: input.queryRunId,
-            discoveryJobId: input.discoveryJobId,
-            pageNumber: input.pageNumber,
-            resultRank: input.resultRank,
-          },
+          candidate: candidateInput,
           attempt: Math.max(2, Number(row.attempts || 0) + 1),
         });
         return { outcome: admissionPendingOutcome(raw), pending: true };
-      } else {
-        const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
-        await enqueueAdmissionVerification({
-          candidate: {
-            candidate: raw,
-            targetCountry,
-            source,
-            query: input.query,
-            queryId: input.queryId,
-            queryRunId: input.queryRunId,
-            discoveryJobId: input.discoveryJobId,
-            pageNumber: input.pageNumber,
-            resultRank: input.resultRank,
-          },
-          ...(waiting ? { runAfter: row.next_check_at as string, attempt: Math.max(2, Number(row.attempts || 0) + 1) } : {}),
-        });
-        return { outcome: admissionPendingOutcome(raw), pending: true };
       }
+      const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
+      await enqueueAdmissionVerification({
+        candidate: candidateInput,
+        ...(waiting ? { runAfter: row.next_check_at as string, attempt: Math.max(2, Number(row.attempts || 0) + 1) } : {}),
+      });
+      return { outcome: admissionPendingOutcome(raw), pending: true };
     } catch (error) {
       if (!isMissingAdmissionSchemaError(error)) throw error;
       console.warn(JSON.stringify({
@@ -3422,17 +3413,15 @@ export async function processDiscoveredChannel(
           targetCountry,
           source,
         });
-        if (await hasActiveAdmissionJob(raw.channelId)) {
-          return admissionPendingOutcome(raw);
-        }
-        if (['ADMITTED', 'ADMITTED_AMBIGUOUS'].includes(row.status)) {
+        const disposition = admissionRediscoveryDisposition(row.status, await hasActiveAdmissionJob(raw.channelId));
+        if (disposition === 'RESUME_ADMITTED') {
           // A prior admission decision exists but its channel write was
           // interrupted. Retry with a fresh key instead of bypassing the gate.
           await enqueueAdmissionVerification({
             candidate: { candidate: raw, targetCountry, source },
             attempt: Math.max(2, Number(row.attempts || 0) + 1),
           });
-        } else if (!isRejectedAdmissionStatus(row.status)) {
+        } else if (disposition === 'ENQUEUE') {
           const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
           await enqueueAdmissionVerification({
             candidate: { candidate: raw, targetCountry, source },

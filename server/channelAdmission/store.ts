@@ -48,15 +48,23 @@ export function admissionCandidateKey(channelId: string): string {
   return `admission:${channelId}:v1`;
 }
 
+export function admissionModeFromOverrides(envValue: unknown, settingValue: unknown): AdmissionMode {
+  const env = String(envValue || '').trim().toUpperCase();
+  // An explicit process override always wins. Unrecognized values fail
+  // closed instead of silently inheriting an ACTIVE database setting.
+  if (env) return env === 'ACTIVE' || env === 'ON' ? 'ACTIVE' : 'OFF';
+  const setting = String(settingValue || '').trim().toUpperCase();
+  // Only an explicit enablement activates the gate. A typo or unknown value
+  // must not silently divert production discovery.
+  return setting === 'ACTIVE' || setting === 'ON' ? 'ACTIVE' : 'OFF';
+}
+
 export async function getAdmissionMode(): Promise<AdmissionMode> {
-  const value = String(process.env.CHANNEL_ADMISSION_MODE || '').trim().toUpperCase();
-  if (value === 'ACTIVE' || value === 'ON') return 'ACTIVE';
-  if (value === 'OFF' || value === 'LEGACY') return 'OFF';
+  if (String(process.env.CHANNEL_ADMISSION_MODE || '').trim()) {
+    return admissionModeFromOverrides(process.env.CHANNEL_ADMISSION_MODE, null);
+  }
   try {
-    const setting = String(await getAppSetting('channel_admission_mode', 'OFF')).trim().toUpperCase();
-    // Only an explicit enablement activates the gate. A typo or unknown value
-    // must not silently divert production discovery.
-    return setting === 'ACTIVE' || setting === 'ON' ? 'ACTIVE' : 'OFF';
+    return admissionModeFromOverrides(null, await getAppSetting('channel_admission_mode', 'OFF'));
   } catch {
     return 'OFF';
   }

@@ -4,7 +4,10 @@ import { assessExtractedQueryAdmission, decideAdmission } from './policy';
 import { evaluateDeterministicAdmission, evaluateStrictRejection } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
-import { isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus } from './types';
+import { nextAdmissionVerificationAttempt } from './worker';
+import { admissionModeFromOverrides } from './store';
+import { candidateFromAdmissionRow } from './index';
+import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus } from './types';
 import { ambiguousAdmitRate, evaluateQueryAdmissionGuard } from './queryGuard';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
 
@@ -627,6 +630,32 @@ test('a genuine trading channel is not deterministically rejected by incidental 
 });
 
 
+test('provider deferral retry keys advance from the job attempt, not evidence attempts', () => {
+  assert.equal(nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 1, candidateAttempts: 0 }), 2);
+  assert.equal(nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 2, candidateAttempts: 0 }), 3);
+  assert.equal(nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 7, candidateAttempts: 0 }), 8);
+  assert.equal(nextAdmissionVerificationAttempt({ status: 'WAITING_EVIDENCE', jobAttempt: 2, candidateAttempts: 2 }), 3);
+  assert.equal(nextAdmissionVerificationAttempt({ status: 'WAITING_EVIDENCE', jobAttempt: 1, candidateAttempts: 0 }), 2);
+});
+
+test('strict rejection needs exactly three matches, not merely two', () => {
+  const twoMatches = evidence({
+    name: 'Two Matches',
+    bio: 'Cooking.',
+    videos: [{ title: 'Bread.', description: '' }],
+  });
+  assert.equal(evaluateStrictRejection(twoMatches), null);
+
+  const threeMatches = evidence({
+    name: 'Three Matches',
+    bio: 'Cooking.',
+    videos: [{ title: 'Bread recipe.', description: '' }],
+  });
+  const rejection = evaluateStrictRejection(threeMatches);
+  assert.ok(rejection);
+  assert.equal(rejection.domain, 'COOKING');
+});
+
 test('admission statuses keep provider waits, review, and terminal rediscovery distinct', () => {
   for (const status of ['PENDING', 'VERIFYING', 'WAITING_EVIDENCE', 'PROVIDER_DEFERRED'] as const) {
     assert.equal(isRetryableAdmissionStatus(status), true, status);
@@ -643,6 +672,17 @@ test('admission statuses keep provider waits, review, and terminal rediscovery d
   }
   assert.equal(isRejectedAdmissionStatus('ADMITTED'), false);
   assert.equal(isRejectedAdmissionStatus('ADMITTED_AMBIGUOUS'), false);
+});
+
+test('rediscovery never enqueues through an active job or terminal outcome', () => {
+  assert.equal(admissionRediscoveryDisposition('NEEDS_REVIEW', false), 'TERMINAL');
+  assert.equal(admissionRediscoveryDisposition('REJECTED_UNRELATED', true), 'TERMINAL');
+  assert.equal(admissionRediscoveryDisposition('PENDING', true), 'ACTIVE_JOB');
+  assert.equal(admissionRediscoveryDisposition('PROVIDER_DEFERRED', true), 'ACTIVE_JOB');
+  assert.equal(admissionRediscoveryDisposition('ADMITTED', false), 'RESUME_ADMITTED');
+  assert.equal(admissionRediscoveryDisposition('ADMITTED_AMBIGUOUS', false), 'RESUME_ADMITTED');
+  assert.equal(admissionRediscoveryDisposition('PENDING', false), 'ENQUEUE');
+  assert.equal(admissionRediscoveryDisposition('PROVIDER_DEFERRED', false), 'ENQUEUE');
 });
 
 test('provider-deferred and review outcomes do not trip the contamination guard', () => {
@@ -672,7 +712,7 @@ test('only transient provider evidence failures defer without consuming attempts
   ]) {
     assert.equal(isProviderEvidenceFailure(reason), true, reason);
   }
-  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'FULL_DESCRIPTIONS_UNAVAILABLE:no description']) {
+  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'FULL_DESCRIPTIONS_UNAVAILABLE:no description', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
     assert.equal(isProviderEvidenceFailure(reason), false, String(reason));
   }
 });
@@ -681,7 +721,43 @@ test('only transient provider evidence failures defer without consuming attempts
 test('malformed AI decisions are evidence failures while provider errors are infrastructure waits', () => {
   assert.equal(isSemanticDecisionFailure(new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT')), true);
   assert.equal(isSemanticDecisionFailure(new Error('INVALID_JSON: unexpected token')), true);
+  assert.equal(isSemanticDecisionFailure(new Error('Unexpected token < in JSON at position 0')), true);
+  assert.equal(isSemanticDecisionFailure(new Error('Groq returned malformed JSON content.')), true);
+  assert.equal(isSemanticDecisionFailure(new Error('invalid JSON response body')), true);
   assert.equal(isSemanticDecisionFailure(new Error('429 rate limit exceeded')), false);
   assert.equal(isSemanticDecisionFailure(new Error('quotaExceeded')), false);
   assert.equal(isSemanticDecisionFailure(new Error('request timed out')), false);
+});
+
+
+test('an explicit invalid admission override fails closed instead of inheriting ACTIVE', () => {
+  assert.equal(admissionModeFromOverrides('ACTIVE', 'OFF'), 'ACTIVE');
+  assert.equal(admissionModeFromOverrides('ON', 'OFF'), 'ACTIVE');
+  assert.equal(admissionModeFromOverrides('OFF', 'ACTIVE'), 'OFF');
+  assert.equal(admissionModeFromOverrides('LEGACY', 'ACTIVE'), 'OFF');
+  assert.equal(admissionModeFromOverrides('typo', 'ACTIVE'), 'OFF');
+  assert.equal(admissionModeFromOverrides('', 'ACTIVE'), 'ACTIVE');
+  assert.equal(admissionModeFromOverrides(undefined, 'OFF'), 'OFF');
+  assert.equal(admissionModeFromOverrides(undefined, 'unknown'), 'OFF');
+});
+
+
+test('review candidates rebuild the original discovery observation without provider calls', () => {
+  const candidate = candidateFromAdmissionRow({
+    channel_id: 'UC-review',
+    channel_name: 'Review Trader',
+    youtube_url: 'https://youtube.com/channel/UC-review',
+    raw_observation: {
+      description: 'technical analysis',
+      videoTitles: ['Gold analysis'],
+      videoDescriptions: ['Support and resistance'],
+      locationTag: 'AE',
+    },
+    matched_document: { type: 'VIDEO', title: 'Gold' },
+  } as any);
+  assert.equal(candidate.channelId, 'UC-review');
+  assert.equal(candidate.description, 'technical analysis');
+  assert.deepEqual(candidate.videoTitles, ['Gold analysis']);
+  assert.deepEqual(candidate.videoDescriptions, ['Support and resistance']);
+  assert.equal(candidate.locationTag, 'AE');
 });

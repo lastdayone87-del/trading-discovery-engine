@@ -244,7 +244,7 @@ export interface VerificationDecision {
     reasonCodes: string[];
   };
   /** C3 honest reporting. All fields optional for replaying older fixtures. */
-  classificationMethod?: 'DETERMINISTIC_EVIDENCE' | 'SEMANTIC_GEMINI' | 'SEMANTIC_GROQ' | 'SEMANTIC_GEMINI_FREE' | 'SEMANTIC_ADMISSION' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  classificationMethod?: 'DETERMINISTIC_EVIDENCE' | 'SEMANTIC_GEMINI' | 'SEMANTIC_GROQ' | 'SEMANTIC_GEMINI_FREE' | 'SEMANTIC_ADMISSION' | 'HUMAN_REVIEW_ADMISSION' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
   /** Count of providers whose availability is `AVAILABLE`. Not a 0-1 ratio. */
   providerCoverage?: number;
   evidenceCount?: number;
