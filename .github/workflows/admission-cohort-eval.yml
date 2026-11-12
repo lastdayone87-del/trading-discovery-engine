@@ -1,0 +1,43 @@
+name: Admission cohort evaluation
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/admission-cohort-eval.yml'
+      - 'scripts/runAdmissionCohort.ts'
+      - 'scripts/fixtures/admission-cohort-60-preserved.jsonl'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cohort:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+      GEMINI_ORG_ID_2: ${{ secrets.GEMINI_ORG_ID_2 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Run 60-channel read-only cohort
+        run: >-
+          npx tsx scripts/runAdmissionCohort.ts
+          --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
+          --out=admission-cohort-ai.jsonl
+          --blind=admission-cohort-ai-blind.jsonl
+          --concurrency=2
+      - name: Upload cohort evidence and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-cohort-ai
+          path: |
+            admission-cohort-ai.jsonl
+            admission-cohort-ai-blind.jsonl
+          if-no-files-found: warn
