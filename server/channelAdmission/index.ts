@@ -371,6 +371,8 @@ export interface VerifyAdmissionOptions {
   dryRun?: boolean;
   /** Legacy revalidation only: retire an existing unrelated row from the dashboard. */
   archiveRejectedExistingChannel?: boolean;
+  /** Test/cohort seam: evaluate this evidence instead of refetching it. */
+  evidenceOverride?: AdmissionEvidence;
 }
 
 export async function verifyAdmissionCandidate(
@@ -380,7 +382,7 @@ export async function verifyAdmissionCandidate(
   const row = options.row || await findAdmissionCandidate(input.candidate.channelId);
   if (!row) throw new Error('ADMISSION_CANDIDATE_MISSING');
   await assertCountryAllowed(input.targetCountry, `admission_worker:${input.candidate.channelId}`);
-  const evidence = await fetchAdmissionEvidence({
+  const evidence = options.evidenceOverride ?? await fetchAdmissionEvidence({
     candidate: input.candidate,
     targetCountry: input.targetCountry,
     source: input.source,

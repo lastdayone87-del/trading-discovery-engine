@@ -33,6 +33,21 @@ const REJECT_DOMAINS: Array<{ domain: string; pattern: RegExp }> = [
  */
 const TRADING_FINANCE_GUARD = /\b(?:technical\s*analysis|price\s*action|market\s*analysis|market\s*structure|order\s*flow|volume\s*profile|risk\s*management|trade\s*setup|trade\s*journal|trade\s*analysis|trading\s*analysis|back\s*test|backtest|live\s*trad(?:e|ing)|day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|scalp(?:ing)?|prop\s*firm|funded\s*trader|trading\s*(?:strategy|education|signals?|course|system)|stock\s*(?:market|trading)|share\s*market|equity\s*market|forex(?:\s*(?:trading|market))?|futures?\s*(?:trading|market)|options?\s*(?:trading|market)|crypto\s*trading|bitcoin|btc|ethereum|eth|nasdaq|s&p\s*500|sp500|xauusd|xagusd|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|nifty|bank\s*nifty|sensex|dax|cac\s*40|ftse\s*100|nikkei|trader|trading|invest(?:ing|or|ment)?|portfolio|dividend|etf|bourse|finance|financial|wealth|broker|equity|commodit(?:y|ies)|market\s*(?:update|recap|outlook|forecast|crash|news|commentary)|chart\s*analysis|support\s*and\s*resistance|candlestick|moving\s*average|rsi|macd|fibonacci|elliott|wyckoff|pnl|p\s*&\s*l)\b/iu;
 
+const FINANCE_ADJACENT_EVIDENCE = /\b(?:personal finance|invest(?:ing|ment|or|ments)?|etf|dividend|portfolio|retirement|broker|budget(?:ing)?|savings?|wealth|stock(?:s)?|equit(?:y|ies)|bond|index fund|mutual fund|real estate|mortgage|insurance|tax(?:es)?|bourse|courtier|épargne|assurance[- ]vie|scpi|patrimoine|finances personnelles|inversi[oó]n|bolsa|corredor|ahorro|jubilaci[oó]n|finanzas personales|investieren|b[oö]rse|sparen|altersvorsorge|finanzen)\b/iu;
+
+/**
+ * Active trading evidence is execution/analysis language, not merely the
+ * existence of a market or an investment. Finance-adjacent creators may use
+ * stock-market vocabulary without being trading creators, so a fast-pass
+ * requires at least one of these anchors.
+ */
+const ACTIVE_TRADING_EVIDENCE = /\b(?:live[\s-]*trad(?:e|ing)|day[\s-]*trad(?:e|ing)|swing[\s-]*trad(?:e|ing)|scalp(?:ing)?|price action|technical analysis|market structure|order[\s-]*flow|volume profile|support and resistance|risk management|trade[\s-]*(?:setup|recap|idea|execution|journal|plan)|back[\s-]*test|backtest|futures?\s*(?:trading|analysis|market|setup)|forex|xauusd|xagusd|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|nifty|bank\s*nifty|sensex|nq|gold\s*(?:trading|analysis|forecast|setup)|bitcoin\s*(?:trading|analysis)|btc\s*(?:trading|analysis)|ethereum\s*(?:trading|analysis)|candlestick|fibonacci|elliott|wyckoff|vwap|footprint|chart[\s-]*(?:analysis|setup|pattern|breakdown))\b/iu;
+
+export function isFinanceAdjacentWithoutActiveTrading(text: string): boolean {
+  const value = String(text || '');
+  return FINANCE_ADJACENT_EVIDENCE.test(value) && !ACTIVE_TRADING_EVIDENCE.test(value);
+}
+
 function evidenceToInput(evidence: AdmissionEvidence): RawChannelInput {
   return {
     channel_id: evidence.channelId,
@@ -231,11 +246,14 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
   });
 
   let passWithoutCitations = false;
+  let passBlockedByFinanceAdjacency = false;
+  const fullEvidenceText = `${evidence.channelName}\n${evidence.description}\n${evidence.videos.map(video => `${video.title}\n${video.description}`).join('\n')}`;
+  const financeAdjacentOnly = isFinanceAdjacentWithoutActiveTrading(fullEvidenceText);
   if (routing.route === 'DETERMINISTIC_TRADING'
     && decision.status === 'TRADING_CONFIRMED'
     && decision.evidenceCollection.sufficiency === 'SUFFICIENT') {
     const citations = tradingCitations(evidence, decision);
-    if (citations.length > 0) {
+    if (citations.length > 0 && !financeAdjacentOnly) {
       const judgment: SemanticJudgment = {
         mainSubject: 'TRADING',
         tradingFocus: decision.confidenceScore,
@@ -257,7 +275,10 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     }
     // A decisive score without a source-anchored citation is not auditable
     // enough for admission. Let the semantic judge review it instead.
-    passWithoutCitations = true;
+    if (citations.length === 0) passWithoutCitations = true;
+    // Finance-adjacent creators must reach downstream classification rather
+    // than bypass it with a deterministic trading fast-pass.
+    if (financeAdjacentOnly) passBlockedByFinanceAdjacency = true;
   }
 
   const rejection = evaluateStrictRejection(evidence);
@@ -288,6 +309,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     confidence: decision.confidenceScore,
     reasonCodes: [
       ...(passWithoutCitations ? ['DETERMINISTIC_PASS_WITHOUT_CITATIONS'] : []),
+      ...(passBlockedByFinanceAdjacency ? ['FINANCE_ADJACENT_DEFERRED_TO_DOWNSTREAM'] : []),
       'DETERMINISTIC_AMBIGUOUS',
       ...routing.reasonCodes,
     ],

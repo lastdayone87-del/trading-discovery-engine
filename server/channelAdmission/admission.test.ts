@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessExtractedQueryAdmission, decideAdmission } from './policy';
-import { evaluateDeterministicAdmission, evaluateStrictRejection } from './deterministic';
+import { evaluateDeterministicAdmission, evaluateStrictRejection, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
@@ -797,4 +797,22 @@ test('review candidates rebuild the original discovery observation without provi
   assert.deepEqual(candidate.videoTitles, ['Gold analysis']);
   assert.deepEqual(candidate.videoDescriptions, ['Support and resistance']);
   assert.equal(candidate.locationTag, 'AE');
+});
+
+
+test('finance-adjacent evidence is held back from deterministic fast-pass without active trading anchors', () => {
+  const financeTexts = [
+    'Bien épargner, investir et gérer tes finances personnelles. Choisir la banque, comparer les courtiers, investir avec des ETF, assurance-vie, SCPI.',
+    'Market insights and investment strategies for financial literacy. Learn how to invest, manage your finances, build wealth, dividend investing and long-term portfolio growth.',
+    'Turning decades of market history into 60-second charts about hypothetical investing, contributions, dividends and portfolio value.',
+  ];
+  for (const text of financeTexts) assert.equal(isFinanceAdjacentWithoutActiveTrading(text), true, text);
+
+  const activeTexts = [
+    'Nifty and Bank Nifty daily trading analysis with technical analysis, price action and risk management.',
+    'Live forex trading sessions on XAUUSD and gold analysis.',
+    'Live NQ futures execution, ICT trade recaps and market structure.',
+    'Stock market analysis with price action and technical analysis on SPY and BTC.',
+  ];
+  for (const text of activeTexts) assert.equal(isFinanceAdjacentWithoutActiveTrading(text), false, text);
 });
