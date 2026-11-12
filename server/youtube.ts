@@ -213,7 +213,7 @@ export interface DiscoveredChannelRaw {
   /** Validated semantic citations and model provenance carried into classification. */
   admissionCitations?: Array<{ field: string; index?: number; quote: string; supports: string }>;
   admissionModel?: string;
-  admissionProvider?: 'gemini_semantic' | 'groq_semantic';
+  admissionProvider?: 'gemini_semantic' | 'groq_semantic' | 'gemini_free_semantic';
   admissionDecisionSource?: 'DETERMINISTIC' | 'SEMANTIC' | 'HUMAN';
   admissionEvidenceHash?: string;
   admissionCategory?: string;

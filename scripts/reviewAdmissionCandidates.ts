@@ -68,6 +68,9 @@ async function main(): Promise<void> {
     await listReviewCandidates(limit);
     return;
   }
+  // Any action touches the database. Track the pool before the mode read so
+  // failures and missing arguments still close it.
+  openedDb = await getDb();
   if (action === 'REQUEUE' && (await getAdmissionMode()) !== 'ACTIVE') {
     throw new Error('ADMISSION_MODE_OFF_FOR_REQUEUE');
   }
@@ -75,7 +78,6 @@ async function main(): Promise<void> {
   const reviewer = String(argValue('reviewer') || '').trim();
   const reason = String(argValue('reason') || '').trim();
   if (!channelId || !reviewer || !reason) throw new Error('CHANNEL_ID_REVIEWER_REASON_REQUIRED');
-  openedDb = await getDb();
   const result = await resolveAdmissionReview({ channelId, action, reviewer, reason });
   console.log(JSON.stringify({
     event: 'admission_review_resolved',

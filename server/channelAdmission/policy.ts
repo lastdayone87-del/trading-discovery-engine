@@ -396,8 +396,8 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
     language: raw.language ? String(raw.language) : undefined,
     explanation: String(raw.reasoning || raw.explanation || ''),
     model,
-    provider: ['gemini_semantic', 'groq_semantic'].includes(String(raw.provider || ''))
-      ? raw.provider as 'gemini_semantic' | 'groq_semantic'
+    provider: ['gemini_semantic', 'groq_semantic', 'gemini_free_semantic'].includes(String(raw.provider || ''))
+      ? raw.provider as 'gemini_semantic' | 'groq_semantic' | 'gemini_free_semantic'
       : undefined,
     raw: value,
   };

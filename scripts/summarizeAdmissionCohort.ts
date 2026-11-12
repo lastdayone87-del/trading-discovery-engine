@@ -66,6 +66,7 @@ const report = {
     correct: finalCorrect.length,
     wrong: finalDecided.length - finalCorrect.length,
     precision: finalDecided.length ? finalCorrect.length / finalDecided.length : null,
+    fetchFailed: rows.filter(row => row.final?.decision === 'COHORT_FETCH_FAILED').length,
     aiUnavailable: rows.filter(row => row.final?.decision === 'AI_UNAVAILABLE').length,
     providerDeferred: rows.filter(row => row.final?.decision === 'PROVIDER_DEFERRED').length,
     needsReview: rows.filter(row => row.final?.decision === 'NEEDS_REVIEW').length,
@@ -79,4 +80,4 @@ const report = {
   generatedAt: new Date().toISOString(),
 };
 console.log(JSON.stringify(report, null, 2));
-if (report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;
+if (report.deterministic.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;

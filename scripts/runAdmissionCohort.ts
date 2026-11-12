@@ -181,7 +181,7 @@ async function collectKeylessEvidence(input: {
     rssFailure = error instanceof Error ? error.message : String(error);
   }
 
-  const complete = about.description.length > 0 || videos.length > 0;
+  const complete = !rssFailure && (about.description.length > 0 || videos.length > 0);
   return {
     channelId,
     channelName: resolvedName,
@@ -204,7 +204,7 @@ async function collectKeylessEvidence(input: {
 
 class CohortJudge implements AdmissionJudge {
   constructor(
-    private readonly clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'groq_semantic' }>,
+    private readonly clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }>,
   ) {}
 
   async judge(evidence: AdmissionEvidence, role: 'PRIMARY' | 'SECOND'): Promise<SemanticJudgment> {
@@ -215,7 +215,7 @@ class CohortJudge implements AdmissionJudge {
         const raw = await attempt.client.classify(buildAdmissionPrompt(evidence, role), attempt.model, {});
         const normalized = normalizeSemanticJudgment(raw, attempt.model);
         if (!normalized) throw new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT');
-        normalized.provider = attempt.provider;
+        if (attempt.provider) normalized.provider = attempt.provider;
         return normalized;
       } catch (error) {
         lastError = error;
@@ -225,12 +225,23 @@ class CohortJudge implements AdmissionJudge {
   }
 }
 
+function semanticClientsAllowedToWriteTelemetry(): boolean {
+  const url = String(process.env.DATABASE_URL || '');
+  if (!url) return false;
+  // Provider clients append call events through getDb(), which can apply
+  // migrations. Only permit that against an explicitly disposable/local test
+  // database; never let a read-only cohort assessment touch production.
+  return /localhost|127\.0\.0\.1|staging|test/i.test(url)
+    && (process.env.NODE_ENV === 'test' || process.env.COHORT_ALLOW_SEMANTIC_DB_WRITES === 'true');
+}
+
 function configuredJudge(): CohortJudge | null {
-  const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'groq_semantic' }> = [];
+  if (!semanticClientsAllowedToWriteTelemetry()) return null;
+  const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }> = [];
   const gemini = geminiDefaultClient();
   if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, provider: 'gemini_semantic' });
   const geminiFree = geminiFreeDefaultClient();
-  if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL });
+  if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL, provider: 'gemini_free_semantic' });
   const groq = groqDefaultClient();
   if (groq) clients.push({ client: groq, model: process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL, provider: 'groq_semantic' });
   return clients.length ? new CohortJudge(clients) : null;

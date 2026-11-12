@@ -17,7 +17,24 @@ jobs:
   cohort:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: admission_cohort
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d admission_cohort"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/admission_cohort
+      PGSSL: disable
+      NODE_ENV: test
       GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
       GEMINI_ORG_ID_2: ${{ secrets.GEMINI_ORG_ID_2 }}
       GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_API_KEY_2 }}
@@ -28,6 +45,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
+      - name: Apply migrations to disposable telemetry database
+        run: npx tsx scripts/runMigrations.ts
       - name: Run 60-channel read-only cohort
         run: >-
           npx tsx scripts/runAdmissionCohort.ts
