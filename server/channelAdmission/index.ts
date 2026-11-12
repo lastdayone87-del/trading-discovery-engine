@@ -381,6 +381,9 @@ export async function verifyAdmissionCandidate(
 ): Promise<AdmissionVerificationResult> {
   const row = options.row || await findAdmissionCandidate(input.candidate.channelId);
   if (!row) throw new Error('ADMISSION_CANDIDATE_MISSING');
+  if (options.evidenceOverride && options.evidenceOverride.channelId !== input.candidate.channelId) {
+    throw new Error('ADMISSION_EVIDENCE_CHANNEL_MISMATCH');
+  }
   await assertCountryAllowed(input.targetCountry, `admission_worker:${input.candidate.channelId}`);
   const evidence = options.evidenceOverride ?? await fetchAdmissionEvidence({
     candidate: input.candidate,

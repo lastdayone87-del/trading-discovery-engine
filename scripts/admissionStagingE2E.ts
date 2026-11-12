@@ -157,16 +157,37 @@ async function insertDeferredChannel(channelId: string): Promise<void> {
   await insertChannelIfAbsent(channel);
 }
 
+function assertIsolatedStagingUrl(raw: string): void {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('STAGING_URL_INVALID');
+  }
+  const host = url.hostname.toLowerCase();
+  const database = decodeURIComponent(url.pathname.replace(/^\/+/, '')).toLowerCase();
+  const local = ['localhost', '127.0.0.1', '::1'].includes(host);
+  const named = /(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(database)
+    || /(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(host);
+  if (/prod/i.test(host) || /prod/i.test(database)) throw new Error('REFUSING_PRODUCTION_LIKE_URL');
+  if (!local && !named) throw new Error('STAGING_URL_REQUIRES_LOCAL_OR_STAGING_MARKER');
+}
+
 async function main(): Promise<void> {
   if (!process.argv.includes('--confirm-staging')) {
     throw new Error('REFUSING_TO_RUN: pass --confirm-staging');
   }
   const stagingUrl = String(process.env.ADMISSION_STAGING_DATABASE_URL || '').trim();
   if (!stagingUrl) throw new Error('ADMISSION_STAGING_DATABASE_URL_REQUIRED');
-  if (/prod/i.test(stagingUrl)) throw new Error('REFUSING_PRODUCTION_LIKE_URL');
+  assertIsolatedStagingUrl(stagingUrl);
   process.env.DATABASE_URL = stagingUrl;
 
   const db = await getDb();
+  const actualDatabase = String((await db.query('SELECT current_database() AS name')).rows[0]?.name || '').toLowerCase();
+  if (!/(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(actualDatabase)) {
+    throw new Error('CONNECTED_DATABASE_IS_NOT_STAGING');
+  }
+  const previousMode = await db.query(`SELECT setting_value FROM app_settings WHERE setting_key='channel_admission_mode' LIMIT 1`);
   const checks: Array<{ name: string; ok: boolean; details?: unknown }> = [];
   const check = async (name: string, work: () => Promise<unknown>) => {
     try {
@@ -180,6 +201,7 @@ async function main(): Promise<void> {
     }
   };
 
+  try {
   await cleanup(db);
   await db.query(`INSERT INTO app_settings(setting_key,setting_value) VALUES('channel_admission_mode','ACTIVE') ON CONFLICT (setting_key) DO UPDATE SET setting_value='ACTIVE'`);
   assert.equal(await getAdmissionMode(), 'ACTIVE');
@@ -354,7 +376,10 @@ async function main(): Promise<void> {
     const input = candidateInput(evidence);
     const row = await upsertAdmissionCandidate(input);
     const job = await enqueueAdmissionVerification({ candidate: input, attempt: 2 });
-    await processAdmissionVerificationJob({ ...job, payload: { ...job.payload, attempt: 2 } } as any);
+    await processAdmissionVerificationJob(
+      { ...job, payload: { ...job.payload, attempt: 2 } } as any,
+      { evidenceOverride: evidence, judge: providerFailureJudge },
+    );
     const candidate = await findAdmissionCandidate(evidence.channelId);
     assert.equal(candidate?.status, 'PROVIDER_DEFERRED');
     assert.equal(Number(candidate?.attempts), 0);
@@ -394,6 +419,15 @@ async function main(): Promise<void> {
     timestamp: new Date().toISOString(),
   }));
   if (failed.length) process.exitCode = 1;
+  } finally {
+    // Never leave the disposable/staging database with the gate ACTIVE or a
+    // setting it did not have before this destructive test.
+    if (previousMode.rows.length) {
+      await db.query(`UPDATE app_settings SET setting_value=$1, updated_at=now() WHERE setting_key='channel_admission_mode'`, [String(previousMode.rows[0].setting_value)]);
+    } else {
+      await db.query(`DELETE FROM app_settings WHERE setting_key='channel_admission_mode'`);
+    }
+  }
 }
 
 main().catch(error => {

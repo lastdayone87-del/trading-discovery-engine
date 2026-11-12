@@ -8,13 +8,57 @@ on:
       - 'scripts/summarizeAdmissionCohort.ts'
       - 'scripts/fixtures/admission-cohort-60-preserved.jsonl'
       - 'scripts/fixtures/admission-cohort-60-ground-truth.json'
+      - 'server/channelAdmission/**'
+      - 'server/evidenceEngine/**'
+      - 'server/classificationRouting/**'
+      - 'server/youtube.ts'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  cohort:
+  deterministic-cohort:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Run 60-channel deterministic cohort (no secrets)
+        run: >-
+          npx tsx scripts/runAdmissionCohort.ts
+          --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
+          --out=admission-cohort-ai.jsonl
+          --blind=admission-cohort-ai-blind.jsonl
+          --concurrency=2
+      - name: Summarize against independent evidence-review labels
+        run: >-
+          npx tsx scripts/summarizeAdmissionCohort.ts
+          --results=admission-cohort-ai.jsonl
+          --ground-truth=scripts/fixtures/admission-cohort-60-ground-truth.json
+          > admission-cohort-summary.json
+      - name: Upload cohort evidence and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-cohort-ai
+          path: |
+            admission-cohort-ai.jsonl
+            admission-cohort-ai-blind.jsonl
+            admission-cohort-summary.json
+          if-no-files-found: warn
+
+  semantic-cohort:
+    # Secret-backed semantic runs are manual only; pull requests must never
+    # receive repository provider credentials.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -47,14 +91,14 @@ jobs:
       - run: npm install
       - name: Apply migrations to disposable telemetry database
         run: npx tsx scripts/runMigrations.ts
-      - name: Run 60-channel read-only cohort
+      - name: Run 60-channel semantic cohort
         run: >-
           npx tsx scripts/runAdmissionCohort.ts
           --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
           --out=admission-cohort-ai.jsonl
           --blind=admission-cohort-ai-blind.jsonl
           --concurrency=2
-      - name: Summarize against independent ground truth
+      - name: Summarize against independent evidence-review labels
         run: >-
           npx tsx scripts/summarizeAdmissionCohort.ts
           --results=admission-cohort-ai.jsonl

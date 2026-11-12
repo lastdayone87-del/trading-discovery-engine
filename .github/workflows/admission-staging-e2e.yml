@@ -5,6 +5,15 @@ on:
     paths:
       - '.github/workflows/admission-staging-e2e.yml'
       - 'scripts/admissionStagingE2E.ts'
+      - 'scripts/runMigrations.ts'
+      - 'server/channelAdmission/**'
+      - 'server/db/migrations/**'
+      - 'server/queueManager.ts'
+      - 'server/youtube.ts'
+      - 'server/evidenceEngine/**'
+      - 'src/types/index.ts'
+      - 'package.json'
+      - 'package-lock.json'
   workflow_dispatch:
 
 permissions:

@@ -19,7 +19,12 @@ const expectedAdmit = new Set<Label>(['TRADING', 'FINANCE_ADJACENT']);
 const resultsPath = argValue('results') || '/tmp/opencode/admission-cohort-60-r3.jsonl';
 const truthPath = argValue('ground-truth') || 'scripts/fixtures/admission-cohort-60-ground-truth.json';
 const rows = readFileSync(resultsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as any);
-const truth = JSON.parse(readFileSync(truthPath, 'utf8')) as Record<string, GroundTruth>;
+const truthDocument = JSON.parse(readFileSync(truthPath, 'utf8')) as { _meta?: { reviewer?: string; method?: string; reviewedAt?: string }; labels?: Record<string, GroundTruth> };
+if (!truthDocument._meta?.reviewer || !truthDocument._meta?.method || !truthDocument._meta?.reviewedAt) {
+  console.error('Ground-truth file is missing reviewer/method/reviewedAt provenance metadata.');
+  process.exitCode = 1;
+}
+const truth = (truthDocument.labels || truthDocument) as Record<string, GroundTruth>;
 const label = (channelId: string): Label => truth[channelId]?.label || 'UNKNOWN_EVIDENCE';
 const tally = (items: string[]) => items.reduce((acc, item) => ({ ...acc, [item]: (acc[item] || 0) + 1 }), {} as Record<string, number>);
 
@@ -41,7 +46,8 @@ const report = {
   resultsPath,
   total: rows.length,
   groups: tally(rows.map(row => row.group)),
-  groundTruth: tally(rows.map(row => label(row.channel.channelId))),
+  independentReviewLabels: tally(rows.map(row => label(row.channel.channelId))),
+  labelProvenance: truthDocument._meta || null,
   prior: tally(rows.map(row => row.prior?.decision || 'NONE')),
   deterministic: {
     outcomes: tally(deterministic),
@@ -80,4 +86,4 @@ const report = {
   generatedAt: new Date().toISOString(),
 };
 console.log(JSON.stringify(report, null, 2));
-if (report.deterministic.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;
+if (rows.length === 0 || report.deterministic.decided === 0 || report.final.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;

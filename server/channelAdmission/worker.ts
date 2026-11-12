@@ -5,9 +5,16 @@ import type { DiscoveredChannelRaw } from '../youtube';
 import { enqueueAdmissionVerification, findAdmissionCandidate, getAdmissionMode } from './store';
 import { resumeAdmittedCandidate, verifyAdmissionCandidate } from './index';
 import { isRejectedAdmissionStatus, isWaitingAdmissionStatus } from './types';
-import type { AdmissionCandidateInput } from './types';
+import type { AdmissionCandidateInput, AdmissionEvidence } from './types';
+import type { AdmissionJudge } from './semanticJudge';
 
 export const ADMISSION_VERIFICATION_JOB_TYPE = 'VERIFY_CHANNEL_ADMISSION';
+
+export interface AdmissionWorkerOverrides {
+  /** Deterministic fixture seam for lifecycle tests. */
+  evidenceOverride?: AdmissionEvidence;
+  judge?: AdmissionJudge;
+}
 
 /**
  * Provider deferrals deliberately do not advance the candidate's evidence
@@ -27,7 +34,7 @@ export function nextAdmissionVerificationAttempt(input: {
   return Math.max(2, Number(input.candidateAttempts || 0) + 1);
 }
 
-export async function processAdmissionVerificationJob(job: DurableJob): Promise<void> {
+export async function processAdmissionVerificationJob(job: DurableJob, overrides: AdmissionWorkerOverrides = {}): Promise<void> {
   if ((await getAdmissionMode()) === 'OFF') throw new Error('ADMISSION_MODE_OFF');
   const payload = job.payload as Record<string, any>;
   const channelId = String(payload.channelId || '');
@@ -64,7 +71,13 @@ export async function processAdmissionVerificationJob(job: DurableJob): Promise<
     if (resumed) return;
   }
   const legacyRevalidation = existingChannel?.scan_status === 'INTAKE_DEFERRED' || existingChannel?.scan_status === 'CLASSIFICATION_PENDING';
-  const result = await verifyAdmissionCandidate(input, { row, existingChannel, archiveRejectedExistingChannel: legacyRevalidation });
+  const result = await verifyAdmissionCandidate(input, {
+    row,
+    existingChannel,
+    archiveRejectedExistingChannel: legacyRevalidation,
+    evidenceOverride: overrides.evidenceOverride,
+    judge: overrides.judge,
+  });
 
   if (isWaitingAdmissionStatus(result.status)) {
     const refreshed = await findAdmissionCandidate(channelId);
