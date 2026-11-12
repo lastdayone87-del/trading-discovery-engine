@@ -327,17 +327,33 @@ export function decideAdmission(input: {
     };
   }
 
-  // Everything else after complete evidence is an ambiguous admit. This is the
-  // explicit policy: never create a permanent uncertain pile.
+  // Finance-adjacent creators that were not confidently rejected are routed
+  // to the #618 downstream classifier. They never get a deterministic
+  // admission verdict and never get a deterministic rejection.
+  if (effective.mainSubject === 'FINANCE_ADJACENT') {
+    reasonCodes.push('SEMANTIC_FINANCE_ADJACENT', 'ADMIT_FOR_DOWNSTREAM_CLASSIFICATION');
+    return {
+      decision: 'ADMIT_AMBIGUOUS',
+      status: 'ADMITTED_AMBIGUOUS',
+      reasonCodes,
+      effectiveRole,
+      rejected: false, admitted: true, hold: false, ambiguous: true,
+      citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
+    };
+  }
+
+  // A genuine semantic ambiguity after complete evidence has no safe
+  // machine decision. Keep the candidate and its full evidence for human
+  // review; never reject it and never consume it through enrichment.
   reasonCodes.push(
     effective.mainSubject === 'UNRELATED' ? 'UNRELATED_BUT_CITATIONS_INSUFFICIENT' : 'AMBIGUOUS_AFTER_COMPLETE_EVIDENCE',
-    'ADMIT_FOR_DOWNSTREAM_CLASSIFICATION',
+    'ROUTE_TO_HUMAN_REVIEW',
   );
   return {
-    decision: 'ADMIT_AMBIGUOUS',
-    status: 'ADMITTED_AMBIGUOUS',
+    decision: 'NEEDS_REVIEW',
+    status: 'NEEDS_REVIEW',
     reasonCodes,
-    rejected: false, admitted: true, hold: false, ambiguous: true,
+    rejected: false, admitted: false, hold: false, ambiguous: false, review: true,
     citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
   };
 }

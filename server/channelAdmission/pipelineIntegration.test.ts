@@ -74,6 +74,56 @@ test('search-worker admission path stores the sighting and never falls through t
   assert.match(queue, /quarantineQuery\(queryId, admissionGuard\.reasonCodes\)/);
 });
 
+test('deterministic admission is a first-class classification without AI provenance', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Deterministic Trader', description: 'technical analysis and price action' },
+    {
+      channelId: 'UC-deterministic',
+      channelName: 'Deterministic Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-deterministic',
+      description: 'technical analysis and price action',
+      videoTitles: ['Gold analysis'],
+      admissionDecisionId: 'decision-det-1',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 96,
+      admissionCategory: 'General Trading',
+      admissionDecisionSource: 'DETERMINISTIC',
+      admissionCitations: [
+        { field: 'bio', quote: 'technical analysis', supports: 'TRADING' },
+        { field: 'video_title', index: 0, quote: 'Gold analysis', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.classificationMethod, 'DETERMINISTIC_EVIDENCE');
+  assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
+  assert.equal(built.decision.deterministicRouting?.semanticUsed, false);
+  assert.equal(built.decision.deterministicRouting?.semanticAttempted, false);
+  assert.equal(built.decision.positiveEvidence[0].source, 'channel_metadata');
+});
+
+test('admission dedupe and admitted preservation prevent duplicate classification/enrichment', () => {
+  const admit = functionSource(queue, 'admitDiscoveredChannel');
+  const shared = functionSource(queue, 'processDiscoveredChannel');
+  assert.match(admit, /hasActiveAdmissionJob/);
+  assert.match(shared, /hasActiveAdmissionJob/);
+  assert.match(admit, /shouldPreserveExistingChannel/);
+  assert.match(admit, /hasActiveEnrichmentJob/);
+  assert.match(admit, /shouldReclassifyPreservedCompletedChannel/);
+  assert.ok(admit.indexOf('hasActiveAdmissionJob') < admit.indexOf('enqueueAdmissionVerification'),
+    'active admission job must be checked before any enqueue');
+  assert.ok(shared.indexOf('hasActiveAdmissionJob') < shared.indexOf('enqueueAdmissionVerification'),
+    'shared discovery path must check the active job before enqueue');
+  const worker = readFileSync(new URL('./worker.ts', import.meta.url), 'utf8');
+  assert.match(worker, /isRejectedAdmissionStatus/);
+  assert.match(worker, /resumeAdmittedCandidate/);
+  assert.ok(worker.indexOf('if (isRejectedAdmissionStatus(row.status))') > -1
+    && worker.indexOf('if (isRejectedAdmissionStatus(row.status))') < worker.indexOf('verifyAdmissionCandidate(input'),
+  'review/rejected rows must not re-enter verification');
+});
+
 test('extracted query offer uses the trading-anchor/gambling guard', () => {
   assert.match(queryIntelligence, /assessExtractedQueryAdmission/);
   assert.match(queryIntelligence, /sourceTitle: candidate\.sourceTitle/);

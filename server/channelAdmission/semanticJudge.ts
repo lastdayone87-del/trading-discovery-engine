@@ -198,6 +198,18 @@ function providerForClient(client: SemanticModelClient): SemanticJudgment['provi
   return undefined;
 }
 
+/**
+ * A syntactically valid provider response that cannot be normalized is an
+ * AI-decision failure, not an infrastructure wait. It may consume a bounded
+ * evidence attempt and, when unresolved, becomes a retained human-review
+ * candidate. Rate limits, quota, auth and transport errors are handled
+ * separately as retry-without-attempt provider deferrals.
+ */
+export function isSemanticDecisionFailure(error: unknown): boolean {
+  const message = String((error as any)?.message || error || '');
+  return /ADMISSION_SEMANTIC_INVALID_OUTPUT|INVALID_JSON|SEMANTIC_(?:SCHEMA|PARSE)|MALFORMED_SEMANTIC/i.test(message);
+}
+
 export class ProviderAdmissionJudge implements AdmissionJudge {
   constructor(
     private readonly options: {

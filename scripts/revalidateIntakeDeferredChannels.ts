@@ -109,8 +109,8 @@ async function main() {
          SELECT 1 FROM semantic_admission_candidates cac
           WHERE cac.channel_id=c.channel_id
             AND (
-              cac.status='EXPIRED_MISSING_EVIDENCE'
-              OR (cac.status='WAITING_EVIDENCE'
+              cac.status IN ('EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW')
+              OR (cac.status IN ('WAITING_EVIDENCE','PROVIDER_DEFERRED')
                   AND cac.next_check_at IS NOT NULL
                   AND cac.next_check_at > now())
             )
@@ -176,7 +176,7 @@ async function main() {
         dryRun: !apply,
         archiveRejectedExistingChannel: apply,
       });
-      if (apply && outcome.status === 'WAITING_EVIDENCE') {
+      if (apply && (outcome.status === 'WAITING_EVIDENCE' || outcome.status === 'PROVIDER_DEFERRED')) {
         const refreshed = await findAdmissionCandidate(row.channel_id);
         if (refreshed?.next_check_at) {
           await enqueueAdmissionVerification({
@@ -213,7 +213,7 @@ async function main() {
             await resumeAdmittedCandidate(input, refreshed).catch(retryError => {
               console.error(JSON.stringify({ event: 'intake_deferred_classification_retry_failed', channelId: row.channel_id, error: retryError instanceof Error ? retryError.message : String(retryError) }));
             });
-          } else if (!['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE'].includes(refreshed.status)) {
+          } else if (!['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE', 'NEEDS_REVIEW'].includes(refreshed.status)) {
             await enqueueAdmissionVerification({
               candidate: input,
               runAfter: refreshed.next_check_at || undefined,

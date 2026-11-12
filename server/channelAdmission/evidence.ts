@@ -6,6 +6,22 @@ function uniqueLinks(values: Array<string | undefined | null>): string[] {
 }
 
 /**
+ * Temporary YouTube/provider failures are infrastructure waits, not creator
+ * evidence. They must never consume an evidence attempt or expire a valid
+ * candidate; only genuinely absent creator text may do that.
+ */
+export function isProviderEvidenceFailure(reason?: string): boolean {
+  const value = String(reason || '').trim();
+  if (!value) return false;
+  // Only these markers mean creator text is genuinely absent. Every other
+  // failure returned by the evidence fetcher is a provider, transport or
+  // local collection failure and must not consume attempts or expire a
+  // valid candidate.
+  if (/^(?:NO_CREATOR_TEXT_AVAILABLE|FULL_DESCRIPTIONS_UNAVAILABLE\b)/i.test(value)) return false;
+  return true;
+}
+
+/**
  * Collect creator-level admission evidence. The channel metadata/upload list
  * costs two units; the full-description fetch costs one more. A failure is
  * returned as PARTIAL evidence so the caller can retry instead of guessing.

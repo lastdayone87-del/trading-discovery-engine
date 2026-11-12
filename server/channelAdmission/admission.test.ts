@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessExtractedQueryAdmission, decideAdmission } from './policy';
+import { evaluateDeterministicAdmission, evaluateStrictRejection } from './deterministic';
+import { isProviderEvidenceFailure } from './evidence';
+import { isSemanticDecisionFailure } from './semanticJudge';
+import { isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus } from './types';
 import { ambiguousAdmitRate, evaluateQueryAdmissionGuard } from './queryGuard';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
 
@@ -225,7 +229,7 @@ test('Arabic, Japanese and Indian-language trading channels are admitted', () =>
   }
 });
 
-test('clear unrelated with valid citations rejects; insufficient citations admit as ambiguous', () => {
+test('clear unrelated with valid citations rejects; insufficient citations go to review', () => {
   const clear = decideAdmission({
     evidence: kikifoodies,
     judgment: judgment({
@@ -243,10 +247,13 @@ test('clear unrelated with valid citations rejects; insufficient citations admit
       citations: [citation('bio', 'not a real quote')],
     }),
   });
-  assert.equal(insufficient.decision, 'ADMIT_AMBIGUOUS');
+  assert.equal(insufficient.decision, 'NEEDS_REVIEW');
+  assert.equal(insufficient.status, 'NEEDS_REVIEW');
+  assert.equal(insufficient.review, true);
+  assert.equal(insufficient.admitted, false);
 });
 
-test('missing evidence holds; unknown after complete evidence admits', () => {
+test('missing evidence holds; unknown after complete evidence goes to review', () => {
   const missing = decideAdmission({
     evidence: evidence({ name: 'New Channel', bio: '', videos: [], coverage: 'PARTIAL' }),
     judgment: undefined,
@@ -258,8 +265,9 @@ test('missing evidence holds; unknown after complete evidence admits', () => {
     evidence: evidence({ name: 'Sparse Trader', bio: 'Short bio', videos: [{ title: 'One video' }] }),
     judgment: judgment({ subject: 'UNKNOWN', focus: 40, citations: [] }),
   });
-  assert.equal(unknown.decision, 'ADMIT_AMBIGUOUS');
-  assert.equal(unknown.status, 'ADMITTED_AMBIGUOUS');
+  assert.equal(unknown.decision, 'NEEDS_REVIEW');
+  assert.equal(unknown.status, 'NEEDS_REVIEW');
+  assert.equal(unknown.review, true);
 });
 
 test('query admission blocks 711/715 while allowing a concrete trading anchor', () => {
@@ -443,7 +451,7 @@ test('two quotes from one link are not independent rejection evidence', () => {
       ],
     }),
   });
-  assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+  assert.equal(result.decision, 'NEEDS_REVIEW');
 });
 
 test('citations without an explicit support label cannot authorize rejection', () => {
@@ -461,7 +469,7 @@ test('citations without an explicit support label cannot authorize rejection', (
       explanation: 'missing supports',
     },
   });
-  assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+  assert.equal(result.decision, 'NEEDS_REVIEW');
 });
 
 test('missing citation fields and trivial quotes cannot authorize rejection', () => {
@@ -479,7 +487,7 @@ test('missing citation fields and trivial quotes cannot authorize rejection', ()
       explanation: 'missing fields',
     },
   });
-  assert.equal(missingField.decision, 'ADMIT_AMBIGUOUS');
+  assert.equal(missingField.decision, 'NEEDS_REVIEW');
 
   const trivialQuote = decideAdmission({
     evidence: kikifoodies,
@@ -489,7 +497,7 @@ test('missing citation fields and trivial quotes cannot authorize rejection', ()
       domains: ['COOKING'],
     }),
   });
-  assert.equal(trivialQuote.decision, 'ADMIT_AMBIGUOUS');
+  assert.equal(trivialQuote.decision, 'NEEDS_REVIEW');
 });
 
 test('crypto-news and finance domains corroborate as one finance family', () => {
@@ -540,4 +548,140 @@ test('zero-quality stop waits for admission-created classifications', () => {
   });
   assert.equal(settled.stop, true);
   assert.equal(settled.quarantine, false);
+});
+
+
+const deterministicTrading = evidence({
+  name: 'Nifty Hindi Trader',
+  bio: 'Nifty और Bank Nifty पर रोज़ाना ट्रेडिंग विश्लेषण, चार्ट सेटअप और रिस्क मैनेजमेंट.',
+  videos: [
+    { title: 'Nifty 50 आज का विश्लेषण', description: 'Technical analysis और price action.' },
+    { title: 'Bank Nifty ट्रेड सेटअप', description: 'Market structure और risk management.' },
+    { title: 'Weekly market outlook', description: 'Support and resistance levels.' },
+  ],
+});
+
+test('deterministic stage fast-passes a decisive trading channel without AI', async () => {
+  const result = await evaluateDeterministicAdmission(deterministicTrading);
+  assert.equal(result.outcome, 'PASS');
+  assert.equal(result.route, 'DETERMINISTIC_TRADING');
+  assert.ok(result.reasonCodes.includes('DETERMINISTIC_FAST_PASS'));
+  assert.ok(result.citations.length > 0);
+  assert.ok(result.citations.every(citation => citation.supports === 'TRADING'));
+});
+
+test('deterministic strict rejection requires three matches across two independent sources', () => {
+  const rejection = evaluateStrictRejection(kikifoodies);
+  assert.ok(rejection);
+  assert.equal(rejection.domain, 'COOKING');
+  assert.equal(rejection.citations.length, 2);
+  assert.ok(rejection.citations.every(citation => citation.supports === 'UNRELATED'));
+  const sourceKeys = new Set(rejection.citations.map(citation => citation.field === 'bio' ? 'bio' : `video:${citation.index}`));
+  assert.equal(sourceKeys.size, 2);
+  // Every quote is an exact substring of the field it cites.
+  for (const citation of rejection.citations) {
+    const text = citation.field === 'bio'
+      ? kikifoodies.description
+      : citation.field === 'video_title'
+        ? kikifoodies.videos[citation.index || 0].title
+        : kikifoodies.videos[citation.index || 0].description;
+    assert.ok(text.includes(citation.quote), `${citation.field}: ${citation.quote}`);
+  }
+});
+
+test('three repeated matches from one video are not independent rejection evidence', () => {
+  const repeated = evidence({
+    name: 'Cooking Shorts',
+    bio: 'A personal channel.',
+    videos: [{ title: 'Recipe recipe recipe', description: 'Cooking and baking.' }],
+  });
+  assert.equal(evaluateStrictRejection(repeated), null);
+});
+
+test('finance-adjacent evidence is never deterministically rejected or fast-passed', async () => {
+  const finance = evidence({
+    name: 'Business Daily',
+    bio: 'Business ideas, banking apps and money tips.',
+    videos: [
+      { title: 'How to open a bank account', description: 'Banking basics.' },
+      { title: 'Business ideas for beginners', description: 'Small business.' },
+    ],
+  });
+  assert.equal(evaluateStrictRejection(finance), null);
+  const result = await evaluateDeterministicAdmission(finance);
+  assert.equal(result.outcome, 'AMBIGUOUS');
+});
+
+test('a genuine trading channel is not deterministically rejected by incidental unrelated titles', () => {
+  const genuine = evidence({
+    name: 'Nifty Hindi Trader',
+    bio: 'Nifty और Bank Nifty पर रोज़ाना ट्रेडिंग विश्लेषण, चार्ट सेटअप और रिस्क मैनेजमेंट.',
+    videos: [
+      { title: 'Nifty 50 आज का विश्लेषण', description: 'Technical analysis और price action.' },
+      { title: 'Weekend cooking vlog', description: 'A personal cooking video.' },
+      { title: 'Easy bread recipe', description: 'Baking at home.' },
+      { title: 'Weekly market outlook', description: 'Support and resistance levels.' },
+    ],
+  });
+  assert.equal(evaluateStrictRejection(genuine), null);
+});
+
+
+test('admission statuses keep provider waits, review, and terminal rediscovery distinct', () => {
+  for (const status of ['PENDING', 'VERIFYING', 'WAITING_EVIDENCE', 'PROVIDER_DEFERRED'] as const) {
+    assert.equal(isRetryableAdmissionStatus(status), true, status);
+  }
+  for (const status of ['WAITING_EVIDENCE', 'PROVIDER_DEFERRED'] as const) {
+    assert.equal(isWaitingAdmissionStatus(status), true, status);
+  }
+  for (const status of ['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE', 'NEEDS_REVIEW', 'ADMITTED', 'ADMITTED_AMBIGUOUS'] as const) {
+    assert.equal(isTerminalAdmissionStatus(status), true, status);
+    assert.equal(isRetryableAdmissionStatus(status), false, status);
+  }
+  for (const status of ['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE', 'NEEDS_REVIEW'] as const) {
+    assert.equal(isRejectedAdmissionStatus(status), true, status);
+  }
+  assert.equal(isRejectedAdmissionStatus('ADMITTED'), false);
+  assert.equal(isRejectedAdmissionStatus('ADMITTED_AMBIGUOUS'), false);
+});
+
+test('provider-deferred and review outcomes do not trip the contamination guard', () => {
+  const decision = evaluateQueryAdmissionGuard({
+    pageNumber: 3,
+    outcomes: { admitted: 3, ambiguous: 0, rejected: 2, held: 1, deferred: 4, review: 3, total: 13 },
+    tradingPrecision: 0,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    priorZeroQualityPages: 0,
+  });
+  assert.equal(decision.stop, false);
+  assert.equal(decision.quarantine, false);
+  assert.deepEqual(decision.reasonCodes, []);
+});
+
+
+test('only transient provider evidence failures defer without consuming attempts', () => {
+  for (const reason of [
+    'YouTube HTTP 403 quotaExceeded',
+    'YouTube HTTP 429 rateLimitExceeded',
+    'YouTube HTTP 403 forbidden',
+    'request timed out',
+    'read ECONNRESET',
+    'Service unavailable (503)',
+    'unexpected provider payload shape',
+  ]) {
+    assert.equal(isProviderEvidenceFailure(reason), true, reason);
+  }
+  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'FULL_DESCRIPTIONS_UNAVAILABLE:no description']) {
+    assert.equal(isProviderEvidenceFailure(reason), false, String(reason));
+  }
+});
+
+
+test('malformed AI decisions are evidence failures while provider errors are infrastructure waits', () => {
+  assert.equal(isSemanticDecisionFailure(new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT')), true);
+  assert.equal(isSemanticDecisionFailure(new Error('INVALID_JSON: unexpected token')), true);
+  assert.equal(isSemanticDecisionFailure(new Error('429 rate limit exceeded')), false);
+  assert.equal(isSemanticDecisionFailure(new Error('quotaExceeded')), false);
+  assert.equal(isSemanticDecisionFailure(new Error('request timed out')), false);
 });

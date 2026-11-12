@@ -5,9 +5,10 @@ import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQ
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
 import { assertCountryAllowed } from '../countryExclusion';
-import { fetchAdmissionEvidence } from './evidence';
+import { fetchAdmissionEvidence, isProviderEvidenceFailure } from './evidence';
 import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP, decideAdmission } from './policy';
-import { admissionEvidenceChecksum, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
+import { admissionEvidenceChecksum, isSemanticDecisionFailure, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
+import { evaluateDeterministicAdmission } from './deterministic';
 import {
   findAdmissionCandidate,
   getAdmissionAmbiguousRate,
@@ -20,6 +21,7 @@ import type {
   AdmissionCandidateInput,
   AdmissionDecision,
   AdmissionEvidence,
+  AdmissionPolicyResult,
   AdmissionVerificationResult,
   SemanticJudgment,
 } from './types';
@@ -252,6 +254,39 @@ export async function verifyAdmissionCandidate(
   }
 
   if (evidence.evidenceCoverage !== 'COMPLETE') {
+    const providerFailure = isProviderEvidenceFailure(evidence.failureReason);
+    if (providerFailure) {
+      // Quota, rate-limit and transient provider failures are infrastructure
+      // waits. Keep the candidate, its evidence and its attempt count exactly
+      // as they are; retry later without expiry.
+      const reasonCodes = ['PROVIDER_RETRY_WITHOUT_ATTEMPT', 'EVIDENCE_PROVIDER_DEFERRED', evidence.failureReason || 'EVIDENCE_PROVIDER_FAILURE'];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          status: 'PROVIDER_DEFERRED',
+          decision: null,
+          reasonCodes,
+          evidence,
+          evidenceHash: hash,
+          attempts: Number(row.attempts || 0),
+          nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
+          expiresAt: null,
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
+        reasonCodes,
+        evidence,
+        decisionSource: 'SEMANTIC',
+        priority: 20,
+      };
+    }
     const attempts = Number(row.attempts || 0) + 1;
     const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
     const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
@@ -279,54 +314,185 @@ export async function verifyAdmissionCandidate(
     };
   }
 
-  const judge = options.judge || new ProviderAdmissionJudge({
-    jobId: input.discoveryJobId,
-    runId: input.queryRunId,
-    readOnly: options.dryRun === true,
+  let decisionSource: 'DETERMINISTIC' | 'SEMANTIC' = 'SEMANTIC';
+  let deterministicRoute: string | null = null;
+  let judgment: SemanticJudgment | undefined;
+  let secondJudgment: SemanticJudgment | undefined;
+  let policy: AdmissionPolicyResult | undefined;
+
+  // Deterministic-first stage. It needs no AI and is deliberately allowed to
+  // decide only the clear cases; anything close is passed to the existing
+  // Gemini/Groq judge below. A local prefilter failure must fall back to AI,
+  // never block admission.
+  const deterministic = await evaluateDeterministicAdmission(evidence).catch(error => {
+    console.warn(`[ChannelAdmission] deterministic stage failed for ${evidence.channelId}:`, error instanceof Error ? error.message : error);
+    return {
+      outcome: 'AMBIGUOUS' as const,
+      route: null,
+      confidence: 0,
+      reasonCodes: ['DETERMINISTIC_STAGE_FAILED'],
+      citations: [],
+      priority: 20,
+    };
   });
-  let judgment: SemanticJudgment;
-  try {
-    judgment = await judge.judge(evidence, 'PRIMARY');
-  } catch (error) {
-    const attempts = Number(row.attempts || 0) + 1;
-    const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
-    const reasonCodes = [expired ? 'SEMANTIC_UNAVAILABLE_EXPIRED' : 'SEMANTIC_UNAVAILABLE_RETRY', error instanceof Error ? error.message : String(error)];
-    if (!options.dryRun) {
-      await updateAdmissionCandidate({
-        id: row.id,
-        status: expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE',
-        decision: expired ? 'HOLD_MISSING_EVIDENCE' : null,
+  deterministicRoute = deterministic.route;
+  if (deterministic.outcome !== 'AMBIGUOUS' && deterministic.judgment) {
+    decisionSource = 'DETERMINISTIC';
+    judgment = deterministic.judgment;
+    if (deterministic.outcome === 'PASS') {
+      policy = {
+        decision: 'ADMIT',
+        status: 'ADMITTED',
+        reasonCodes: deterministic.reasonCodes,
+        rejected: false,
+        admitted: true,
+        hold: false,
+        ambiguous: false,
+        review: false,
+        citationsValid: deterministic.citations.length > 0,
+        independentUnrelatedCitations: 0,
+        independentTradingCitations: deterministic.citations.length,
+        effectiveRole: 'PRIMARY',
+      };
+    } else {
+      policy = {
+        decision: 'REJECT_UNRELATED',
+        status: 'REJECTED_UNRELATED',
+        reasonCodes: deterministic.reasonCodes,
+        rejected: true,
+        admitted: false,
+        hold: false,
+        ambiguous: false,
+        review: false,
+        citationsValid: true,
+        independentUnrelatedCitations: deterministic.citations.length,
+        independentTradingCitations: 0,
+        effectiveRole: 'PRIMARY',
+      };
+    }
+  }
+
+  if (!policy) {
+    const judge = options.judge || new ProviderAdmissionJudge({
+      jobId: input.discoveryJobId,
+      runId: input.queryRunId,
+      readOnly: options.dryRun === true,
+    });
+    try {
+      judgment = await judge.judge(evidence, 'PRIMARY');
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (isSemanticDecisionFailure(error)) {
+        // Both providers returned a response that cannot become a decisive
+        // judgment. That is an AI-decision failure, so it may consume bounded
+        // evidence attempts and end in retained human review rather than an
+        // endless provider deferral.
+        const attempts = Number(row.attempts || 0) + 1;
+        const exhausted = attempts >= 3;
+        const status = exhausted ? 'NEEDS_REVIEW' as const : 'WAITING_EVIDENCE' as const;
+        const reasonCodes = [exhausted ? 'SEMANTIC_UNRESOLVED_NEEDS_REVIEW' : 'SEMANTIC_INVALID_OUTPUT_RETRY', reason];
+        if (!options.dryRun) {
+          if (exhausted) {
+            await recordAdmissionOutcome({
+              decision: {
+                candidateId: row.id,
+                decisionKey: `${row.id}:NEEDS_REVIEW:${hash}`,
+                channelId: evidence.channelId,
+                decision: 'NEEDS_REVIEW',
+                reasonCodes,
+                evidenceHash: hash,
+              },
+              candidate: {
+                id: row.id,
+                status: 'NEEDS_REVIEW',
+                decision: 'NEEDS_REVIEW',
+                reasonCodes,
+                evidence,
+                evidenceHash: hash,
+                attempts,
+                nextCheckAt: null,
+                expiresAt: null,
+                expectedStatus: row.status,
+                expectedAttempts: row.attempts,
+              },
+            });
+          } else {
+            const updated = await updateAdmissionCandidate({
+              id: row.id,
+              status,
+              decision: null,
+              reasonCodes,
+              evidence,
+              evidenceHash: hash,
+              attempts,
+              nextCheckAt: new Date(Date.now() + retryDelayMs(attempts)).toISOString(),
+              expiresAt: null,
+              expectedStatus: row.status,
+              expectedAttempts: row.attempts,
+            });
+            if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+          }
+        }
+        return {
+          channelId: evidence.channelId,
+          channelName: evidence.channelName,
+          decision: exhausted ? 'NEEDS_REVIEW' : 'HOLD_MISSING_EVIDENCE',
+          status,
+          reasonCodes,
+          evidence,
+          judgment: undefined,
+          decisionSource: 'SEMANTIC',
+          deterministicRoute,
+          priority: deterministic.priority,
+        };
+      }
+      // Provider, budget and transport failures are infrastructure waits. They
+      // must never consume evidence attempts or expire a valid creator.
+      const attempts = Number(row.attempts || 0);
+      const reasonCodes = ['PROVIDER_RETRY_WITHOUT_ATTEMPT', 'SEMANTIC_UNAVAILABLE_RETRY', reason];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          status: 'PROVIDER_DEFERRED',
+          decision: null,
+          reasonCodes,
+          evidence,
+          evidenceHash: hash,
+          attempts,
+          nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
+          expiresAt: null,
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
         reasonCodes,
         evidence,
-        evidenceHash: hash,
-        attempts,
-        nextCheckAt: expired ? null : new Date(Date.now() + retryDelayMs(attempts)).toISOString(),
-        expiresAt: row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
-      });
+        deterministicRoute,
+        decisionSource: 'SEMANTIC',
+        priority: deterministic.priority,
+      };
     }
-    return {
-      channelId: evidence.channelId,
-      channelName: evidence.channelName,
-      decision: 'HOLD_MISSING_EVIDENCE',
-      status: expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE',
-      reasonCodes,
-      evidence,
-    };
+
+    if (needsSecondJudge(judgment, evidence)) {
+      try {
+        secondJudgment = await judge.judge(evidence, 'SECOND');
+      } catch (error) {
+        // The primary judgment still stands; ambiguity policy will preserve
+        // the candidate for human review rather than rejecting it.
+        console.warn(`[ChannelAdmission] second judge unavailable for ${evidence.channelId}:`, error instanceof Error ? error.message : error);
+      }
+    }
+    policy = decideAdmission({ evidence, judgment, secondJudgment });
   }
 
-  let secondJudgment: SemanticJudgment | undefined;
-  if (needsSecondJudge(judgment, evidence)) {
-    try {
-      secondJudgment = await judge.judge(evidence, 'SECOND');
-    } catch (error) {
-      // The primary judgment still stands; ambiguity policy will admit rather
-      // than reject when citations are not decisive.
-      console.warn(`[ChannelAdmission] second judge unavailable for ${evidence.channelId}:`, error instanceof Error ? error.message : error);
-    }
-  }
-
-  const policy = decideAdmission({ evidence, judgment, secondJudgment });
   const effectiveJudgment = policy.effectiveRole === 'SECOND' && secondJudgment ? secondJudgment : judgment;
+  if (!effectiveJudgment) throw new Error('ADMISSION_JUDGMENT_MISSING');
   let recordedDecisionId: string | null = null;
   if (policy.ambiguous) {
     const health = await getAdmissionAmbiguousRate().catch(() => null);
@@ -365,10 +531,27 @@ export async function verifyAdmissionCandidate(
         model: effectiveJudgment.model,
         attempts: Number(row.attempts || 0) + 1,
         nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
-        expiresAt: row.expires_at || (policy.hold ? new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString() : null),
+        expiresAt: policy.hold ? (row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()) : null,
       },
     });
     recordedDecisionId = recorded.decisionId;
+  }
+
+  if (policy.review) {
+    // Human review is a deliberate terminal admission outcome, not an
+    // enrichment or provider retry. The candidate and its evidence stay
+    // available for an operator without entering the served corpus.
+    return {
+      channelId: evidence.channelId,
+      channelName: evidence.channelName,
+      decision: 'NEEDS_REVIEW',
+      status: 'NEEDS_REVIEW',
+      reasonCodes: policy.reasonCodes,
+      evidence,
+      judgment: effectiveJudgment,
+      decisionSource,
+      deterministicRoute,
+    };
   }
 
   if (policy.rejected && options.archiveRejectedExistingChannel && !options.dryRun) {
@@ -428,13 +611,14 @@ export async function verifyAdmissionCandidate(
       }
       input.candidate.admissionDecisionId = decisionId;
       input.candidate.admissionStatus = policy.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
-      input.candidate.admissionConfirmedTrading = policy.status === 'ADMITTED';
-      input.candidate.admissionTradingConfidence = effectiveJudgment.tradingFocus;
+      input.candidate.admissionDecisionSource = decisionSource;
       input.candidate.admissionCitations = effectiveJudgment.citations;
       input.candidate.admissionModel = effectiveJudgment.model;
       input.candidate.admissionProvider = effectiveJudgment.provider;
+      input.candidate.admissionConfirmedTrading = policy.status === 'ADMITTED';
+      input.candidate.admissionTradingConfidence = effectiveJudgment.tradingFocus;
       input.candidate.admissionEvidenceHash = hash;
-      input.candidate.admissionCategory = judgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
+      input.candidate.admissionCategory = effectiveJudgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
         candidate: input.candidate,
         targetCountry: input.targetCountry,
@@ -457,8 +641,11 @@ export async function verifyAdmissionCandidate(
     status: policy.status,
     reasonCodes: policy.reasonCodes,
     evidence,
-    judgment,
+    judgment: effectiveJudgment,
     secondJudgment,
+    decisionSource,
+    deterministicRoute,
+    priority: deterministic.priority,
   };
 }
 

@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS semantic_admission_candidates (
 
 CREATE INDEX IF NOT EXISTS semantic_admission_candidates_due_idx
   ON semantic_admission_candidates (status, next_check_at)
-  WHERE status IN ('PENDING', 'WAITING_EVIDENCE');
+  WHERE status IN ('PENDING', 'WAITING_EVIDENCE', 'PROVIDER_DEFERRED');
 
 CREATE INDEX IF NOT EXISTS semantic_admission_candidates_channel_idx
   ON semantic_admission_candidates (channel_id, created_at DESC);

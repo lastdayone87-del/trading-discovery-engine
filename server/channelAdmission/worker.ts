@@ -4,6 +4,7 @@ import type { DiscoverySource } from '../../src/types';
 import type { DiscoveredChannelRaw } from '../youtube';
 import { enqueueAdmissionVerification, findAdmissionCandidate, getAdmissionMode } from './store';
 import { resumeAdmittedCandidate, verifyAdmissionCandidate } from './index';
+import { isRejectedAdmissionStatus, isWaitingAdmissionStatus } from './types';
 import type { AdmissionCandidateInput } from './types';
 
 export const ADMISSION_VERIFICATION_JOB_TYPE = 'VERIFY_CHANNEL_ADMISSION';
@@ -15,7 +16,7 @@ export async function processAdmissionVerificationJob(job: DurableJob): Promise<
   if (!channelId) throw new Error('ADMISSION_JOB_CHANNEL_ID_REQUIRED');
   const row = await findAdmissionCandidate(channelId);
   if (!row) return;
-  if (['REJECTED_UNRELATED', 'REJECTED_COUNTRY', 'EXPIRED_MISSING_EVIDENCE'].includes(row.status)) {
+  if (isRejectedAdmissionStatus(row.status)) {
     return;
   }
   const candidate = (payload.candidate || {
@@ -47,13 +48,14 @@ export async function processAdmissionVerificationJob(job: DurableJob): Promise<
   const legacyRevalidation = existingChannel?.scan_status === 'INTAKE_DEFERRED' || existingChannel?.scan_status === 'CLASSIFICATION_PENDING';
   const result = await verifyAdmissionCandidate(input, { row, existingChannel, archiveRejectedExistingChannel: legacyRevalidation });
 
-  if (result.status === 'WAITING_EVIDENCE') {
+  if (isWaitingAdmissionStatus(result.status)) {
     const refreshed = await findAdmissionCandidate(channelId);
     if (refreshed?.next_check_at) {
       await enqueueAdmissionVerification({
         candidate: input,
         runAfter: refreshed.next_check_at,
         attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+        priority: result.priority,
       });
     }
   }

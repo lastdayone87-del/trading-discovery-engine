@@ -111,16 +111,16 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
        raw_observation=EXCLUDED.raw_observation,
        declared_language=COALESCE(EXCLUDED.declared_language,semantic_admission_candidates.declared_language),
        status=CASE
-         WHEN semantic_admission_candidates.status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY','ADMITTED','ADMITTED_AMBIGUOUS','EXPIRED_MISSING_EVIDENCE')
+         WHEN semantic_admission_candidates.status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY','ADMITTED','ADMITTED_AMBIGUOUS','EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW')
            THEN semantic_admission_candidates.status
-         WHEN semantic_admission_candidates.status='WAITING_EVIDENCE'
+         WHEN semantic_admission_candidates.status IN ('WAITING_EVIDENCE','PROVIDER_DEFERRED')
            AND semantic_admission_candidates.next_check_at IS NOT NULL
            AND semantic_admission_candidates.next_check_at > now()
            THEN semantic_admission_candidates.status
          ELSE 'PENDING'
        END,
        next_check_at=CASE
-         WHEN semantic_admission_candidates.status='WAITING_EVIDENCE'
+         WHEN semantic_admission_candidates.status IN ('WAITING_EVIDENCE','PROVIDER_DEFERRED')
            AND semantic_admission_candidates.next_check_at IS NOT NULL
            AND semantic_admission_candidates.next_check_at > now()
            THEN semantic_admission_candidates.next_check_at
@@ -150,10 +150,24 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
   return mapped;
 }
 
+export async function hasActiveAdmissionJob(channelId: string): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT 1 FROM jobs
+      WHERE type='VERIFY_CHANNEL_ADMISSION'
+        AND status IN ('PENDING','PROCESSING')
+        AND payload->>'channelId'=$1
+      LIMIT 1`,
+    [channelId],
+  );
+  return Boolean(result.rowCount);
+}
+
 export async function enqueueAdmissionVerification(input: {
   candidate: AdmissionCandidateInput;
   runAfter?: string;
   attempt?: number;
+  priority?: number;
 }): Promise<Awaited<ReturnType<typeof enqueueJob>>> {
   const attempt = Math.max(1, input.attempt || 1);
   const key = attempt === 1
@@ -174,7 +188,7 @@ export async function enqueueAdmissionVerification(input: {
     resultRank: input.candidate.resultRank,
     attempt,
   }, {
-    priority: 20,
+    priority: input.priority ?? 20,
     maxAttempts: 3,
     idempotencyKey: key,
     ...(input.runAfter ? { runAfter: input.runAfter } : {}),
@@ -194,6 +208,9 @@ export async function updateAdmissionCandidate(input: {
   attempts?: number;
   nextCheckAt?: string | null;
   expiresAt?: string | null;
+  /** Optimistic-concurrency guard for provider retries. */
+  expectedStatus?: AdmissionStatus;
+  expectedAttempts?: number;
   client?: AdmissionQueryable;
 }): Promise<AdmissionCandidateRow | null> {
   const db = input.client || await getDb();
@@ -209,15 +226,18 @@ export async function updateAdmissionCandidate(input: {
        attempts=COALESCE($9,attempts),
        next_check_at=$10,
        expires_at=$11,
-       decided_at=CASE WHEN $2 IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','EXPIRED_MISSING_EVIDENCE') THEN now() ELSE decided_at END,
+       decided_at=CASE WHEN $2 IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW') THEN now() ELSE decided_at END,
        updated_at=now()
      WHERE id=$1
+       AND ($12::text IS NULL OR status=$12)
+       AND ($13::int IS NULL OR attempts=$13)
      RETURNING *`,
     [
       input.id, input.status, input.decision || null, JSON.stringify(input.reasonCodes || []),
       input.evidence ? JSON.stringify(input.evidence) : null, input.evidenceHash || null,
       input.judgment ? JSON.stringify(input.judgment) : null, input.model || null,
       input.attempts ?? null, input.nextCheckAt ?? null, input.expiresAt ?? null,
+      input.expectedStatus ?? null, input.expectedAttempts ?? null,
     ],
   );
   return result.rows[0] ? mapRow(result.rows[0]) : null;
@@ -280,6 +300,8 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
   ambiguous: number;
   rejected: number;
   held: number;
+  deferred: number;
+  review: number;
   pending: number;
   total: number;
 }> {
@@ -296,8 +318,10 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
        COUNT(*) FILTER (WHERE status='ADMITTED_AMBIGUOUS')::int ambiguous,
        COUNT(*) FILTER (WHERE status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY'))::int rejected,
        COUNT(*) FILTER (WHERE status IN ('WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int held,
+       COUNT(*) FILTER (WHERE status='PROVIDER_DEFERRED')::int deferred,
+       COUNT(*) FILTER (WHERE status='NEEDS_REVIEW')::int review,
        COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
-       COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int total
+       COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE','PROVIDER_DEFERRED','NEEDS_REVIEW'))::int total
      FROM scoped`,
     [queryRunId],
   );
@@ -307,6 +331,8 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
     ambiguous: Number(row.ambiguous || 0),
     rejected: Number(row.rejected || 0),
     held: Number(row.held || 0),
+    deferred: Number(row.deferred || 0),
+    review: Number(row.review || 0),
     pending: Number(row.pending || 0),
     total: Number(row.total || 0),
   };
@@ -317,6 +343,8 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
   ambiguous: number;
   rejected: number;
   held: number;
+  deferred: number;
+  review: number;
   pending: number;
   total: number;
 }> {
@@ -333,8 +361,10 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
        COUNT(*) FILTER (WHERE status='ADMITTED_AMBIGUOUS')::int ambiguous,
        COUNT(*) FILTER (WHERE status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY'))::int rejected,
        COUNT(*) FILTER (WHERE status IN ('WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int held,
+       COUNT(*) FILTER (WHERE status='PROVIDER_DEFERRED')::int deferred,
+       COUNT(*) FILTER (WHERE status='NEEDS_REVIEW')::int review,
        COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
-       COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE'))::int total
+       COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE','PROVIDER_DEFERRED','NEEDS_REVIEW'))::int total
      FROM scoped`,
     [queryRunId, pageNumber],
   );
@@ -344,6 +374,8 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
     ambiguous: Number(row.ambiguous || 0),
     rejected: Number(row.rejected || 0),
     held: Number(row.held || 0),
+    deferred: Number(row.deferred || 0),
+    review: Number(row.review || 0),
     pending: Number(row.pending || 0),
     total: Number(row.total || 0),
   };

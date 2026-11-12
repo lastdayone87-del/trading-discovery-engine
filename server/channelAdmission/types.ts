@@ -7,18 +7,63 @@ export type AdmissionStatus =
   | 'PENDING'
   | 'VERIFYING'
   | 'WAITING_EVIDENCE'
+  | 'PROVIDER_DEFERRED'
+  | 'NEEDS_REVIEW'
   | 'ADMITTED'
   | 'ADMITTED_AMBIGUOUS'
   | 'REJECTED_UNRELATED'
   | 'REJECTED_COUNTRY'
   | 'EXPIRED_MISSING_EVIDENCE';
 
+/**
+ * Terminal admission outcomes. Their evidence and decisions stay available,
+ * but rediscovery must not reopen verification or enrichment.
+ */
+export const TERMINAL_ADMISSION_STATUSES: readonly AdmissionStatus[] = [
+  'REJECTED_UNRELATED',
+  'REJECTED_COUNTRY',
+  'EXPIRED_MISSING_EVIDENCE',
+  'NEEDS_REVIEW',
+  'ADMITTED',
+  'ADMITTED_AMBIGUOUS',
+];
+
+export function isTerminalAdmissionStatus(status: AdmissionStatus | string): boolean {
+  return TERMINAL_ADMISSION_STATUSES.includes(status as AdmissionStatus);
+}
+
+/**
+ * Outcomes that are finished without an admitted channel. Rediscovery must
+ * neither reopen verification nor spend AI/enrichment on them.
+ */
+export const REJECTED_ADMISSION_STATUSES: readonly AdmissionStatus[] = [
+  'REJECTED_UNRELATED',
+  'REJECTED_COUNTRY',
+  'EXPIRED_MISSING_EVIDENCE',
+  'NEEDS_REVIEW',
+];
+
+export function isRejectedAdmissionStatus(status: AdmissionStatus | string): boolean {
+  return REJECTED_ADMISSION_STATUSES.includes(status as AdmissionStatus);
+}
+
+export function isRetryableAdmissionStatus(status: AdmissionStatus | string): boolean {
+  return status === 'PENDING' || status === 'VERIFYING'
+    || status === 'WAITING_EVIDENCE' || status === 'PROVIDER_DEFERRED';
+}
+
+export function isWaitingAdmissionStatus(status: AdmissionStatus | string): boolean {
+  return status === 'WAITING_EVIDENCE' || status === 'PROVIDER_DEFERRED';
+}
+
 export type AdmissionDecision =
   | 'ADMIT'
   | 'ADMIT_AMBIGUOUS'
   | 'REJECT_UNRELATED'
   | 'REJECT_COUNTRY'
-  | 'HOLD_MISSING_EVIDENCE';
+  | 'HOLD_MISSING_EVIDENCE'
+  | 'PROVIDER_DEFERRED'
+  | 'NEEDS_REVIEW';
 
 export interface AdmissionVideo {
   videoId?: string;
@@ -83,6 +128,7 @@ export interface AdmissionPolicyResult {
   independentUnrelatedCitations: number;
   independentTradingCitations: number;
   effectiveRole?: 'PRIMARY' | 'SECOND';
+  review?: boolean;
 }
 
 export interface AdmissionCandidateInput {
@@ -106,5 +152,8 @@ export interface AdmissionVerificationResult {
   evidence: AdmissionEvidence;
   judgment?: SemanticJudgment;
   secondJudgment?: SemanticJudgment;
+  decisionSource?: 'DETERMINISTIC' | 'SEMANTIC' | 'HUMAN';
+  deterministicRoute?: string | null;
+  priority?: number;
   channelRecord?: unknown;
 }

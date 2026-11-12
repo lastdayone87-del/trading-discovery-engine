@@ -206,7 +206,7 @@ export class EvidenceBasedTradingEngine {
     this.decisionStrategy = new ConfigurableWeightedStrategy(customConfig);
   }
 
-  public async evaluateChannel(input: RawChannelInput): Promise<VerificationDecision> {
+  public async evaluateChannel(input: RawChannelInput, options: { semanticMode?: 'ON' | 'OFF' } = {}): Promise<VerificationDecision> {
     // Accept the field-aware schema while retaining the legacy parallel arrays at
     // the provider boundary during the migration.
     input = {
@@ -257,7 +257,8 @@ export class EvidenceBasedTradingEngine {
 
     // A provider object in the chain is not proof of configuration: the
     // default Gemini provider remains present without an API key.
-    const semanticAvailable = semanticChain.some(provider =>
+    const semanticMode = options.semanticMode === 'OFF' ? 'OFF' : 'ON';
+    const semanticAvailable = semanticMode === 'ON' && semanticChain.some(provider =>
       (provider.availability?.(input) || { availability: 'AVAILABLE' as const }).availability === 'AVAILABLE');
     const decisionConfig = this.decisionStrategy.policyConfig();
 
@@ -364,6 +365,17 @@ export class EvidenceBasedTradingEngine {
         deadlineAtMs: Date.now() + Math.max(1, aggregateBudgetMs),
         attemptTimeoutMs: Math.max(1, attemptBudgetMs),
       });
+    } else if (semanticMode === 'OFF') {
+      // Deterministic-only admission evaluation: the semantic route is
+      // deliberately suppressed, never marked as a provider/configuration
+      // failure.
+      semanticResult.reports = semanticChain.map(provider => ({
+        provider: provider.name,
+        availability: 'UNAVAILABLE' as const,
+        evidenceCount: 0,
+        outcome: 'SUPPRESSED_BY_POLICY' as const,
+        reasonCodes: ['DETERMINISTIC_ONLY'],
+      }));
     } else if (!semanticAvailable && semanticChain.length > 0) {
       // Configuration absence is not a policy skip. Keep each provider
       // visible with its declared state so operators can distinguish an
@@ -418,8 +430,8 @@ export class EvidenceBasedTradingEngine {
 // Global Singleton Instance
 const defaultEngine = new EvidenceBasedTradingEngine();
 
-export async function verifyChannelTradingRelevance(input: RawChannelInput): Promise<VerificationDecision> {
-  return defaultEngine.evaluateChannel(input);
+export async function verifyChannelTradingRelevance(input: RawChannelInput, options: { semanticMode?: 'ON' | 'OFF' } = {}): Promise<VerificationDecision> {
+  return defaultEngine.evaluateChannel(input, options);
 }
 
 export * from './types';

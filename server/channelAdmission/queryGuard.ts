@@ -3,6 +3,10 @@ export interface AdmissionOutcomeCounts {
   ambiguous: number;
   rejected: number;
   held: number;
+  /** Provider/budget waits are infrastructure, not query contamination. */
+  deferred?: number;
+  /** Genuine ambiguity is a retained outcome, not query contamination. */
+  review?: number;
   pending?: number;
   total: number;
 }
@@ -42,6 +46,9 @@ export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): Qu
   }
   if (total < 8) return { stop: false, quarantine: false, reasonCodes: [] };
   const rejectedShare = input.outcomes.rejected / total;
+  // Deferred and review outcomes are deliberately retained. They must never
+  // stop pagination or quarantine a query merely because AI capacity or a
+  // human decision is pending.
   const unresolvedShare = (input.outcomes.rejected + input.outcomes.held) / total;
   const reasonCodes: string[] = [];
   if (rejectedShare >= 0.6) {

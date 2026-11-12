@@ -16,16 +16,18 @@ export function buildAdmissionConfirmedClassification(
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
-  // Never infer the provider from the model name. Missing provider provenance
-  // is reported as insufficient evidence and routed to human review.
-  const provider = candidate.admissionProvider;
+  // Deterministic admission is a first-class evidence source. Semantic
+  // admissions must carry the actual provider; it is never inferred from a
+  // model name.
+  const deterministic = candidate.admissionDecisionSource === 'DETERMINISTIC';
+  const provider = deterministic ? 'channel_metadata' as const : candidate.admissionProvider;
   const timestamp = new Date().toISOString();
   const positiveEvidence: EvidenceItem[] = provider ? citations.map((citation, index) => ({
-    id: `semantic-admission-${index + 1}`,
+    id: `${deterministic ? 'deterministic' : 'semantic'}-admission-${index + 1}`,
     source: provider,
     polarity: 'POSITIVE',
     category: 'METHODOLOGY_CONCEPT',
-    fact: `Semantic admission citation: ${citation.quote}`,
+    fact: `${deterministic ? 'Deterministic admission' : 'Semantic admission'} citation: ${citation.quote}`,
     rawMatches: [citation.quote],
     confidence,
     reliability: 'HIGH',
@@ -34,27 +36,30 @@ export function buildAdmissionConfirmedClassification(
     finalWeight: confidence / 100,
     provenance: {
       provider,
-      type: 'semantic_admission_citation',
+      type: deterministic ? 'deterministic_admission_citation' : 'semantic_admission_citation',
       matchedTerm: citation.quote,
       sourceRef: `${citation.field}${citation.index == null ? '' : `:${citation.index}`}`,
-      semantic: {
-        modelVersion: candidate.admissionModel || 'semantic-admission-v1',
-        promptVersion: 'semantic-admission-v1',
-        featureVersion: 'semantic-admission-v1',
-        calibrationVersion: 'semantic-admission-v1',
-        taxonomyLabel: 'TRADING',
-        rawConfidence: confidence,
-        calibratedConfidence: confidence,
-        detectedLanguages: [],
-        reasonCodes: ['SEMANTIC_ADMISSION'],
-      },
+      ...(deterministic ? {} : {
+        semantic: {
+          modelVersion: candidate.admissionModel || 'semantic-admission-v1',
+          promptVersion: 'semantic-admission-v1',
+          featureVersion: 'semantic-admission-v1',
+          calibrationVersion: 'semantic-admission-v1',
+          taxonomyLabel: 'TRADING',
+          rawConfidence: confidence,
+          calibratedConfidence: confidence,
+          detectedLanguages: [],
+          reasonCodes: ['SEMANTIC_ADMISSION'],
+        },
+      }),
     },
     timestamp,
   })) : [];
-  const providerMissing = citations.length > 0 && !provider;
-  const evidenceSufficiency = positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
-  const degraded = confidence < 80 || positiveEvidence.length === 0;
+  const providerMissing = !deterministic && citations.length > 0 && !provider;
+  const evidenceSufficiency = deterministic || positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
+  const degraded = confidence < 80 || (!deterministic && positiveEvidence.length === 0);
   const humanReview = degraded;
+  const reasonCode = deterministic ? 'DETERMINISTIC_ADMISSION_CONFIRMED' : 'SEMANTIC_ADMISSION_CONFIRMED';
   const decision: VerificationDecision = {
     status: degraded ? 'UNCERTAIN' : 'TRADING_CONFIRMED',
     confidenceScore: confidence,
@@ -77,21 +82,21 @@ export function buildAdmissionConfirmedClassification(
       knowledgePackVersion: 'semantic-admission-v1',
       geminiModelVersion: 'semantic-admission-v1',
     },
-    mathematicalJustification: `Semantic admission judged the creator's main subject to be trading with confidence ${confidence}/100. Admission decision ${candidate.admissionDecisionId || 'unknown'} owns this result; country and Discord gates still run.`,
+    mathematicalJustification: `${deterministic ? 'Deterministic #618 admission' : 'Semantic admission'} judged the creator's main subject to be trading with confidence ${confidence}/100. Admission decision ${candidate.admissionDecisionId || 'unknown'} owns this result; country and Discord gates still run.`,
     evidenceCollection: {
       sufficiency: evidenceSufficiency,
       sparseMetadata: positiveEvidence.length === 0,
       degraded,
-      fieldsPresent: positiveEvidence.length > 0 ? ['admission_evidence'] : [],
-      reasonCodes: positiveEvidence.length > 0
-        ? ['SEMANTIC_ADMISSION_CONFIRMED']
+      fieldsPresent: deterministic ? ['deterministic_evidence'] : positiveEvidence.length > 0 ? ['admission_evidence'] : [],
+      reasonCodes: evidenceSufficiency === 'SUFFICIENT'
+        ? [reasonCode]
         : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
       providers: provider ? [{
         provider,
         availability: 'AVAILABLE',
         evidenceCount: positiveEvidence.length,
         outcome: positiveEvidence.length > 0 ? 'EXECUTED_WITH_EVIDENCE' : 'EXECUTED_NO_MATCH',
-        reasonCodes: positiveEvidence.length > 0 ? ['SEMANTIC_ADMISSION'] : ['SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+        reasonCodes: [deterministic ? 'DETERMINISTIC_ADMISSION' : 'SEMANTIC_ADMISSION'],
       }] : [],
       terminalNegativeSufficiency: {
         status: 'INSUFFICIENT',
@@ -106,34 +111,32 @@ export function buildAdmissionConfirmedClassification(
       version: 'semantic-admission-v1',
       tradingProbability: confidence,
       nonTradingProbability: 100 - confidence,
-      coverageConfidence: positiveEvidence.length > 0 ? 100 : 0,
-      reasonCodes: positiveEvidence.length > 0
-        ? ['SEMANTIC_ADMISSION_CONFIRMED']
+      coverageConfidence: evidenceSufficiency === 'SUFFICIENT' ? 100 : 0,
+      reasonCodes: evidenceSufficiency === 'SUFFICIENT'
+        ? [reasonCode]
         : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
-    classificationMethod: 'SEMANTIC_ADMISSION',
-    recognitionState: confidence >= 80 && positiveEvidence.length > 0 ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
-    semanticPolicy: 'SKIP',
+    classificationMethod: deterministic ? 'DETERMINISTIC_EVIDENCE' : 'SEMANTIC_ADMISSION',
+    recognitionState: confidence >= 80 && evidenceSufficiency === 'SUFFICIENT' ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+    semanticPolicy: deterministic ? 'NONE' : 'SKIP',
     providerCoverage: 1,
     evidenceCount: positiveEvidence.length,
     deterministicRouting: {
       version: 'semantic-admission-v1',
       route: humanReview ? 'HUMAN_REVIEW' : 'DETERMINISTIC_TRADING',
       fastTrack: !humanReview,
-      semanticUsed: true,
-      semanticAttempted: true,
+      semanticUsed: !deterministic,
+      semanticAttempted: !deterministic,
       humanReview,
       enrich: false,
       confidence,
       evidenceSufficiency,
-      recognitionState: confidence >= 80 && positiveEvidence.length > 0 ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
-      semanticPolicy: 'SKIP',
-      fallbackReason: positiveEvidence.length === 0
-        ? (providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING')
-        : null,
-      reasonCodes: positiveEvidence.length > 0
-        ? ['SEMANTIC_ADMISSION_CONFIRMED']
-        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+      recognitionState: confidence >= 80 && evidenceSufficiency === 'SUFFICIENT' ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+      semanticPolicy: deterministic ? 'NONE' : 'SKIP',
+      fallbackReason: evidenceSufficiency === 'SUFFICIENT'
+        ? null
+        : (providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'),
+      reasonCodes: [reasonCode],
     },
   };
   const result: TradingClassificationResult = {
@@ -143,13 +146,15 @@ export function buildAdmissionConfirmedClassification(
     breakdown: {
       stage_a_score: confidence,
       consistency_ratio: 1,
-      ai_reviewed: true,
-      classification_method: 'SEMANTIC_ADMISSION',
+      ai_reviewed: !deterministic,
+      classification_method: deterministic ? 'DETERMINISTIC_EVIDENCE' : 'SEMANTIC_ADMISSION',
       confidence_basis: degraded ? 'HEURISTIC' : 'CALIBRATED',
       reasoning: [
-        `Semantic admission confirmed trading focus at ${confidence}/100.`,
+        `${deterministic ? 'Deterministic admission' : 'Semantic admission'} confirmed trading focus at ${confidence}/100.`,
         `Admission decision: ${candidate.admissionDecisionId || 'unknown'}.`,
-        'Deterministic trading-relevance re-decision skipped; country and Discord gates remain authoritative.',
+        deterministic
+          ? 'Deterministic #618 admission result owns this classification; country and Discord gates remain authoritative.'
+          : 'Deterministic trading-relevance re-decision skipped; country and Discord gates remain authoritative.',
       ],
     },
   };

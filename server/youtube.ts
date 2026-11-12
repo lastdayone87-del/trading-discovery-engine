@@ -214,6 +214,7 @@ export interface DiscoveredChannelRaw {
   admissionCitations?: Array<{ field: string; index?: number; quote: string; supports: string }>;
   admissionModel?: string;
   admissionProvider?: 'gemini_semantic' | 'groq_semantic';
+  admissionDecisionSource?: 'DETERMINISTIC' | 'SEMANTIC' | 'HUMAN';
   admissionEvidenceHash?: string;
   admissionCategory?: string;
   /** True when this admission created the channel row; reporting must not call it known. */
