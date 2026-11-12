@@ -30,6 +30,7 @@ test('confident admission produces a first-class TRADING_CONFIRMED result withou
       admissionTradingConfidence: 93,
       admissionCategory: 'General Trading',
       admissionModel: 'gemini/gemini-3.8-flash',
+      admissionProvider: 'gemini_semantic',
       admissionCitations: [
         { field: 'bio', quote: 'technical analysis and price action', supports: 'TRADING' },
         { field: 'video_title', index: 0, quote: 'Gold analysis', supports: 'TRADING' },
@@ -153,6 +154,8 @@ test('confirmed admission carries citations and flags missing confidence for rev
     },
   );
   assert.equal(missingConfidence.decision.confidenceScore, 0);
+  assert.equal(missingConfidence.decision.status, 'NEEDS_REVIEW');
+  assert.equal(missingConfidence.result.status, 'NEEDS_REVIEW');
   assert.equal(missingConfidence.decision.evidenceCollection.sufficiency, 'INSUFFICIENT');
   assert.equal(missingConfidence.decision.deterministicRouting?.humanReview, true);
 });

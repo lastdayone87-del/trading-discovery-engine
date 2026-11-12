@@ -16,12 +16,11 @@ export function buildAdmissionConfirmedClassification(
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
-  const provider = candidate.admissionProvider
-    || (/(?:gpt-oss|llama|mixtral|qwen)/i.test(String(candidate.admissionModel || ''))
-      ? 'groq_semantic' as const
-      : 'gemini_semantic' as const);
+  // Never infer the provider from the model name. Missing provider provenance
+  // is reported as insufficient evidence and routed to human review.
+  const provider = candidate.admissionProvider;
   const timestamp = new Date().toISOString();
-  const positiveEvidence: EvidenceItem[] = citations.map((citation, index) => ({
+  const positiveEvidence: EvidenceItem[] = provider ? citations.map((citation, index) => ({
     id: `semantic-admission-${index + 1}`,
     source: provider,
     polarity: 'POSITIVE',
@@ -51,18 +50,19 @@ export function buildAdmissionConfirmedClassification(
       },
     },
     timestamp,
-  }));
-  const evidenceSufficiency = citations.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
-  const degraded = confidence < 80 || citations.length === 0;
+  })) : [];
+  const providerMissing = citations.length > 0 && !provider;
+  const evidenceSufficiency = positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
+  const degraded = confidence < 80 || positiveEvidence.length === 0;
   const humanReview = degraded;
   const decision: VerificationDecision = {
-    status: 'TRADING_CONFIRMED',
+    status: degraded ? 'NEEDS_REVIEW' : 'TRADING_CONFIRMED',
     confidenceScore: confidence,
     category,
     multiVideoConsistencyRatio: 1,
     positiveEvidence,
     negativeEvidence: [],
-    totalPositiveWeight: positiveEvidence.length,
+    totalPositiveWeight: positiveEvidence.reduce((sum, item) => sum + item.finalWeight, 0),
     totalNegativeWeight: 0,
     countryContextUsed: {
       country: input.country || 'UNKNOWN',
@@ -80,17 +80,19 @@ export function buildAdmissionConfirmedClassification(
     mathematicalJustification: `Semantic admission judged the creator's main subject to be trading with confidence ${confidence}/100. Admission decision ${candidate.admissionDecisionId || 'unknown'} owns this result; country and Discord gates still run.`,
     evidenceCollection: {
       sufficiency: evidenceSufficiency,
-      sparseMetadata: citations.length === 0,
+      sparseMetadata: positiveEvidence.length === 0,
       degraded,
-      fieldsPresent: citations.length > 0 ? ['admission_evidence'] : [],
-      reasonCodes: citations.length > 0 ? ['SEMANTIC_ADMISSION_CONFIRMED'] : ['SEMANTIC_ADMISSION_CITATIONS_MISSING'],
-      providers: [{
+      fieldsPresent: positiveEvidence.length > 0 ? ['admission_evidence'] : [],
+      reasonCodes: positiveEvidence.length > 0
+        ? ['SEMANTIC_ADMISSION_CONFIRMED']
+        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+      providers: provider ? [{
         provider,
         availability: 'AVAILABLE',
         evidenceCount: positiveEvidence.length,
         outcome: positiveEvidence.length > 0 ? 'EXECUTED_WITH_EVIDENCE' : 'EXECUTED_NO_MATCH',
         reasonCodes: positiveEvidence.length > 0 ? ['SEMANTIC_ADMISSION'] : ['SEMANTIC_ADMISSION_CITATIONS_MISSING'],
-      }],
+      }] : [],
       terminalNegativeSufficiency: {
         status: 'INSUFFICIENT',
         creatorLevelCoverage: false,
@@ -104,11 +106,13 @@ export function buildAdmissionConfirmedClassification(
       version: 'semantic-admission-v1',
       tradingProbability: confidence,
       nonTradingProbability: 100 - confidence,
-      coverageConfidence: citations.length > 0 ? 100 : 0,
-      reasonCodes: citations.length > 0 ? ['SEMANTIC_ADMISSION_CONFIRMED'] : ['SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+      coverageConfidence: positiveEvidence.length > 0 ? 100 : 0,
+      reasonCodes: positiveEvidence.length > 0
+        ? ['SEMANTIC_ADMISSION_CONFIRMED']
+        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
     classificationMethod: 'SEMANTIC_ADMISSION',
-    recognitionState: confidence >= 80 && citations.length > 0 ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+    recognitionState: confidence >= 80 && positiveEvidence.length > 0 ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
     semanticPolicy: 'SKIP',
     providerCoverage: 1,
     evidenceCount: positiveEvidence.length,
@@ -122,14 +126,18 @@ export function buildAdmissionConfirmedClassification(
       enrich: false,
       confidence,
       evidenceSufficiency,
-      recognitionState: confidence >= 80 && citations.length > 0 ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+      recognitionState: confidence >= 80 && positiveEvidence.length > 0 ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
       semanticPolicy: 'SKIP',
-      fallbackReason: citations.length === 0 ? 'SEMANTIC_ADMISSION_CITATIONS_MISSING' : null,
-      reasonCodes: citations.length > 0 ? ['SEMANTIC_ADMISSION_CONFIRMED'] : ['SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+      fallbackReason: positiveEvidence.length === 0
+        ? (providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING')
+        : null,
+      reasonCodes: positiveEvidence.length > 0
+        ? ['SEMANTIC_ADMISSION_CONFIRMED']
+        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
   };
   const result: TradingClassificationResult = {
-    status: 'TRADING_CONFIRMED',
+    status: degraded ? 'NEEDS_REVIEW' : 'TRADING_CONFIRMED',
     confidenceScore: confidence,
     category,
     breakdown: {
@@ -137,7 +145,7 @@ export function buildAdmissionConfirmedClassification(
       consistency_ratio: 1,
       ai_reviewed: true,
       classification_method: 'SEMANTIC_ADMISSION',
-      confidence_basis: 'CALIBRATED',
+      confidence_basis: degraded ? 'HEURISTIC' : 'CALIBRATED',
       reasoning: [
         `Semantic admission confirmed trading focus at ${confidence}/100.`,
         `Admission decision: ${candidate.admissionDecisionId || 'unknown'}.`,

@@ -142,6 +142,29 @@ async function main() {
     try {
       let candidateRow: AdmissionCandidateRow;
       if (apply) {
+        const existingCandidate = await findAdmissionCandidate(row.channel_id);
+        if (existingCandidate && ['ADMITTED', 'ADMITTED_AMBIGUOUS'].includes(existingCandidate.status)) {
+          // A terminal admission already owns this creator. Resume its
+          // downstream classification instead of re-judging it and risking a
+          // contradictory decision or unnecessary provider spend.
+          const resumed = await resumeAdmittedCandidate(input, existingCandidate);
+          if (resumed) {
+            if (existingCandidate.status === 'ADMITTED') counts.admitted += 1;
+            else counts.ambiguous += 1;
+            console.log(JSON.stringify({
+              event: 'intake_deferred_revalidation',
+              apply,
+              channelId: row.channel_id,
+              channelName: row.channel_name,
+              decision: existingCandidate.decision,
+              status: existingCandidate.status,
+              resumed: true,
+              counts,
+              timestamp: new Date().toISOString(),
+            }));
+            continue;
+          }
+        }
         candidateRow = await upsertAdmissionCandidate(input);
       } else {
         candidateRow = fakeRow(row);

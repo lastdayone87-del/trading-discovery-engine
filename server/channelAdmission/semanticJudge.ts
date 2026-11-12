@@ -192,6 +192,12 @@ async function reserveAdmissionModelCall(role: 'PRIMARY' | 'SECOND', provider: s
   }
 }
 
+function providerForClient(client: SemanticModelClient): SemanticJudgment['provider'] | undefined {
+  if (client.batchGroup === 'groq-semantic') return 'groq_semantic';
+  if (client.batchGroup === 'gemini-semantic') return 'gemini_semantic';
+  return undefined;
+}
+
 export class ProviderAdmissionJudge implements AdmissionJudge {
   constructor(
     private readonly options: {
@@ -222,7 +228,13 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
       if (!attempt.client) continue;
       const cacheKey = admissionCacheKey(role, attempt.model, checksum);
       const cached = await readAdmissionCache(cacheKey, !this.options.readOnly);
-      if (cached) return cached;
+      if (cached) {
+        // Rows cached before provider provenance was introduced have no
+        // provider. Stamp the actual attempt route; never infer it from the
+        // model name.
+        if (!cached.provider) cached.provider = providerForClient(attempt.client);
+        return cached;
+      }
       try {
         if (this.options.readOnly) await assertAdmissionBudgetAvailable();
         else await reserveAdmissionModelCall(role, attempt.client.batchGroup || 'unknown', attempt.model);
@@ -233,8 +245,7 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         );
         const normalized = normalizeSemanticJudgment(raw, attempt.model);
         if (!normalized) throw new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT');
-        if (attempt.client.batchGroup === 'groq-semantic') normalized.provider = 'groq_semantic';
-        else if (attempt.client.batchGroup === 'gemini-semantic') normalized.provider = 'gemini_semantic';
+        normalized.provider = providerForClient(attempt.client);
         // A fallback provider is a capacity bridge. Its decisive answers are
         // used directly; its ambiguity is returned to policy after complete
         // evidence so ambiguous creators are admitted for downstream
