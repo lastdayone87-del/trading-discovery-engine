@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { assessIntakeTradingFocus } from './intakeTradingFocus';
 import { observeKeywordBaseline, triageAutonomousSearchCandidate } from './candidateTriage';
-import { buildDeferredTradingIntakeChannel } from './ingestionPipeline';
 import type { DiscoveredChannelRaw } from './youtube';
 
 function candidate(overrides: Partial<DiscoveredChannelRaw> & { channelName: string }): DiscoveredChannelRaw {
@@ -115,23 +114,6 @@ test('polysemous single market words still do not admit', () => {
 });
 
 
-test('ingestion pipeline persists a DEFER as INTAKE_DEFERRED without an enrichment enqueue', () => {
-  const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
-  const start = source.indexOf("retrievalTriage.disposition === 'DEFER_NO_CONFIDENT_EVIDENCE'");
-  const end = source.indexOf('// Step 1: GATE 1', start);
-  assert.ok(start >= 0 && end > start, 'DEFER branch must exist before Gate 1');
-  const block = source.slice(start, end);
-  assert.match(block, /buildDeferredTradingIntakeChannel/);
-  const builderStart = source.indexOf('function buildDeferredTradingIntakeChannel');
-  const builderEnd = source.indexOf('\nexport async function processChannelThroughPipeline(', builderStart);
-  assert.ok(builderStart >= 0 && builderEnd > builderStart);
-  const builder = source.slice(builderStart, builderEnd);
-  assert.match(builder, /channel\.scan_status = 'INTAKE_DEFERRED'/);
-  assert.match(builder, /channel\.trading_status = 'UNCERTAIN'/);
-  assert.doesNotMatch(block, /enqueueJob\s*\(/);
-});
-
-
 test('incidental Indic share/investment words do not admit an unrelated channel', () => {
   const decision = assessIntakeTradingFocus({
     channelName: 'सामान्य चैनल',
@@ -160,107 +142,6 @@ test('an incidental music word in an explicit trading video does not withhold th
   assert.notEqual(decision.decision, 'WITHHOLD');
 });
 
-
-test('deferred channel persistence uses INTAKE_DEFERRED and does not manufacture review debt', () => {
-  const channel = buildDeferredTradingIntakeChannel({
-    channelId: 'UCdefer00000000000000001',
-    channelName: 'Deferred Channel',
-    youtubeUrl: 'https://youtube.com/channel/UCdefer00000000000000001',
-    description: 'Sparse metadata',
-    videoTitles: [],
-  }, undefined, 'automated_query', '2026-11-10T00:00:00.000Z', ['INSUFFICIENT_CHANNEL_EVIDENCE']);
-  assert.equal(channel.scan_status, 'INTAKE_DEFERRED');
-  assert.equal(channel.trading_status, 'UNCERTAIN');
-  assert.equal(channel.country_status, 'UNCERTAIN');
-  assert.equal(channel.inspection_trail.at(-1)?.step, 'BIO');
-});
-
-test('sparse rediscovery does not downgrade a resolved country on a deferred row', () => {
-  const existing = {
-    channel_id: 'UCdefer00000000000000002',
-    channel_name: 'Deferred Trader',
-    youtube_url: 'https://youtube.com/channel/UCdefer00000000000000002',
-    country: 'Germany',
-    country_status: 'CONFIRMED',
-    confidence_score: 95,
-    scan_status: 'ENRICHMENT_PENDING',
-    trading_status: 'UNCERTAIN',
-    scan_attempts: 0,
-    inspection_trail: [],
-  } as any;
-  const channel = buildDeferredTradingIntakeChannel({
-    channelId: existing.channel_id,
-    channelName: existing.channel_name,
-    youtubeUrl: existing.youtube_url,
-    description: 'Sparse metadata',
-    videoTitles: [],
-  }, existing, 'automated_query', '2026-11-10T00:00:00.000Z', ['INSUFFICIENT_CHANNEL_EVIDENCE'], {
-    country: 'Germany',
-    status: 'UNCERTAIN',
-    score: 0,
-  });
-  assert.equal(channel.country, 'Germany');
-  assert.equal(channel.country_status, 'CONFIRMED');
-  assert.equal(channel.confidence_score, 95);
-});
-
-test('reviewable uncertain country evidence replaces a stored resolved country', () => {
-  const existing = {
-    channel_id: 'UCdefer00000000000000003',
-    channel_name: 'Deferred Trader',
-    youtube_url: 'https://youtube.com/channel/UCdefer00000000000000003',
-    country: 'Germany',
-    country_status: 'CONFIRMED',
-    confidence_score: 95,
-    scan_status: 'ENRICHMENT_PENDING',
-    trading_status: 'UNCERTAIN',
-    scan_attempts: 0,
-    inspection_trail: [],
-  } as any;
-  const channel = buildDeferredTradingIntakeChannel({
-    channelId: existing.channel_id,
-    channelName: existing.channel_name,
-    youtubeUrl: existing.youtube_url,
-    description: 'Sparse metadata',
-    videoTitles: [],
-  }, existing, 'automated_query', '2026-11-10T00:00:00.000Z', ['INSUFFICIENT_CHANNEL_EVIDENCE'], {
-    country: 'France',
-    status: 'UNCERTAIN',
-    score: 55,
-    gateDisposition: 'NEEDS_REVIEW',
-  });
-  assert.equal(channel.country, 'France');
-  assert.equal(channel.country_status, 'UNCERTAIN');
-  assert.equal(channel.confidence_score, 55);
-});
-
-test('resolved status without a country cannot block incoming uncertain evidence', () => {
-  const existing = {
-    channel_id: 'UCdefer00000000000000004',
-    channel_name: 'Deferred Trader',
-    youtube_url: 'https://youtube.com/channel/UCdefer00000000000000004',
-    country: '',
-    country_status: 'CONFIRMED',
-    confidence_score: 95,
-    scan_status: 'ENRICHMENT_PENDING',
-    trading_status: 'UNCERTAIN',
-    scan_attempts: 0,
-    inspection_trail: [],
-  } as any;
-  const channel = buildDeferredTradingIntakeChannel({
-    channelId: existing.channel_id,
-    channelName: existing.channel_name,
-    youtubeUrl: existing.youtube_url,
-    description: 'Sparse metadata',
-    videoTitles: [],
-  }, existing, 'automated_query', '2026-11-10T00:00:00.000Z', ['INSUFFICIENT_CHANNEL_EVIDENCE'], {
-    country: 'Germany',
-    status: 'UNCERTAIN',
-    score: 55,
-  });
-  assert.equal(channel.country, 'Germany');
-  assert.equal(channel.country_status, 'UNCERTAIN');
-});
 
 test('incidental market words do not admit a music channel with a hard domain signal', () => {
   const decision = assessIntakeTradingFocus({

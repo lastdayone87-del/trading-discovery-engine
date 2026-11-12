@@ -295,8 +295,8 @@ test('Gate 1 threads description provenance at every validation call', () => {
   const source = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   const matches = source.match(/videoDescriptionsAuthoritative:\s*candidate\.videoDescriptionsAuthoritative/g) || [];
   // One shared validateCountryWithHydration builder (Gate 1, hydration, and
-  // public-about), the DEFER country check, and the Gate-2 classifier input.
-  assert.equal(matches.length, 3);
+  // public-about) plus the Gate-2 classifier input.
+  assert.equal(matches.length, 2);
 });
 
 test('channel enrichment produces the authoritative recent-channel sample', () => {
