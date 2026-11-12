@@ -45,6 +45,34 @@ function argValue(name: string): string | undefined {
   return process.argv.find(arg => arg.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+}
+
+async function callJudgeWithPacing(
+  judge: AdmissionJudge,
+  evidence: AdmissionEvidence,
+  role: 'PRIMARY' | 'SECOND',
+  delayMs: number,
+  retries: number,
+): Promise<SemanticJudgment> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    if (attempt > 0) await sleep(delayMs);
+    try {
+      const judgment = await judge.judge(evidence, role);
+      await sleep(delayMs);
+      return judgment;
+    } catch (error) {
+      lastError = error;
+      if (isSemanticDecisionFailure(error)) throw error;
+      const retryAfter = Number((error as { retryAfterMs?: unknown })?.retryAfterMs || 0);
+      if (attempt < retries) await sleep(Math.min(120_000, Math.max(delayMs, retryAfter)));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('ADMISSION_SEMANTIC_UNAVAILABLE');
+}
+
 function argNumber(name: string, fallback: number): number {
   const value = Number(argValue(name));
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
@@ -274,6 +302,8 @@ async function evaluateOne(input: {
   session?: Innertube;
   judge: CohortJudge | null;
   evidenceOverride?: AdmissionEvidence;
+  aiDelayMs: number;
+  aiRetries: number;
 }): Promise<Record<string, unknown>> {
   const evidence = input.evidenceOverride || await collectKeylessEvidence({
     channelId: input.row.channelId,
@@ -380,7 +410,7 @@ async function evaluateOne(input: {
   let decisionFailure: string | undefined;
   for (let attempt = 0; attempt < 3 && !judgment; attempt += 1) {
     try {
-      judgment = await input.judge.judge(evidence, 'PRIMARY');
+      judgment = await callJudgeWithPacing(input.judge, evidence, 'PRIMARY', input.aiDelayMs, input.aiRetries);
     } catch (error) {
       if (isSemanticDecisionFailure(error)) {
         decisionFailure = error instanceof Error ? error.message : String(error);
@@ -422,7 +452,7 @@ async function evaluateOne(input: {
   let secondJudgment: SemanticJudgment | undefined;
   if (needsSecondJudge(judgment, evidence)) {
     try {
-      secondJudgment = await input.judge.judge(evidence, 'SECOND');
+      secondJudgment = await callJudgeWithPacing(input.judge, evidence, 'SECOND', input.aiDelayMs, input.aiRetries);
     } catch (error) {
       console.warn(`[cohort] second judge unavailable for ${evidence.channelId}:`, error instanceof Error ? error.message : error);
     }
@@ -453,6 +483,8 @@ async function main(): Promise<void> {
     held: argNumber('held', 10),
   };
   const concurrency = Math.max(1, Math.min(4, argNumber('concurrency', 2)));
+  const aiDelayMs = Math.max(0, argNumber('ai-delay-ms', 0));
+  const aiRetries = Math.max(0, argNumber('ai-retries', 0));
   const fromEvidence = argValue('from-evidence');
   const rows = readFileSync(manifest, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as PreservedResult);
   const cohort: Array<{ group: CohortGroup; row: PreservedResult; evidence?: AdmissionEvidence }> = fromEvidence
@@ -494,6 +526,8 @@ async function main(): Promise<void> {
     seed,
     concurrency,
     semanticAvailable: Boolean(judge),
+    aiDelayMs,
+    aiRetries,
     fromEvidence: fromEvidence || null,
     groups: GROUP_ORDER.reduce((acc, group) => ({ ...acc, [group]: cohort.filter(item => item.group === group).length }), {}),
     timestamp: new Date().toISOString(),
@@ -514,7 +548,15 @@ async function main(): Promise<void> {
       const item = cohort[index];
       let result: Record<string, unknown>;
       try {
-        result = await evaluateOne({ group: item.group, row: item.row, session, judge, evidenceOverride: item.evidence });
+        result = await evaluateOne({
+          group: item.group,
+          row: item.row,
+          session,
+          judge,
+          evidenceOverride: item.evidence,
+          aiDelayMs,
+          aiRetries,
+        });
       } catch (error) {
         result = {
           event: 'admission_cohort_result',

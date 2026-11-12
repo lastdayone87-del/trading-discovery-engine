@@ -8,6 +8,14 @@ on:
         type: choice
         options: [auto, gemini, groq]
         default: auto
+      ai_delay_ms:
+        description: Delay between semantic calls (ms)
+        type: number
+        default: 45000
+      ai_retries:
+        description: Retries per semantic call
+        type: number
+        default: 1
   pull_request:
     paths:
       - '.github/workflows/admission-cohort-eval.yml'
@@ -65,7 +73,7 @@ jobs:
     # receive repository provider credentials.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17
@@ -90,6 +98,8 @@ jobs:
       GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_FREE_API_KEY || secrets.GEMINI_API_KEY_2 }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       COHORT_SEMANTIC_PROVIDER: ${{ inputs.semantic_provider || 'auto' }}
+      COHORT_AI_DELAY_MS: ${{ inputs.ai_delay_ms || 45000 }}
+      COHORT_AI_RETRIES: ${{ inputs.ai_retries || 1 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -105,7 +115,9 @@ jobs:
           --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
           --out=admission-cohort-ai.jsonl
           --blind=admission-cohort-ai-blind.jsonl
-          --concurrency=2
+          --concurrency=1
+          --ai-delay-ms=$COHORT_AI_DELAY_MS
+          --ai-retries=$COHORT_AI_RETRIES
       - name: Summarize against independent evidence-review labels
         run: >-
           npx tsx scripts/summarizeAdmissionCohort.ts
