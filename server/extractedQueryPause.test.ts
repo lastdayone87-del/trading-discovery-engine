@@ -26,7 +26,7 @@ test('paused extracted rows are filtered from every selection path', () => {
 });
 
 test('pause migration quarantines only extracted queries and clears only the candidate ledger', () => {
-  const sql = readFileSync(new URL('./db/migrations/181_pause_extracted_query_discovery.sql', import.meta.url), 'utf8');
+  const sql = readFileSync(new URL('./db/migrations/183_pause_extracted_query_discovery.sql', import.meta.url), 'utf8');
   assert.match(sql, /'extracted_query_discovery_enabled', 'false'/);
   assert.match(sql, /SET\s+collection\s*=\s*'REJECTED'/i);
   assert.match(sql, /extractedQueryPaused/);
