@@ -916,7 +916,7 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
  * provider profile, same tick lifecycle) behind its own settings gate, so no
  * new worker architecture is required for continuous canary consumption.
  */
-export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
+export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastSemanticCooldownEnrichProbeAt = 0;
@@ -1334,6 +1334,30 @@ export async function admitDiscoveredChannel(input: {
     return { outcome: classificationPendingOutcome(raw, channel), pending: true };
   }
   if (classificationAdmission(backpressure) === 'INLINE') {
+    // Do not run the full enrichment/classification pipeline inside the
+    // retrieval worker at the cap. Persist a durable overflow job and let the
+    // enrichment lane drain it; the nomination and channel identity remain
+    // the deduplication boundary.
+    const queued = await enqueueJob('PROCESS_DISCOVERED_CHANNEL', {
+      channelId: raw.channelId,
+      raw,
+      targetCountry,
+      source,
+      query: input.query,
+      queryId: input.queryId,
+      queryRunId: input.queryRunId,
+      discoveryJobId: input.discoveryJobId,
+      pageNumber: input.pageNumber,
+      resultRank: input.resultRank,
+      forceExtraction: input.forceExtraction,
+      quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL',
+    }, {
+      priority: 20,
+      maxAttempts: 3,
+      idempotencyKey: `discovery-overflow:${raw.channelId}:${new Date().toISOString().slice(0, 10)}`,
+      preventCompletedReopen: true,
+    });
+    if (queued) return { outcome: classificationPendingOutcome(raw, existing), pending: true };
     return { outcome: await inline(), pending: false };
   }
   const config = resolveClassificationDecouplingConfig();
@@ -1490,6 +1514,7 @@ export async function processNextSearchJob(
     }
   }
   if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
@@ -1611,6 +1636,19 @@ export async function processNextSearchJob(
     }
     if(job.type==='COUNTRY_BOUNDARY_REPROCESS'){
       await processCountryBoundaryReprocessJob(job);
+      await completeJob(job.id);
+      return true;
+    }
+    if(job.type==='PROCESS_DISCOVERED_CHANNEL'){
+      const p=job.payload as any;
+      await processDiscoveredChannelContained(p.raw || p.candidate, String(p.targetCountry||''), p.source as DiscoverySource, {
+        admissionBypass: true,
+        forceExtraction: p.forceExtraction === true,
+        jobId: job.id,
+        runId: typeof p.queryRunId === 'string' ? p.queryRunId : undefined,
+        lane: 'DISCOVERY',
+        jobType: job.type,
+      });
       await completeJob(job.id);
       return true;
     }
@@ -5365,7 +5403,7 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
   }
   const enrichmentSplit = resolveEnrichmentWorkerSplit(Math.min(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers), decoupling.enabled);
   setRunningEnrichmentWorkerCount(enrichmentSplit.classificationWorkers + enrichmentSplit.enrichmentOnlyWorkers);
-  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE], 'enrich_channel_shared');
+  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], 'enrich_channel_shared');
   if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
     startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
   }

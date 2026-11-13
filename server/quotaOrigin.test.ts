@@ -172,3 +172,16 @@ test('pipeline origin: existing PROBE is sticky; malformed persisted marker fail
   assert.equal(await resolvePipelineQuotaOrigin({ channelId: 'new' }, undefined, absent), 'NORMAL');
   assert.equal(await resolvePipelineQuotaOrigin({ channelId: 'new', quotaOrigin: 'PROBE' }, undefined, absent), 'PROBE');
 });
+
+
+test('discovery overflow jobs resolve NORMAL/PROBE before a channels row exists', async () => {
+  const empty: QuotaOriginDb = { query: async () => ({ rows: [], rowCount: 0 }) };
+  assert.equal(await resolveJobQuotaOrigin({
+    type: 'PROCESS_DISCOVERED_CHANNEL',
+    payload: { channelId: 'UC-overflow-new', quotaOrigin: 'NORMAL' },
+  }, empty), 'NORMAL');
+  assert.equal(await resolveJobQuotaOrigin({
+    type: 'PROCESS_DISCOVERED_CHANNEL',
+    payload: { channelId: 'UC-overflow-probe', quotaOrigin: 'PROBE' },
+  }, empty), 'PROBE');
+});

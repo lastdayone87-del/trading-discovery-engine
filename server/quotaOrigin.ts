@@ -242,7 +242,8 @@ export async function resolveJobQuotaOrigin(
   // an existing PROBE row stays sticky. Other channel-keyed jobs still fail
   // closed when the row is missing.
   const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS'
-    || job.type === 'VERIFY_CHANNEL_ADMISSION';
+    || job.type === 'VERIFY_CHANNEL_ADMISSION'
+    || job.type === 'PROCESS_DISCOVERED_CHANNEL';
   let resolved: ResolvedQuotaOrigin = mergeQuotaOrigins(hinted ?? 'NORMAL', candidateOrigin) ?? 'NORMAL';
   if (resolved === 'PROBE') return 'PROBE';
   for (const channelId of channelIds) {
