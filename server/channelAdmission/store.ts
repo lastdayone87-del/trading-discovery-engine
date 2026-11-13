@@ -101,6 +101,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
     videoDescriptions: input.candidate.videoDescriptions || [],
     quotaOrigin: resolvePreChannelAdmissionQuotaOrigin(input.candidate.quotaOrigin),
     matchedDocument,
+    relationshipProvenance: input.candidate.relationshipProvenance || null,
   };
   const result = await db.query(
     `INSERT INTO semantic_admission_candidates(

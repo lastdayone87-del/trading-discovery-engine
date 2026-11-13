@@ -26,6 +26,7 @@ import {
 } from './querySelectionExperiments';
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchAction } from './persistentResearch';
+import { sweepRelationshipCanarySeeds } from './relationshipCanarySeeds';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -377,6 +378,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
 
       };
     }
+
+    // Seed expansion rides the existing relationship canary. The sweep is
+    // daily, bounded, and default-inert until relationship_canary_enabled is
+    // explicitly true. It never schedules a query run itself.
+    await sweepRelationshipCanarySeeds()
+      .catch(error => console.warn('[RelationshipCanary] Seed sweep failed:', error instanceof Error ? error.message : String(error)));
 
     // The research controller is an isolated observer/planner. Failure never
     // delays the proven query scheduler, and serving remains separately gated.

@@ -1,9 +1,14 @@
 import { createHash } from 'node:crypto';
-import { getDb } from './db';
+import { getAppSetting, getCountryVocabularies, getDb, getQueriesByCountry, setAppSetting } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
+import { assertCountryAllowed } from './countryExclusion';
+import { countryDiscoveryLanguagesByWeight, countryDiscoveryRegionCode } from './countryDiscoveryProfile';
+import { generateNativeQueriesWithLlm, NATIVE_QUERY_BATCH_SIZE, type NativeQueryCandidate } from './nativeQueryGeneration';
+import { generateAutocompleteQueries, getCachedAutocompleteSuggestions } from './youtubeAutocomplete';
+import { getCandidateMemory } from './queryGenerationMemory';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -665,6 +670,182 @@ export function selectFairCountryNativeProposals(
   return selected;
 }
 
+// 5b. LLM NATIVE Generator
+// Generated surfaces enter the same COUNTRY_NATIVE proposal path as static
+// vocabulary. They are proposals, never executable query_library rows.
+const NATIVE_GENERATION_MODES: Array<{ mode: 'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED'; share: number }> = [
+  { mode: 'OPEN_WORLD', share: 0.6 },
+  { mode: 'REAL_SIGNAL', share: 0.25 },
+  { mode: 'GROUNDED', share: 0.15 },
+];
+
+async function nativeQueryCoverageGaps(country: string): Promise<string[]> {
+  try {
+    const db = await getDb();
+    const result = await db.query(
+      `SELECT segment_type, segment_key
+       FROM neighborhood_health_diagnostics
+       WHERE coverage_gap_identified = true
+         AND (
+           (segment_type = 'COUNTRY' AND UPPER(segment_key) = $1)
+           OR segment_type IN ('INTENT', 'INSTRUMENT', 'NEIGHBORHOOD')
+         )
+       ORDER BY underexplored_quota_percent ASC, calculated_at DESC
+       LIMIT 16`,
+      [country.toUpperCase()],
+    );
+    return result.rows.map(row => `${row.segment_type}:${row.segment_key}`);
+  } catch {
+    return [];
+  }
+}
+
+async function nativeQueryLocalVocabulary(country: string): Promise<string[]> {
+  try {
+    const vocabularies = await getCountryVocabularies();
+    const vocabulary = vocabularies.find(item => item.country.toLowerCase() === country.toLowerCase());
+    if (!vocabulary) return [];
+    return [...new Set([
+      ...(vocabulary.native_trading_terminology || []),
+      ...(vocabulary.popular_instruments || []),
+      ...(vocabulary.local_market_phrases || []),
+      ...(vocabulary.common_content_format_names || []),
+    ].map(String).filter(Boolean))].slice(0, 120);
+  } catch {
+    return [];
+  }
+}
+
+export async function generateLlmNativeProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+  try {
+    await assertCountryAllowed(country, 'native_query_generation');
+    const enabled = await getAppSetting(
+      'native_query_generation_enabled',
+      process.env.NODE_ENV === 'production' && (process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY) ? 'true' : 'false',
+    );
+    if (String(enabled).trim().toLowerCase() !== 'true') return [];
+    const canonicalC = canonicalCountry(country);
+    const languages = countryDiscoveryLanguagesByWeight(canonicalC);
+    if (!languages.length) return [];
+    const maxLanguages = Math.max(1, Math.min(4, Number(await getAppSetting('native_query_generation_languages_per_cycle', '1')) || 1));
+    const cursorKey = `native_query_generation_cursor:${canonicalC}`;
+    const cursor = Math.max(0, Number(await getAppSetting(cursorKey, '0')) || 0);
+    const selectedLanguages = Array.from({ length: Math.min(maxLanguages, languages.length) }, (_, index) =>
+      languages[(cursor + index) % languages.length],
+    );
+    await setAppSetting(cursorKey, String(cursor + selectedLanguages.length)).catch(() => undefined);
+    const lastAttemptKey = `native_query_generation_last_attempt:${canonicalC}`;
+    const lastAttempt = Date.parse(await getAppSetting(lastAttemptKey, ''));
+    if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < 6 * 60 * 60 * 1000) return [];
+    await setAppSetting(lastAttemptKey, new Date().toISOString()).catch(() => undefined);
+
+    const existingQueries = (await getQueriesByCountry(canonicalC)).map(query => ({
+      query: query.query,
+      country: query.country,
+      intent: query.intent,
+    }));
+    const coverageGaps = await nativeQueryCoverageGaps(canonicalC);
+    const localVocabulary = await nativeQueryLocalVocabulary(canonicalC);
+    const proposals: DiscoveryFrontierProposal[] = [];
+
+    for (const language of selectedLanguages) {
+      const memory = await getCandidateMemory(canonicalC, language.code).catch(() => []);
+      const autocompleteSuggestions = await getCachedAutocompleteSuggestions(canonicalC, language.code);
+      const generated: NativeQueryCandidate[] = [];
+      for (const { mode, share } of NATIVE_GENERATION_MODES) {
+        const count = Math.max(1, Math.round(NATIVE_QUERY_BATCH_SIZE * share));
+        try {
+          const batch = await generateNativeQueriesWithLlm({
+            context: {
+              country: canonicalC,
+              language: language.code,
+              regionCode: countryDiscoveryRegionCode(canonicalC),
+              mode,
+              existingQueries,
+              candidateMemory: memory,
+              coverageGaps,
+              autocompleteSuggestions,
+              localVocabulary,
+            },
+            count,
+          });
+          generated.push(...batch.candidates);
+        } catch {
+          // Provider failure is non-fatal; other families and the cache remain.
+        }
+      }
+      for (const candidate of generated) {
+        proposals.push(buildFrontierProposal({
+          proposalFamily: 'COUNTRY_NATIVE',
+          country: canonicalC,
+          preserveCountryIdentity: true,
+          language: candidate.language,
+          concept: candidate.query,
+          intent: candidate.intent,
+          primaryTermFamily: candidate.query,
+          retrievalLane: 'VIDEO',
+          sourceFamily: 'llm_native_query',
+          sourceProvenance: `llm_native_query:${candidate.provider || 'unknown'}:${candidate.model || 'unknown'}:${candidate.batchId || 'nocache'}`,
+          supportingEvidence: {
+            nativeTerm: candidate.query,
+            nativeEvidenceStatus: 'LLM_GENERATED',
+            sourceProvenanceFamily: 'LLM_NATIVE_QUERY',
+            provenanceType: 'llm_generated',
+            language: candidate.language,
+            market: canonicalC,
+            llmBatchId: candidate.batchId,
+            generationMode: candidate.mode,
+            generationProvenance: candidate.provenance,
+          },
+          confidence: Math.min(0.85, Math.max(0.45, candidate.confidence)),
+          ttlDays: 14,
+          noveltyRationale: `LLM ${candidate.mode.toLowerCase()} native query for ${canonicalC} (${candidate.language}); generated as a new search surface rather than a translation of an existing query.`,
+        }));
+        if (proposals.length >= limit) break;
+      }
+      if (proposals.length >= limit) break;
+    }
+    return proposals.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+// 5c. YOUTUBE AUTOCOMPLETE Generator
+export async function generateAutocompleteProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+  try {
+    const canonicalC = canonicalCountry(country);
+    const result = await generateAutocompleteQueries({ country: canonicalC, limit: Math.max(limit * 3, 20) });
+    return result.candidates.slice(0, limit).map(candidate => buildFrontierProposal({
+      proposalFamily: 'COUNTRY_NATIVE',
+      country: canonicalC,
+      preserveCountryIdentity: true,
+      language: candidate.language,
+      concept: candidate.query,
+      intent: candidate.intent,
+      primaryTermFamily: candidate.query,
+      retrievalLane: 'VIDEO',
+      sourceFamily: 'youtube_autocomplete',
+      sourceProvenance: `youtube_autocomplete:${candidate.provenance.prefix || 'prefix'}:${candidate.batchId || 'cache'}`,
+      supportingEvidence: {
+        nativeTerm: candidate.query,
+        nativeEvidenceStatus: 'AUTOCOMPLETE_OBSERVED',
+        sourceProvenanceFamily: 'YOUTUBE_AUTOCOMPLETE',
+        provenanceType: 'youtube_autocomplete',
+        language: candidate.language,
+        market: canonicalC,
+        autocompletePrefix: candidate.provenance.prefix,
+        generationProvenance: candidate.provenance,
+      },
+      confidence: Math.min(0.85, Math.max(0.5, candidate.confidence)),
+      ttlDays: 14,
+      noveltyRationale: `YouTube Autocomplete observed this local search surface for ${canonicalC} (${candidate.language}) from prefix "${candidate.provenance.prefix || ''}".`,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 // 6. COVERAGE_GAP Generator
 export async function generateCoverageGapProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
@@ -883,7 +1064,7 @@ export async function persistFrontierProposals(
 }
 
 /**
- * Runs all 7 proposal generators for a country, applying governance caps and deduplication.
+ * Runs all proposal generators for a country, applying governance caps and deduplication.
  */
 export async function generateFrontierProposalsForCountry(
   country: string,
@@ -904,6 +1085,8 @@ export async function generateFrontierProposalsForCountry(
     neighborhood,
     playlist,
     native,
+    llmNative,
+    autocomplete,
     coverageGap,
     temporal
   ] = await Promise.all([
@@ -912,6 +1095,8 @@ export async function generateFrontierProposalsForCountry(
     generateCreatorNeighborhoodProposals(country, perFamilyCap).catch(() => []),
     generatePlaylistTopicProposals(country, perFamilyCap).catch(() => []),
     generateCountryNativeProposals(country, perFamilyCap).catch(() => []),
+    settleBeforeDeadline(generateLlmNativeProposals(country, perFamilyCap), 2_500, []).catch(() => []),
+    settleBeforeDeadline(generateAutocompleteProposals(country, perFamilyCap), 2_500, []).catch(() => []),
     generateCoverageGapProposals(country, perFamilyCap).catch(() => []),
     generateTemporalProposals(country, perFamilyCap).catch(() => [])
   ]);
@@ -922,6 +1107,8 @@ export async function generateFrontierProposalsForCountry(
     ...neighborhood,
     ...playlist,
     ...native,
+    ...llmNative,
+    ...autocomplete,
     ...coverageGap,
     ...temporal
   ];

@@ -118,6 +118,7 @@ export interface AdmissionEvidence {
   subscriberCount?: string;
   videos: AdmissionVideo[];
   matchedDocument?: Record<string, unknown>;
+  relationshipProvenance?: Record<string, unknown>;
   query?: string;
   queryId?: number;
   queryRunId?: string;
