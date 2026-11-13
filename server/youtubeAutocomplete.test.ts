@@ -13,6 +13,7 @@ test('YouTube autocomplete sends language and region and parses suggestions', as
     }) as typeof fetch,
   });
   assert.deepEqual(suggestions, ['dax trading', 'dax analyse heute', 'DAX live']);
+  assert.match(called, /oe=utf-8/);
   assert.match(called, /hl=de/);
   assert.match(called, /gl=DE/);
   assert.match(called, /ds=yt/);

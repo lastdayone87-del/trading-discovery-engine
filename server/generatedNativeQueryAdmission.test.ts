@@ -6,6 +6,7 @@ import { buildFrontierProposal } from './discoveryProposalGenerators';
 import { planCountryNativeProposalQuery } from './queryPlanner';
 import { classifyCountryNativeAuthorizationInput } from './queryIntelligence';
 import { assessGeneratedNativeQuery, dedupeGeneratedCandidates } from './nativeQueryGeneration';
+import { allocateNativeGenerationSlots } from './discoveryProposalGenerators';
 
 const france = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'France');
 assert.ok(france);
@@ -153,4 +154,17 @@ test('generated batch dedupe removes repeats but keeps distinct intentions', () 
   ]);
   assert.deepEqual(result.accepted.map(item => item.query), ['DAX Analyse heute', 'DAX live trading']);
   assert.equal(result.rejected.length, 1);
+});
+
+
+test('default proposal cap keeps all three generation modes visible', () => {
+  assert.deepEqual(allocateNativeGenerationSlots(5, { OPEN_WORLD: 10, REAL_SIGNAL: 10, GROUNDED: 10 }), {
+    OPEN_WORLD: 3,
+    REAL_SIGNAL: 1,
+    GROUNDED: 1,
+  });
+  const ten = allocateNativeGenerationSlots(10, { OPEN_WORLD: 10, REAL_SIGNAL: 10, GROUNDED: 10 });
+  assert.ok(ten.OPEN_WORLD > ten.REAL_SIGNAL);
+  assert.ok(ten.REAL_SIGNAL > 0);
+  assert.ok(ten.GROUNDED > 0);
 });

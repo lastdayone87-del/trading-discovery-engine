@@ -111,17 +111,19 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
   const lastDay = await getAppSetting('relationship_canary_seed_sweep_day', '');
   if (lastDay === day) return { status: 'ALREADY_RAN', queued: 0, countries: [] };
 
-  const configured = selectedCountries(await getAppSetting('query_intelligence_selected_countries', ''));
+  const scope = String(await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL') || 'GLOBAL').trim().toUpperCase();
+  const configured = scope === 'SELECTED_COUNTRIES'
+    ? selectedCountries(await getAppSetting('query_intelligence_selected_countries', ''))
+    : [];
   const countries = [...new Set(configured.length ? configured : DEFAULT_NON_DORMANT_COUNTRIES)];
   if (!countries.length) return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
   const cursor = Math.max(0, Number(await getAppSetting('relationship_canary_seed_cursor', '0')) || 0);
   const selected = Array.from({ length: Math.min(RELATIONSHIP_SEED_SWEEP_MAX_COUNTRIES, countries.length) }, (_, index) =>
     countries[(cursor + index) % countries.length],
   );
-  await setAppSetting('relationship_canary_seed_sweep_day', day).catch(() => undefined);
-  await setAppSetting('relationship_canary_seed_cursor', String(cursor + selected.length)).catch(() => undefined);
 
   let queued = 0;
+  let failures = 0;
   const queuedCountries: string[] = [];
   for (const country of selected) {
     try {
@@ -150,8 +152,15 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
       queued += 1;
       queuedCountries.push(country);
     } catch {
+      failures += 1;
       // A single country's provider/admission failure must not abort the sweep.
     }
+  }
+  // Do not burn the day's sweep when every selected country failed before a
+  // durable enqueue. A later cycle may then retry the same cursor position.
+  if (queued > 0 && failures === 0) {
+    await setAppSetting('relationship_canary_seed_sweep_day', day).catch(() => undefined);
+    await setAppSetting('relationship_canary_seed_cursor', String(cursor + selected.length)).catch(() => undefined);
   }
   return { status: 'COMPLETED', queued, countries: queuedCountries };
 }

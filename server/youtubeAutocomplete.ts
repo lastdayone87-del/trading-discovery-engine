@@ -35,6 +35,7 @@ export async function fetchYouTubeAutocomplete(
   url.searchParams.set('client', 'firefox');
   url.searchParams.set('ds', 'yt');
   url.searchParams.set('q', clean);
+  url.searchParams.set('oe', 'utf-8');
   url.searchParams.set('hl', options.language);
   if (options.regionCode) url.searchParams.set('gl', options.regionCode);
   const controller = new AbortController();
@@ -138,12 +139,13 @@ export async function generateAutocompleteQueries(input: {
   const cursorKey = `youtube_autocomplete_cursor:${country}`;
   const cursor = Math.max(0, Number(await getAppSetting(cursorKey, '0')) || 0);
   const language = languages[cursor % languages.length];
-  await setAppSetting(cursorKey, String(cursor + 1)).catch(() => undefined);
   const lastAttemptKey = `youtube_autocomplete_last_attempt:${country}`;
   const lastAttempt = Date.parse(await getAppSetting(lastAttemptKey, ''));
   if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < 6 * 60 * 60 * 1000) {
     return { candidates: [], prefixesAttempted: 0, cacheHits: 0 };
   }
+  // Advance the language turn only when generation is actually attempted.
+  await setAppSetting(cursorKey, String(cursor + 1)).catch(() => undefined);
   await setAppSetting(lastAttemptKey, new Date().toISOString()).catch(() => undefined);
 
   const existing = (await getQueriesByCountry(country)).map(query => ({
@@ -152,10 +154,7 @@ export async function generateAutocompleteQueries(input: {
     intent: query.intent,
   }));
   const memory = await getCandidateMemory(country, language.code).catch(() => []);
-  const history: CandidateHistoryItem[] = [
-    ...existing,
-    ...memory.map(row => ({ query: row.normalizedQuery, country, intent: null })),
-  ];
+  const acceptedHistory: CandidateHistoryItem[] = [];
   const allPrefixes = prefixPlan(country, language.code, existing, await localVocabulary(country));
   const prefixCursorKey = `youtube_autocomplete_prefix_cursor:${country}`;
   const prefixCursor = Math.max(0, Number(await getAppSetting(prefixCursorKey, '0')) || 0);
@@ -226,10 +225,17 @@ export async function generateAutocompleteQueries(input: {
       });
       if (candidate) assessed.push(candidate);
     }
-    const deduped = dedupeCandidateBatch(assessed, history);
+    const prefixHistory: CandidateHistoryItem[] = [
+      ...existing,
+      ...memory
+        .filter(row => row.batchKey !== batchKey)
+        .map(row => ({ query: row.normalizedQuery, country, intent: null })),
+      ...acceptedHistory,
+    ];
+    const deduped = dedupeCandidateBatch(assessed, prefixHistory);
     for (const candidate of deduped.accepted) {
       accepted.push(candidate);
-      history.push({ query: candidate.query, country, intent: candidate.intent });
+      acceptedHistory.push({ query: candidate.query, country, intent: candidate.intent });
     }
     await rememberQueryCandidates([
       ...deduped.accepted.map(candidate => ({

@@ -671,6 +671,28 @@ export function selectFairCountryNativeProposals(
 }
 
 // 5b. LLM NATIVE Generator
+export function allocateNativeGenerationSlots(
+  limit: number,
+  available: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number>,
+): Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number> {
+  const rows = NATIVE_GENERATION_MODES.map(({ mode, share }) => {
+    const exact = Math.max(0, limit) * share;
+    const base = Math.min(available[mode] || 0, Math.floor(exact));
+    return { mode, exact, count: base, remainder: exact - Math.floor(exact) };
+  });
+  let assigned = rows.reduce((sum, row) => sum + row.count, 0);
+  while (assigned < limit) {
+    const next = rows
+      .filter(row => row.count < (available[row.mode] || 0))
+      .sort((a, b) => (b.remainder - a.remainder) || a.mode.localeCompare(b.mode))[0];
+    if (!next) break;
+    next.count += 1;
+    next.remainder -= 1;
+    assigned += 1;
+  }
+  return Object.fromEntries(rows.map(row => [row.mode, row.count])) as Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number>;
+}
+
 // Generated surfaces enter the same COUNTRY_NATIVE proposal path as static
 // vocabulary. They are proposals, never executable query_library rows.
 const NATIVE_GENERATION_MODES: Array<{ mode: 'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED'; share: number }> = [
@@ -733,10 +755,12 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     const selectedLanguages = Array.from({ length: Math.min(maxLanguages, languages.length) }, (_, index) =>
       languages[(cursor + index) % languages.length],
     );
-    await setAppSetting(cursorKey, String(cursor + selectedLanguages.length)).catch(() => undefined);
     const lastAttemptKey = `native_query_generation_last_attempt:${canonicalC}`;
     const lastAttempt = Date.parse(await getAppSetting(lastAttemptKey, ''));
     if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < 6 * 60 * 60 * 1000) return [];
+    // Advance the language turn only when generation is actually attempted.
+    // Cooldown-only calls must not consume a language slot.
+    await setAppSetting(cursorKey, String(cursor + selectedLanguages.length)).catch(() => undefined);
     await setAppSetting(lastAttemptKey, new Date().toISOString()).catch(() => undefined);
 
     const existingQueries = (await getQueriesByCountry(canonicalC)).map(query => ({
@@ -746,12 +770,15 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     }));
     const coverageGaps = await nativeQueryCoverageGaps(canonicalC);
     const localVocabulary = await nativeQueryLocalVocabulary(canonicalC);
-    const proposals: DiscoveryFrontierProposal[] = [];
+    const byMode: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', NativeQueryCandidate[]> = {
+      OPEN_WORLD: [],
+      REAL_SIGNAL: [],
+      GROUNDED: [],
+    };
 
     for (const language of selectedLanguages) {
       const memory = await getCandidateMemory(canonicalC, language.code).catch(() => []);
       const autocompleteSuggestions = await getCachedAutocompleteSuggestions(canonicalC, language.code);
-      const generated: NativeQueryCandidate[] = [];
       for (const { mode, share } of NATIVE_GENERATION_MODES) {
         const count = Math.max(1, Math.round(NATIVE_QUERY_BATCH_SIZE * share));
         try {
@@ -769,43 +796,45 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
             },
             count,
           });
-          generated.push(...batch.candidates);
+          byMode[mode].push(...batch.candidates);
         } catch {
           // Provider failure is non-fatal; other families and the cache remain.
         }
       }
-      for (const candidate of generated) {
-        proposals.push(buildFrontierProposal({
-          proposalFamily: 'COUNTRY_NATIVE',
-          country: canonicalC,
-          preserveCountryIdentity: true,
-          language: candidate.language,
-          concept: candidate.query,
-          intent: candidate.intent,
-          primaryTermFamily: candidate.query,
-          retrievalLane: 'VIDEO',
-          sourceFamily: 'llm_native_query',
-          sourceProvenance: `llm_native_query:${candidate.provider || 'unknown'}:${candidate.model || 'unknown'}:${candidate.batchId || 'nocache'}`,
-          supportingEvidence: {
-            nativeTerm: candidate.query,
-            nativeEvidenceStatus: 'LLM_GENERATED',
-            sourceProvenanceFamily: 'LLM_NATIVE_QUERY',
-            provenanceType: 'llm_generated',
-            language: candidate.language,
-            market: canonicalC,
-            llmBatchId: candidate.batchId,
-            generationMode: candidate.mode,
-            generationProvenance: candidate.provenance,
-          },
-          confidence: Math.min(0.85, Math.max(0.45, candidate.confidence)),
-          ttlDays: 14,
-          noveltyRationale: `LLM ${candidate.mode.toLowerCase()} native query for ${canonicalC} (${candidate.language}); generated as a new search surface rather than a translation of an existing query.`,
-        }));
-        if (proposals.length >= limit) break;
-      }
-      if (proposals.length >= limit) break;
     }
-    return proposals.slice(0, limit);
+
+    const slots = allocateNativeGenerationSlots(limit, {
+      OPEN_WORLD: byMode.OPEN_WORLD.length,
+      REAL_SIGNAL: byMode.REAL_SIGNAL.length,
+      GROUNDED: byMode.GROUNDED.length,
+    });
+    const selected = NATIVE_GENERATION_MODES.flatMap(({ mode }) => byMode[mode].slice(0, slots[mode]));
+    return selected.map(candidate => buildFrontierProposal({
+      proposalFamily: 'COUNTRY_NATIVE',
+      country: canonicalC,
+      preserveCountryIdentity: true,
+      language: candidate.language,
+      concept: candidate.query,
+      intent: candidate.intent,
+      primaryTermFamily: candidate.query,
+      retrievalLane: 'VIDEO',
+      sourceFamily: 'llm_native_query',
+      sourceProvenance: `llm_native_query:${candidate.provider || 'unknown'}:${candidate.model || 'unknown'}:${candidate.batchId || 'nocache'}`,
+      supportingEvidence: {
+        nativeTerm: candidate.query,
+        nativeEvidenceStatus: 'LLM_GENERATED',
+        sourceProvenanceFamily: 'LLM_NATIVE_QUERY',
+        provenanceType: 'llm_generated',
+        language: candidate.language,
+        market: canonicalC,
+        llmBatchId: candidate.batchId,
+        generationMode: candidate.mode,
+        generationProvenance: candidate.provenance,
+      },
+      confidence: Math.min(0.85, Math.max(0.45, candidate.confidence)),
+      ttlDays: 14,
+      noveltyRationale: `LLM ${candidate.mode.toLowerCase()} native query for ${canonicalC} (${candidate.language}); generated as a new search surface rather than a translation of an existing query.`,
+    })).slice(0, limit);
   } catch {
     return [];
   }
@@ -843,6 +872,44 @@ export async function generateAutocompleteProposals(country: string, limit = 10)
     }));
   } catch {
     return [];
+  }
+}
+
+const generatedQueryCountriesInFlight = new Set<string>();
+
+/**
+ * Production entry point for the new query sources. The autonomous producer
+ * calls this once per cycle outside its scheduling deadline, so a slow
+ * provider cannot block the legacy query scheduler. The per-country cooldowns
+ * in the generators keep this from repeating every cycle.
+ */
+export async function materializeGeneratedQueryProposalsForCountry(country: string): Promise<{
+  generated: number;
+  persisted: number;
+  proposals: DiscoveryFrontierProposal[];
+}> {
+  const canonicalC = canonicalCountry(country);
+  if (!canonicalC || generatedQueryCountriesInFlight.has(canonicalC)) {
+    return { generated: 0, persisted: 0, proposals: [] };
+  }
+  generatedQueryCountriesInFlight.add(canonicalC);
+  try {
+    const [llm, autocomplete] = await Promise.all([
+      generateLlmNativeProposals(canonicalC, 5).catch(() => []),
+      generateAutocompleteProposals(canonicalC, 5).catch(() => []),
+    ]);
+    const proposals = [...llm, ...autocomplete];
+    if (!proposals.length) return { generated: 0, persisted: 0, proposals: [] };
+    const seen = new Set<string>();
+    const deduped = proposals.filter(proposal => {
+      if (seen.has(proposal.dedupKey)) return false;
+      seen.add(proposal.dedupKey);
+      return true;
+    });
+    const persisted = await persistFrontierProposals(deduped);
+    return { generated: deduped.length, persisted, proposals: deduped };
+  } finally {
+    generatedQueryCountriesInFlight.delete(canonicalC);
   }
 }
 

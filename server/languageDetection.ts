@@ -63,7 +63,7 @@ const TOKENS: Partial<Record<SupportedLanguage, Set<string>>> = {
   it: new Set(['il', 'la', 'i', 'gli', 'di', 'del', 'e', 'per', 'con', 'in', 'analisi', 'tecnica', 'borsa', 'mercato', 'azioni', 'trading', 'intraday', 'candele', 'supporto', 'resistenza', 'apertura', 'ciclica', 'titoli']),
   ms: new Set(['saham', 'pasaran', 'analisis', 'teknikal', 'dagangan', 'pelaburan', 'niaga', 'forex', 'komoditi', 'indeks', 'modal', 'untung', 'rugi']),
   ga: new Set(['trádáil', 'trádála', 'scaireanna', 'scair', 'earraí', 'anailís', 'teicniúil', 'margadh', 'infheistíocht', 'brabús', 'stoc', 'malartán', 'airgead']),
-  mi: new Set(['hokohoko', 'moni', 'haumi', 'mahere', 'pūtea', 'putea', 'tāke', 'take', 'pakihi', 'utu', 'hoko', 'ohanga']),
+  mi: new Set(['hokohoko', 'moni', 'haumi', 'mahere', 'pūtea', 'putea', 'tāke', 'pakihi', 'utu', 'hoko', 'ohanga']),
   pt: new Set(['o', 'a', 'os', 'as', 'de', 'do', 'da', 'e', 'para', 'com', 'em', 'analise', 'análise', 'tecnica', 'técnica', 'bolsa', 'mercado', 'acoes', 'ações', 'negociacao', 'negociação', 'day', 'trade', 'mini', 'indice', 'índice', 'suporte', 'resistencia', 'resistência', 'abertura']),
 };
 
@@ -77,7 +77,6 @@ const DIACRITIC_HINTS: Partial<Record<SupportedLanguage, RegExp>> = {
   sv: /[åäö]/u,
   no: /[æøå]/u,
   nl: /[ëïé]/u,
-  ga: /[áéíóú]/u,
   mi: /[āēīōū]/u,
 };
 

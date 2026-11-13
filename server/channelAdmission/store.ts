@@ -122,8 +122,21 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
        raw_observation=CASE
          WHEN semantic_admission_candidates.raw_observation->>'quotaOrigin'='PROBE'
            OR EXCLUDED.raw_observation->>'quotaOrigin'='PROBE'
-           THEN jsonb_set(EXCLUDED.raw_observation,'{quotaOrigin}','"PROBE"'::jsonb,true)
-         ELSE EXCLUDED.raw_observation
+           THEN jsonb_set(
+             CASE
+               WHEN semantic_admission_candidates.raw_observation ? 'relationshipProvenance'
+                 AND NOT (EXCLUDED.raw_observation ? 'relationshipProvenance')
+                 THEN jsonb_set(EXCLUDED.raw_observation,'{relationshipProvenance}',semantic_admission_candidates.raw_observation->'relationshipProvenance',true)
+               ELSE EXCLUDED.raw_observation
+             END,
+             '{quotaOrigin}','"PROBE"'::jsonb,true
+           )
+         ELSE CASE
+           WHEN semantic_admission_candidates.raw_observation ? 'relationshipProvenance'
+             AND NOT (EXCLUDED.raw_observation ? 'relationshipProvenance')
+             THEN jsonb_set(EXCLUDED.raw_observation,'{relationshipProvenance}',semantic_admission_candidates.raw_observation->'relationshipProvenance',true)
+           ELSE EXCLUDED.raw_observation
+         END
        END,
        declared_language=COALESCE(EXCLUDED.declared_language,semantic_admission_candidates.declared_language),
        status=CASE

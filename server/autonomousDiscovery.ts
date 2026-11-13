@@ -27,6 +27,7 @@ import {
 import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchAction } from './persistentResearch';
 import { sweepRelationshipCanarySeeds } from './relationshipCanarySeeds';
+import { materializeGeneratedQueryProposalsForCountry } from './discoveryProposalGenerators';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -518,6 +519,23 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       }
       return setAppSetting('country_native_materialization_cursor', String(nativeFairnessCursor + 25));
     }).catch(error => console.warn('[FrontierProposals] Adaptive proposal generation warning:', error));
+    // New LLM/Autocomplete proposals run once per cycle for one country in the
+    // background. They are proposal-only and cannot block the scheduler.
+    try {
+      const generatedCursor = Math.max(0, Number(await getAppSetting('generated_query_country_cursor', '0')) || 0);
+      const generatedCountry = countries[generatedCursor % countries.length];
+      if (generatedCountry) {
+        void materializeGeneratedQueryProposalsForCountry(generatedCountry)
+          .then(result => {
+            if (result.persisted > 0) log(`Generated-query materialization: ${result.persisted} proposal(s) for ${generatedCountry}.`);
+          })
+          .catch(error => console.warn('[FrontierProposals] Generated-query materialization warning:', error));
+        await setAppSetting('generated_query_country_cursor', String(generatedCursor + 1)).catch(() => undefined);
+      }
+    } catch (error) {
+      console.warn('[FrontierProposals] Generated-query cursor warning:', error);
+    }
+
     const osintEnabled = await getAppSetting('external_osint_materialization_enabled', 'false') === 'true';
     await materializeStoredExternalOsintProposals({ enabled: osintEnabled, deadlineMs: 2_500 })
       .catch(error => console.warn('[FrontierProposals] External OSINT degradation; legacy discovery continues:', error));

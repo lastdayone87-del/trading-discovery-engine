@@ -315,7 +315,7 @@ async function callGemini(prompt: string): Promise<{ text: string; provider: str
       }),
     });
     const text = String((response as { text?: string }).text || '').trim();
-    return text ? { text, provider: 'gemini', model } : null;
+    return text && parseResponse(text).length ? { text, provider: 'gemini', model } : null;
   } catch {
     return null;
   }
@@ -350,7 +350,7 @@ export async function generateNativeQueriesWithLlm(input: {
   });
   const cachedHistory: CandidateHistoryItem[] = [
     ...context.existingQueries,
-    ...context.candidateMemory.map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
+    ...context.candidateMemory.filter(row => row.batchKey !== batchKey).map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
   ];
   const cached = await getGenerationBatch(batchKey).catch(() => null);
   if (cached && Array.isArray(cached.candidates)) {
@@ -378,7 +378,7 @@ export async function generateNativeQueriesWithLlm(input: {
   const scenario = SCENARIOS[Math.abs(digest.charCodeAt(2) + digest.charCodeAt(3)) % SCENARIOS.length];
   const history: CandidateHistoryItem[] = [
     ...context.existingQueries,
-    ...context.candidateMemory.map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
+    ...context.candidateMemory.filter(row => row.batchKey !== batchKey).map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
   ];
   const accepted: NativeQueryCandidate[] = [];
   const rejected: Array<{ query: string; reasons: string[] }> = [];
@@ -390,10 +390,11 @@ export async function generateNativeQueriesWithLlm(input: {
     const prompt = buildPrompt(context, persona, scenario, rejected.map(item => item.query), count);
     const response = await generate(prompt);
     if (!response?.text) break;
+    const parsed = parseResponse(response.text);
+    if (!parsed.length) break;
     provider = response.provider;
     model = response.model;
     lastText = response.text;
-    const parsed = parseResponse(response.text);
     for (const row of parsed) {
       const assessed = assessCandidate({
         query: row.query,
