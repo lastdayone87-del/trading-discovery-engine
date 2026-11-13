@@ -12,6 +12,7 @@ import {
   evaluateEnrichmentScaleGate,
   loadEnrichmentScaleMetrics,
   loadEnrichmentScaleMetricsWithinDeadline,
+  semanticScaleGateProvider,
   type EnrichmentScaleMetrics,
 } from './enrichmentScaleGate';
 
@@ -127,6 +128,14 @@ test('percent-style rate thresholds fall back instead of silently blocking scale
   assert.equal(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_COMPLETION_RATIO: '0' } as any).minCompletionToCreationRatio, 0);
 });
 
+test('scale gate selects only the active classification provider', () => {
+  assert.equal(semanticScaleGateProvider({} as any), 'gemini');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'gemini' } as any), 'gemini');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'gemini-free' } as any), 'gemini-free');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'groq' } as any), 'groq');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'unknown' } as any), 'gemini');
+});
+
 test('metrics queries inherit the live deadline and abort signal', async () => {
   const controller = new AbortController();
   const deadlineAtMs = Date.now() + 1_000;
@@ -219,10 +228,13 @@ test('every scale-metrics query carries the configured query timeout', async () 
     },
   });
   assert.deepEqual(seen, [1500, 1500, 1500]);
+  assert.match(statements[0], /provider = 'gemini'/, 'only the active classification provider may enter the scale gate');
   assert.match(statements[0], /geminiScaleGateDeferral/, 'reason-coded capacity deferrals must not count as semantic failures');
   assert.doesNotMatch(statements[0], /geminiCapacityDeferral/, 'lock-wait contention must stay in the scale-gate denominator');
   assert.match(statements[0], /groqCooldownDeferral/, 'local Groq cooldown deferrals must not count as semantic failures');
   assert.match(statements[0], /geminiFreeCooldownDeferral/, 'local free-Gemini deferrals must not count as semantic failures');
+  assert.match(statements[0], /SEMANTIC_DEFERRED_RATE_PRESSURE/, 'local semantic deferrals must not count as provider failures');
+  assert.match(statements[0], /VOCABULARY_DEFERRED_RATE_PRESSURE/, 'local vocabulary deferrals must not count as provider failures');
   assert.equal(metrics.semanticCalls, 100);
   assert.equal(metrics.semanticSuccesses, 95);
   assert.equal(metrics.backlogStable, true);
