@@ -17,6 +17,7 @@ test('classification-cap overflow is durably enqueued instead of running inline'
   assert.match(block, /queued\.reopen_blocked/);
   assert.match(block, /queued\.status === 'PENDING' \|\| queued\.status === 'PROCESSING'/);
   assert.match(block, /if \(queued && !queued\.reopen_blocked/);
+  assert.match(block, /if \(queued === null\)[\s\S]{0,400}hasActiveClassificationJob\(raw\.channelId\)/);
   assert.match(block, /return \{ outcome: await inline\(\), pending: false \};/,
     'inline remains only as the enqueue-failure/terminal fallback');
 });

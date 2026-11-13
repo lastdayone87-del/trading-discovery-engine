@@ -1371,6 +1371,14 @@ export async function admitDiscoveredChannel(input: {
     if (queued && !queued.reopen_blocked && (queued.status === 'PENDING' || queued.status === 'PROCESSING')) {
       return { outcome: classificationPendingOutcome(raw, existing), pending: true };
     }
+    if (queued === null) {
+      // The atomic ownership helper returns null when a concurrent
+      // classification or overflow job already owns this channel. Re-check
+      // before falling back inline so the race cannot create two owners.
+      let owned = false;
+      try { owned = await hasActiveClassificationJob(raw.channelId); } catch { owned = false; }
+      if (owned) return { outcome: classificationPendingOutcome(raw, existing), pending: true };
+    }
     return { outcome: await inline(), pending: false };
   }
   const config = resolveClassificationDecouplingConfig();
