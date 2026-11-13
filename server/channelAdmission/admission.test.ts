@@ -257,6 +257,30 @@ test('clear unrelated with valid citations rejects; insufficient citations go to
   assert.equal(insufficient.admitted, false);
 });
 
+test('a trailing ellipsis does not invalidate an otherwise exact citation', () => {
+  const trader = evidence({
+    name: 'Aker fixture',
+    bio: 'Trading en vivo y analisis de mercados financieros.',
+    videos: [
+      { title: 'Analisis semanal del mercado', description: 'Escenarios operativos y niveles.' },
+      { title: 'Sesion de trading en directo', description: 'Ejecucion y gestion de riesgo.' },
+    ],
+  });
+  const decision = decideAdmission({
+    evidence: trader,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 1,
+      citations: [
+        citation('bio', 'Trading en vivo y analisis de mercados...', undefined, 'TRADING'),
+        citation('video_title', 'Analisis semanal del mercado...', 0, 'TRADING'),
+      ],
+    }),
+  });
+  assert.equal(decision.decision, 'ADMIT');
+  assert.equal(decision.admitted, true);
+});
+
 test('review and finance-adjacent outcomes report the effective second judgment', () => {
   const review = decideAdmission({
     evidence: kikifoodies,

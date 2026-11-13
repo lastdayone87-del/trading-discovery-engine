@@ -102,7 +102,10 @@ function isMeaningfulCitationQuote(quote: string): boolean {
 }
 
 function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {
-  const quote = normalizeEvidenceText(citation.quote);
+  // Models commonly truncate a real quote with a trailing ellipsis. The
+  // prefix before the ellipsis is still exact evidence; only trailing
+  // truncation is accepted so a mid-quote ellipsis cannot splice fields.
+  const quote = normalizeEvidenceText(citation.quote).replace(/(?:\.\.\.|…)+$/, '').trim();
   if (!quote || !isMeaningfulCitationQuote(quote)) return null;
   if (citation.field === 'channel_name') {
     return normalizeEvidenceText(evidence.channelName).includes(quote) ? 'name' : null;
