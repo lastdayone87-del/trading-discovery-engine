@@ -364,8 +364,8 @@ const languages = scored.reduce((acc, row) => ({ ...acc, [row.language]: (acc[ro
 const pendingRows = rows.filter(row => !terminal.has(row.decision) && !unresolvedLabels.has(row.label));
 const pendingPositive = pendingRows.filter(row => row.positive).length;
 const pendingNegative = pendingRows.filter(row => !row.positive).length;
-const operationalRecall = any.confusion.tp / (any.confusion.tp + any.confusion.fn + pendingPositive);
-const operationalSpecificity = any.confusion.tn / (any.confusion.tn + any.confusion.fp + pendingNegative);
+const operationalRecall = ratio(any.confusion.tp, any.confusion.tp + any.confusion.fn + pendingPositive);
+const operationalSpecificity = ratio(any.confusion.tn, any.confusion.tn + any.confusion.fp + pendingNegative);
 const errors = scored
   .filter(row => terminal.has(row.decision) && ((row.positive && !anyAdmit(row)) || (!row.positive && anyAdmit(row))))
   .map(row => ({

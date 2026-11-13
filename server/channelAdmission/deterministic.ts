@@ -249,13 +249,35 @@ function creatorSignalsTrading(evidence: AdmissionEvidence): boolean {
   return hasTradingAnchor(text) || CREATOR_TRADING_SIGNAL.test(text);
 }
 
-export function hasDecisiveTradingShare(evidence: AdmissionEvidence, citations: SemanticCitation[]): boolean {
-  const tradingVideoIndexes = new Set(citations
+export function hasDecisiveTradingShare(
+  evidence: AdmissionEvidence,
+  citations: SemanticCitation[],
+  tradingVideoIndexes?: Set<number>,
+): boolean {
+  const indexes = tradingVideoIndexes || new Set(citations
     .filter(citation => citation.field === 'video_title' || citation.field === 'video_description')
     .map(citation => citation.index)
     .filter((index): index is number => typeof index === 'number'));
-  const tradingVideoShare = evidence.videos.length > 0 ? tradingVideoIndexes.size / evidence.videos.length : 0;
-  return creatorSignalsTrading(evidence) || (tradingVideoIndexes.size >= 3 && tradingVideoShare >= 0.4);
+  const tradingVideoShare = evidence.videos.length > 0 ? indexes.size / evidence.videos.length : 0;
+  return creatorSignalsTrading(evidence) || (indexes.size >= 3 && tradingVideoShare >= 0.4);
+}
+
+/**
+ * Count every video the deterministic classifier cited, before the audit
+ * citation list is shortened for persistence. Repeated trading instruments
+ * can otherwise collapse to the first video and undercount the share.
+ */
+function decisionTradingVideoIndexes(decision: VerificationDecision): Set<number> {
+  const indexes = new Set<number>();
+  for (const item of decision.positiveEvidence) {
+    for (const fieldRef of item.provenance?.fields || []) {
+      if ((fieldRef.field === 'video_title' || fieldRef.field === 'video_description')
+        && typeof fieldRef.index === 'number') {
+        indexes.add(fieldRef.index);
+      }
+    }
+  }
+  return indexes;
 }
 
 export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence): Promise<DeterministicAdmissionResult> {
@@ -281,7 +303,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     // anchor in the creator-owned name/bio, or trading evidence spread across
     // a substantial share of recent videos. Three trading uploads on an
     // otherwise music/lifestyle channel are not decisive.
-    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations);
+    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations, decisionTradingVideoIndexes(decision));
     if (citations.length > 0 && !financeAdjacentOnly && decisiveTradingShare) {
       const judgment: SemanticJudgment = {
         mainSubject: 'TRADING',

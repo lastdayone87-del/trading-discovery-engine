@@ -72,19 +72,19 @@ jobs:
           set -euo pipefail
           for db in fresh_sequence prod_clone; do
             echo "== $db =="
-            versions=$(psql -h localhost -U postgres -d "$db" -Atc \
+            versions=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
               "SELECT string_agg(version::text, ',' ORDER BY version) FROM schema_migrations WHERE version IN (181,182,183)")
             [ "$versions" = "181,182,183" ] || { echo "$db: expected 181,182,183, got '$versions'"; exit 1; }
-            duplicates=$(psql -h localhost -U postgres -d "$db" -Atc \
+            duplicates=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
               "SELECT string_agg(version::text, ',') FROM (SELECT version FROM schema_migrations GROUP BY version HAVING count(*) > 1) d")
             [ -z "$duplicates" ] || { echo "$db: duplicate migration versions: $duplicates"; exit 1; }
-            subscriber=$(psql -h localhost -U postgres -d "$db" -Atc \
+            subscriber=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
               "SELECT column_name FROM information_schema.columns WHERE table_name='channels' AND column_name='subscriber_count_hidden'")
             [ "$subscriber" = "subscriber_count_hidden" ] || { echo "$db: subscriber_count_hidden missing"; exit 1; }
-            admission=$(psql -h localhost -U postgres -d "$db" -Atc \
+            admission=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
               "SELECT to_regclass('public.semantic_admission_candidates')")
             [ "$admission" = "semantic_admission_candidates" ] || { echo "$db: semantic_admission_candidates missing"; exit 1; }
-            setting=$(psql -h localhost -U postgres -d "$db" -Atc \
+            setting=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
               "SELECT setting_value FROM app_settings WHERE setting_key='extracted_query_discovery_enabled'")
             [ "$setting" = "false" ] || { echo "$db: extracted_query_discovery_enabled is not false ('$setting')"; exit 1; }
             echo "$db: 181,182,183 + schema assertions passed"

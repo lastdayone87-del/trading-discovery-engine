@@ -571,16 +571,42 @@ async function main(): Promise<void> {
   }));
 
   const existingResults: Array<Record<string, unknown>> = [];
+  const existingLines: string[] = [];
+  let partialTrailingLineDropped = false;
   if (resume && existsSync(output)) {
     for (const line of readFileSync(output, 'utf8').split('\n')) {
       if (!line.trim()) continue;
       try {
-        existingResults.push(JSON.parse(line) as Record<string, unknown>);
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        existingResults.push(parsed);
+        existingLines.push(JSON.stringify(parsed));
       } catch {
-        // A killed process may leave one partial trailing line. Ignore it and
-        // re-evaluate that channel; every complete line is durable.
+        // A killed process may leave one partial trailing line. Keep the
+        // complete records and truncate the fragment before appending.
+        partialTrailingLineDropped = true;
       }
     }
+    // Never append to a file whose last line is a partial JSON object. Rewrite
+    // the recovered complete records first so the next append starts clean.
+    const normalized = existingLines.length ? `${existingLines.join('\n')}\n` : '';
+    if (readFileSync(output, 'utf8') !== normalized) writeFileSync(output, normalized);
+    // Rebuild the blind sidecar from the durable result records. A result may
+    // have been persisted immediately before its sidecar write; reconstructing
+    // it here prevents a resume from leaving the blinded dataset incomplete.
+    const blindLines = existingResults.map(result => {
+      const channel = (result.channel || {}) as any;
+      const evidence = (result.evidence || {}) as any;
+      return JSON.stringify({
+        channelId: channel.channelId || null,
+        channelName: channel.channelName || null,
+        youtubeUrl: channel.youtubeUrl || null,
+        description: evidence.description || '',
+        links: evidence.links || [],
+        videos: evidence.videos || [],
+        coverage: evidence.coverage || evidence.evidenceCoverage || 'UNKNOWN',
+      });
+    });
+    writeFileSync(blind, blindLines.length ? `${blindLines.join('\n')}\n` : '');
   } else {
     for (const path of [output, blind]) {
       if (existsSync(path)) rmSync(path);
@@ -595,6 +621,8 @@ async function main(): Promise<void> {
       existing: existingResults.length,
       pending: pending.length,
       output,
+      blind,
+      trailingFragmentDropped: partialTrailingLineDropped,
       timestamp: new Date().toISOString(),
     }));
   }
@@ -602,7 +630,7 @@ async function main(): Promise<void> {
   let cursor = 0;
   let completed = existingResults.length;
   const results: Array<Record<string, unknown>> = [...existingResults];
-  const workers = Array.from({ length: concurrency }, async () => {
+  const workers = pending.length === 0 ? [] : Array.from({ length: concurrency }, async () => {
     const session = fromEvidence ? undefined : await Innertube.create({ retrieve_player: false } as any);
     for (;;) {
       const index = cursor++;
