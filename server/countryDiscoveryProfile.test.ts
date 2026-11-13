@@ -52,3 +52,8 @@ test('language detection recognizes Malay, Irish and Māori trading vocabulary',
   assert.equal(detectLanguage('trádáil scaireanna agus anailís theicniúil', { countryHint: 'Ireland' }).language, 'ga');
   assert.equal(detectLanguage('hokohoko haumi mahere pūtea', { countryHint: 'New Zealand' }).language, 'mi');
 });
+
+test('secondary-language hints do not claim common English or Spanish phrases', () => {
+  assert.notEqual(detectLanguage('take profit trading', { countryHint: 'New Zealand' }).language, 'mi');
+  assert.equal(detectLanguage('cómo hacer trading', { countryHint: 'Spain' }).language, 'es');
+});
