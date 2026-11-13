@@ -8,6 +8,12 @@ PostgreSQL service was not reachable from this environment. Whether qualifying
 rows already exist in that service or one of its external backups therefore
 remains an operationally verifiable unknown, not an established absence.
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. The Railway target described below was a separate
+> configured database that was mistakenly treated as production; it is not the
+> production access path. The observed failure and findings are retained. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## 1. Exact expected location and contract
 
 The authoritative dataset is not a file. It is expected in the PostgreSQL
@@ -46,14 +52,15 @@ the same `DATABASE_URL` through the normal PostgreSQL store.
 - The three local `.db` files are legacy stores. String inspection found none of
   the evaluation, creator-focus, or coverage table names. They cannot satisfy the
   immutable lineage contract and must not be treated as evaluation data.
-- The previous evaluation attempt reached no database: the configured Railway
-  proxy hostname failed DNS resolution with `EAI_AGAIN`. Thus it inventoried zero
-  datasets, but did **not** establish that the remote database has zero datasets.
+- The previous evaluation attempt reached no database: the configured database
+  proxy hostname (a Railway target, not production) failed DNS resolution with
+  `EAI_AGAIN`. Thus it inventoried zero datasets, but did **not** establish that
+  the remote database has zero datasets.
 - Repository configuration identifies one database connection contract
   (`DATABASE_URL`). It contains no second environment endpoint, replica, dump
   location, backup credentials, or automated dataset export. Existing repository
-  documentation also characterizes Railway backups as externally configured
-  infrastructure, not repository-managed artifacts.
+  documentation also characterizes Coolify production backups as externally
+  configured infrastructure, not repository-managed artifacts.
 
 ### Not verifiable from the repository
 
@@ -63,8 +70,8 @@ state:
 1. whether production or staging contains rows in
    `decision_evaluation_datasets`;
 2. whether unsealed prerequisite history exists in production;
-3. whether Railway has a usable point-in-time backup or restored clone containing
-   those rows;
+3. whether the Coolify production database has a usable point-in-time backup or
+   restored clone containing those rows;
 4. whether the Phase B controls were active long enough to create representative
    assignments, labels, assertions, focus snapshots, and coverage snapshots.
 
@@ -129,8 +136,8 @@ needed by the evaluation protocol.
 
 The preferred order is:
 
-1. restore the relevant Railway/PostgreSQL backup into a new, network-restricted
-   evaluator database;
+1. restore the relevant production/PostgreSQL backup into a new,
+   network-restricted evaluator database;
 2. grant the evaluator a dedicated `SELECT`-only role and set
    `default_transaction_read_only = on` for that role/database;
 3. compare dataset and example counts and stored checksums with the source;
