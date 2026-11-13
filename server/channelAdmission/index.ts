@@ -9,6 +9,7 @@ import { fetchAdmissionEvidence, isProviderEvidenceFailure } from './evidence';
 import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP, decideAdmission } from './policy';
 import { admissionEvidenceChecksum, isSemanticDecisionFailure, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
 import { evaluateDeterministicAdmission } from './deterministic';
+import { admissionSemanticRouteAvailable } from './routeHealth';
 import {
   enqueueAdmissionVerification,
   findAdmissionCandidate,
@@ -324,7 +325,7 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
   const db = await getDb();
   const decision = await db.query(
-    `SELECT id,decision FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
+    `SELECT id,decision,semantic_output,evidence_hash FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
     [row.id],
   ).catch(() => null);
   let channel = await getChannelById(row.channel_id);
@@ -370,7 +371,9 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
       channel.scan_status = 'CLASSIFICATION_PENDING';
     }
   }
-  const semanticOutput = row.semantic_output as Record<string, any> | null;
+  // The decision ledger is authoritative. A stale candidate projection must
+  // not change the confidence or citations used by resumed classification.
+  const semanticOutput = (decision?.rows[0]?.semantic_output || row.semantic_output) as Record<string, any> | null;
   input.candidate.admissionDecisionId = decisionId;
   input.candidate.admissionStatus = admissionStatus;
   input.candidate.admissionDecisionSource = semanticOutput?.model === 'deterministic-first-v1'
@@ -386,7 +389,7 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   input.candidate.admissionProvider = ['gemini_semantic', 'groq_semantic', 'gemini_free_semantic'].includes(String(semanticOutput?.provider || ''))
     ? semanticOutput.provider
     : undefined;
-  input.candidate.admissionEvidenceHash = row.evidence_hash || undefined;
+  input.candidate.admissionEvidenceHash = decision?.rows[0]?.evidence_hash || row.evidence_hash || undefined;
   input.candidate.admissionCategory = 'General Trading';
   const queued = await enqueueClassificationAfterAdmission({
     candidate: input.candidate,
@@ -613,6 +616,38 @@ export async function verifyAdmissionCandidate(
   }
 
   if (!policy) {
+    // Deterministic admission already completed above. Only the semantic
+    // fallback needs a healthy provider route; preflight it before reserving
+    // model budget so an all-cooling/unconfigured pool defers without a
+    // wasted reservation.
+    if (!options.judge && !(await admissionSemanticRouteAvailable())) {
+      const reasonCodes = ['PROVIDER_RETRY_WITHOUT_ATTEMPT', 'SEMANTIC_ROUTES_COOLING'];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          ...providerDeferredCandidateFields(row.attempts),
+          decision: null,
+          reasonCodes,
+          evidence,
+          evidenceHash: hash,
+          nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
+        reasonCodes,
+        evidence,
+        deterministicRoute,
+        decisionSource: 'SEMANTIC',
+        priority: deterministic.priority,
+      };
+    }
     const judge = options.judge || new ProviderAdmissionJudge({
       jobId: input.discoveryJobId,
       runId: input.queryRunId,

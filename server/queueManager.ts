@@ -152,6 +152,8 @@ import { enqueueAdmissionVerification, getAdmissionMode, hasActiveAdmissionJob, 
 import { admissionRediscoveryDisposition, isWaitingAdmissionStatus } from './channelAdmission/types';
 import { ADMISSION_VERIFICATION_JOB_TYPE, processAdmissionVerificationJob } from './channelAdmission/worker';
 import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
+import { allRoutesCoolingDown, groqFallbackCoolingDown } from './channelAdmission/routeHealth';
+export { allRoutesCoolingDown, groqFallbackCoolingDown, judgeRoutePoolHealthy } from './channelAdmission/routeHealth';
 import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery } from './channelAdmission/store';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
@@ -326,28 +328,6 @@ export function enrichChannelClaimableDuringCooldown(input: {
 export const SEMANTIC_COOLDOWN_ENRICH_PROBE_INTERVAL_MS = 15_000;
 export function semanticCooldownProbeAllowed(lastProbeAt: number, now = Date.now(), intervalMs = SEMANTIC_COOLDOWN_ENRICH_PROBE_INTERVAL_MS): boolean {
   return lastProbeAt <= 0 || now - lastProbeAt >= Math.max(1_000, intervalMs);
-}
-
-/**
- * Groq fallback cooldown composition for the ENRICH claim gate.
- * Groq is usable as a fallback only when BOTH cooldown mechanisms are clear:
- * the persisted shared cooldown (cross-replica ledger) AND the current
- * process's local in-process cooldown. Either one alone blocks the fallback
- * claim so a 429 whose ledger write failed cannot recreate a claim/defer loop.
- * Pure and unit-testable; callers pass the two existing mechanism reads.
- */
-export function groqFallbackCoolingDown(persistedCooldownActive: boolean, localCooldownRemainingMs: number): boolean {
-  return persistedCooldownActive || localCooldownRemainingMs > 0;
-}
-
-/**
- * Pool-level cooling composition over independent routes/orgs: the pool is
- * cooling only when every known route is cooling (fail-closed on an empty
- * list). One healthy account keeps enrichment claimable while the others
- * cool. Pure and unit-testable; async ledger reads stay at the call site.
- */
-export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
-  return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
 }
 
 /** True only for the pre-migration semantic-admission schema. */

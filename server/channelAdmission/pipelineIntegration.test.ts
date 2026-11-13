@@ -215,7 +215,8 @@ test('all discovery sources pass the admission gate and admission honors the kil
   const legacyHandoff = shared.indexOf('return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);');
   assert.ok(gate > -1 && legacyHandoff > gate, 'the admission gate must precede the legacy pipeline handoff');
   assert.match(queue, /admissionModeActive = \(await getAdmissionMode\(\)\) === 'ACTIVE'/);
-  assert.match(queue, /admissionSemanticClaimable = admissionModeActive/);
+  assert.match(queue, /const admissionSemanticClaimable = admissionModeActive;/);
+  assert.doesNotMatch(queue, /admissionSemanticRouteHealthy/);
   const worker = readFileSync(new URL('./worker.ts', import.meta.url), 'utf8');
   assert.match(worker, /getAdmissionMode\(\)\) === 'OFF'/);
 });

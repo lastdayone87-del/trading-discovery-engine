@@ -6,6 +6,7 @@ import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
 import { admissionModeFromOverrides } from './store';
+import { judgeRoutePoolHealthy } from './routeHealth';
 import { candidateFromAdmissionRow } from './index';
 import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus, providerDeferredCandidateFields } from './types';
 import { ambiguousAdmitRate, evaluateQueryAdmissionGuard } from './queryGuard';
@@ -836,4 +837,15 @@ test('one valid trading citation is enough when the video evidence contains a tr
     }),
   });
   assert.equal(result.decision, 'ADMIT');
+});
+
+
+test('admission semantic route health treats unconfigured providers as unavailable', () => {
+  assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: false }, { gemini: false, groq: false }), false);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: false }, { gemini: false, groq: false }), true);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: false }, { gemini: true, groq: false }), false);
+  assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: false }), true);
+  assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: true }), false);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: false }), true);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: true }), false);
 });
