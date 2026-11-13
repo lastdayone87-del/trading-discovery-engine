@@ -67,17 +67,27 @@ jobs:
           mv /tmp/183_pause_extracted_query_discovery.sql server/db/migrations/183_pause_extracted_query_discovery.sql
           DATABASE_URL=postgresql://postgres:postgres@localhost:5432/prod_clone npx tsx scripts/runMigrations.ts
       - name: Assert schema and migration versions
+        shell: bash
         run: |
+          set -euo pipefail
           for db in fresh_sequence prod_clone; do
             echo "== $db =="
-            psql -h localhost -U postgres -d "$db" -Atc \
-              "SELECT version FROM schema_migrations WHERE version IN (181,182,183) ORDER BY version"
-            psql -h localhost -U postgres -d "$db" -Atc \
-              "SELECT column_name FROM information_schema.columns WHERE table_name='channels' AND column_name='subscriber_count_hidden'"
-            psql -h localhost -U postgres -d "$db" -Atc \
-              "SELECT to_regclass('public.semantic_admission_candidates')"
-            psql -h localhost -U postgres -d "$db" -Atc \
-              "SELECT setting_value FROM app_settings WHERE setting_key='extracted_query_discovery_enabled'"
+            versions=$(psql -h localhost -U postgres -d "$db" -Atc \
+              "SELECT string_agg(version::text, ',' ORDER BY version) FROM schema_migrations WHERE version IN (181,182,183)")
+            [ "$versions" = "181,182,183" ] || { echo "$db: expected 181,182,183, got '$versions'"; exit 1; }
+            duplicates=$(psql -h localhost -U postgres -d "$db" -Atc \
+              "SELECT string_agg(version::text, ',') FROM (SELECT version FROM schema_migrations GROUP BY version HAVING count(*) > 1) d")
+            [ -z "$duplicates" ] || { echo "$db: duplicate migration versions: $duplicates"; exit 1; }
+            subscriber=$(psql -h localhost -U postgres -d "$db" -Atc \
+              "SELECT column_name FROM information_schema.columns WHERE table_name='channels' AND column_name='subscriber_count_hidden'")
+            [ "$subscriber" = "subscriber_count_hidden" ] || { echo "$db: subscriber_count_hidden missing"; exit 1; }
+            admission=$(psql -h localhost -U postgres -d "$db" -Atc \
+              "SELECT to_regclass('public.semantic_admission_candidates')")
+            [ "$admission" = "semantic_admission_candidates" ] || { echo "$db: semantic_admission_candidates missing"; exit 1; }
+            setting=$(psql -h localhost -U postgres -d "$db" -Atc \
+              "SELECT setting_value FROM app_settings WHERE setting_key='extracted_query_discovery_enabled'")
+            [ "$setting" = "false" ] || { echo "$db: extracted_query_discovery_enabled is not false ('$setting')"; exit 1; }
+            echo "$db: 181,182,183 + schema assertions passed"
           done
       - name: Reject duplicate migration versions
         run: |

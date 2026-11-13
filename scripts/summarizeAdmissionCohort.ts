@@ -46,6 +46,7 @@ interface Interval { low: number; high: number; n: number }
 
 const expectedAdmit = new Set<Label>(['TRADING', 'FINANCE_ADJACENT']);
 const unresolvedLabels = new Set<Label>(['AMBIGUOUS', 'UNKNOWN_EVIDENCE']);
+const validLabels = new Set<Label>(['TRADING', 'FINANCE_ADJACENT', 'UNRELATED', 'AMBIGUOUS', 'UNKNOWN_EVIDENCE']);
 const terminal = new Set<string>(['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED']);
 const iterations = Math.max(200, Number(argValue('bootstrap') || 10_000));
 const seed = argValue('seed') || 'admission-cohort-bootstrap-v1';
@@ -78,7 +79,10 @@ function loadReview(path: string): { labels: ReviewLabel[]; meta: Record<string,
   if (document?.labels) {
     return {
       meta: document._meta || null,
-      labels: Object.entries(document.labels).map(([channelId, value]) => ({ channelId, label: value.label, note: value.note, language: value.language })),
+      labels: Object.entries(document.labels).map(([channelId, value]) => {
+        if (!validLabels.has(value.label)) fail(`Unknown review label ${JSON.stringify(value.label)} for ${channelId} in ${path}`);
+        return { channelId, label: value.label, note: value.note, language: value.language };
+      }),
     };
   }
   const labels = raw.split('\n').filter(Boolean).map((line, index) => {
@@ -89,6 +93,7 @@ function loadReview(path: string): { labels: ReviewLabel[]; meta: Record<string,
       fail(`Invalid review label JSON on line ${index + 1} of ${path}`);
     }
     if (!value.channelId || !value.label) fail(`Invalid review label on line ${index + 1} of ${path}`);
+    if (!validLabels.has(value.label)) fail(`Unknown review label ${JSON.stringify(value.label)} on line ${index + 1} of ${path}`);
     return value;
   });
   return { labels, meta: null };
@@ -180,7 +185,10 @@ function wilson(successes: number, total: number, z = 1.96): Interval | null {
 function f1From(c: Confusion): number | null {
   const precision = ratio(c.tp, c.tp + c.fp);
   const recall = ratio(c.tp, c.tp + c.fn);
-  if (precision === null || recall === null || precision + recall === 0) return null;
+  // Positive-class F1 convention: an undefined precision or recall (no
+  // predicted positives or no actual positives) contributes 0, not a dropped
+  // bootstrap sample. Dropping undefined resamples biases intervals upward.
+  if (precision === null || recall === null || precision + recall === 0) return 0;
   return (2 * precision * recall) / (precision + recall);
 }
 
