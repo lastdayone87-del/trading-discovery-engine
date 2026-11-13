@@ -9,9 +9,9 @@ test('classification-cap overflow is durably enqueued instead of running inline'
   const end = source.indexOf('const config = resolveClassificationDecouplingConfig();', start);
   assert.ok(start >= 0 && end > start);
   const block = source.slice(start, end);
-  assert.match(block, /try \{[\s\S]*enqueueClassificationJobAtomic\(raw\.channelId/);
+  assert.match(block, /try \{[\s\S]*enqueueClassificationJobAtomic\(raw\.channelId[\s\S]*\} catch \(error\)/,
+    'the enqueue call must be inside the guarded fallback construct');
   assert.match(block, /jobType: 'PROCESS_DISCOVERED_CHANNEL'/);
-  assert.match(block, /catch \(error\)/);
   assert.match(block, /preventCompletedReopen: true/);
   assert.match(block, /priority: 14/);
   assert.match(block, /queued\.reopen_blocked/);
@@ -26,8 +26,10 @@ test('overflow jobs run in the enrichment lane with admission already decided', 
   const start = source.indexOf("if(job.type==='PROCESS_DISCOVERED_CHANNEL')");
   assert.ok(start >= 0);
   const block = source.slice(start, start + 1800);
-  assert.match(block, /assertCountryAllowed/);
-  assert.match(block, /processDiscoveredChannelContained/);
+  assert.match(block, /assertCountryAllowed[\s\S]*processDiscoveredChannelContained/,
+    'country policy must be checked before the pipeline starts');
+  assert.match(block, /if \(!outcome\)[\s\S]*await completeJob\(job\.id\)/,
+    'a contained probe deferral must not overwrite the pending sighting');
   assert.match(block, /admissionBypass: true/);
   assert.match(block, /isRepairEligibleRetry\(job\)/);
   assert.match(block, /reconcileClassificationResult/);
@@ -43,7 +45,7 @@ test('overflow ownership and failure reconciliation are visible to recovery path
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const recovery = readFileSync(new URL('./classificationResolutionRecovery.ts', import.meta.url), 'utf8');
   const monitoring = readFileSync(new URL('./classificationResolutionMonitoring.ts', import.meta.url), 'utf8');
-  assert.match(dbCore, /\[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'\]/);
+  assert.match(dbCore, /\[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL', 'ENRICH_CHANNEL'\]/);
   assert.match(dbCore, /deps\.jobType \|\| CLASSIFICATION_JOB_TYPE/);
   assert.match(recovery, /'CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL'/);
   assert.match(monitoring, /'CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL'/);

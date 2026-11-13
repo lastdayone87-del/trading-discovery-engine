@@ -1673,7 +1673,14 @@ export async function processNextSearchJob(
         lane: 'DISCOVERY',
         jobType: job.type,
       });
-      const channel=outcome?.channelRecord || await getChannelById(channelId);
+      if (!outcome) {
+        // A contained probe refusal is replayed by a durable ENRICH job. The
+        // sighting must stay pending until that replay produces the real
+        // outcome; do not overwrite it with a false "not persisted" verdict.
+        await completeJob(job.id);
+        return true;
+      }
+      const channel=outcome.channelRecord || await getChannelById(channelId);
       await reconcileClassificationResult({
         channelId,
         jobId: job.id,
