@@ -1338,26 +1338,39 @@ export async function admitDiscoveredChannel(input: {
     // retrieval worker at the cap. Persist a durable overflow job and let the
     // enrichment lane drain it; the nomination and channel identity remain
     // the deduplication boundary.
-    const queued = await enqueueJob('PROCESS_DISCOVERED_CHANNEL', {
-      channelId: raw.channelId,
-      raw,
-      targetCountry,
-      source,
-      query: input.query,
-      queryId: input.queryId,
-      queryRunId: input.queryRunId,
-      discoveryJobId: input.discoveryJobId,
-      pageNumber: input.pageNumber,
-      resultRank: input.resultRank,
-      forceExtraction: input.forceExtraction,
-      quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL',
-    }, {
-      priority: 20,
-      maxAttempts: 3,
-      idempotencyKey: `discovery-overflow:${raw.channelId}:${new Date().toISOString().slice(0, 10)}`,
-      preventCompletedReopen: true,
-    });
-    if (queued) return { outcome: classificationPendingOutcome(raw, existing), pending: true };
+    let queued: Awaited<ReturnType<typeof enqueueJob>> | null = null;
+    try {
+      queued = await enqueueClassificationJobAtomic(raw.channelId, {
+        channelId: raw.channelId,
+        raw,
+        targetCountry,
+        source,
+        query: input.query,
+        queryId: input.queryId,
+        queryRunId: input.queryRunId,
+        discoveryJobId: input.discoveryJobId,
+        pageNumber: input.pageNumber,
+        resultRank: input.resultRank,
+        forceExtraction: input.forceExtraction,
+        quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL',
+      }, {
+        // Below classification (21) and admission (30), above ENRICH backfill.
+        priority: 14,
+        maxAttempts: 3,
+        idempotencyKey: `discovery-overflow:${raw.channelId}:${new Date().toISOString().slice(0, 10)}`,
+        preventCompletedReopen: true,
+      }, { jobType: 'PROCESS_DISCOVERED_CHANNEL' });
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'discovery_overflow_enqueue_failed',
+        channelId: raw.channelId,
+        reason: error instanceof Error ? error.message : String(error),
+        timestamp: new Date().toISOString(),
+      }));
+    }
+    if (queued && !queued.reopen_blocked && (queued.status === 'PENDING' || queued.status === 'PROCESSING')) {
+      return { outcome: classificationPendingOutcome(raw, existing), pending: true };
+    }
     return { outcome: await inline(), pending: false };
   }
   const config = resolveClassificationDecouplingConfig();
@@ -1511,10 +1524,10 @@ export async function processNextSearchJob(
       // probe: stage-1/2 evidence is persisted before the semantic attempt, so
       // the next pass can resume without re-spending YouTube quota.
       if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE))) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
+      if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
   if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
@@ -1641,13 +1654,24 @@ export async function processNextSearchJob(
     }
     if(job.type==='PROCESS_DISCOVERED_CHANNEL'){
       const p=job.payload as any;
-      await processDiscoveredChannelContained(p.raw || p.candidate, String(p.targetCountry||''), p.source as DiscoverySource, {
+      const channelId=String(p.channelId||p.raw?.channelId||p.candidate?.channelId||'');
+      const targetCountry=String(p.targetCountry||'');
+      await assertCountryAllowed(targetCountry, `discovery_overflow_worker:${job.id}`);
+      const outcome=await processDiscoveredChannelContained(p.raw || p.candidate, targetCountry, p.source as DiscoverySource, {
         admissionBypass: true,
-        forceExtraction: p.forceExtraction === true,
+        forceExtraction: p.forceExtraction === true || isRepairEligibleRetry(job),
         jobId: job.id,
         runId: typeof p.queryRunId === 'string' ? p.queryRunId : undefined,
         lane: 'DISCOVERY',
         jobType: job.type,
+      });
+      const channel=outcome?.channelRecord || await getChannelById(channelId);
+      await reconcileClassificationResult({
+        channelId,
+        jobId: job.id,
+        channel,
+        outcome,
+        persisted: Boolean(channel && outcome?.persisted),
       });
       await completeJob(job.id);
       return true;
@@ -2753,9 +2777,9 @@ export async function processNextSearchJob(
       // without retrying so it can never spend external API quota.
       // Classification jobs never own the search run: the run already completed
       // before classification started, so a later policy change must not fail it.
-      const runId = job.type === CLASSIFICATION_JOB_TYPE ? '' : String(job.payload?.queryRunId || '');
+      const runId = job.type === CLASSIFICATION_JOB_TYPE || job.type === 'PROCESS_DISCOVERED_CHANNEL' ? '' : String(job.payload?.queryRunId || '');
       if (runId) await failQueryRun(runId, err, true);
-      if (job.type === CLASSIFICATION_JOB_TYPE) {
+      if (job.type === CLASSIFICATION_JOB_TYPE || job.type === 'PROCESS_DISCOVERED_CHANNEL') {
         const channelId = String(job.payload?.channelId || '');
         if (channelId) {
           await deleteClassificationPlaceholder(channelId).catch(() => undefined);
@@ -2798,7 +2822,7 @@ export async function processNextSearchJob(
           .catch(error=>console.warn(`[CandidateAdmission] operational-failure shadow write failed for ${channelId}:`,error instanceof Error?error.message:error));
       }
     }
-    if (job.type === CLASSIFICATION_JOB_TYPE && terminal) {
+    if ((job.type === CLASSIFICATION_JOB_TYPE || job.type === 'PROCESS_DISCOVERED_CHANNEL') && terminal) {
       const channelId = String(job.payload?.channelId || '');
       const scanStatus = isProviderDeferredEnrichmentError(err) ? 'PROVIDER_DEFERRED' : 'FAILED';
       // Conditional projection: only an untouched placeholder may become a
@@ -2821,7 +2845,7 @@ export async function processNextSearchJob(
       const channel=channelId?await getChannelById(channelId):null;
       if(channel)await upsertChannel(projectTerminalCommunityRetryFailure(channel,job.attempts,new Date().toISOString()));
     }
-    const runId = job.type === CLASSIFICATION_JOB_TYPE ? '' : String(job.payload?.queryRunId || '');
+    const runId = job.type === CLASSIFICATION_JOB_TYPE || job.type === 'PROCESS_DISCOVERED_CHANNEL' ? '' : String(job.payload?.queryRunId || '');
     if (runId) await failQueryRun(runId, err, terminal);
     return false;
   } finally {

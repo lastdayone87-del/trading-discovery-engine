@@ -1539,7 +1539,7 @@ export async function enqueueClassificationJobAtomic(
   channelId: string,
   payload: any,
   opts: Parameters<typeof enqueueJob>[2] = {},
-  deps: { client?: any } = {},
+  deps: { client?: any; jobType?: typeof CLASSIFICATION_JOB_TYPE | 'PROCESS_DISCOVERED_CHANNEL' } = {},
 ): Promise<DurableJob | null> {
   // The helper owns the transaction. `deps.client` exists only so tests can
   // drive the locking/admission branches; production callers must not pass a
@@ -1550,14 +1550,14 @@ export async function enqueueClassificationJobAtomic(
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`classification-admit:${channelId}`]);
     const active = await client.query(
-      `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
-      [CLASSIFICATION_JOB_TYPE, channelId],
+      `SELECT 1 FROM jobs WHERE type=ANY($1::text[]) AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+      [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], channelId],
     );
     if (active.rowCount) {
       await client.query('COMMIT');
       return null;
     }
-    const job = await enqueueJob(CLASSIFICATION_JOB_TYPE, payload, { ...opts, clientOverride: client });
+    const job = await enqueueJob(deps.jobType || CLASSIFICATION_JOB_TYPE, payload, { ...opts, clientOverride: client });
     await client.query('COMMIT');
     return job;
   } catch (error) {
@@ -1572,8 +1572,8 @@ export async function enqueueClassificationJobAtomic(
 export async function hasActiveClassificationJob(channelId: string): Promise<boolean> {
   const db = await getDb();
   const result = await db.query(
-    `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
-    [CLASSIFICATION_JOB_TYPE, channelId],
+    `SELECT 1 FROM jobs WHERE type=ANY($1::text[]) AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+    [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], channelId],
   );
   return (result.rowCount || 0) > 0;
 }
