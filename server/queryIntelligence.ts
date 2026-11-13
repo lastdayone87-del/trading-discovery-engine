@@ -87,6 +87,40 @@ import {
 } from './freeQuerySignals';
 import type { DemandSignalQueryCandidate } from './queryPlanner';
 
+/**
+ * Extracted-query discovery is paused while the semantic extractor is rebuilt.
+ * The flag is fail-closed: only a trimmed, case-insensitive `true` re-enables
+ * generation and serving. The ledger/schema stay in place for the future rewrite.
+ */
+export const EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY = 'extracted_query_discovery_enabled';
+
+export function isExtractedQueryDiscoveryEnabled(value: unknown): boolean {
+  return String(value ?? '').trim().toLowerCase() === 'true';
+}
+
+/** Single fail-closed reader used by extraction, generation and selection. */
+export async function loadExtractedQueryDiscoveryEnabled(): Promise<boolean> {
+  return isExtractedQueryDiscoveryEnabled(
+    await getAppSetting(EXTRACTED_QUERY_DISCOVERY_ENABLED_KEY, 'false')
+  );
+}
+
+/** True for rows owned by the paused feature, including its quarantine marker. */
+export function isExtractedStandaloneQueryRow(row: { generation_metadata?: unknown }): boolean {
+  const metadata = row.generation_metadata;
+  if (!metadata || typeof metadata !== 'object') return false;
+  const value = metadata as Record<string, unknown>;
+  return value.queryTemplate === 'EXTRACTED_STANDALONE' || value.extractedQueryPaused === true;
+}
+
+/** Keep the paused feature out of every selection path while disabled. */
+export function filterPausedExtractedQueryRows<T extends { generation_metadata?: unknown }>(
+  rows: T[],
+  enabled: boolean,
+): T[] {
+  return enabled ? rows : rows.filter(row => !isExtractedStandaloneQueryRow(row));
+}
+
 // AI Client lazy initialization
 let aiClient: GoogleGenAI | null = null;
 function getAIClient(): GoogleGenAI | null {
@@ -978,7 +1012,9 @@ export async function extractVocabularyFromCreator(
   // Below-quality creators may contribute observations, but their text must
   // not become discovery queries. The same flag also keeps query-only provider
   // responses from suppressing Gemini fallback for an unusable bucket.
-  const queryCandidatesEligible = options?.promotionEligible !== false
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
+  const queryCandidatesEligible = extractedQueryDiscoveryEnabled
+    && options?.promotionEligible !== false
     && options?.persistLegacyTerm !== false;
   // Literal sources are built before any provider attempt. Playlist titles and
   // descriptions are first-class context candidates, never separate shadow
@@ -1022,6 +1058,12 @@ export async function extractVocabularyFromCreator(
     // misreported as Gemini errors or silently swallowed.
     let parsed: { terminology?: unknown; instruments?: unknown; phrases?: unknown; formats?: unknown; queries?: unknown } | undefined;
     let parsedSource: 'GROQ' | 'GEMINI' = 'GEMINI';
+    const queryPromptSection = extractedQueryDiscoveryEnabled
+      ? '- "queries": clean native-language discovery queries. Use 2-6 words. Split composite titles into useful independent candidates. Remove promotional suffixes, CTAs, clickbait, dates, episode labels, hashtags, emoji, metadata and incomplete fragments. Preserve the original language; do not translate. Only include phrases with genuine trading intent.'
+      : '';
+    const queryJsonField = extractedQueryDiscoveryEnabled
+      ? ',\n  "queries": ["native search phrase"]'
+      : '';
     const prompt = `Analyze this YouTube trading channel and recent video titles for country "${channel.country}".
 Channel Name: "${channel.channel_name}"
 Description: "${effDesc}"
@@ -1037,7 +1079,7 @@ Identify localized trading vocabulary used by traders in ${channel.country}. Eac
 - "instruments": tradeable instruments, exchanges or contracts (for example "NQ Futures", "XAUUSD", "DAX").
 - "phrases": multiword phrases with a genuine market/trading meaning (for example "live trading", "trade review", "risk management").
 - "formats": trading-specific content formats only (for example "live trading", "trade review"), never generic packaging.
-- "queries": clean native-language discovery queries. Use 2-6 words. Split composite titles into useful independent candidates. Remove promotional suffixes, CTAs, clickbait, dates, episode labels, hashtags, emoji, metadata and incomplete fragments. Preserve the original language; do not translate. Only include phrases with genuine trading intent.
+${queryPromptSection}
 Quote every term EXACTLY as it appears in the texts above: do not paraphrase, translate, or invent terms.
 Exclude calls to action (subscribe, like, comment, notification), channel boilerplate, episode/part/volume labels, emoji-only or symbol-only surfaces, hashtags, URLs, handles, and generic words such as "free", "video", "channel", "interview", "live" or "session" without a trading qualifier. Do not return "Subscribe and Like button", "Free Interviews", "Épisode 6", "🔴" or "#trading".
 Return ONLY a valid JSON object with format:
@@ -1045,8 +1087,7 @@ Return ONLY a valid JSON object with format:
   "terminology": ["term1", "term2"],
   "instruments": ["inst1"],
   "phrases": ["phrase1"],
-  "formats": ["format1"],
-  "queries": ["native search phrase"]
+  "formats": ["format1"]${queryJsonField}
 }`;
 
     // Literal sources were built before any provider attempt; the novelty
@@ -1232,7 +1273,11 @@ Return ONLY a valid JSON object with format:
           if (aiRun) {
             aiRun.responseChars += resText.length;
           }
-          parsed = parseNativeVocabularyResponse(resText);
+          const geminiParsed = parseNativeVocabularyResponse(resText);
+          // Apply the same admissibility boundary as Groq. A query-only
+          // response must not be recorded as a successful extraction while
+          // extracted-query discovery is paused.
+          if (isAdmissible(geminiParsed)) parsed = geminiParsed;
         } catch (e: any) {
           const msg = e?.message || String(e);
           const isQuota = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
@@ -1404,7 +1449,9 @@ export async function selectNextQueryForCountry(
   const familyCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_family_share_cap', process.env.QUERY_INTELLIGENCE_FAMILY_SHARE_CAP || '0.45')) || 0.45));
   const sourceCap = Math.min(1, Math.max(0.1, Number(await getAppSetting('query_intelligence_source_share_cap', process.env.QUERY_INTELLIGENCE_SOURCE_SHARE_CAP || '0.60')) || 0.60));
 
-  const loadQueries = async (): Promise<QueryRecord[]> => getQueriesByCountry(country);
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
+  const loadQueries = async (): Promise<QueryRecord[]> =>
+    filterPausedExtractedQueryRows(await getQueriesByCountry(country), extractedQueryDiscoveryEnabled);
   const loadPool = async (queries: QueryRecord[]): Promise<SelectorPool> =>
     buildSelectorPool(country, queries, { now, cooldownMinutes, maxPrimaryUses, nowIso, portfolioRatio, familyCap, sourceCap, scopePromotionBasis: options.scopePromotionBasis });
 
@@ -1888,16 +1935,21 @@ export async function generateCandidateQueriesForCountry(
   options: { scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET' } = {}
 ): Promise<QueryRecord[]> {
   await assertCountryAllowed(country, 'query_generation');
-  await reconcileExtractedQueryCandidates(country).catch(error => {
-    console.warn('[Extracted Query] reconciliation failed', error instanceof Error ? error.message : String(error));
-  });
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
+  if (extractedQueryDiscoveryEnabled) {
+    await reconcileExtractedQueryCandidates(country).catch(error => {
+      console.warn('[Extracted Query] reconciliation failed', error instanceof Error ? error.message : String(error));
+    });
+  }
   const [vocabs, extractedTerms, existingQueries, provenTerminology, organicCandidates, standaloneExtractedCandidates] = await Promise.all([
     getCountryVocabularies(),
     getExtractedVocabulary(country),
     getQueriesByCountry(country),
     getPlannerTerminology(country),
     getPublishedOrganicQueryCandidates(country),
-    getStandaloneExtractedQueryCandidates(country)
+    extractedQueryDiscoveryEnabled
+      ? getStandaloneExtractedQueryCandidates(country)
+      : Promise.resolve([])
   ]);
   // Reconcile ledger rows against existing query text before planning. A
   // transient link failure then self-heals instead of stranding outcomes, and
