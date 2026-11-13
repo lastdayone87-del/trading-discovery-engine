@@ -350,54 +350,12 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
   return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
 }
 
-/**
- * Admission judge availability treats an unconfigured provider as
- * unavailable, not healthy. A pool with zero configured routes is unhealthy;
- * one configured healthy route keeps admission claimable.
- */
-export function judgeRoutePoolHealthy(
-  configured: { gemini: boolean; groq: boolean },
-  cooling: { gemini: boolean; groq: boolean },
-): boolean {
-  return (configured.gemini && !cooling.gemini) || (configured.groq && !cooling.groq);
-}
-
 /** True only for the pre-migration semantic-admission schema. */
 function isMissingAdmissionSchemaError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   const namesAdmissionRelation = /semantic_admission_(candidates|decisions|sightings|model_calls)/i.test(message);
   const missingRelation = /relation ["']?[^"']*["']? does not exist/i.test(message);
   return namesAdmissionRelation && ((error as { code?: unknown })?.code === '42P01' || missingRelation);
-}
-
-/**
- * Admission judge health is independent of the enrichment route. The judge
- * always has a Gemini primary and a Groq second/fallback route, so admission
- * is claimable while at least one configured route is healthy.
- */
-async function admissionSemanticRouteHealthy(): Promise<boolean> {
-  const geminiRoutes = configuredGeminiRoutes();
-  const groqRoutes = configuredGroqRoutes();
-  // ProviderAdmissionJudge uses paid Gemini and Groq only. A healthy free
-  // Gemini route must not keep an admission job claimable when both judge
-  // routes are cooling, because that job would spend evidence/budget and
-  // consume attempts without a usable judge.
-  if (geminiRoutes.length === 0 && groqRoutes.length === 0) return false;
-  const [geminiCooling, groqCooling] = await Promise.all([
-    geminiRoutes.length > 0
-      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
-      : true,
-    groqRoutes.length > 0
-      ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(
-          await isGroqOrgCooldownActive(groqRouteOrg(route)),
-          groqOrgCooldownRemainingMs(groqRouteOrg(route)),
-        ))))
-      : true,
-  ]);
-  return judgeRoutePoolHealthy(
-    { gemini: geminiRoutes.length > 0, groq: groqRoutes.length > 0 },
-    { gemini: geminiCooling, groq: groqCooling },
-  );
 }
 
 /**
@@ -1507,7 +1465,7 @@ export async function processNextSearchJob(
   // already-working fallback.
   let enrichProbeOnly = false;
   const admissionModeActive = (await getAdmissionMode()) === 'ACTIVE';
-  let admissionSemanticClaimable = admissionModeActive;
+  const admissionSemanticClaimable = admissionModeActive;
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
@@ -1528,7 +1486,6 @@ export async function processNextSearchJob(
       if (groqFallbackConfigured) groqFallbackCooldownActive = allRoutesCoolingDown(await Promise.all(fallbackRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
     const enrichmentFullyClaimable = enrichChannelClaimableDuringCooldown({ groqSelected, geminiFreeSelected, geminiCooldownActive, groqCooldownActive, geminiFreeCooldownActive, groqFallbackConfigured, groqFallbackCooldownActive });
-    admissionSemanticClaimable = admissionModeActive && await admissionSemanticRouteHealthy();
     const nowMs = Date.now();
     const probeTimeAllowed = !enrichmentFullyClaimable && semanticCooldownProbeAllowed(lastSemanticCooldownEnrichProbeAt, nowMs);
     // Reserve the interval before awaiting the scan. Empty results and

@@ -377,7 +377,10 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
     ? 'DETERMINISTIC'
     : semanticOutput?.provider ? 'SEMANTIC' : 'HUMAN';
   input.candidate.admissionConfirmedTrading = admissionStatus === 'ADMITTED';
-  input.candidate.admissionTradingConfidence = Number(semanticOutput?.tradingFocus) || (admissionStatus === 'ADMITTED' ? 90 : 0);
+  const savedConfidence = semanticOutput?.tradingFocus;
+  input.candidate.admissionTradingConfidence = savedConfidence === undefined || savedConfidence === null
+    ? (admissionStatus === 'ADMITTED' ? 90 : 0)
+    : Number(savedConfidence);
   input.candidate.admissionCitations = Array.isArray(semanticOutput?.citations) ? semanticOutput.citations : [];
   input.candidate.admissionModel = semanticOutput?.model || undefined;
   input.candidate.admissionProvider = ['gemini_semantic', 'groq_semantic', 'gemini_free_semantic'].includes(String(semanticOutput?.provider || ''))

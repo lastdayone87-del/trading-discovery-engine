@@ -268,12 +268,19 @@ async function main(): Promise<void> {
   });
 
   await check('resume rebuilds a missing admitted channel from the durable decision', async () => {
-    const evidence = { ...tradingEvidence, channelId: `${PREFIX}RESUME`, channelName: 'Resume Trader' };
+    const evidence = { ...tradingEvidence, channelId: `${PREFIX}RESUME`, channelName: 'Resume Trader', youtubeUrl: `https://youtube.com/channel/${PREFIX}RESUME` };
     const input = candidateInput(evidence);
     const row = await upsertAdmissionCandidate(input);
     const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: evidence });
     assert.equal(result.status, 'ADMITTED');
+    await db.query(`DELETE FROM jobs WHERE payload->>'channelId'=$1 AND type='CLASSIFY_DISCOVERED_CHANNEL'`, [evidence.channelId]);
     await db.query(`DELETE FROM channels WHERE channel_id=$1`, [evidence.channelId]);
+    await db.query(
+      `UPDATE semantic_admission_candidates
+          SET semantic_output=jsonb_set(COALESCE(semantic_output,'{}'::jsonb),'{tradingFocus}','0'::jsonb)
+        WHERE channel_id=$1`,
+      [evidence.channelId],
+    );
     assert.equal(await getChannelById(evidence.channelId), null);
     const candidate = await findAdmissionCandidate(evidence.channelId);
     const resumed = await resumeAdmittedCandidate(input, candidate!);
@@ -284,6 +291,7 @@ async function main(): Promise<void> {
     assert.equal(jobs.rowCount, 1);
     assert.equal(jobs.rows[0].payload.candidate?.admissionConfirmedTrading, true);
     assert.equal(jobs.rows[0].payload.candidate?.admissionDecisionSource, 'DETERMINISTIC');
+    assert.equal(jobs.rows[0].payload.candidate?.admissionTradingConfidence, 0);
     assert.equal(jobs.rows[0].payload.quotaOrigin, 'NORMAL');
     return { channel: channel?.admission_status, classificationJobs: jobs.rowCount };
   });

@@ -65,17 +65,25 @@ const report = {
     coverage: rows.length ? detDecided.length / rows.length : null,
     fastPass: {
       total: rows.filter(row => row.deterministic?.outcome === 'PASS').length,
-      wrong: rows.filter(row => row.deterministic?.outcome === 'PASS' && !expectedAdmit.has(label(row.channel.channelId))).length,
+      scored: rows.filter(row => row.deterministic?.outcome === 'PASS' && isScoredLabel(row.channel.channelId)).length,
+      wrong: rows.filter(row => row.deterministic?.outcome === 'PASS'
+        && isScoredLabel(row.channel.channelId)
+        && label(row.channel.channelId) === 'UNRELATED').length,
     },
     strictReject: {
       total: rows.filter(row => row.deterministic?.outcome === 'REJECT').length,
-      wrong: rows.filter(row => row.deterministic?.outcome === 'REJECT' && expectedAdmit.has(label(row.channel.channelId))).length,
+      scored: rows.filter(row => row.deterministic?.outcome === 'REJECT' && isScoredLabel(row.channel.channelId)).length,
+      wrong: rows.filter(row => row.deterministic?.outcome === 'REJECT'
+        && isScoredLabel(row.channel.channelId)
+        && expectedAdmit.has(label(row.channel.channelId))).length,
     },
     ambiguousByGroundTruth: tally(rows.filter(row => row.deterministic?.outcome === 'AMBIGUOUS').map(row => label(row.channel.channelId))),
   },
   final: (() => {
     const admitted = rows.filter(row => row.final?.decision === 'ADMIT' || row.final?.decision === 'ADMIT_AMBIGUOUS');
     const rejected = rows.filter(row => row.final?.decision === 'REJECT_UNRELATED');
+    const admittedScored = admitted.filter(row => isScoredLabel(row.channel.channelId));
+    const rejectedScored = rejected.filter(row => isScoredLabel(row.channel.channelId));
     const review = rows.filter(row => row.final?.decision === 'NEEDS_REVIEW');
     const expectedAdmitRows = rows.filter(row => expectedAdmit.has(label(row.channel.channelId)));
     const expectedRejectRows = rows.filter(row => label(row.channel.channelId) === 'UNRELATED');
@@ -87,8 +95,8 @@ const report = {
       correct: finalCorrect.length,
       wrong: finalDecided.length - finalCorrect.length,
       accuracy: finalDecided.length ? finalCorrect.length / finalDecided.length : null,
-      admitPrecision: admitted.length ? admittedExpected.length / admitted.length : null,
-      rejectPrecision: rejected.length ? rejectedExpected.length / rejected.length : null,
+      admitPrecision: admittedScored.length ? admittedExpected.length / admittedScored.length : null,
+      rejectPrecision: rejectedScored.length ? rejectedExpected.length / rejectedScored.length : null,
       admitRecall: expectedAdmitRows.length ? admittedExpected.length / expectedAdmitRows.length : null,
       rejectRecall: expectedRejectRows.length ? rejectedExpected.length / expectedRejectRows.length : null,
       pendingReviewByLabel: tally(review.map(row => label(row.channel.channelId))),
