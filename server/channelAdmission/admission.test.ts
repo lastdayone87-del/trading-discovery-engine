@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessExtractedQueryAdmission, decideAdmission } from './policy';
-import { evaluateDeterministicAdmission, evaluateStrictRejection, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
+import { evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
@@ -618,6 +618,76 @@ test('deterministic stage fast-passes a decisive trading channel without AI', as
   assert.ok(result.reasonCodes.includes('DETERMINISTIC_FAST_PASS'));
   assert.ok(result.citations.length > 0);
   assert.ok(result.citations.every(citation => citation.supports === 'TRADING'));
+});
+
+test('a few trading uploads on an otherwise music channel do not fast-pass', async () => {
+  const musicWithTrading = evidence({
+    name: 'Music Producer',
+    bio: 'I do the most.',
+    videos: [
+      { title: 'Live Trading GOLD | Fibonacci and Volume Profile', description: 'XAUUSD session.' },
+      { title: 'XAUUSD Live Trading', description: 'Gold trade recap.' },
+      { title: 'Gold live stream', description: 'Volume profile and risk management.' },
+      ...Array.from({ length: 12 }, (_, index) => ({
+        title: `New song ${index + 1} (Official Visualizer)`,
+        description: 'Produced and mixed by the artist.',
+      })),
+    ],
+  });
+  const citations = [
+    citation('video_title', 'Live Trading GOLD', 0, 'TRADING'),
+    citation('video_title', 'XAUUSD Live Trading', 1, 'TRADING'),
+    citation('video_title', 'Gold live stream', 2, 'TRADING'),
+  ];
+  assert.equal(hasDecisiveTradingShare(musicWithTrading, citations), false);
+  const result = await evaluateDeterministicAdmission(musicWithTrading);
+  assert.notEqual(result.outcome, 'PASS');
+
+  const namedTrader = evidence({
+    name: 'Fade Me Trades',
+    bio: 'Doing the best I can with what I know.',
+    videos: Array.from({ length: 15 }, (_, index) => ({
+      title: index < 3 ? 'NQ futures trade recap' : `Music visualizer ${index}`,
+      description: 'Futures trading recap.',
+    })),
+  });
+  assert.equal(hasDecisiveTradingShare(namedTrader, citations), true);
+});
+
+test('mid-quote ellipses are accepted only when every segment is exact and in order', () => {
+  const trader = evidence({
+    name: 'Aker fixture',
+    bio: 'Trading en vivo y analisis de mercados financieros.',
+    videos: [
+      { title: 'Analisis semanal del mercado', description: 'Escenarios operativos y niveles.' },
+      { title: 'Sesion de trading en directo', description: 'Ejecucion y gestion de riesgo.' },
+    ],
+  });
+  const valid = decideAdmission({
+    evidence: trader,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 1,
+      citations: [
+        citation('bio', 'Trading en vivo... analisis de mercados', undefined, 'TRADING'),
+        citation('video_title', 'Analisis semanal del mercado', 0, 'TRADING'),
+      ],
+    }),
+  });
+  assert.equal(valid.decision, 'ADMIT');
+
+  const fabricated = decideAdmission({
+    evidence: trader,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 1,
+      citations: [
+        citation('bio', 'Trading en vivo... not in the evidence', undefined, 'TRADING'),
+        citation('video_title', 'Analisis semanal del mercado', 0, 'TRADING'),
+      ],
+    }),
+  });
+  assert.notEqual(fabricated.decision, 'ADMIT');
 });
 
 test('deterministic strict rejection requires three matches across two independent sources', () => {

@@ -101,20 +101,37 @@ function isMeaningfulCitationQuote(quote: string): boolean {
   return words.length >= 2 ? quote.length >= 5 : quote.length >= 6;
 }
 
+/**
+ * A citation may quote one contiguous span or several exact spans separated by
+ * an ellipsis. Every segment must appear verbatim, in order, in the same
+ * field; an ellipsis never permits a fabricated or reordered quote. This
+ * matches how models abbreviate long descriptions while preserving auditability.
+ */
+function textContainsCitation(text: string, quote: string): boolean {
+  const normalizedText = normalizeEvidenceText(text);
+  const segments = quote.split(/(?:\.\.\.|…)+/).map(segment => segment.trim()).filter(Boolean);
+  if (!segments.length) return false;
+  let cursor = 0;
+  for (const segment of segments) {
+    if (segment.length < 4) continue;
+    const index = normalizedText.indexOf(segment, cursor);
+    if (index < 0) return false;
+    cursor = index + segment.length;
+  }
+  return true;
+}
+
 function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {
-  // Models commonly truncate a real quote with a trailing ellipsis. The
-  // prefix before the ellipsis is still exact evidence; only trailing
-  // truncation is accepted so a mid-quote ellipsis cannot splice fields.
-  const quote = normalizeEvidenceText(citation.quote).replace(/(?:\.\.\.|…)+$/, '').trim();
+  const quote = normalizeEvidenceText(citation.quote);
   if (!quote || !isMeaningfulCitationQuote(quote)) return null;
   if (citation.field === 'channel_name') {
-    return normalizeEvidenceText(evidence.channelName).includes(quote) ? 'name' : null;
+    return textContainsCitation(evidence.channelName, quote) ? 'name' : null;
   }
   if (citation.field === 'bio') {
-    return normalizeEvidenceText(evidence.description).includes(quote) ? 'bio' : null;
+    return textContainsCitation(evidence.description, quote) ? 'bio' : null;
   }
   if (citation.field === 'link') {
-    const index = evidence.links.findIndex(link => normalizeEvidenceText(link).includes(quote));
+    const index = evidence.links.findIndex(link => textContainsCitation(link, quote));
     return index >= 0 ? `link:${index}` : null;
   }
   if (citation.field === 'video_title' || citation.field === 'video_description') {
@@ -126,7 +143,7 @@ function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): s
       if (!video) continue;
       const actualIndex = citation.index == null ? index : citation.index;
       const text = citation.field === 'video_title' ? video.title : video.description;
-      if (normalizeEvidenceText(text).includes(quote)) {
+      if (textContainsCitation(text, quote)) {
         // Title and description of the same video are one evidence source.
         return `video:${actualIndex}`;
       }

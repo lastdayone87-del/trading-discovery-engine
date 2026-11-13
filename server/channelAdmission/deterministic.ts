@@ -235,6 +235,29 @@ export function evaluateStrictRejection(evidence: AdmissionEvidence): {
   };
 }
 
+/**
+ * Decide whether a deterministic trading result is concentrated enough for a
+ * high-precision fast pass. A creator-owned trading anchor is sufficient; a
+ * generic creator needs at least three trading videos and 40% of the sample.
+ * This prevents a music/lifestyle channel with a few trading uploads from
+ * bypassing the semantic judge.
+ */
+const CREATOR_TRADING_SIGNAL = /\b(?:trades?|trader|trading|fx|forex|futures?|options?|stocks?|equit(?:y|ies)|markets?|invest(?:ing|or|ment|issements?)?|portfolios?|dividends?|etfs?|nq|mnq|es|gc|mcl|nasdaq|s&p|xauusd|xagusd|btc|bitcoin|crypto|charts?|charting|pips?|scalp(?:er|ing)?|bookmap|volume\s*profile|order\s*flow|metatrader|watchlist|securities|bourse|courtier|financ(?:e|ial|ière)|wealth|証券|投资|株|주식|بورس|سرمایه)\b/iu;
+
+function creatorSignalsTrading(evidence: AdmissionEvidence): boolean {
+  const text = `${evidence.channelName}\n${evidence.description}`;
+  return hasTradingAnchor(text) || CREATOR_TRADING_SIGNAL.test(text);
+}
+
+export function hasDecisiveTradingShare(evidence: AdmissionEvidence, citations: SemanticCitation[]): boolean {
+  const tradingVideoIndexes = new Set(citations
+    .filter(citation => citation.field === 'video_title' || citation.field === 'video_description')
+    .map(citation => citation.index)
+    .filter((index): index is number => typeof index === 'number'));
+  const tradingVideoShare = evidence.videos.length > 0 ? tradingVideoIndexes.size / evidence.videos.length : 0;
+  return creatorSignalsTrading(evidence) || (tradingVideoIndexes.size >= 3 && tradingVideoShare >= 0.4);
+}
+
 export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence): Promise<DeterministicAdmissionResult> {
   const decision = await verifyChannelTradingRelevance(evidenceToInput(evidence), { semanticMode: 'OFF' });
   const videoTexts = evidence.videos.map(video => `${video.title}\n${video.description}`.trim());
@@ -247,13 +270,19 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
 
   let passWithoutCitations = false;
   let passBlockedByFinanceAdjacency = false;
+  let passBlockedByMinorityTrading = false;
   const fullEvidenceText = `${evidence.channelName}\n${evidence.description}\n${evidence.links.join('\n')}\n${evidence.videos.map(video => `${video.title}\n${video.description}`).join('\n')}`;
   const financeAdjacentOnly = isFinanceAdjacentWithoutActiveTrading(fullEvidenceText);
   if (routing.route === 'DETERMINISTIC_TRADING'
     && decision.status === 'TRADING_CONFIRMED'
     && decision.evidenceCollection.sufficiency === 'SUFFICIENT') {
     const citations = tradingCitations(evidence, decision);
-    if (citations.length > 0 && !financeAdjacentOnly) {
+    // A fast pass is a high-precision shortcut. Require either a trading
+    // anchor in the creator-owned name/bio, or trading evidence spread across
+    // a substantial share of recent videos. Three trading uploads on an
+    // otherwise music/lifestyle channel are not decisive.
+    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations);
+    if (citations.length > 0 && !financeAdjacentOnly && decisiveTradingShare) {
       const judgment: SemanticJudgment = {
         mainSubject: 'TRADING',
         tradingFocus: decision.confidenceScore,
@@ -279,6 +308,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     // Finance-adjacent creators must reach downstream classification rather
     // than bypass it with a deterministic trading fast-pass.
     if (financeAdjacentOnly) passBlockedByFinanceAdjacency = true;
+    if (!decisiveTradingShare) passBlockedByMinorityTrading = true;
   }
 
   // Finance-adjacent creators must never be deterministically rejected, even
@@ -323,6 +353,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     reasonCodes: [
       ...(passWithoutCitations ? ['DETERMINISTIC_PASS_WITHOUT_CITATIONS'] : []),
       ...(passBlockedByFinanceAdjacency ? ['FINANCE_ADJACENT_DEFERRED_TO_DOWNSTREAM'] : []),
+      ...(passBlockedByMinorityTrading ? ['DETERMINISTIC_TRADING_MINORITY'] : []),
       'DETERMINISTIC_AMBIGUOUS',
       ...routing.reasonCodes,
     ],
