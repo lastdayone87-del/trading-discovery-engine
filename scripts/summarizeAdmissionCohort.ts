@@ -361,6 +361,11 @@ const deterministicMetrics = (() => {
 const decisions = rows.reduce((acc, row) => ({ ...acc, [row.decision]: (acc[row.decision] || 0) + 1 }), {} as Record<string, number>);
 const labels = scored.reduce((acc, row) => ({ ...acc, [row.label]: (acc[row.label] || 0) + 1 }), {} as Record<string, number>);
 const languages = scored.reduce((acc, row) => ({ ...acc, [row.language]: (acc[row.language] || 0) + 1 }), {} as Record<string, number>);
+const pendingRows = rows.filter(row => !terminal.has(row.decision) && !unresolvedLabels.has(row.label));
+const pendingPositive = pendingRows.filter(row => row.positive).length;
+const pendingNegative = pendingRows.filter(row => !row.positive).length;
+const operationalRecall = any.confusion.tp / (any.confusion.tp + any.confusion.fn + pendingPositive);
+const operationalSpecificity = any.confusion.tn / (any.confusion.tn + any.confusion.fp + pendingNegative);
 const errors = scored
   .filter(row => terminal.has(row.decision) && ((row.positive && !anyAdmit(row)) || (!row.positive && anyAdmit(row))))
   .map(row => ({
@@ -393,6 +398,15 @@ const report = {
   pendingPolicy: 'Rows without ADMIT/ADMIT_AMBIGUOUS/REJECT_UNRELATED are excluded from precision/recall/F1 and reported as undecided.',
   finalAnyAdmit: any,
   finalStrictAdmit: strict,
+  pendingTreatment: {
+    pending: pendingRows.length,
+    pendingPositive,
+    pendingNegative,
+    operationalRecall: round(operationalRecall),
+    operationalRecallCI: wilson(any.confusion.tp, any.confusion.tp + any.confusion.fn + pendingPositive),
+    operationalSpecificity: round(operationalSpecificity),
+    operationalSpecificityCI: wilson(any.confusion.tn, any.confusion.tn + any.confusion.fp + pendingNegative),
+  },
   deterministic: deterministicMetrics,
   byCategory: groupBy(
     scored,
@@ -441,6 +455,12 @@ const md = [
   `- Reject recall (specificity): **${pct(any.specificity)}** (95% CI ${ci(any.specificityCI)})`,
   `- Accuracy among decided: **${pct(any.accuracy)}** (95% CI ${ci(any.accuracyCI)})`,
   `- Decided: ${any.decided}/${any.n}; undecided/pending: ${any.undecided}`,
+  '',
+  '## Pending treatment (safety view)',
+  '',
+  `Pending rows are not admitted. Counting every pending positive as a miss gives operational recall **${pct(operationalRecall)}** (95% CI ${ci(wilson(any.confusion.tp, any.confusion.tp + any.confusion.fn + pendingPositive))}); counting every pending unrelated row as a missed rejection gives operational reject recall **${pct(operationalSpecificity)}** (95% CI ${ci(wilson(any.confusion.tn, any.confusion.tn + any.confusion.fp + pendingNegative))}).`,
+  '',
+  `- Pending positives: ${pendingPositive}; pending unrelated: ${pendingNegative}`,
   '',
   '## Confusion matrix',
   '',
