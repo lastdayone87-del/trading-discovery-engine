@@ -10,6 +10,7 @@ import { getDb } from './dbCore';
 import {
   currentOfficialYouTubeQuotaOrigin,
   mergeQuotaOrigins,
+  OfficialYouTubeQuotaFenceError,
   type ResolvedQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import type { QuotaOrigin } from '../src/types';
@@ -124,6 +125,28 @@ export async function resolvePipelineQuotaOrigin(
   return mergeQuotaOrigins(hinted, stored) ?? 'UNKNOWN';
 }
 
+/**
+ * Pre-channel admission verification has no channels row, so the normal
+ * channel-row lookup cannot establish provenance. Its only valid origins are
+ * NORMAL and PROBE: an explicit PROBE hint or an enclosing PROBE run stays
+ * sticky, and missing provenance falls back to NORMAL. An explicit NORMAL hint
+ * cannot downgrade an enclosing PROBE run. The discovery dispatcher has
+ * already blocked an UNKNOWN-origin parent before this point.
+ */
+export function resolvePreChannelAdmissionQuotaOrigin(
+  explicit: QuotaOrigin | null | undefined,
+  ambient: ResolvedQuotaOrigin = currentOfficialYouTubeQuotaOrigin(),
+): QuotaOrigin {
+  if (explicit && explicit !== 'PROBE' && explicit !== 'NORMAL') {
+    throw new OfficialYouTubeQuotaFenceError('UNKNOWN', 'admission-verification');
+  }
+  if (explicit === 'PROBE' || ambient === 'PROBE') return 'PROBE';
+  if (ambient === 'UNKNOWN') {
+    throw new OfficialYouTubeQuotaFenceError('UNKNOWN', 'admission-verification');
+  }
+  return 'NORMAL';
+}
+
 function collectChannelIds(payload: any): string[] {
   if (!payload || typeof payload !== 'object') return [];
   const values = new Set<string>();
@@ -151,11 +174,14 @@ function collectChannelIds(payload: any): string[] {
 }
 
 /**
- * Resolves the origin for a claimed job from the persisted payload and the
- * authoritative channel rows. Channel-keyed jobs with a missing or malformed
- * row return UNKNOWN and are failed closed by the queue dispatcher. A database
- * read failure throws QuotaOriginUnavailableError so the dispatcher's normal
- * retry lifecycle applies instead of a terminal provenance failure.
+ * Resolves the origin for a claimed job from the persisted payload, the
+ * admission candidate (for pre-channel verification), and the authoritative
+ * channel rows. Channel-keyed jobs with a missing or malformed row return
+ * UNKNOWN and are failed closed by the queue dispatcher, except
+ * INSPECT_FEATURED_CHANNELS and VERIFY_CHANNEL_ADMISSION, whose sources may
+ * legitimately exist before a channels row. A database read failure throws
+ * QuotaOriginUnavailableError so the dispatcher's normal retry lifecycle
+ * applies instead of a terminal provenance failure.
  */
 export async function resolveJobQuotaOrigin(
   job: { type: string; payload?: any },
@@ -173,18 +199,37 @@ export async function resolveJobQuotaOrigin(
   }
 
   let result: { rows: any[] };
+  let candidateOrigin: QuotaOrigin | undefined;
+  let candidateInvalid = false;
   try {
     const db = client ?? (await getDb());
     result = await db.query(
       `SELECT channel_id, quota_origin FROM channels WHERE channel_id = ANY($1::text[])`,
       [channelIds],
     ) as { rows: any[] };
+    if (job.type === 'VERIFY_CHANNEL_ADMISSION') {
+      const candidates = await db.query(
+        `SELECT raw_observation->>'quotaOrigin' AS quota_origin
+           FROM semantic_admission_candidates
+          WHERE channel_id = ANY($1::text[])`,
+        [channelIds],
+      ) as { rows: any[] };
+      for (const row of candidates.rows || []) {
+        const value = row?.quota_origin;
+        if (value === undefined || value === null || value === '') continue;
+        if (value !== 'PROBE' && value !== 'NORMAL') candidateInvalid = true;
+        else if (value === 'PROBE') candidateOrigin = 'PROBE';
+        else if (candidateOrigin !== 'PROBE') candidateOrigin = 'NORMAL';
+      }
+    }
   } catch (error) {
     throw new QuotaOriginUnavailableError(
       `Unable to read durable quota provenance for job type ${job.type}.`,
       { cause: error },
     );
   }
+  if (candidateInvalid) return 'UNKNOWN';
+  if (candidateOrigin === 'PROBE') return 'PROBE';
 
   const byId = new Map<string, string>();
   for (const row of result.rows || []) {
@@ -192,11 +237,14 @@ export async function resolveJobQuotaOrigin(
   }
 
   // A featured-canary source can exist only in creator_outcome_records /
-  // entity_bindings, so it may have no channels row. The adapter still has its
-  // own canary controls and ordinary quota; treat a missing source row as
-  // NORMAL for this job type only, while an existing PROBE row stays sticky.
-  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS';
-  let resolved: ResolvedQuotaOrigin = hinted ?? 'NORMAL';
+  // entity_bindings, and a pre-channel admission candidate has no channels row
+  // yet. Both may lack a row; their explicit PROBE hint is honored above, and
+  // an existing PROBE row stays sticky. Other channel-keyed jobs still fail
+  // closed when the row is missing.
+  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS'
+    || job.type === 'VERIFY_CHANNEL_ADMISSION';
+  let resolved: ResolvedQuotaOrigin = mergeQuotaOrigins(hinted ?? 'NORMAL', candidateOrigin) ?? 'NORMAL';
+  if (resolved === 'PROBE') return 'PROBE';
   for (const channelId of channelIds) {
     if (!byId.has(channelId)) {
       if (missingRowIsNormal) continue;
@@ -204,7 +252,7 @@ export async function resolveJobQuotaOrigin(
     }
     const origin = rowOrigin(byId.get(channelId));
     if (origin === 'UNKNOWN') return 'UNKNOWN';
-    resolved = mergeQuotaOrigins(resolved, origin) ?? 'NORMAL';
+    resolved = mergeQuotaOrigins(resolved, candidateOrigin, origin) ?? 'NORMAL';
     if (resolved === 'PROBE') return 'PROBE';
   }
   return resolved;

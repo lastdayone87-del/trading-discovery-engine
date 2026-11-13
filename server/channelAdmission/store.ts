@@ -8,6 +8,7 @@ import type {
   SemanticJudgment,
 } from './types';
 import { ADMISSION_POLICY_VERSION } from './policy';
+import { resolvePreChannelAdmissionQuotaOrigin } from '../quotaOrigin';
 
 type AdmissionQueryable = {
   query: (text: string, values?: any[]) => Promise<{ rows: any[]; rowCount?: number | null }>;
@@ -98,7 +99,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
     description: input.candidate.description || '',
     videoTitles: input.candidate.videoTitles || [],
     videoDescriptions: input.candidate.videoDescriptions || [],
-    quotaOrigin: input.candidate.quotaOrigin || null,
+    quotaOrigin: resolvePreChannelAdmissionQuotaOrigin(input.candidate.quotaOrigin),
     matchedDocument,
   };
   const result = await db.query(
@@ -117,7 +118,12 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
        result_rank=COALESCE(EXCLUDED.result_rank,semantic_admission_candidates.result_rank),
        target_country=COALESCE(EXCLUDED.target_country,semantic_admission_candidates.target_country),
        matched_document=EXCLUDED.matched_document,
-       raw_observation=EXCLUDED.raw_observation,
+       raw_observation=CASE
+         WHEN semantic_admission_candidates.raw_observation->>'quotaOrigin'='PROBE'
+           OR EXCLUDED.raw_observation->>'quotaOrigin'='PROBE'
+           THEN jsonb_set(EXCLUDED.raw_observation,'{quotaOrigin}','"PROBE"'::jsonb,true)
+         ELSE EXCLUDED.raw_observation
+       END,
        declared_language=COALESCE(EXCLUDED.declared_language,semantic_admission_candidates.declared_language),
        status=CASE
          WHEN semantic_admission_candidates.status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY','ADMITTED','ADMITTED_AMBIGUOUS','EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW')
@@ -187,11 +193,12 @@ export async function enqueueAdmissionVerification(input: {
   const key = attempt === 1
     ? admissionCandidateKey(input.candidate.candidate.channelId)
     : `admission:${input.candidate.candidate.channelId}:${retryKind}:${attempt}`;
+  const quotaOrigin = resolvePreChannelAdmissionQuotaOrigin(input.candidate.candidate.quotaOrigin);
   return enqueueJob('VERIFY_CHANNEL_ADMISSION', {
     candidateKey: admissionCandidateKey(input.candidate.candidate.channelId),
     channelId: input.candidate.candidate.channelId,
-    candidate: input.candidate.candidate,
-    quotaOrigin: input.candidate.candidate.quotaOrigin,
+    candidate: { ...input.candidate.candidate, quotaOrigin },
+    quotaOrigin,
     targetCountry: input.candidate.targetCountry,
     source: input.candidate.source,
     query: input.candidate.query,

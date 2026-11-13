@@ -24,6 +24,7 @@ import {
   verifyAdmissionCandidate,
 } from '../server/channelAdmission';
 import { nextAdmissionVerificationAttempt, processAdmissionVerificationJob } from '../server/channelAdmission/worker';
+import { resolveJobQuotaOrigin } from '../server/quotaOrigin';
 import type { AdmissionCandidateInput, AdmissionEvidence, SemanticJudgment } from '../server/channelAdmission/types';
 import type { ChannelRecord } from '../src/types';
 
@@ -225,6 +226,36 @@ async function main(): Promise<void> {
   const schema = await db.query(`SELECT to_regclass('public.semantic_admission_candidates') AS candidates, to_regclass('public.semantic_admission_decisions') AS decisions`);
   assert.ok(schema.rows[0]?.candidates && schema.rows[0]?.decisions, 'migration 182 tables missing');
   checks.push({ name: 'migration 182 tables present', ok: true });
+
+  await check('pre-channel admission provenance is sticky and resolved before dispatch', async () => {
+    const evidence = fixtureEvidence({
+      channelId: `${PREFIX}PROBE_STICKY`,
+      channelName: 'Probe Sticky Trader',
+      description: 'Nifty trading analysis and risk management.',
+      videos: [
+        { title: 'Nifty analysis', description: 'Technical analysis and price action.' },
+        { title: 'Bank Nifty setup', description: 'Market structure and risk management.' },
+      ],
+    });
+    const probeInput = candidateInput(evidence);
+    probeInput.candidate.quotaOrigin = 'PROBE';
+    const probeRow = await upsertAdmissionCandidate(probeInput);
+    assert.equal(probeRow.raw_observation.quotaOrigin, 'PROBE');
+
+    const normalInput = candidateInput(evidence);
+    normalInput.candidate.quotaOrigin = 'NORMAL';
+    const normalRow = await upsertAdmissionCandidate(normalInput);
+    assert.equal(normalRow.raw_observation.quotaOrigin, 'PROBE');
+
+    const job = await enqueueAdmissionVerification({ candidate: normalInput });
+    assert.ok(job);
+    const resolved = await resolveJobQuotaOrigin({
+      type: 'VERIFY_CHANNEL_ADMISSION',
+      payload: job!.payload,
+    });
+    assert.equal(resolved, 'PROBE');
+    return { persisted: normalRow.raw_observation.quotaOrigin, resolved, jobOrigin: (job!.payload as any).quotaOrigin };
+  });
 
   await check('deterministic ADMIT persists ledger, candidate, channel and classification once', async () => {
     const input = candidateInput(tradingEvidence);
