@@ -478,6 +478,39 @@ test('admission jobs resolve NORMAL/PROBE provenance before a channels row exist
   });
   assert.equal(storedProbe, 'PROBE');
 
+  const candidateProbeDb = {
+    query: async (sql: string) => sql.includes('semantic_admission_candidates')
+      ? { rows: [{ quota_origin: 'PROBE' }], rowCount: 1 }
+      : { rows: [], rowCount: 0 },
+  };
+  const candidateProbe = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-candidate-probe', quotaOrigin: 'NORMAL' },
+  }, candidateProbeDb);
+  assert.equal(candidateProbe, 'PROBE');
+
+  const candidateNormalDb = {
+    query: async (sql: string) => sql.includes('semantic_admission_candidates')
+      ? { rows: [{ quota_origin: 'NORMAL' }], rowCount: 1 }
+      : { rows: [], rowCount: 0 },
+  };
+  const candidateNormal = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-candidate-normal' },
+  }, candidateNormalDb);
+  assert.equal(candidateNormal, 'NORMAL');
+
+  const candidateInvalidDb = {
+    query: async (sql: string) => sql.includes('semantic_admission_candidates')
+      ? { rows: [{ quota_origin: 'BOGUS' }], rowCount: 1 }
+      : { rows: [], rowCount: 0 },
+  };
+  const candidateInvalid = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-candidate-invalid' },
+  }, candidateInvalidDb);
+  assert.equal(candidateInvalid, 'UNKNOWN');
+
   const otherJob = await resolveJobQuotaOrigin({
     type: 'ENRICH_CHANNEL',
     payload: { channelId: 'UC-missing-enrichment' },

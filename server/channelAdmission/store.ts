@@ -118,7 +118,12 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
        result_rank=COALESCE(EXCLUDED.result_rank,semantic_admission_candidates.result_rank),
        target_country=COALESCE(EXCLUDED.target_country,semantic_admission_candidates.target_country),
        matched_document=EXCLUDED.matched_document,
-       raw_observation=EXCLUDED.raw_observation,
+       raw_observation=CASE
+         WHEN semantic_admission_candidates.raw_observation->>'quotaOrigin'='PROBE'
+           OR EXCLUDED.raw_observation->>'quotaOrigin'='PROBE'
+           THEN jsonb_set(EXCLUDED.raw_observation,'{quotaOrigin}','"PROBE"'::jsonb,true)
+         ELSE EXCLUDED.raw_observation
+       END,
        declared_language=COALESCE(EXCLUDED.declared_language,semantic_admission_candidates.declared_language),
        status=CASE
          WHEN semantic_admission_candidates.status IN ('REJECTED_UNRELATED','REJECTED_COUNTRY','ADMITTED','ADMITTED_AMBIGUOUS','EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW')
