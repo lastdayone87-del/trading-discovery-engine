@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessExtractedQueryAdmission, decideAdmission } from './policy';
-import { evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
+import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
@@ -750,6 +750,22 @@ test('mid-quote ellipses are accepted only when every segment is exact and in or
     }),
   });
   assert.notEqual(fabricatedPrefix.decision, 'ADMIT');
+});
+
+test('sample-wide consistency references are not counted as trading videos', () => {
+  const indexes = decisionTradingVideoIndexes({
+    positiveEvidence: [
+      {
+        category: 'MULTI_VIDEO_CONSISTENCY',
+        provenance: { fields: [0, 1, 2, 3, 4, 5].map(index => ({ field: 'video_title', index })) },
+      },
+      {
+        category: 'INSTRUMENT',
+        provenance: { fields: [{ field: 'video_title', index: 1 }] },
+      },
+    ],
+  } as any);
+  assert.deepEqual([...indexes], [1]);
 });
 
 test('deterministic strict rejection requires three matches across two independent sources', () => {

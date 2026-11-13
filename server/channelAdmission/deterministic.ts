@@ -267,9 +267,12 @@ export function hasDecisiveTradingShare(
  * citation list is shortened for persistence. Repeated trading instruments
  * can otherwise collapse to the first video and undercount the share.
  */
-function decisionTradingVideoIndexes(decision: VerificationDecision): Set<number> {
+export function decisionTradingVideoIndexes(decision: VerificationDecision): Set<number> {
   const indexes = new Set<number>();
   for (const item of decision.positiveEvidence) {
+    // The consistency item lists the whole sample, including videos without a
+    // trading match. Counting it would report a false 100% trading share.
+    if (item.category === 'MULTI_VIDEO_CONSISTENCY') continue;
     for (const fieldRef of item.provenance?.fields || []) {
       if ((fieldRef.field === 'video_title' || fieldRef.field === 'video_description')
         && typeof fieldRef.index === 'number') {
