@@ -1,19 +1,15 @@
 import type { EvidenceItem, RawChannelInput, VerificationDecision } from '../evidenceEngine';
 import type { TradingClassificationResult } from '../../src/types';
 import type { DiscoveredChannelRaw } from '../youtube';
+import { normalizeTradingFocus } from './confidence';
 
 /**
- * Semantic models sometimes return `trading_focus` as a 0–1 probability even
- * though admission stores a 0–100 percentage. `channels.confidence_score` and
- * `channels.trading_confidence_score` are integers, so a fractional value
- * makes the whole classification pipeline fail at persistence. Normalize both
- * representations defensively at the admission boundary.
+ * Legacy admission rows can still carry a 0–1 semantic confidence. Confirmed
+ * admission is a positive-trading subject, so fractions below 1 are scaled to
+ * percentages here before they reach integer channel columns.
  */
-export function normalizeAdmissionTradingConfidence(value: unknown): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return 0;
-  const percentage = parsed > 0 && parsed <= 1 ? parsed * 100 : parsed;
-  return Math.max(0, Math.min(100, Math.round(percentage)));
+export function normalizeAdmissionTradingConfidence(value: unknown, mainSubject?: string | null): number {
+  return normalizeTradingFocus(value, mainSubject || 'TRADING');
 }
 
 /**
