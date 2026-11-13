@@ -23,6 +23,7 @@ on:
       - 'scripts/summarizeAdmissionCohort.ts'
       - 'scripts/fixtures/admission-cohort-60-preserved.jsonl'
       - 'scripts/fixtures/admission-cohort-60-ground-truth.json'
+      - 'scripts/fixtures/admission-cohort-60-evidence.jsonl'
       - 'server/channelAdmission/**'
       - 'server/evidenceEngine/**'
       - 'server/classificationRouting/**'
@@ -48,6 +49,7 @@ jobs:
         run: >-
           npx tsx scripts/runAdmissionCohort.ts
           --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
+          --from-evidence=scripts/fixtures/admission-cohort-60-evidence.jsonl
           --out=admission-cohort-ai.jsonl
           --blind=admission-cohort-ai-blind.jsonl
           --concurrency=2
@@ -113,6 +115,7 @@ jobs:
         run: >-
           npx tsx scripts/runAdmissionCohort.ts
           --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
+          --from-evidence=scripts/fixtures/admission-cohort-60-evidence.jsonl
           --out=admission-cohort-ai.jsonl
           --blind=admission-cohort-ai-blind.jsonl
           --concurrency=1
