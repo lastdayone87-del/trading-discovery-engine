@@ -1354,7 +1354,7 @@ export async function admitDiscoveredChannel(input: {
         forceExtraction: input.forceExtraction,
         quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL',
       }, {
-        // Below classification (21) and admission (30), above ENRICH backfill.
+        // Below classification and admission, above ENRICH backfill.
         priority: 14,
         maxAttempts: 3,
         idempotencyKey: `discovery-overflow:${raw.channelId}:${new Date().toISOString().slice(0, 10)}`,
