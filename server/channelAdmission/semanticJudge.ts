@@ -151,7 +151,7 @@ async function assertAdmissionBudgetAvailable(): Promise<void> {
     if (error instanceof Error && error.message === 'ADMISSION_SEMANTIC_BUDGET_EXHAUSTED') throw error;
     const code = (error as { code?: unknown })?.code;
     const message = error instanceof Error ? error.message : String(error);
-    // A read-only dry-run must remain usable before migration 178. There is no
+    // A read-only dry-run must remain usable before migration 182. There is no
     // ledger to overspend yet, and read-only mode writes nothing.
     if (code === '42P01' || /semantic_admission_model_calls.*does not exist|relation .*semantic_admission_model_calls/i.test(message)) {
       return;

@@ -223,8 +223,8 @@ async function main(): Promise<void> {
   checks.push({ name: 'admission mode ACTIVE in staging', ok: true });
 
   const schema = await db.query(`SELECT to_regclass('public.semantic_admission_candidates') AS candidates, to_regclass('public.semantic_admission_decisions') AS decisions`);
-  assert.ok(schema.rows[0]?.candidates && schema.rows[0]?.decisions, 'migration 178 tables missing');
-  checks.push({ name: 'migration 178 tables present', ok: true });
+  assert.ok(schema.rows[0]?.candidates && schema.rows[0]?.decisions, 'migration 182 tables missing');
+  checks.push({ name: 'migration 182 tables present', ok: true });
 
   await check('deterministic ADMIT persists ledger, candidate, channel and classification once', async () => {
     const input = candidateInput(tradingEvidence);

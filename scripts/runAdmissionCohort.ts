@@ -504,6 +504,7 @@ async function main(): Promise<void> {
   const output = argValue('out') || '/tmp/opencode/admission-cohort-60.jsonl';
   const blind = argValue('blind') || '/tmp/opencode/admission-cohort-60-blind.jsonl';
   const seed = argValue('seed') || 'admission-cohort-v1';
+  const collectOnly = process.argv.includes('--collect-only');
   const counts: Record<CohortGroup, number> = {
     trading: argNumber('trading', 20),
     unrelated: argNumber('unrelated', 20),
@@ -538,14 +539,14 @@ async function main(): Promise<void> {
           videos: saved.evidence.videos || [],
           source: 'automated_query',
           targetCountry: 'UNKNOWN',
-          evidenceCoverage: saved.evidence.coverage || 'PARTIAL',
+          evidenceCoverage: saved.evidence.evidenceCoverage || saved.evidence.coverage || 'PARTIAL',
           failureReason: saved.evidence.failureReason || undefined,
           fetchedAt: new Date().toISOString(),
         } : undefined,
       };
     }) as Array<{ group: CohortGroup; row: PreservedResult; evidence?: AdmissionEvidence }>
     : selectCohort(rows, counts, seed);
-  const judge = configuredJudge();
+  const judge = collectOnly ? null : configuredJudge();
   // Semantic calls share a provider quota. Serialize them whenever pacing is
   // configured so two workers cannot burst the same organization.
   const concurrency = judge ? 1 : requestedConcurrency;
@@ -557,6 +558,7 @@ async function main(): Promise<void> {
     seed,
     concurrency,
     semanticAvailable: Boolean(judge),
+    collectOnly,
     aiDelayMs,
     aiRetries,
     fromEvidence: fromEvidence || null,
@@ -580,7 +582,23 @@ async function main(): Promise<void> {
       const item = cohort[index];
       let result: Record<string, unknown>;
       try {
-        result = await evaluateOne({
+        result = collectOnly
+          ? {
+            event: 'admission_cohort_evidence',
+            group: item.group,
+            prior: { decision: item.row.decision, status: item.row.status, reasonCodes: item.row.reasonCodes || [] },
+            channel: {
+              channelId: item.row.channelId,
+              channelName: item.row.channelName,
+              youtubeUrl: youtubeUrl(item.row.channelId),
+            },
+            evidence: await collectKeylessEvidence({
+              channelId: item.row.channelId,
+              channelName: item.row.channelName,
+              session: session!,
+            }),
+          }
+          : await evaluateOne({
           group: item.group,
           row: item.row,
           session,
@@ -644,7 +662,7 @@ async function main(): Promise<void> {
     usableDecisions,
     timestamp: new Date().toISOString(),
   }));
-  if (results.length === 0 || usableDecisions === 0) {
+  if (!collectOnly && (results.length === 0 || usableDecisions === 0)) {
     console.error('Admission cohort produced no usable admission decisions.');
     process.exitCode = 1;
   }

@@ -96,7 +96,7 @@ ON CONFLICT (setting_key) DO NOTHING;
 -- the planner before revalidation.
 UPDATE query_library
    SET collection='REJECTED', status='REJECTED',
-       generation_metadata=COALESCE(generation_metadata,'{}'::jsonb) || '{"queryHold":{"source":"semantic-admission-migration-178","reasonCodes":["GAMBLING_SOURCE_VIDEO","NO_CONCRETE_TRADING_ANCHOR"]}}'::jsonb
+       generation_metadata=COALESCE(generation_metadata,'{}'::jsonb) || '{"queryHold":{"source":"semantic-admission-migration-182","reasonCodes":["GAMBLING_SOURCE_VIDEO","NO_CONCRETE_TRADING_ANCHOR"]}}'::jsonb
  WHERE normalized_query IN (
    'systems keep showing up in trading',
    'martingale betting system in trading'

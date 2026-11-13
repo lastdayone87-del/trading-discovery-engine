@@ -102,7 +102,7 @@ async function main() {
   if (apply) {
     if ((await getAdmissionMode()) !== 'ACTIVE') throw new Error('CHANNEL_ADMISSION_OFF');
     const schema = await db.query(`SELECT to_regclass('public.semantic_admission_candidates') AS table_oid`);
-    if (!schema.rows[0]?.table_oid) throw new Error('MIGRATION_178_REQUIRED: apply mode needs the semantic admission tables');
+    if (!schema.rows[0]?.table_oid) throw new Error('MIGRATION_182_REQUIRED: apply mode needs the semantic admission tables');
   }
   const waitingFilter = apply
     ? `AND NOT EXISTS (
