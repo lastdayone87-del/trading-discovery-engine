@@ -178,6 +178,8 @@ export async function hasActiveAdmissionJob(channelId: string): Promise<boolean>
   return Boolean(result.rowCount);
 }
 
+export const ADMISSION_VERIFICATION_PRIORITY = 30;
+
 export async function enqueueAdmissionVerification(input: {
   candidate: AdmissionCandidateInput;
   runAfter?: string;
@@ -209,7 +211,7 @@ export async function enqueueAdmissionVerification(input: {
     resultRank: input.candidate.resultRank,
     attempt,
   }, {
-    priority: input.priority ?? 20,
+    priority: input.priority ?? ADMISSION_VERIFICATION_PRIORITY,
     maxAttempts: 3,
     idempotencyKey: input.idempotencyKey || key,
     ...(input.runAfter ? { runAfter: input.runAfter } : {}),

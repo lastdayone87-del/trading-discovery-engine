@@ -117,7 +117,7 @@ async function enqueueClassificationAfterAdmission(input: {
     forceExtraction: false,
   });
   const job = await enqueueClassificationJobAtomic(input.candidate.channelId, payload, {
-    priority: 20,
+    priority: 21,
     maxAttempts: 4,
     idempotencyKey: `admission-classify:${input.candidate.channelId}:${input.admissionDecisionId || 'v1'}`,
     preventCompletedReopen: true,

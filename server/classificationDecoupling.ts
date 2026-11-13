@@ -34,7 +34,7 @@ export const CLASSIFICATION_MAX_PER_QUERY_DEFAULT = 50;
  * classification lane drains promptly, but stays below search continuations
  * (20) and manual/operator work.
  */
-export const CLASSIFICATION_JOB_PRIORITY_DEFAULT = 15;
+export const CLASSIFICATION_JOB_PRIORITY_DEFAULT = 21;
 
 /** Classification + first ENRICH attempt per classification job. */
 export const CLASSIFICATION_JOB_MAX_ATTEMPTS_DEFAULT = 4;
@@ -142,7 +142,10 @@ export function resolveEnrichmentWorkerSplit(totalWorkers: number, decouplingEna
   // through the split rather than silently dropped.
   const total = positiveInt(totalWorkers, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT);
   if (total === 1) return { classificationWorkers: 1, enrichmentOnlyWorkers: 0 };
-  const classificationCap = decouplingEnabled ? 2 : 1;
+  // Admission and classification share this pool. Three classification-
+  // capable workers are safe only once the total pool grows; the baseline
+  // three-worker pool keeps the historical 2/1 split.
+  const classificationCap = decouplingEnabled ? 3 : 1;
   const classificationWorkers = Math.max(1, Math.min(classificationCap, total - 1));
   return {
     classificationWorkers,

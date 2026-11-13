@@ -5,7 +5,8 @@ import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateSt
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
-import { admissionModeFromOverrides } from './store';
+import { ADMISSION_VERIFICATION_PRIORITY, admissionModeFromOverrides } from './store';
+import { CLASSIFICATION_JOB_PRIORITY_DEFAULT } from '../classificationDecoupling';
 import { judgeRoutePoolHealthy } from './routeHealth';
 import { candidateFromAdmissionRow } from './index';
 import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus, providerDeferredCandidateFields } from './types';
@@ -433,6 +434,12 @@ test('finance-adjacent rejection requires independent citation proof', () => {
     }),
   });
   assert.equal(withProof.decision, 'REJECT_UNRELATED');
+});
+
+test('admission verification outranks classification, which outranks ENRICH backfill', () => {
+  assert.ok(ADMISSION_VERIFICATION_PRIORITY > 25, 'admission must outrank high-priority search and manual work');
+  assert.ok(ADMISSION_VERIFICATION_PRIORITY > CLASSIFICATION_JOB_PRIORITY_DEFAULT);
+  assert.ok(CLASSIFICATION_JOB_PRIORITY_DEFAULT > 20, 'classification must outrank the highest ENRICH backfill priority');
 });
 
 test('pending admissions do not trip the contamination guard', () => {

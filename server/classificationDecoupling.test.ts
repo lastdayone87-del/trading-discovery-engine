@@ -100,7 +100,9 @@ test('enrichment pool splits 2/1 when enabled and always leaves an ENRICH-only l
   // Direct callers keep their configured total: there is no second 100-worker
   // clamp inside the split. Startup applies the historical 20-worker cap in
   // resolveEnrichmentWorkerCount before calling this function.
-  assert.deepEqual(resolveEnrichmentWorkerSplit(250, true), { classificationWorkers: 2, enrichmentOnlyWorkers: 248 });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(4, true), { classificationWorkers: 3, enrichmentOnlyWorkers: 1 });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(5, true), { classificationWorkers: 3, enrichmentOnlyWorkers: 2 });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(250, true), { classificationWorkers: 3, enrichmentOnlyWorkers: 247 });
   // Total worker count is preserved for every split.
   for (const total of [1, 2, 3, 6, 250]) {
     for (const enabled of [true, false]) {
