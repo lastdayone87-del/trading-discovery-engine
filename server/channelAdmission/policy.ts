@@ -123,8 +123,10 @@ function textContainsCitation(text: string, quote: string): boolean {
     cursor = index + segment.length;
   }
   // A quote made only of short ellipsis-separated tokens must not pass by
-  // matching nothing. Require at least one substantive exact segment.
-  return matchedSegments > 0 && matchedChars >= 8;
+  // matching nothing. Require at least one substantive exact segment; do not
+  // impose an eight-character floor, which would reject valid short tickers
+  // such as XAUUSD.
+  return matchedSegments > 0;
 }
 
 function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {

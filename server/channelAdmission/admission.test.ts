@@ -712,6 +712,27 @@ test('mid-quote ellipses are accepted only when every segment is exact and in or
     }),
   });
   assert.notEqual(shortSegments.decision, 'ADMIT');
+
+  const tickerEvidence = evidence({
+    name: 'Ticker fixture',
+    bio: 'XAUUSD and gold trading.',
+    videos: [
+      { title: 'XAUUSD setup', description: 'Gold trading.' },
+      { title: 'XAUUSD recap', description: 'Gold trading.' },
+    ],
+  });
+  const tickerDecision = decideAdmission({
+    evidence: tickerEvidence,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 80,
+      citations: [
+        citation('bio', 'XAUUSD', undefined, 'TRADING'),
+        citation('video_title', 'XAUUSD setup', 0, 'TRADING'),
+      ],
+    }),
+  });
+  assert.equal(tickerDecision.decision, 'ADMIT');
 });
 
 test('deterministic strict rejection requires three matches across two independent sources', () => {
