@@ -210,6 +210,36 @@ export function isSemanticDecisionFailure(error: unknown): boolean {
   return /ADMISSION_SEMANTIC_INVALID_OUTPUT|invalid[\s_-]?json|JSON\.parse|unexpected token|malformed JSON|SEMANTIC_(?:SCHEMA|PARSE)|MALFORMED_SEMANTIC/i.test(message);
 }
 
+/**
+ * Read a cached primary judgment before a provider-health deferral. A cached
+ * decision is reusable even when every provider route is cooling; only a
+ * cache miss should defer the candidate.
+ */
+export async function readCachedAdmissionJudgment(
+  evidence: AdmissionEvidence,
+  role: 'PRIMARY' | 'SECOND' = 'PRIMARY',
+): Promise<SemanticJudgment | null> {
+  const checksum = admissionEvidenceChecksum(evidence);
+  const models: Array<[SemanticModelClient | undefined, string]> = role === 'PRIMARY'
+    ? [
+        [geminiDefaultClient(), process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL],
+        [groqDefaultClient(), process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL],
+      ]
+    : [
+        [groqDefaultClient(), process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL],
+        [geminiDefaultClient(), process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL],
+      ];
+  for (const [client, model] of models) {
+    if (!client) continue;
+    const cached = await readAdmissionCache(admissionCacheKey(role, String(model), checksum), false);
+    if (cached) {
+      if (!cached.provider) cached.provider = providerForClient(client);
+      return cached;
+    }
+  }
+  return null;
+}
+
 export class ProviderAdmissionJudge implements AdmissionJudge {
   constructor(
     private readonly options: {

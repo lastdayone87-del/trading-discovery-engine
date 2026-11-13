@@ -7,7 +7,7 @@ import { validateChannelCountry } from '../countryValidator';
 import { assertCountryAllowed } from '../countryExclusion';
 import { fetchAdmissionEvidence, isProviderEvidenceFailure } from './evidence';
 import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP, decideAdmission } from './policy';
-import { admissionEvidenceChecksum, isSemanticDecisionFailure, needsSecondJudge, ProviderAdmissionJudge, type AdmissionJudge } from './semanticJudge';
+import { admissionEvidenceChecksum, isSemanticDecisionFailure, needsSecondJudge, ProviderAdmissionJudge, readCachedAdmissionJudgment, type AdmissionJudge } from './semanticJudge';
 import { evaluateDeterministicAdmission } from './deterministic';
 import { admissionSemanticRouteAvailable } from './routeHealth';
 import {
@@ -620,7 +620,8 @@ export async function verifyAdmissionCandidate(
     // fallback needs a healthy provider route; preflight it before reserving
     // model budget so an all-cooling/unconfigured pool defers without a
     // wasted reservation.
-    if (!options.judge && !(await admissionSemanticRouteAvailable())) {
+    const cachedJudgment = options.judge ? null : await readCachedAdmissionJudgment(evidence, 'PRIMARY');
+    if (!options.judge && !cachedJudgment && !(await admissionSemanticRouteAvailable())) {
       const reasonCodes = ['PROVIDER_RETRY_WITHOUT_ATTEMPT', 'SEMANTIC_ROUTES_COOLING'];
       if (!options.dryRun) {
         const updated = await updateAdmissionCandidate({
