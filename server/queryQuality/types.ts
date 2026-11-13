@@ -64,6 +64,8 @@ export interface QueryCandidate {
   relation?: string;
   source: QuerySource;
   primaryTerm: string;
+  /** Bounded 2-6 token whole-query surface produced by a governed generator. */
+  generatedNativePhrase?: boolean;
 }
 
 export type QuerySource =
