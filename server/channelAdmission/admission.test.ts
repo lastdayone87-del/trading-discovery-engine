@@ -7,6 +7,7 @@ import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
 import { ADMISSION_VERIFICATION_PRIORITY, admissionModeFromOverrides, admissionVerificationPriority } from './store';
 import { CLASSIFICATION_JOB_PRIORITY_DEFAULT } from '../classificationDecoupling';
+import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from '../operationalEnrichmentRecovery';
 import { judgeRoutePoolHealthy } from './routeHealth';
 import { candidateFromAdmissionRow } from './index';
 import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus, providerDeferredCandidateFields } from './types';
@@ -437,7 +438,7 @@ test('finance-adjacent rejection requires independent citation proof', () => {
 });
 
 test('admission verification outranks classification, which outranks ENRICH backfill', () => {
-  assert.ok(ADMISSION_VERIFICATION_PRIORITY > 30, 'admission must outrank operational recovery, high-priority search, and manual work');
+  assert.ok(ADMISSION_VERIFICATION_PRIORITY > OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY, 'admission must outrank operational recovery, high-priority search, and manual work');
   assert.ok(ADMISSION_VERIFICATION_PRIORITY > CLASSIFICATION_JOB_PRIORITY_DEFAULT);
   assert.ok(CLASSIFICATION_JOB_PRIORITY_DEFAULT > 20, 'classification must outrank the highest ENRICH backfill priority');
   assert.equal(admissionVerificationPriority(undefined), ADMISSION_VERIFICATION_PRIORITY);
