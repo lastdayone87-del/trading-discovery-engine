@@ -100,10 +100,19 @@ export function enrichmentScaleGateEnabled(env: NodeJS.ProcessEnv = process.env)
  * classification success-rate sample.
  */
 export function semanticScaleGateProvider(env: NodeJS.ProcessEnv = process.env): 'gemini' | 'gemini-free' | 'groq' {
-  const provider = String(env.SEMANTIC_PROVIDER || 'gemini').trim().toLowerCase();
-  if (provider === 'groq') return 'groq';
-  if (provider === 'gemini-free') return 'gemini-free';
+  if (env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return 'gemini';
+  const provider = String(env.SEMANTIC_PROVIDER || 'gemini');
+  if (provider === 'groq' && hasConfiguredGroqRoute(env)) return 'groq';
+  if (provider === 'gemini-free' && hasConfiguredGeminiFreeRoute(env)) return 'gemini-free';
   return 'gemini';
+}
+
+function hasConfiguredGroqRoute(env: NodeJS.ProcessEnv): boolean {
+  return Object.keys(env).some(name => /^GROQ_API_KEY(_[1-9][0-9]*)?$/.test(name) && String(env[name] || '').trim().length > 0);
+}
+
+function hasConfiguredGeminiFreeRoute(env: NodeJS.ProcessEnv): boolean {
+  return Object.keys(env).some(name => /^GEMINI_FREE_API_KEY(_[2-9][0-9]*)?$/.test(name) && String(env[name] || '').trim().length > 0);
 }
 
 /**

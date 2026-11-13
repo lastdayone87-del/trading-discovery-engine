@@ -128,12 +128,18 @@ test('percent-style rate thresholds fall back instead of silently blocking scale
   assert.equal(enrichmentScaleThresholds({ ENRICHMENT_SCALE_MIN_COMPLETION_RATIO: '0' } as any).minCompletionToCreationRatio, 0);
 });
 
-test('scale gate selects only the active classification provider', () => {
+test('scale gate mirrors classification provider routing', () => {
   assert.equal(semanticScaleGateProvider({} as any), 'gemini');
   assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'gemini' } as any), 'gemini');
-  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'gemini-free' } as any), 'gemini-free');
-  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'groq' } as any), 'groq');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'gemini-free', GEMINI_FREE_API_KEY: 'k' } as any), 'gemini-free');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'groq', GROQ_API_KEY: 'k' } as any), 'groq');
   assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'unknown' } as any), 'gemini');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'GROQ', GROQ_API_KEY: 'k' } as any), 'gemini',
+    'runtime routing is exact-case; the gate must not normalize it');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'groq' } as any), 'gemini',
+    'a selected provider without a configured route falls back to Gemini');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'gemini-free' } as any), 'gemini');
+  assert.equal(semanticScaleGateProvider({ SEMANTIC_PROVIDER: 'groq', GROQ_API_KEY: 'k', SEMANTIC_PROVIDER_FORCE_GEMINI: 'true' } as any), 'gemini');
 });
 
 test('metrics queries inherit the live deadline and abort signal', async () => {
@@ -233,11 +239,30 @@ test('every scale-metrics query carries the configured query timeout', async () 
   assert.doesNotMatch(statements[0], /geminiCapacityDeferral/, 'lock-wait contention must stay in the scale-gate denominator');
   assert.match(statements[0], /groqCooldownDeferral/, 'local Groq cooldown deferrals must not count as semantic failures');
   assert.match(statements[0], /geminiFreeCooldownDeferral/, 'local free-Gemini deferrals must not count as semantic failures');
-  assert.match(statements[0], /SEMANTIC_DEFERRED_RATE_PRESSURE/, 'local semantic deferrals must not count as provider failures');
-  assert.match(statements[0], /VOCABULARY_DEFERRED_RATE_PRESSURE/, 'local vocabulary deferrals must not count as provider failures');
+  assert.match(statements[0], /COALESCE\(request_metadata->>'providerReasons',''\) NOT LIKE '%SEMANTIC_DEFERRED_RATE_PRESSURE%'/, 'local semantic deferrals must be excluded, not merely named');
+  assert.match(statements[0], /COALESCE\(request_metadata->>'providerReasons',''\) NOT LIKE '%VOCABULARY_DEFERRED_RATE_PRESSURE%'/, 'local vocabulary deferrals must be excluded, not merely named');
   assert.equal(metrics.semanticCalls, 100);
   assert.equal(metrics.semanticSuccesses, 95);
   assert.equal(metrics.backlogStable, true);
+});
+
+test('metrics query follows an explicitly configured non-default provider', async () => {
+  const statements: string[] = [];
+  let call = 0;
+  await loadEnrichmentScaleMetrics(0, {
+    SEMANTIC_PROVIDER: 'groq',
+    GROQ_API_KEY: 'test-key',
+    ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '1500',
+  } as any, {
+    query: async config => {
+      statements.push(config.text);
+      call += 1;
+      if (call === 1) return { rows: [{ calls: 10, successes: 9, p95: 1000 }] };
+      if (call === 2) return { rows: [{ pending: 1 }] };
+      return { rows: [{ created_last_hour: 1, completed_last_hour: 1 }] };
+    },
+  });
+  assert.match(statements[0], /provider = 'groq'/);
 });
 
 test('a stalled metrics load resolves at the deadline so startup can use baseline', async () => {
