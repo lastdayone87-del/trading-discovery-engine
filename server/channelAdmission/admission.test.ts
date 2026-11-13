@@ -437,7 +437,7 @@ test('finance-adjacent rejection requires independent citation proof', () => {
 });
 
 test('admission verification outranks classification, which outranks ENRICH backfill', () => {
-  assert.ok(ADMISSION_VERIFICATION_PRIORITY > 25, 'admission must outrank high-priority search and manual work');
+  assert.ok(ADMISSION_VERIFICATION_PRIORITY > 30, 'admission must outrank operational recovery, high-priority search, and manual work');
   assert.ok(ADMISSION_VERIFICATION_PRIORITY > CLASSIFICATION_JOB_PRIORITY_DEFAULT);
   assert.ok(CLASSIFICATION_JOB_PRIORITY_DEFAULT > 20, 'classification must outrank the highest ENRICH backfill priority');
   assert.equal(admissionVerificationPriority(undefined), ADMISSION_VERIFICATION_PRIORITY);

@@ -178,7 +178,7 @@ export async function hasActiveAdmissionJob(channelId: string): Promise<boolean>
   return Boolean(result.rowCount);
 }
 
-export const ADMISSION_VERIFICATION_PRIORITY = 30;
+export const ADMISSION_VERIFICATION_PRIORITY = 40;
 
 /** Admission retries inherit the protected priority even when a route-derived
  * priority is lower; higher explicit priorities remain allowed. */
