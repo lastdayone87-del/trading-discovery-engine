@@ -30,9 +30,9 @@ export const CLASSIFICATION_MAX_PENDING_DEFAULT = 500;
 export const CLASSIFICATION_MAX_PER_QUERY_DEFAULT = 50;
 
 /**
- * New discoveries outrank the default ENRICH_CHANNEL priority (10) so the
- * classification lane drains promptly, but stays below search continuations
- * (20) and manual/operator work.
+ * New discoveries outrank ENRICH backfill (10–20) and ordinary search (20).
+ * Admission verification is protected at 30, and high-priority manual/operator
+ * work at 25 remains above classification.
  */
 export const CLASSIFICATION_JOB_PRIORITY_DEFAULT = 21;
 

@@ -5,7 +5,7 @@ import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateSt
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
-import { ADMISSION_VERIFICATION_PRIORITY, admissionModeFromOverrides } from './store';
+import { ADMISSION_VERIFICATION_PRIORITY, admissionModeFromOverrides, admissionVerificationPriority } from './store';
 import { CLASSIFICATION_JOB_PRIORITY_DEFAULT } from '../classificationDecoupling';
 import { judgeRoutePoolHealthy } from './routeHealth';
 import { candidateFromAdmissionRow } from './index';
@@ -440,6 +440,10 @@ test('admission verification outranks classification, which outranks ENRICH back
   assert.ok(ADMISSION_VERIFICATION_PRIORITY > 25, 'admission must outrank high-priority search and manual work');
   assert.ok(ADMISSION_VERIFICATION_PRIORITY > CLASSIFICATION_JOB_PRIORITY_DEFAULT);
   assert.ok(CLASSIFICATION_JOB_PRIORITY_DEFAULT > 20, 'classification must outrank the highest ENRICH backfill priority');
+  assert.equal(admissionVerificationPriority(undefined), ADMISSION_VERIFICATION_PRIORITY);
+  assert.equal(admissionVerificationPriority(20), ADMISSION_VERIFICATION_PRIORITY);
+  assert.equal(admissionVerificationPriority(10), ADMISSION_VERIFICATION_PRIORITY);
+  assert.equal(admissionVerificationPriority(40), 40);
 });
 
 test('pending admissions do not trip the contamination guard', () => {
