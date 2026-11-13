@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { buildAdmissionConfirmedClassification } from './confirmedTrading';
+import { buildAdmissionConfirmedClassification, normalizeAdmissionTradingConfidence } from './confirmedTrading';
 import { parseAdmissionReviewAction } from './index';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
@@ -43,6 +43,45 @@ test('confident admission produces a first-class TRADING_CONFIRMED result withou
   assert.equal(built.decision.classificationMethod, 'SEMANTIC_ADMISSION');
   assert.equal(built.decision.recognitionState, 'DECISIVE_TRADING');
   assert.equal(built.decision.confidenceScore, 93);
+});
+
+test('fractional semantic admission confidence is normalized to an integer percentage', () => {
+  assert.equal(normalizeAdmissionTradingConfidence(0.9), 90);
+  assert.equal(normalizeAdmissionTradingConfidence(0.85), 85);
+  assert.equal(normalizeAdmissionTradingConfidence(0.95), 95);
+  assert.equal(normalizeAdmissionTradingConfidence(0.5), 50);
+  assert.equal(normalizeAdmissionTradingConfidence(1), 100);
+  assert.equal(normalizeAdmissionTradingConfidence(93), 93);
+  assert.equal(normalizeAdmissionTradingConfidence(0), 0);
+  assert.equal(normalizeAdmissionTradingConfidence(150), 100);
+  assert.equal(normalizeAdmissionTradingConfidence('0.85'), 85);
+  assert.equal(normalizeAdmissionTradingConfidence(undefined), 0);
+
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Fractional Trader', description: 'gold technical analysis', country: 'France' },
+    {
+      channelId: 'UC-fractional',
+      channelName: 'Fractional Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-fractional',
+      description: 'gold technical analysis',
+      videoTitles: ['Gold weekly analysis'],
+      admissionDecisionId: 'decision-fractional',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 0.9,
+      admissionCategory: 'General Trading',
+      admissionModel: 'gemini/gemini-3.6-flash',
+      admissionProvider: 'gemini_semantic',
+      admissionCitations: [
+        { field: 'bio', quote: 'gold technical analysis', supports: 'TRADING' },
+        { field: 'video_title', index: 0, quote: 'Gold weekly analysis', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.confidenceScore, 90);
+  assert.equal(built.decision.confidenceScore, 90);
+  assert.ok(Number.isInteger(built.result.confidenceScore));
+  assert.ok(Number.isInteger(built.decision.confidenceScore));
 });
 
 test('confirmed admission branch precedes the legacy classifier in the pipeline slice', () => {

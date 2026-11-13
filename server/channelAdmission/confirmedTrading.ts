@@ -3,6 +3,20 @@ import type { TradingClassificationResult } from '../../src/types';
 import type { DiscoveredChannelRaw } from '../youtube';
 
 /**
+ * Semantic models sometimes return `trading_focus` as a 0–1 probability even
+ * though admission stores a 0–100 percentage. `channels.confidence_score` and
+ * `channels.trading_confidence_score` are integers, so a fractional value
+ * makes the whole classification pipeline fail at persistence. Normalize both
+ * representations defensively at the admission boundary.
+ */
+export function normalizeAdmissionTradingConfidence(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  const percentage = parsed > 0 && parsed <= 1 ? parsed * 100 : parsed;
+  return Math.max(0, Math.min(100, Math.round(percentage)));
+}
+
+/**
  * A confident semantic admission is a first-class classification result. It
  * bypasses the deterministic trading-relevance re-decision but still flows
  * through country validation, Discord inspection and quality gates.
@@ -11,8 +25,7 @@ export function buildAdmissionConfirmedClassification(
   input: RawChannelInput,
   candidate: DiscoveredChannelRaw,
 ): { result: TradingClassificationResult; decision: VerificationDecision; input: RawChannelInput } {
-  const rawConfidence = Number(candidate.admissionTradingConfidence);
-  const confidence = Number.isFinite(rawConfidence) ? Math.max(0, Math.min(100, rawConfidence)) : 0;
+  const confidence = normalizeAdmissionTradingConfidence(candidate.admissionTradingConfidence);
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
