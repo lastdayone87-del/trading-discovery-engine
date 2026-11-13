@@ -365,6 +365,7 @@ test('semantic prompt treats creator text as untrusted data and query as provena
   assert.match(prompt, /still the creator evidence you must analyze/i);
   assert.match(prompt, /do not discard it or return UNKNOWN merely because it is delimited as untrusted/i);
   assert.match(prompt, /UNKNOWN is retained for human review/i);
+  assert.match(prompt, /business or financial-news channel whose main focus is companies, markets, investing, or the economy is FINANCE_ADJACENT/i);
   assert.match(prompt, /discovery query and matched document are provenance only/i);
 });
 

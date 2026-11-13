@@ -12,7 +12,7 @@ import {
 import { independentCitationCount, normalizeSemanticJudgment } from './policy';
 import type { AdmissionEvidence, SemanticJudgment } from './types';
 
-export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v3';
+export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v4';
 const ADMISSION_FEATURE_VERSION = 'semantic-admission-v1';
 const ADMISSION_PROVIDER = 'admission-semantic';
 
@@ -71,7 +71,7 @@ Critical rules:
 5. Gambling/betting (casino, roulette, martingale, sports betting, binary options) is not trading unless the creator explicitly applies it to financial-market trading with substantial market analysis.
 6. Rejection requires at least two independent, exact citations from different fields or different videos that support the same unrelated subject. If you cannot provide them, return MIXED or UNKNOWN.
 7. Do not infer from stereotypes, production quality, subscriber count, or country. Use only the evidence.
-8. General news, business news, politics, sports, weather, entertainment, lifestyle, and consumer channels are UNRELATED unless the creator’s main focus is market/trading analysis or execution. A business segment on a general news channel does not make the channel a trading channel.
+8. General news, politics, sports, weather, entertainment, lifestyle, and consumer channels are UNRELATED. A business or financial-news channel whose main focus is companies, markets, investing, or the economy is FINANCE_ADJACENT, not UNRELATED. A single business segment on a general news channel does not make the channel finance-adjacent or a trading channel.
 9. If evidence is complete and still ambiguous, return MIXED when multiple genuine subjects are present, or UNKNOWN only when the evidence itself cannot be assessed. UNKNOWN is retained for human review; MIXED may be admitted for downstream classification. Never return UNKNOWN just because the evidence block is marked untrusted.
 
 Return JSON only:
