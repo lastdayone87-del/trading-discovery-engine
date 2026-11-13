@@ -733,6 +733,19 @@ test('mid-quote ellipses are accepted only when every segment is exact and in or
     }),
   });
   assert.equal(tickerDecision.decision, 'ADMIT');
+
+  const fabricatedPrefix = decideAdmission({
+    evidence: trader,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 1,
+      citations: [
+        citation('bio', 'foo... analisis de mercados', undefined, 'TRADING'),
+        citation('video_title', 'Analisis semanal del mercado', 0, 'TRADING'),
+      ],
+    }),
+  });
+  assert.notEqual(fabricatedPrefix.decision, 'ADMIT');
 });
 
 test('deterministic strict rejection requires three matches across two independent sources', () => {

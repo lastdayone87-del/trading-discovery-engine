@@ -113,20 +113,19 @@ function textContainsCitation(text: string, quote: string): boolean {
   if (!segments.length) return false;
   let cursor = 0;
   let matchedSegments = 0;
-  let matchedChars = 0;
+  let substantiveSegment = false;
   for (const segment of segments) {
-    if (segment.length < 4) continue;
+    // Every nonempty segment must appear verbatim, in order. A short segment
+    // is still checked; it just cannot be the only proof on its own.
     const index = normalizedText.indexOf(segment, cursor);
     if (index < 0) return false;
     matchedSegments += 1;
-    matchedChars += segment.length;
+    if (segment.length >= 4) substantiveSegment = true;
     cursor = index + segment.length;
   }
-  // A quote made only of short ellipsis-separated tokens must not pass by
-  // matching nothing. Require at least one substantive exact segment; do not
-  // impose an eight-character floor, which would reject valid short tickers
-  // such as XAUUSD.
-  return matchedSegments > 0;
+  // A quote made only of short fragments must not pass by matching nothing
+  // meaningful. A single substantive token such as XAUUSD is sufficient.
+  return matchedSegments > 0 && substantiveSegment;
 }
 
 function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {
