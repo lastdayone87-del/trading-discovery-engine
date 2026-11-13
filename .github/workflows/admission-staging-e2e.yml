@@ -48,7 +48,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install
+      - run: npm ci
       - name: Apply migrations to disposable PostgreSQL
         run: npx tsx scripts/runMigrations.ts
       - name: Admission database lifecycle E2E

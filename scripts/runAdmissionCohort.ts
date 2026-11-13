@@ -127,7 +127,8 @@ function selectCohort(rows: PreservedResult[], counts: Record<CohortGroup, numbe
   const selected: Array<{ group: CohortGroup; row: PreservedResult }> = [];
   const seen = new Set<string>();
   for (const group of GROUP_ORDER) {
-    const bucket = [...buckets.get(group)!]
+    const uniqueBucket = [...new Map(buckets.get(group)!.map(row => [row.channelId, row])).values()];
+    const bucket = uniqueBucket
       .filter(row => !seen.has(row.channelId))
       .sort((a, b) => sha(`${seed}:${a.channelId}`).localeCompare(sha(`${seed}:${b.channelId}`)));
     for (const row of bucket.slice(0, counts[group])) {
@@ -264,13 +265,25 @@ class CohortJudge implements AdmissionJudge {
 }
 
 function semanticClientsAllowedToWriteTelemetry(): boolean {
-  const url = String(process.env.DATABASE_URL || '');
-  if (!url) return false;
+  const raw = String(process.env.DATABASE_URL || '');
+  if (!raw) return false;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
   // Provider clients append call events through getDb(), which can apply
   // migrations. Only permit that against an explicitly disposable/local test
   // database; never let a read-only cohort assessment touch production.
-  return /localhost|127\.0\.0\.1|staging|test/i.test(url)
-    && (process.env.NODE_ENV === 'test' || process.env.COHORT_ALLOW_SEMANTIC_DB_WRITES === 'true');
+  if (['host', 'hostaddr', 'port', 'dbname', 'user', 'password'].some(key => url.searchParams.has(key))) return false;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const database = decodeURIComponent(url.pathname.replace(/^\/+/, '')).toLowerCase();
+  const local = ['localhost', '127.0.0.1', '::1'].includes(host);
+  const named = /(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(database)
+    || /(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(host);
+  if (!local && !named) return false;
+  return (process.env.NODE_ENV === 'test' || process.env.COHORT_ALLOW_SEMANTIC_DB_WRITES === 'true');
 }
 
 function configuredJudge(): CohortJudge | null {
@@ -558,6 +571,7 @@ async function main(): Promise<void> {
 
   let cursor = 0;
   let completed = 0;
+  const results: Array<Record<string, unknown>> = [];
   const workers = Array.from({ length: concurrency }, async () => {
     const session = fromEvidence ? undefined : await Innertube.create({ retrieve_player: false } as any);
     for (;;) {
@@ -590,6 +604,7 @@ async function main(): Promise<void> {
           },
         };
       }
+      results.push(result);
       appendFileSync(output, `${JSON.stringify(result)}\n`);
       const evidence = result.evidence as any;
       const final = result.final as any;
@@ -617,13 +632,22 @@ async function main(): Promise<void> {
     }
   });
   await Promise.all(workers);
+  const usableDecisions = results.filter(result => {
+    const decision = (result.final as any)?.decision;
+    return ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED'].includes(decision);
+  }).length;
   console.log(JSON.stringify({
     event: 'admission_cohort_complete',
     output,
     blind,
     completed,
+    usableDecisions,
     timestamp: new Date().toISOString(),
   }));
+  if (results.length === 0 || usableDecisions === 0) {
+    console.error('Admission cohort produced no usable admission decisions.');
+    process.exitCode = 1;
+  }
 }
 
 main().catch(error => {

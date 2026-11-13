@@ -109,7 +109,14 @@ async function main() {
          SELECT 1 FROM semantic_admission_candidates cac
           WHERE cac.channel_id=c.channel_id
             AND (
-              cac.status IN ('EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW')
+              cac.status IN ('EXPIRED_MISSING_EVIDENCE','NEEDS_REVIEW','REJECTED_UNRELATED','REJECTED_COUNTRY')
+              OR (cac.status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+                  AND EXISTS (
+                    SELECT 1 FROM jobs cj
+                     WHERE cj.type='CLASSIFY_DISCOVERED_CHANNEL'
+                       AND cj.status IN ('PENDING','PROCESSING')
+                       AND cj.payload->>'channelId'=c.channel_id
+                  ))
               OR (cac.status IN ('WAITING_EVIDENCE','PROVIDER_DEFERRED')
                   AND cac.next_check_at IS NOT NULL
                   AND cac.next_check_at > now())
@@ -183,6 +190,7 @@ async function main() {
             candidate: input,
             runAfter: refreshed.next_check_at,
             attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+            retryKind: outcome.status === 'PROVIDER_DEFERRED' ? 'provider' : 'evidence',
           });
         }
       }
@@ -218,6 +226,7 @@ async function main() {
               candidate: input,
               runAfter: refreshed.next_check_at || undefined,
               attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+              retryKind: refreshed.status === 'PROVIDER_DEFERRED' ? 'provider' : 'evidence',
             }).catch(retryError => {
               console.error(JSON.stringify({ event: 'intake_deferred_verification_retry_failed', channelId: row.channel_id, error: retryError instanceof Error ? retryError.message : String(retryError) }));
             });

@@ -52,7 +52,8 @@ export async function processAdmissionVerificationJob(job: DurableJob, overrides
     videoTitles: row.raw_observation?.videoTitles || [],
     videoDescriptions: row.raw_observation?.videoDescriptions || [],
     matchedDocument: row.matched_document,
-    locationTag: row.raw_observation?.locationTag || undefined,
+    locationTag: typeof row.raw_observation?.locationTag === 'string' ? row.raw_observation.locationTag : undefined,
+    quotaOrigin: row.raw_observation?.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
   }) as DiscoveredChannelRaw;
   const input: AdmissionCandidateInput = {
     candidate,
@@ -69,6 +70,10 @@ export async function processAdmissionVerificationJob(job: DurableJob, overrides
   if (['ADMITTED', 'ADMITTED_AMBIGUOUS'].includes(row.status)) {
     const resumed = await resumeAdmittedCandidate(input, row);
     if (resumed) return;
+    // A terminal admission must never fall through to fresh verification just
+    // because its channel projection is missing. Keep the durable result and
+    // let the job retry the recovery path.
+    throw new Error('ADMISSION_RESUME_FAILED');
   }
   const legacyRevalidation = existingChannel?.scan_status === 'INTAKE_DEFERRED' || existingChannel?.scan_status === 'CLASSIFICATION_PENDING';
   const result = await verifyAdmissionCandidate(input, {
@@ -82,7 +87,7 @@ export async function processAdmissionVerificationJob(job: DurableJob, overrides
   if (isWaitingAdmissionStatus(result.status)) {
     const refreshed = await findAdmissionCandidate(channelId);
     if (refreshed?.next_check_at) {
-      await enqueueAdmissionVerification({
+      const queued = await enqueueAdmissionVerification({
         candidate: input,
         runAfter: refreshed.next_check_at,
         attempt: nextAdmissionVerificationAttempt({
@@ -90,8 +95,13 @@ export async function processAdmissionVerificationJob(job: DurableJob, overrides
           jobAttempt: Number(payload.attempt || 1),
           candidateAttempts: Number(refreshed.attempts || 0),
         }),
+        retryKind: result.status === 'PROVIDER_DEFERRED' ? 'provider' : 'evidence',
         priority: result.priority,
       });
+      if (!queued || queued.id === job.id || queued.reopen_blocked
+        || (queued.status !== 'PENDING' && queued.status !== 'PROCESSING')) {
+        throw new Error('ADMISSION_RETRY_NOT_QUEUED');
+      }
     }
   }
 }

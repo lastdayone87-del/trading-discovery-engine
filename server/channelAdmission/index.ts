@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelRecord, DiscoverySource } from '../../src/types';
-import { getDb, getChannelById, hasActiveClassificationJob, insertChannelIfAbsent, upsertChannel } from '../db';
+import { getDb, getChannelById, hasActiveClassificationJob, insertChannelIfAbsent, upsertChannel, upsertChannelWithResult } from '../db';
 import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQueryScopeKey } from '../classificationDecoupling';
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
@@ -112,7 +112,7 @@ async function enqueueClassificationAfterAdmission(input: {
       country: input.targetCountry,
     }),
     discoveryJobId: input.discoveryJobId || `admission:${input.candidate.channelId}`,
-    quotaOrigin: input.candidate.quotaOrigin,
+    quotaOrigin: input.candidate.quotaOrigin === 'PROBE' ? 'PROBE' : 'NORMAL',
     forceExtraction: false,
   });
   const job = await enqueueClassificationJobAtomic(input.candidate.channelId, payload, {
@@ -137,6 +137,7 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
     videoDescriptions: Array.isArray(row.raw_observation?.videoDescriptions) ? row.raw_observation.videoDescriptions : [],
     matchedDocument: row.matched_document as unknown as DiscoveredChannelRaw['matchedDocument'],
     locationTag: typeof row.raw_observation?.locationTag === 'string' ? row.raw_observation.locationTag : undefined,
+    quotaOrigin: row.raw_observation?.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
   };
 }
 
@@ -182,8 +183,11 @@ export async function resolveAdmissionReview(input: {
       id: row.id,
       status: 'PENDING',
       decision: null,
-      reasonCodes,
-      attempts: Number(row.attempts || 0),
+      reasonCodes: [...reasonCodes, 'REVIEW_REQUEUE_RESETS_ATTEMPTS'],
+      // A person is explicitly restarting the evidence lifecycle. Reset the
+      // attempt counter so an exhausted review candidate is not immediately
+      // exhausted again on its first retry.
+      attempts: 0,
       nextCheckAt: null,
       expiresAt: null,
       expectedStatus: row.status,
@@ -318,20 +322,37 @@ export async function resolveAdmissionReview(input: {
 
 export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, row: AdmissionCandidateRow): Promise<boolean> {
   await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
-  const channel = await getChannelById(row.channel_id);
-  if (!channel) return false;
-  // Repair the channel projection from the durable decision before resuming.
-  // A crash between the ledger commit and the channel write can otherwise leave
-  // a legacy row INTAKE_DEFERRED with no admission provenance while its
-  // classification job is already durable.
   const db = await getDb();
   const decision = await db.query(
-    `SELECT id FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
+    `SELECT id,decision FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
     [row.id],
   ).catch(() => null);
-  const decisionId = channel.admission_decision_id || decision?.rows[0]?.id || null;
-  if (decisionId) {
-    const admissionStatus = row.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
+  let channel = await getChannelById(row.channel_id);
+  const decisionId = channel?.admission_decision_id || decision?.rows[0]?.id || null;
+  if (!decisionId) return false;
+  const admissionStatus = row.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
+  if (!channel) {
+    // The ledger decision committed but the channel write did not. Rebuild
+    // the admitted projection from the durable decision instead of running a
+    // fresh verification that could contradict the terminal admission.
+    const evidence = (row.evidence_snapshot || null) as AdmissionEvidence | null;
+    if (!evidence) return false;
+    const now = new Date().toISOString();
+    await insertChannelIfAbsent(admittedChannel({
+      evidence,
+      decisionId,
+      status: admissionStatus,
+      source: String(row.source) as DiscoverySource,
+      now,
+    }));
+    await markChannelAdmitted({ channelId: row.channel_id, decisionId, status: admissionStatus });
+    channel = await getChannelById(row.channel_id);
+    if (!channel) return false;
+  } else {
+    // Repair the channel projection from the durable decision before resuming.
+    // A crash between the ledger commit and the channel write can otherwise leave
+    // a legacy row INTAKE_DEFERRED with no admission provenance while its
+    // classification job is already durable.
     await db.query(
       `UPDATE channels
           SET admitted_at=COALESCE(admitted_at,now()),
@@ -349,6 +370,21 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
       channel.scan_status = 'CLASSIFICATION_PENDING';
     }
   }
+  const semanticOutput = row.semantic_output as Record<string, any> | null;
+  input.candidate.admissionDecisionId = decisionId;
+  input.candidate.admissionStatus = admissionStatus;
+  input.candidate.admissionDecisionSource = semanticOutput?.model === 'deterministic-first-v1'
+    ? 'DETERMINISTIC'
+    : semanticOutput?.provider ? 'SEMANTIC' : 'HUMAN';
+  input.candidate.admissionConfirmedTrading = admissionStatus === 'ADMITTED';
+  input.candidate.admissionTradingConfidence = Number(semanticOutput?.tradingFocus) || (admissionStatus === 'ADMITTED' ? 90 : 0);
+  input.candidate.admissionCitations = Array.isArray(semanticOutput?.citations) ? semanticOutput.citations : [];
+  input.candidate.admissionModel = semanticOutput?.model || undefined;
+  input.candidate.admissionProvider = ['gemini_semantic', 'groq_semantic', 'gemini_free_semantic'].includes(String(semanticOutput?.provider || ''))
+    ? semanticOutput.provider
+    : undefined;
+  input.candidate.admissionEvidenceHash = row.evidence_hash || undefined;
+  input.candidate.admissionCategory = 'General Trading';
   const queued = await enqueueClassificationAfterAdmission({
     candidate: input.candidate,
     targetCountry: input.targetCountry,
@@ -799,6 +835,8 @@ export async function verifyAdmissionCandidate(
           status: policy.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED',
         });
       } else {
+        const expectedScanStatus = existing.scan_status;
+        const expectedTradingStatus = existing.trading_status;
         existing.admitted_at = existing.admitted_at || now;
         existing.admission_status = policy.status === 'ADMITTED_AMBIGUOUS' ? 'ADMITTED_AMBIGUOUS' : 'ADMITTED';
         existing.admission_decision_id = decisionId;
@@ -806,7 +844,23 @@ export async function verifyAdmissionCandidate(
           existing.scan_status = 'CLASSIFICATION_PENDING';
           existing.trading_status = 'UNCERTAIN';
         }
-        await upsertChannel(existing, { preserveDiscordOnUpdate: true });
+        const applied = await upsertChannelWithResult(existing, {
+          preserveDiscordOnUpdate: true,
+          requireStatusSnapshot: {
+            scan_status: expectedScanStatus,
+            trading_status: expectedTradingStatus,
+          },
+        });
+        if (!applied) {
+          // A classification completed between our read and this write. Keep
+          // its result; markChannelAdmitted below applies only safe admission
+          // provenance.
+          console.warn(JSON.stringify({
+            event: 'admission_channel_snapshot_stale',
+            channelId: evidence.channelId,
+            timestamp: new Date().toISOString(),
+          }));
+        }
         await markChannelAdmitted({
           channelId: evidence.channelId,
           decisionId,

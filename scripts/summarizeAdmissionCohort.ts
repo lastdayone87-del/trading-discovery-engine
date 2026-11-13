@@ -15,6 +15,7 @@ function argValue(name: string): string | undefined {
 type Label = 'TRADING' | 'FINANCE_ADJACENT' | 'UNRELATED' | 'AMBIGUOUS' | 'UNKNOWN_EVIDENCE';
 interface GroundTruth { label: Label; note?: string }
 const expectedAdmit = new Set<Label>(['TRADING', 'FINANCE_ADJACENT']);
+const unresolvedLabels = new Set<Label>(['AMBIGUOUS', 'UNKNOWN_EVIDENCE']);
 
 const resultsPath = argValue('results') || '/tmp/opencode/admission-cohort-60.jsonl';
 const truthPath = argValue('ground-truth') || 'scripts/fixtures/admission-cohort-60-ground-truth.json';
@@ -26,6 +27,7 @@ if (!truthDocument._meta?.reviewer || !truthDocument._meta?.method || !truthDocu
 }
 const truth = (truthDocument.labels || truthDocument) as Record<string, GroundTruth>;
 const label = (channelId: string): Label => truth[channelId]?.label || 'UNKNOWN_EVIDENCE';
+const isScoredLabel = (channelId: string): boolean => !unresolvedLabels.has(label(channelId));
 const missingLabelIds = rows.map(row => row.channel?.channelId).filter(channelId => !channelId || !truth[channelId]);
 if (missingLabelIds.length) {
   console.error(`Independent review labels are missing for ${missingLabelIds.length} cohort channel(s): ${missingLabelIds.join(', ')}`);
@@ -35,12 +37,12 @@ const tally = (items: string[]) => items.reduce((acc, item) => ({ ...acc, [item]
 
 const deterministic = rows.map(row => row.deterministic?.outcome || 'NONE');
 const finalDecisions = rows.map(row => row.final?.decision || 'NONE');
-const detDecided = rows.filter(row => row.deterministic?.outcome === 'PASS' || row.deterministic?.outcome === 'REJECT');
+const detDecided = rows.filter(row => isScoredLabel(row.channel.channelId) && (row.deterministic?.outcome === 'PASS' || row.deterministic?.outcome === 'REJECT'));
 const detCorrect = detDecided.filter(row => {
   const expected = expectedAdmit.has(label(row.channel.channelId));
   return row.deterministic.outcome === 'PASS' ? expected : !expected;
 });
-const finalDecided = rows.filter(row => ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED'].includes(row.final?.decision));
+const finalDecided = rows.filter(row => isScoredLabel(row.channel.channelId) && ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED'].includes(row.final?.decision));
 const finalCorrect = finalDecided.filter(row => {
   const expected = expectedAdmit.has(label(row.channel.channelId));
   return row.final.decision === 'REJECT_UNRELATED' ? !expected : expected;
@@ -76,9 +78,9 @@ const report = {
     const rejected = rows.filter(row => row.final?.decision === 'REJECT_UNRELATED');
     const review = rows.filter(row => row.final?.decision === 'NEEDS_REVIEW');
     const expectedAdmitRows = rows.filter(row => expectedAdmit.has(label(row.channel.channelId)));
-    const expectedRejectRows = rows.filter(row => !expectedAdmit.has(label(row.channel.channelId)));
+    const expectedRejectRows = rows.filter(row => label(row.channel.channelId) === 'UNRELATED');
     const admittedExpected = admitted.filter(row => expectedAdmit.has(label(row.channel.channelId)));
-    const rejectedExpected = rejected.filter(row => !expectedAdmit.has(label(row.channel.channelId)));
+    const rejectedExpected = rejected.filter(row => label(row.channel.channelId) === 'UNRELATED');
     return {
       decisions: tally(finalDecisions),
       decided: finalDecided.length,
@@ -90,12 +92,14 @@ const report = {
       admitRecall: expectedAdmitRows.length ? admittedExpected.length / expectedAdmitRows.length : null,
       rejectRecall: expectedRejectRows.length ? rejectedExpected.length / expectedRejectRows.length : null,
       pendingReviewByLabel: tally(review.map(row => label(row.channel.channelId))),
+      unresolvedLabels: tally(rows.filter(row => unresolvedLabels.has(label(row.channel.channelId))).map(row => label(row.channel.channelId))),
+      scored: rows.filter(row => isScoredLabel(row.channel.channelId)).length,
       fetchFailed: rows.filter(row => row.final?.decision === 'COHORT_FETCH_FAILED').length,
       aiUnavailable: rows.filter(row => row.final?.decision === 'AI_UNAVAILABLE').length,
       providerDeferred: rows.filter(row => row.final?.decision === 'PROVIDER_DEFERRED').length,
       needsReview: review.length,
       unsafeRejects: rejected.filter(row => expectedAdmit.has(label(row.channel.channelId))).map(row => row.channel.channelName),
-      unsafeAdmits: admitted.filter(row => !expectedAdmit.has(label(row.channel.channelId))).map(row => row.channel.channelName),
+      unsafeAdmits: admitted.filter(row => label(row.channel.channelId) === 'UNRELATED').map(row => row.channel.channelName),
     };
   })(),
   unsafeTransitions: {
@@ -105,4 +109,4 @@ const report = {
   generatedAt: new Date().toISOString(),
 };
 console.log(JSON.stringify(report, null, 2));
-if (rows.length === 0 || missingLabelIds.length > 0 || report.deterministic.decided === 0 || report.final.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;
+if (rows.length === 0 || missingLabelIds.length > 0 || report.deterministic.decided === 0 || report.final.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0 || report.unsafeTransitions.priorAdmitToDeterministicReject.length > 0 || report.unsafeTransitions.priorRejectToDeterministicPass.length > 0) process.exitCode = 1;

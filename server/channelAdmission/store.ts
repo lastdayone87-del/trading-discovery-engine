@@ -98,6 +98,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
     description: input.candidate.description || '',
     videoTitles: input.candidate.videoTitles || [],
     videoDescriptions: input.candidate.videoDescriptions || [],
+    quotaOrigin: input.candidate.quotaOrigin || null,
     matchedDocument,
   };
   const result = await db.query(
@@ -176,13 +177,16 @@ export async function enqueueAdmissionVerification(input: {
   runAfter?: string;
   attempt?: number;
   priority?: number;
+  /** Provider waits and evidence retries use disjoint key namespaces. */
+  retryKind?: 'evidence' | 'provider';
   /** Explicit key for operator-initiated requeue work. */
   idempotencyKey?: string;
 }): Promise<Awaited<ReturnType<typeof enqueueJob>>> {
   const attempt = Math.max(1, input.attempt || 1);
+  const retryKind = input.retryKind === 'provider' ? 'provider-retry' : 'retry';
   const key = attempt === 1
     ? admissionCandidateKey(input.candidate.candidate.channelId)
-    : `admission:${input.candidate.candidate.channelId}:retry:${attempt}`;
+    : `admission:${input.candidate.candidate.channelId}:${retryKind}:${attempt}`;
   return enqueueJob('VERIFY_CHANNEL_ADMISSION', {
     candidateKey: admissionCandidateKey(input.candidate.candidate.channelId),
     channelId: input.candidate.candidate.channelId,

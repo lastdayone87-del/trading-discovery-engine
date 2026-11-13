@@ -127,7 +127,7 @@ export function buildAdmissionConfirmedClassification(
     evidenceCount: positiveEvidence.length,
     deterministicRouting: {
       version: versionTag,
-      route: humanReview ? 'HUMAN_REVIEW' : 'DETERMINISTIC_TRADING',
+      route: humanReview ? 'HUMAN_REVIEW' : nonSemantic ? 'DETERMINISTIC_TRADING' : 'SEMANTIC_TRADING',
       fastTrack: !humanReview,
       semanticUsed: !nonSemantic,
       semanticAttempted: !nonSemantic,

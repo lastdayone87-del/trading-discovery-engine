@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { enrichChannelClaimableDuringCooldown, groqFallbackCoolingDown, allRoutesCoolingDown } from './queueManager';
+import { enrichChannelClaimableDuringCooldown, groqFallbackCoolingDown, allRoutesCoolingDown, judgeRoutePoolHealthy } from './queueManager';
 
 test('gemini healthy allows ENRICH claim (fallback absent or present)', () => {
   assert.equal(enrichChannelClaimableDuringCooldown({ groqSelected: false, geminiCooldownActive: false, groqCooldownActive: false }), true);
@@ -112,4 +112,15 @@ test('multi-org groq pool keeps the ENRICH claim open while one org is healthy',
 test('multi-account gemini pool keeps the ENRICH claim open while one account is healthy', () => {
   assert.equal(allRoutesCoolingDown([true, false, true]), false);
   assert.equal(allRoutesCoolingDown([true, true, true]), true);
+});
+
+
+test('admission judge health treats unconfigured routes as unavailable', () => {
+  assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: false }, { gemini: false, groq: false }), false);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: false }, { gemini: false, groq: false }), true);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: false }, { gemini: true, groq: false }), false);
+  assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: false }), true);
+  assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: true }), false);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: false }), true);
+  assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: true }), false);
 });

@@ -1,4 +1,4 @@
-import { getDb } from '../server/db';
+import { createReadOnlyDbPool, getDb } from '../server/db';
 import { getAdmissionMode } from '../server/channelAdmission/store';
 import { parseAdmissionReviewAction, resolveAdmissionReview } from '../server/channelAdmission';
 
@@ -17,7 +17,7 @@ function argFlag(name: string): boolean {
 }
 
 async function listReviewCandidates(limit: number): Promise<void> {
-  const db = await getDb();
+  const db = createReadOnlyDbPool('admission-review-list');
   openedDb = db;
   const result = await db.query(
     `SELECT channel_id,channel_name,youtube_url,reason_codes,attempts,evidence_hash,created_at,

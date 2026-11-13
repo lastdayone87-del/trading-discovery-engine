@@ -10,7 +10,7 @@
  * that URL; it never reads production settings or applies production changes.
  */
 import assert from 'node:assert/strict';
-import { getDb, getChannelById, insertChannelIfAbsent } from '../server/db';
+import { createReadOnlyDbPool, getDb, getChannelById, insertChannelIfAbsent } from '../server/db';
 import {
   enqueueAdmissionVerification,
   findAdmissionCandidate,
@@ -165,6 +165,9 @@ function assertIsolatedStagingUrl(raw: string): void {
   } catch {
     throw new Error('STAGING_URL_INVALID');
   }
+  for (const key of ['host', 'hostaddr', 'port', 'dbname', 'user', 'password']) {
+    if (url.searchParams.has(key)) throw new Error('STAGING_URL_ROUTING_OVERRIDE_REJECTED');
+  }
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   const database = decodeURIComponent(url.pathname.replace(/^\/+/, '')).toLowerCase();
   const local = ['localhost', '127.0.0.1', '::1'].includes(host);
@@ -183,11 +186,20 @@ async function main(): Promise<void> {
   assertIsolatedStagingUrl(stagingUrl);
   process.env.DATABASE_URL = stagingUrl;
 
-  const db = await getDb();
-  const actualDatabase = String((await db.query('SELECT current_database() AS name')).rows[0]?.name || '').toLowerCase();
+  // Probe with a non-migrating read-only pool before getDb(), which applies
+  // pending migrations and seeds defaults. The destructive E2E must verify the
+  // connected database identity before any schema or data write.
+  const probe = createReadOnlyDbPool('admission-staging-identity');
+  let actualDatabase = '';
+  try {
+    actualDatabase = String((await probe.query('SELECT current_database() AS name')).rows[0]?.name || '').toLowerCase();
+  } finally {
+    await probe.end().catch(() => undefined);
+  }
   if (!/(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(actualDatabase)) {
     throw new Error('CONNECTED_DATABASE_IS_NOT_STAGING');
   }
+  const db = await getDb();
   const previousMode = await db.query(`SELECT setting_value FROM app_settings WHERE setting_key='channel_admission_mode' LIMIT 1`);
   const checks: Array<{ name: string; ok: boolean; details?: unknown }> = [];
   const check = async (name: string, work: () => Promise<unknown>) => {
@@ -253,6 +265,27 @@ async function main(): Promise<void> {
     const jobs = await db.query(`SELECT id FROM jobs WHERE payload->>'channelId'=$1`, [cookingEvidence.channelId]);
     assert.equal(jobs.rowCount, 0);
     return { citations: result.judgment?.citations.length || 0, channel: null };
+  });
+
+  await check('resume rebuilds a missing admitted channel from the durable decision', async () => {
+    const evidence = { ...tradingEvidence, channelId: `${PREFIX}RESUME`, channelName: 'Resume Trader' };
+    const input = candidateInput(evidence);
+    const row = await upsertAdmissionCandidate(input);
+    const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: evidence });
+    assert.equal(result.status, 'ADMITTED');
+    await db.query(`DELETE FROM channels WHERE channel_id=$1`, [evidence.channelId]);
+    assert.equal(await getChannelById(evidence.channelId), null);
+    const candidate = await findAdmissionCandidate(evidence.channelId);
+    const resumed = await resumeAdmittedCandidate(input, candidate!);
+    assert.equal(resumed, true);
+    const channel = await getChannelById(evidence.channelId);
+    assert.equal(channel?.admission_status, 'ADMITTED');
+    const jobs = await db.query(`SELECT payload FROM jobs WHERE payload->>'channelId'=$1 AND type='CLASSIFY_DISCOVERED_CHANNEL'`, [evidence.channelId]);
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0].payload.candidate?.admissionConfirmedTrading, true);
+    assert.equal(jobs.rows[0].payload.candidate?.admissionDecisionSource, 'DETERMINISTIC');
+    assert.equal(jobs.rows[0].payload.quotaOrigin, 'NORMAL');
+    return { channel: channel?.admission_status, classificationJobs: jobs.rowCount };
   });
 
   await check('semantic ambiguity persists terminal NEEDS_REVIEW without channel or enrichment', async () => {
@@ -325,6 +358,7 @@ async function main(): Promise<void> {
     const row = await upsertAdmissionCandidate(input);
     const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: evidence, judge: unknownJudge });
     assert.equal(result.status, 'NEEDS_REVIEW');
+    await db.query(`UPDATE semantic_admission_candidates SET attempts=3 WHERE channel_id=$1`, [evidence.channelId]);
     const resolved = await resolveAdmissionReview({
       channelId: evidence.channelId,
       action: 'REQUEUE',
@@ -337,10 +371,12 @@ async function main(): Promise<void> {
     assert.equal(jobs.rows[0].status, 'PENDING');
     assert.match(jobs.rows[0].idempotency_key, /:review:/);
     assert.equal(await hasActiveAdmissionJob(evidence.channelId), true);
-    return { jobs: jobs.rowCount, key: jobs.rows[0].idempotency_key };
+    const requeued = await findAdmissionCandidate(evidence.channelId);
+    assert.equal(Number(requeued?.attempts), 0);
+    return { jobs: jobs.rowCount, key: jobs.rows[0].idempotency_key, attempts: requeued?.attempts };
   });
 
-  await check('provider failure retains attempts/expiry and schedules retry:2 then retry:3', async () => {
+  await check('provider failure retains attempts/expiry and schedules provider-retry:2 then provider-retry:3', async () => {
     const evidence = fixtureEvidence({
       channelId: `${PREFIX}DEFERRED`,
       channelName: 'Provider Deferred Candidate',
@@ -359,13 +395,13 @@ async function main(): Promise<void> {
     const ledger = await db.query(`SELECT id FROM semantic_admission_decisions WHERE channel_id=$1`, [evidence.channelId]);
     assert.equal(ledger.rowCount, 0);
     const attempt2 = nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 1, candidateAttempts: 0 });
-    await enqueueAdmissionVerification({ candidate: input, attempt: attempt2, runAfter: candidate!.next_check_at! });
+    await enqueueAdmissionVerification({ candidate: input, attempt: attempt2, runAfter: candidate!.next_check_at!, retryKind: 'provider' });
     const attempt3 = nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 2, candidateAttempts: 0 });
-    await enqueueAdmissionVerification({ candidate: input, attempt: attempt3, runAfter: candidate!.next_check_at! });
+    await enqueueAdmissionVerification({ candidate: input, attempt: attempt3, runAfter: candidate!.next_check_at!, retryKind: 'provider' });
     const keys = await db.query(`SELECT idempotency_key,status FROM jobs WHERE payload->>'channelId'=$1 AND type='VERIFY_CHANNEL_ADMISSION' ORDER BY idempotency_key`, [evidence.channelId]);
     assert.equal(keys.rowCount, 2);
-    assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':retry:2')));
-    assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':retry:3')));
+    assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':provider-retry:2')));
+    assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':provider-retry:3')));
     return { attempts: candidate?.attempts, expiresAt: candidate?.expires_at, retryKeys: keys.rows.map((job: any) => job.idempotency_key) };
   });
 
@@ -378,7 +414,7 @@ async function main(): Promise<void> {
     });
     const input = candidateInput(evidence);
     const row = await upsertAdmissionCandidate(input);
-    const job = await enqueueAdmissionVerification({ candidate: input, attempt: 2 });
+    const job = await enqueueAdmissionVerification({ candidate: input, attempt: 2, retryKind: 'provider' });
     await processAdmissionVerificationJob(
       { ...job, payload: { ...job.payload, attempt: 2 } } as any,
       { evidenceOverride: evidence, judge: providerFailureJudge },
@@ -388,8 +424,8 @@ async function main(): Promise<void> {
     assert.equal(Number(candidate?.attempts), 0);
     assert.equal(candidate?.expires_at, null);
     const keys = await db.query(`SELECT idempotency_key FROM jobs WHERE payload->>'channelId'=$1 AND type='VERIFY_CHANNEL_ADMISSION' ORDER BY idempotency_key`, [evidence.channelId]);
-    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':retry:2')));
-    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':retry:3')));
+    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':provider-retry:2')));
+    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':provider-retry:3')));
     return { attempts: candidate?.attempts, retryKeys: keys.rows.map((item: any) => item.idempotency_key) };
   });
 

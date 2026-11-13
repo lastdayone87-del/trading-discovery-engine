@@ -350,6 +350,18 @@ export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
   return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
 }
 
+/**
+ * Admission judge availability treats an unconfigured provider as
+ * unavailable, not healthy. A pool with zero configured routes is unhealthy;
+ * one configured healthy route keeps admission claimable.
+ */
+export function judgeRoutePoolHealthy(
+  configured: { gemini: boolean; groq: boolean },
+  cooling: { gemini: boolean; groq: boolean },
+): boolean {
+  return (configured.gemini && !cooling.gemini) || (configured.groq && !cooling.groq);
+}
+
 /** True only for the pre-migration semantic-admission schema. */
 function isMissingAdmissionSchemaError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -374,15 +386,18 @@ async function admissionSemanticRouteHealthy(): Promise<boolean> {
   const [geminiCooling, groqCooling] = await Promise.all([
     geminiRoutes.length > 0
       ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
-      : isGeminiSemanticCooldownActive(),
+      : true,
     groqRoutes.length > 0
       ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(
           await isGroqOrgCooldownActive(groqRouteOrg(route)),
           groqOrgCooldownRemainingMs(groqRouteOrg(route)),
         ))))
-      : isGroqSemanticCooldownActive(),
+      : true,
   ]);
-  return !(geminiCooling && groqCooling);
+  return judgeRoutePoolHealthy(
+    { gemini: geminiRoutes.length > 0, groq: groqRoutes.length > 0 },
+    { gemini: geminiCooling, groq: groqCooling },
+  );
 }
 
 /**
@@ -1291,7 +1306,11 @@ export async function admitDiscoveredChannel(input: {
       const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
       await enqueueAdmissionVerification({
         candidate: candidateInput,
-        ...(waiting ? { runAfter: row.next_check_at as string, attempt: Math.max(2, Number(row.attempts || 0) + 1) } : {}),
+        ...(waiting ? {
+          runAfter: row.next_check_at as string,
+          attempt: Math.max(2, Number(row.attempts || 0) + 1),
+          retryKind: row.status === 'PROVIDER_DEFERRED' ? 'provider' as const : 'evidence' as const,
+        } : {}),
       });
       return { outcome: admissionPendingOutcome(raw), pending: true };
     } catch (error) {
@@ -3425,7 +3444,11 @@ export async function processDiscoveredChannel(
           const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
           await enqueueAdmissionVerification({
             candidate: { candidate: raw, targetCountry, source },
-            ...(waiting ? { runAfter: row.next_check_at as string, attempt: Math.max(2, Number(row.attempts || 0) + 1) } : {}),
+            ...(waiting ? {
+              runAfter: row.next_check_at as string,
+              attempt: Math.max(2, Number(row.attempts || 0) + 1),
+              retryKind: row.status === 'PROVIDER_DEFERRED' ? 'provider' as const : 'evidence' as const,
+            } : {}),
           });
         }
         return admissionPendingOutcome(raw);

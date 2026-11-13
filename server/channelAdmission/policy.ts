@@ -366,22 +366,24 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
   const mainSubject = String(raw.main_subject || raw.mainSubject || '').toUpperCase();
   if (!['TRADING', 'FINANCE_ADJACENT', 'UNRELATED', 'MIXED', 'UNKNOWN'].includes(mainSubject)) return null;
   const citations = Array.isArray(raw.evidence_citations) ? raw.evidence_citations : Array.isArray(raw.citations) ? raw.citations : [];
+  const unrelatedDomains = Array.isArray(raw.unrelated_domains)
+    ? raw.unrelated_domains
+    : Array.isArray(raw.unrelatedDomains) ? raw.unrelatedDomains : [];
+  const incidentalMentions = Array.isArray(raw.incidental_trading_mentions)
+    ? raw.incidental_trading_mentions
+    : Array.isArray(raw.incidentalTradingMentions) ? raw.incidentalTradingMentions : [];
   return {
     mainSubject: mainSubject as SemanticJudgment['mainSubject'],
     tradingFocus: Math.max(0, Math.min(100, Number(raw.trading_focus ?? raw.tradingFocus ?? 0) || 0)),
-    unrelatedDomains: Array.isArray(raw.unrelated_domains) || Array.isArray(raw.unrelatedDomains)
-      ? (raw.unrelated_domains || raw.unrelatedDomains).map((item: any) => ({
-        domain: String(item?.domain || item?.name || 'UNKNOWN').toUpperCase(),
-        confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
-      }))
-      : [],
-    incidentalTradingMentions: Array.isArray(raw.incidental_trading_mentions) || Array.isArray(raw.incidentalTradingMentions)
-      ? (raw.incidental_trading_mentions || raw.incidentalTradingMentions).map((item: any) => ({
-        field: String(item?.field || 'unknown'),
-        index: Number.isInteger(item?.index) ? item.index : undefined,
-        quote: String(item?.quote || ''),
-      }))
-      : [],
+    unrelatedDomains: unrelatedDomains.map((item: any) => ({
+      domain: String(item?.domain || item?.name || 'UNKNOWN').toUpperCase(),
+      confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
+    })),
+    incidentalTradingMentions: incidentalMentions.map((item: any) => ({
+      field: String(item?.field || 'unknown'),
+      index: Number.isInteger(item?.index) ? item.index : undefined,
+      quote: String(item?.quote || ''),
+    })),
     citations: citations.flatMap((item: any) => {
       const supports = String(item?.supports || '').toUpperCase();
       const field = String(item?.field || '').trim();

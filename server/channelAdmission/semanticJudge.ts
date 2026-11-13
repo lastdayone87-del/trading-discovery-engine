@@ -235,6 +235,7 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         ];
     const checksum = admissionEvidenceChecksum(evidence);
     let lastError: unknown;
+    let decisionFailure: unknown;
     for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
       const attempt = attempts[attemptIndex];
       if (!attempt.client) continue;
@@ -266,8 +267,12 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
         return normalized;
       } catch (error) {
         lastError = error;
+        if (!decisionFailure && isSemanticDecisionFailure(error)) decisionFailure = error;
       }
     }
+    // A malformed response is a bounded AI-decision failure even if a later
+    // provider attempt failed for an unrelated infrastructure reason.
+    if (decisionFailure instanceof Error) throw decisionFailure;
     if (lastError instanceof Error) throw lastError;
     throw new Error('ADMISSION_SEMANTIC_UNAVAILABLE');
   }

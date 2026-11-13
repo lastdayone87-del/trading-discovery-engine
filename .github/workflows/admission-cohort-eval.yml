@@ -44,7 +44,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install
+      - run: npm ci
       - name: Run 60-channel deterministic cohort (no secrets)
         run: >-
           npx tsx scripts/runAdmissionCohort.ts
@@ -108,7 +108,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm install
+      - run: npm ci
       - name: Apply migrations to disposable telemetry database
         run: npx tsx scripts/runMigrations.ts
       - name: Run 60-channel semantic cohort
