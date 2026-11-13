@@ -8,6 +8,7 @@ import type {
   SemanticJudgment,
 } from './types';
 import { ADMISSION_POLICY_VERSION } from './policy';
+import { resolvePreChannelAdmissionQuotaOrigin } from '../quotaOrigin';
 
 type AdmissionQueryable = {
   query: (text: string, values?: any[]) => Promise<{ rows: any[]; rowCount?: number | null }>;
@@ -98,7 +99,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
     description: input.candidate.description || '',
     videoTitles: input.candidate.videoTitles || [],
     videoDescriptions: input.candidate.videoDescriptions || [],
-    quotaOrigin: input.candidate.quotaOrigin || null,
+    quotaOrigin: resolvePreChannelAdmissionQuotaOrigin(input.candidate.quotaOrigin),
     matchedDocument,
   };
   const result = await db.query(
@@ -187,11 +188,12 @@ export async function enqueueAdmissionVerification(input: {
   const key = attempt === 1
     ? admissionCandidateKey(input.candidate.candidate.channelId)
     : `admission:${input.candidate.candidate.channelId}:${retryKind}:${attempt}`;
+  const quotaOrigin = resolvePreChannelAdmissionQuotaOrigin(input.candidate.candidate.quotaOrigin);
   return enqueueJob('VERIFY_CHANNEL_ADMISSION', {
     candidateKey: admissionCandidateKey(input.candidate.candidate.channelId),
     channelId: input.candidate.candidate.channelId,
-    candidate: input.candidate.candidate,
-    quotaOrigin: input.candidate.candidate.quotaOrigin,
+    candidate: { ...input.candidate.candidate, quotaOrigin },
+    quotaOrigin,
     targetCountry: input.candidate.targetCountry,
     source: input.candidate.source,
     query: input.candidate.query,

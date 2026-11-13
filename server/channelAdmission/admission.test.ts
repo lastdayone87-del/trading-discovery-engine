@@ -448,23 +448,50 @@ test('pending admissions do not trip the contamination guard', () => {
   assert.equal(decision.quarantine, false);
 });
 
-test('admission jobs resolve quota provenance before a channels row exists', async () => {
-  const { resolveJobQuotaOrigin } = await import('../quotaOrigin');
-  const origin = await resolveJobQuotaOrigin({
+test('admission jobs resolve NORMAL/PROBE provenance before a channels row exists', async () => {
+  const { resolveJobQuotaOrigin, resolvePreChannelAdmissionQuotaOrigin } = await import('../quotaOrigin');
+  const empty = { query: async () => ({ rows: [], rowCount: 0 }) };
+
+  const missing = await resolveJobQuotaOrigin({
     type: 'VERIFY_CHANNEL_ADMISSION',
     payload: { channelId: 'UC-not-yet-admitted' },
-  }, {
-    query: async () => ({ rows: [], rowCount: 0 }),
-  });
-  assert.equal(origin, 'UNKNOWN');
+  }, empty);
+  assert.equal(missing, 'NORMAL');
 
-  const hinted = await resolveJobQuotaOrigin({
+  const normal = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-normal-admission', quotaOrigin: 'NORMAL' },
+  }, empty);
+  assert.equal(normal, 'NORMAL');
+
+  const probe = await resolveJobQuotaOrigin({
     type: 'VERIFY_CHANNEL_ADMISSION',
     payload: { channelId: 'UC-probe-admission', quotaOrigin: 'PROBE' },
+  }, empty);
+  assert.equal(probe, 'PROBE');
+
+  const storedProbe = await resolveJobQuotaOrigin({
+    type: 'VERIFY_CHANNEL_ADMISSION',
+    payload: { channelId: 'UC-existing-probe', quotaOrigin: 'NORMAL' },
   }, {
-    query: async () => ({ rows: [], rowCount: 0 }),
+    query: async () => ({ rows: [{ channel_id: 'UC-existing-probe', quota_origin: 'PROBE' }], rowCount: 1 }),
   });
-  assert.equal(hinted, 'PROBE');
+  assert.equal(storedProbe, 'PROBE');
+
+  const otherJob = await resolveJobQuotaOrigin({
+    type: 'ENRICH_CHANNEL',
+    payload: { channelId: 'UC-missing-enrichment' },
+  }, empty);
+  assert.equal(otherJob, 'UNKNOWN');
+
+  assert.equal(resolvePreChannelAdmissionQuotaOrigin(null, 'NORMAL'), 'NORMAL');
+  assert.equal(resolvePreChannelAdmissionQuotaOrigin(null, 'PROBE'), 'PROBE');
+  assert.equal(resolvePreChannelAdmissionQuotaOrigin('NORMAL', 'PROBE'), 'PROBE');
+  assert.equal(resolvePreChannelAdmissionQuotaOrigin('PROBE', 'NORMAL'), 'PROBE');
+  assert.throws(
+    () => resolvePreChannelAdmissionQuotaOrigin(null, 'UNKNOWN'),
+    /quota fence blocked admission-verification/i,
+  );
 });
 
 test('second judgment is marked effective when it supplies the decisive citations', () => {

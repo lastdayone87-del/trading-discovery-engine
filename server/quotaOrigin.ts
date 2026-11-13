@@ -10,6 +10,7 @@ import { getDb } from './dbCore';
 import {
   currentOfficialYouTubeQuotaOrigin,
   mergeQuotaOrigins,
+  OfficialYouTubeQuotaFenceError,
   type ResolvedQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import type { QuotaOrigin } from '../src/types';
@@ -124,6 +125,25 @@ export async function resolvePipelineQuotaOrigin(
   return mergeQuotaOrigins(hinted, stored) ?? 'UNKNOWN';
 }
 
+/**
+ * Pre-channel admission verification has no channels row, so the normal
+ * channel-row lookup cannot establish provenance. Its only valid origins are
+ * NORMAL and PROBE: an explicit PROBE hint or an enclosing PROBE run stays
+ * sticky, and missing provenance falls back to NORMAL. An explicit NORMAL hint
+ * cannot downgrade an enclosing PROBE run. The discovery dispatcher has
+ * already blocked an UNKNOWN-origin parent before this point.
+ */
+export function resolvePreChannelAdmissionQuotaOrigin(
+  explicit: QuotaOrigin | null | undefined,
+  ambient: ResolvedQuotaOrigin = currentOfficialYouTubeQuotaOrigin(),
+): QuotaOrigin {
+  if (explicit === 'PROBE' || ambient === 'PROBE') return 'PROBE';
+  if (ambient === 'UNKNOWN') {
+    throw new OfficialYouTubeQuotaFenceError('UNKNOWN', 'admission-verification');
+  }
+  return 'NORMAL';
+}
+
 function collectChannelIds(payload: any): string[] {
   if (!payload || typeof payload !== 'object') return [];
   const values = new Set<string>();
@@ -192,10 +212,12 @@ export async function resolveJobQuotaOrigin(
   }
 
   // A featured-canary source can exist only in creator_outcome_records /
-  // entity_bindings, so it may have no channels row. The adapter still has its
-  // own canary controls and ordinary quota; treat a missing source row as
-  // NORMAL for this job type only, while an existing PROBE row stays sticky.
-  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS';
+  // entity_bindings, and a pre-channel admission candidate has no channels row
+  // yet. Both may lack a row; their explicit PROBE hint is honored above, and
+  // an existing PROBE row stays sticky. Other channel-keyed jobs still fail
+  // closed when the row is missing.
+  const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS'
+    || job.type === 'VERIFY_CHANNEL_ADMISSION';
   let resolved: ResolvedQuotaOrigin = hinted ?? 'NORMAL';
   for (const channelId of channelIds) {
     if (!byId.has(channelId)) {
