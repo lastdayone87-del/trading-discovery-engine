@@ -505,6 +505,8 @@ async function main(): Promise<void> {
   const blind = argValue('blind') || '/tmp/opencode/admission-cohort-60-blind.jsonl';
   const seed = argValue('seed') || 'admission-cohort-v1';
   const collectOnly = process.argv.includes('--collect-only');
+  const resume = process.argv.includes('--resume');
+  const semanticConcurrency = Math.max(1, Math.min(4, argNumber('semantic-concurrency', 1)));
   const counts: Record<CohortGroup, number> = {
     trading: argNumber('trading', 20),
     unrelated: argNumber('unrelated', 20),
@@ -549,7 +551,7 @@ async function main(): Promise<void> {
   const judge = collectOnly ? null : configuredJudge();
   // Semantic calls share a provider quota. Serialize them whenever pacing is
   // configured so two workers cannot burst the same organization.
-  const concurrency = judge ? 1 : requestedConcurrency;
+  const concurrency = judge ? semanticConcurrency : requestedConcurrency;
   console.log(JSON.stringify({
     event: 'admission_cohort_start',
     manifest,
@@ -559,6 +561,8 @@ async function main(): Promise<void> {
     concurrency,
     semanticAvailable: Boolean(judge),
     collectOnly,
+    resume,
+    semanticConcurrency,
     aiDelayMs,
     aiRetries,
     fromEvidence: fromEvidence || null,
@@ -566,20 +570,44 @@ async function main(): Promise<void> {
     timestamp: new Date().toISOString(),
   }));
 
-  for (const path of [output, blind]) {
-    if (existsSync(path)) rmSync(path);
-    writeFileSync(path, '');
+  const existingResults: Array<Record<string, unknown>> = [];
+  if (resume && existsSync(output)) {
+    for (const line of readFileSync(output, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        existingResults.push(JSON.parse(line) as Record<string, unknown>);
+      } catch {
+        // A killed process may leave one partial trailing line. Ignore it and
+        // re-evaluate that channel; every complete line is durable.
+      }
+    }
+  } else {
+    for (const path of [output, blind]) {
+      if (existsSync(path)) rmSync(path);
+      writeFileSync(path, '');
+    }
+  }
+  const completedIds = new Set(existingResults.map(result => (result.channel as any)?.channelId).filter(Boolean));
+  const pending = cohort.filter(item => !completedIds.has(item.row.channelId));
+  if (resume) {
+    console.log(JSON.stringify({
+      event: 'admission_cohort_resume',
+      existing: existingResults.length,
+      pending: pending.length,
+      output,
+      timestamp: new Date().toISOString(),
+    }));
   }
 
   let cursor = 0;
-  let completed = 0;
-  const results: Array<Record<string, unknown>> = [];
+  let completed = existingResults.length;
+  const results: Array<Record<string, unknown>> = [...existingResults];
   const workers = Array.from({ length: concurrency }, async () => {
     const session = fromEvidence ? undefined : await Innertube.create({ retrieve_player: false } as any);
     for (;;) {
       const index = cursor++;
-      if (index >= cohort.length) return;
-      const item = cohort[index];
+      if (index >= pending.length) return;
+      const item = pending[index];
       let result: Record<string, unknown>;
       try {
         result = collectOnly
