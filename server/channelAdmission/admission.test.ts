@@ -492,6 +492,10 @@ test('admission jobs resolve NORMAL/PROBE provenance before a channels row exist
     () => resolvePreChannelAdmissionQuotaOrigin(null, 'UNKNOWN'),
     /quota fence blocked admission-verification/i,
   );
+  assert.throws(
+    () => resolvePreChannelAdmissionQuotaOrigin('BOGUS' as any, 'NORMAL'),
+    /quota fence blocked admission-verification/i,
+  );
 });
 
 test('second judgment is marked effective when it supplies the decisive citations', () => {

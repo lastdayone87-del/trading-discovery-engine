@@ -137,6 +137,9 @@ export function resolvePreChannelAdmissionQuotaOrigin(
   explicit: QuotaOrigin | null | undefined,
   ambient: ResolvedQuotaOrigin = currentOfficialYouTubeQuotaOrigin(),
 ): QuotaOrigin {
+  if (explicit && explicit !== 'PROBE' && explicit !== 'NORMAL') {
+    throw new OfficialYouTubeQuotaFenceError('UNKNOWN', 'admission-verification');
+  }
   if (explicit === 'PROBE' || ambient === 'PROBE') return 'PROBE';
   if (ambient === 'UNKNOWN') {
     throw new OfficialYouTubeQuotaFenceError('UNKNOWN', 'admission-verification');
