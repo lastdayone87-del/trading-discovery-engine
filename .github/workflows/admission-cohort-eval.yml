@@ -6,7 +6,7 @@ on:
       semantic_provider:
         description: Provider for the manual semantic cohort
         type: choice
-        options: [auto, gemini, groq]
+        options: [auto, gemini, gemini-free, groq]
         default: auto
       ai_delay_ms:
         description: Delay between semantic calls (ms)
@@ -98,8 +98,8 @@ jobs:
       GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_FREE_API_KEY || secrets.GEMINI_API_KEY_2 }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       COHORT_SEMANTIC_PROVIDER: ${{ inputs.semantic_provider || 'auto' }}
-      COHORT_AI_DELAY_MS: ${{ inputs.ai_delay_ms || 45000 }}
-      COHORT_AI_RETRIES: ${{ inputs.ai_retries || 1 }}
+      COHORT_AI_DELAY_MS: ${{ inputs.ai_delay_ms }}
+      COHORT_AI_RETRIES: ${{ inputs.ai_retries }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

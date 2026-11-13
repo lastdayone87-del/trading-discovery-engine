@@ -125,13 +125,14 @@ function candidateInput(evidence: AdmissionEvidence): AdmissionCandidateInput {
 }
 
 async function cleanup(db: any): Promise<void> {
-  const ids = `${PREFIX}%`;
-  await db.query(`DELETE FROM semantic_admission_sightings WHERE candidate_id IN (SELECT id FROM semantic_admission_candidates WHERE channel_id LIKE $1)`, [ids]);
-  await db.query(`DELETE FROM semantic_admission_decisions WHERE channel_id LIKE $1`, [ids]);
-  await db.query(`DELETE FROM semantic_admission_candidates WHERE channel_id LIKE $1`, [ids]);
-  await db.query(`DELETE FROM jobs WHERE payload->>'channelId' LIKE $1`, [ids]);
-  await db.query(`DELETE FROM channel_reviews WHERE channel_id LIKE $1`, [ids]);
-  await db.query(`DELETE FROM channels WHERE channel_id LIKE $1`, [ids]);
+  // LEFT(..., length($1)) treats the underscore in UCSTG_ literally; LIKE
+  // would interpret it as a single-character wildcard.
+  await db.query(`DELETE FROM semantic_admission_sightings WHERE candidate_id IN (SELECT id FROM semantic_admission_candidates WHERE LEFT(channel_id, length($1)) = $1)`, [PREFIX]);
+  await db.query(`DELETE FROM semantic_admission_decisions WHERE LEFT(channel_id, length($1)) = $1`, [PREFIX]);
+  await db.query(`DELETE FROM semantic_admission_candidates WHERE LEFT(channel_id, length($1)) = $1`, [PREFIX]);
+  await db.query(`DELETE FROM jobs WHERE LEFT(payload->>'channelId', length($1)) = $1`, [PREFIX]);
+  await db.query(`DELETE FROM channel_reviews WHERE LEFT(channel_id, length($1)) = $1`, [PREFIX]);
+  await db.query(`DELETE FROM channels WHERE LEFT(channel_id, length($1)) = $1`, [PREFIX]);
 }
 
 async function insertDeferredChannel(channelId: string): Promise<void> {
@@ -164,7 +165,7 @@ function assertIsolatedStagingUrl(raw: string): void {
   } catch {
     throw new Error('STAGING_URL_INVALID');
   }
-  const host = url.hostname.toLowerCase();
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   const database = decodeURIComponent(url.pathname.replace(/^\/+/, '')).toLowerCase();
   const local = ['localhost', '127.0.0.1', '::1'].includes(host);
   const named = /(^|[-_.])(staging|stage|test|disposable|e2e)([-_.]|$)/i.test(database)
@@ -197,7 +198,9 @@ async function main(): Promise<void> {
     } catch (error) {
       checks.push({ name, ok: false, details: error instanceof Error ? error.message : String(error) });
       console.log(JSON.stringify({ event: 'staging_check', name, ok: false, error: error instanceof Error ? error.message : String(error) }));
-      throw error;
+      // Keep executing the remaining lifecycle checks so one failure still
+      // produces the full summary; the batch exits non-zero at the end.
+      return undefined;
     }
   };
 

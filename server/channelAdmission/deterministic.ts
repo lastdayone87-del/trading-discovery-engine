@@ -33,7 +33,7 @@ const REJECT_DOMAINS: Array<{ domain: string; pattern: RegExp }> = [
  */
 const TRADING_FINANCE_GUARD = /\b(?:technical\s*analysis|price\s*action|market\s*analysis|market\s*structure|order\s*flow|volume\s*profile|risk\s*management|trade\s*setup|trade\s*journal|trade\s*analysis|trading\s*analysis|back\s*test|backtest|live\s*trad(?:e|ing)|day\s*trad(?:e|ing)|swing\s*trad(?:e|ing)|scalp(?:ing)?|prop\s*firm|funded\s*trader|trading\s*(?:strategy|education|signals?|course|system)|stock\s*(?:market|trading)|share\s*market|equity\s*market|forex(?:\s*(?:trading|market))?|futures?\s*(?:trading|market)|options?\s*(?:trading|market)|crypto\s*trading|bitcoin|btc|ethereum|eth|nasdaq|s&p\s*500|sp500|xauusd|xagusd|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|nifty|bank\s*nifty|sensex|dax|cac\s*40|ftse\s*100|nikkei|trader|trading|invest(?:ing|or|ment)?|portfolio|dividend|etf|bourse|finance|financial|wealth|broker|equity|commodit(?:y|ies)|market\s*(?:update|recap|outlook|forecast|crash|news|commentary)|chart\s*analysis|support\s*and\s*resistance|candlestick|moving\s*average|rsi|macd|fibonacci|elliott|wyckoff|pnl|p\s*&\s*l)\b/iu;
 
-const FINANCE_ADJACENT_EVIDENCE = /\b(?:personal finance|invest(?:ing|ment|or|ments)?|etf|dividend|portfolio|retirement|broker|budget(?:ing)?|savings?|wealth|stock(?:s)?|equit(?:y|ies)|bond|index fund|mutual fund|real estate|mortgage|insurance|tax(?:es)?|bourse|courtier|épargne|assurance[- ]vie|scpi|patrimoine|finances personnelles|inversi[oó]n|bolsa|corredor|ahorro|jubilaci[oó]n|finanzas personales|investieren|b[oö]rse|sparen|altersvorsorge|finanzen)\b/iu;
+const FINANCE_ADJACENT_EVIDENCE = /\b(?:personal finance|invest(?:ing|ment|or|ments)|investir|investissement|etf|dividend|portfolio|retirement|broker|budgeting|budget\s+(?:tips|plan|money)|savings account|wealth|stock market|stock investing|stock trading|stocks and shares|stock portfolio|equity market|equities|bond market|government bonds?|corporate bonds?|treasury bonds?|bond (?:fund|etf|yield)|index fund|mutual fund|real estate|mortgage|insurance|income tax|tax return|tax filing|tax planning|tax bracket|tax refund|bourse|courtier|épargne|assurance[- ]vie|scpi|patrimoine|finances personnelles|inversi[oó]n|bolsa|corredor|ahorro|jubilaci[oó]n|finanzas personales|investieren|b[oö]rse|sparen|altersvorsorge|finanzen)\b/iu;
 
 /**
  * Active trading evidence is execution/analysis language, not merely the
@@ -41,7 +41,7 @@ const FINANCE_ADJACENT_EVIDENCE = /\b(?:personal finance|invest(?:ing|ment|or|me
  * stock-market vocabulary without being trading creators, so a fast-pass
  * requires at least one of these anchors.
  */
-const ACTIVE_TRADING_EVIDENCE = /\b(?:live[\s-]*trad(?:e|ing)|day[\s-]*trad(?:e|ing)|swing[\s-]*trad(?:e|ing)|scalp(?:ing)?|price action|technical analysis|market structure|order[\s-]*flow|order block|fair value gap|fvg|volume profile|support and resistance|risk management|trade[\s-]*(?:setup|recap|idea|execution|journal|plan|breakdown)|entry[\s-]*(?:strategy|setup|point|model)|liquidity[\s-]*(?:pool|sweep)|back[\s-]*test|backtest|futures?\s*(?:trading|analysis|market|setup)|forex\s*(?:trading|analysis|strategy)|nifty\s*(?:analysis|trading|view|setup|outlook|forecast)|bank\s*nifty|sensex\s*(?:analysis|trading|view)|nq\s*(?:futures|analysis|trading|setup)|gold\s*(?:trading|analysis|forecast|setup)|bitcoin\s*(?:trading|analysis)|btc\s*(?:trading|analysis)|ethereum\s*(?:trading|analysis)|xauusd|xagusd|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|candlestick|fibonacci|elliott|wyckoff|vwap|footprint|chart[\s-]*(?:analysis|setup|pattern|breakdown)|ict|smc|funded\s*(?:account|challenge|trader))\b/iu;
+const ACTIVE_TRADING_EVIDENCE = /\b(?:live[\s-]+trad(?:e|ing)|day[\s-]+trad(?:e|ing)|swing[\s-]+trad(?:e|ing)|scalp(?:ing)?|price action|technical analysis|market structure|order[\s-]*flow|order block|fair value gap|fvg|volume profile|support and resistance|risk management|trade[\s-]+(?:setup|recap|idea|execution|journal|plan|breakdown)|trading\s+(?:strategy|education|course|system)|stock\s+trading|crypto\s+trading|liquidity[\s-]*(?:pool|sweep)|back[\s-]*test|backtest|futures?\s*(?:trading|analysis|market|setup)|forex\s*(?:trading|analysis|strategy)|nifty\s*(?:analysis|trading|view|setup|outlook|forecast)|bank\s*nifty|sensex\s*(?:analysis|trading|view)|nq\s*(?:futures|analysis|trading|setup)|gold\s*(?:trading|analysis|forecast|setup)|bitcoin\s*(?:trading|analysis)|btc\s*(?:trading|analysis)|ethereum\s*(?:trading|analysis)|xauusd|xagusd|eurusd|gbpusd|usdjpy|audusd|usdcad|usdchf|nzdusd|candlestick|fibonacci|elliott|wyckoff|vwap|footprint|chart[\s-]+(?:analysis|setup|pattern|breakdown)|(?:ict|smc)\s+(?:trading|concepts?|model|strategy|trader|analysis)|funded\s+(?:account|challenge|trader))\b/iu;
 
 export function isFinanceAdjacentWithoutActiveTrading(text: string): boolean {
   const value = String(text || '');
@@ -247,7 +247,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
 
   let passWithoutCitations = false;
   let passBlockedByFinanceAdjacency = false;
-  const fullEvidenceText = `${evidence.channelName}\n${evidence.description}\n${evidence.videos.map(video => `${video.title}\n${video.description}`).join('\n')}`;
+  const fullEvidenceText = `${evidence.channelName}\n${evidence.description}\n${evidence.links.join('\n')}\n${evidence.videos.map(video => `${video.title}\n${video.description}`).join('\n')}`;
   const financeAdjacentOnly = isFinanceAdjacentWithoutActiveTrading(fullEvidenceText);
   if (routing.route === 'DETERMINISTIC_TRADING'
     && decision.status === 'TRADING_CONFIRMED'
@@ -279,6 +279,19 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     // Finance-adjacent creators must reach downstream classification rather
     // than bypass it with a deterministic trading fast-pass.
     if (financeAdjacentOnly) passBlockedByFinanceAdjacency = true;
+  }
+
+  // Finance-adjacent creators must never be deterministically rejected, even
+  // if the unrelated-domain matcher finds corroborated non-finance content.
+  if (financeAdjacentOnly) {
+    return {
+      outcome: 'AMBIGUOUS',
+      route: routing.route,
+      confidence: decision.confidenceScore,
+      reasonCodes: ['FINANCE_ADJACENT_DEFERRED_TO_DOWNSTREAM', 'DETERMINISTIC_AMBIGUOUS', ...routing.reasonCodes],
+      citations: [],
+      priority: 20,
+    };
   }
 
   const rejection = evaluateStrictRejection(evidence);

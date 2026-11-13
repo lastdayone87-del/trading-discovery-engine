@@ -58,7 +58,6 @@ async function callJudgeWithPacing(
 ): Promise<SemanticJudgment> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    if (attempt > 0) await sleep(delayMs);
     try {
       const judgment = await judge.judge(evidence, role);
       await sleep(delayMs);
@@ -67,7 +66,10 @@ async function callJudgeWithPacing(
       lastError = error;
       if (isSemanticDecisionFailure(error)) throw error;
       const retryAfter = Number((error as { retryAfterMs?: unknown })?.retryAfterMs || 0);
-      if (attempt < retries) await sleep(Math.min(120_000, Math.max(delayMs, retryAfter)));
+      const waitMs = Math.min(120_000, Math.max(delayMs, retryAfter));
+      // One delay per failure: preserve provider pressure before either the
+      // retry or the next candidate starts.
+      await sleep(waitMs);
     }
   }
   throw lastError instanceof Error ? lastError : new Error('ADMISSION_SEMANTIC_UNAVAILABLE');
@@ -76,6 +78,14 @@ async function callJudgeWithPacing(
 function argNumber(name: string, fallback: number): number {
   const value = Number(argValue(name));
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+function argNonNegative(name: string, fallback: number): number {
+  const raw = argValue(name);
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`INVALID_${name.replace(/-/g, '_').toUpperCase()}`);
+  return Math.floor(value);
 }
 
 function sha(value: string): string {
@@ -266,14 +276,19 @@ function semanticClientsAllowedToWriteTelemetry(): boolean {
 function configuredJudge(): CohortJudge | null {
   if (!semanticClientsAllowedToWriteTelemetry()) return null;
   const requested = String(process.env.COHORT_SEMANTIC_PROVIDER || 'auto').trim().toLowerCase();
+  if (!['auto', 'gemini', 'gemini-free', 'groq'].includes(requested)) {
+    throw new Error('INVALID_COHORT_SEMANTIC_PROVIDER');
+  }
   const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }> = [];
-  if (requested !== 'groq') {
+  if (requested === 'auto' || requested === 'gemini') {
     const gemini = geminiDefaultClient();
     if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, provider: 'gemini_semantic' });
+  }
+  if (requested === 'auto' || requested === 'gemini-free') {
     const geminiFree = geminiFreeDefaultClient();
     if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL, provider: 'gemini_free_semantic' });
   }
-  if (requested !== 'gemini') {
+  if (requested === 'auto' || requested === 'groq') {
     const groq = groqDefaultClient();
     if (groq) clients.push({ client: groq, model: process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL, provider: 'groq_semantic' });
   }
@@ -482,9 +497,9 @@ async function main(): Promise<void> {
     ambiguous: argNumber('ambiguous', 10),
     held: argNumber('held', 10),
   };
-  const concurrency = Math.max(1, Math.min(4, argNumber('concurrency', 2)));
-  const aiDelayMs = Math.max(0, argNumber('ai-delay-ms', 0));
-  const aiRetries = Math.max(0, argNumber('ai-retries', 0));
+  const requestedConcurrency = Math.max(1, Math.min(4, argNumber('concurrency', 2)));
+  const aiDelayMs = argNonNegative('ai-delay-ms', 0);
+  const aiRetries = argNonNegative('ai-retries', 0);
   const fromEvidence = argValue('from-evidence');
   const rows = readFileSync(manifest, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as PreservedResult);
   const cohort: Array<{ group: CohortGroup; row: PreservedResult; evidence?: AdmissionEvidence }> = fromEvidence
@@ -518,6 +533,9 @@ async function main(): Promise<void> {
     }) as Array<{ group: CohortGroup; row: PreservedResult; evidence?: AdmissionEvidence }>
     : selectCohort(rows, counts, seed);
   const judge = configuredJudge();
+  // Semantic calls share a provider quota. Serialize them whenever pacing is
+  // configured so two workers cannot burst the same organization.
+  const concurrency = judge ? 1 : requestedConcurrency;
   console.log(JSON.stringify({
     event: 'admission_cohort_start',
     manifest,

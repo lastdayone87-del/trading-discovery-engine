@@ -16,7 +16,7 @@ type Label = 'TRADING' | 'FINANCE_ADJACENT' | 'UNRELATED' | 'AMBIGUOUS' | 'UNKNO
 interface GroundTruth { label: Label; note?: string }
 const expectedAdmit = new Set<Label>(['TRADING', 'FINANCE_ADJACENT']);
 
-const resultsPath = argValue('results') || '/tmp/opencode/admission-cohort-60-r3.jsonl';
+const resultsPath = argValue('results') || '/tmp/opencode/admission-cohort-60.jsonl';
 const truthPath = argValue('ground-truth') || 'scripts/fixtures/admission-cohort-60-ground-truth.json';
 const rows = readFileSync(resultsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as any);
 const truthDocument = JSON.parse(readFileSync(truthPath, 'utf8')) as { _meta?: { reviewer?: string; method?: string; reviewedAt?: string }; labels?: Record<string, GroundTruth> };
@@ -26,6 +26,11 @@ if (!truthDocument._meta?.reviewer || !truthDocument._meta?.method || !truthDocu
 }
 const truth = (truthDocument.labels || truthDocument) as Record<string, GroundTruth>;
 const label = (channelId: string): Label => truth[channelId]?.label || 'UNKNOWN_EVIDENCE';
+const missingLabelIds = rows.map(row => row.channel?.channelId).filter(channelId => !channelId || !truth[channelId]);
+if (missingLabelIds.length) {
+  console.error(`Independent review labels are missing for ${missingLabelIds.length} cohort channel(s): ${missingLabelIds.join(', ')}`);
+  process.exitCode = 1;
+}
 const tally = (items: string[]) => items.reduce((acc, item) => ({ ...acc, [item]: (acc[item] || 0) + 1 }), {} as Record<string, number>);
 
 const deterministic = rows.map(row => row.deterministic?.outcome || 'NONE');
@@ -54,7 +59,7 @@ const report = {
     decided: detDecided.length,
     correct: detCorrect.length,
     wrong: detDecided.length - detCorrect.length,
-    precision: detDecided.length ? detCorrect.length / detDecided.length : null,
+    accuracy: detDecided.length ? detCorrect.length / detDecided.length : null,
     coverage: rows.length ? detDecided.length / rows.length : null,
     fastPass: {
       total: rows.filter(row => row.deterministic?.outcome === 'PASS').length,
@@ -79,7 +84,7 @@ const report = {
       decided: finalDecided.length,
       correct: finalCorrect.length,
       wrong: finalDecided.length - finalCorrect.length,
-      precision: finalDecided.length ? finalCorrect.length / finalDecided.length : null,
+      accuracy: finalDecided.length ? finalCorrect.length / finalDecided.length : null,
       admitPrecision: admitted.length ? admittedExpected.length / admitted.length : null,
       rejectPrecision: rejected.length ? rejectedExpected.length / rejected.length : null,
       admitRecall: expectedAdmitRows.length ? admittedExpected.length / expectedAdmitRows.length : null,
@@ -100,4 +105,4 @@ const report = {
   generatedAt: new Date().toISOString(),
 };
 console.log(JSON.stringify(report, null, 2));
-if (rows.length === 0 || report.deterministic.decided === 0 || report.final.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;
+if (rows.length === 0 || missingLabelIds.length > 0 || report.deterministic.decided === 0 || report.final.decided === 0 || report.deterministic.wrong > 0 || report.final.wrong > 0) process.exitCode = 1;
