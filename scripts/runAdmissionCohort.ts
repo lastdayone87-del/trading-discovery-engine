@@ -534,8 +534,8 @@ async function main(): Promise<void> {
           youtubeUrl: saved.channel.youtubeUrl,
           description: saved.evidence.description || '',
           links: saved.evidence.links || [],
-          country: saved.channel.country || undefined,
-          subscriberCount: saved.channel.subscriberCount || undefined,
+          country: saved.channel.country || saved.evidence.country || undefined,
+          subscriberCount: saved.channel.subscriberCount || saved.evidence.subscriberCount || undefined,
           videos: saved.evidence.videos || [],
           source: 'automated_query',
           targetCountry: 'UNKNOWN',
@@ -633,7 +633,7 @@ async function main(): Promise<void> {
         description: evidence?.description || '',
         links: evidence?.links || [],
         videos: evidence?.videos || [],
-        coverage: evidence?.coverage || 'UNKNOWN',
+        coverage: evidence?.evidenceCoverage || evidence?.coverage || 'UNKNOWN',
       })}\n`);
       completed += 1;
       console.log(JSON.stringify({

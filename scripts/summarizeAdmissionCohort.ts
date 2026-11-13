@@ -66,16 +66,28 @@ function sha256File(path: string): string {
 function loadReview(path: string): { labels: ReviewLabel[]; meta: Record<string, unknown> | null } {
   const raw = readFileSync(path, 'utf8').trim();
   if (!raw) fail(`Review label file is empty: ${path}`);
-  if (raw.startsWith('{')) {
-    const parsed = JSON.parse(raw) as { _meta?: Record<string, unknown>; labels?: Record<string, { label: Label; note?: string; language?: string }> };
-    if (!parsed.labels) fail(`Review label document has no labels object: ${path}`);
+  // A JSONL file also begins with '{'. Only use the whole-document branch when
+  // parsing succeeds AND the document actually has a labels object.
+  let document: { _meta?: Record<string, unknown>; labels?: Record<string, { label: Label; note?: string; language?: string }> } | null = null;
+  try {
+    const parsed = JSON.parse(raw) as typeof document;
+    if (parsed && typeof parsed === 'object' && parsed.labels) document = parsed;
+  } catch {
+    // Not a single JSON document; fall through to JSONL.
+  }
+  if (document?.labels) {
     return {
-      meta: parsed._meta || null,
-      labels: Object.entries(parsed.labels).map(([channelId, value]) => ({ channelId, label: value.label, note: value.note, language: value.language })),
+      meta: document._meta || null,
+      labels: Object.entries(document.labels).map(([channelId, value]) => ({ channelId, label: value.label, note: value.note, language: value.language })),
     };
   }
   const labels = raw.split('\n').filter(Boolean).map((line, index) => {
-    const value = JSON.parse(line) as ReviewLabel;
+    let value: ReviewLabel;
+    try {
+      value = JSON.parse(line) as ReviewLabel;
+    } catch {
+      fail(`Invalid review label JSON on line ${index + 1} of ${path}`);
+    }
     if (!value.channelId || !value.label) fail(`Invalid review label on line ${index + 1} of ${path}`);
     return value;
   });
@@ -94,12 +106,14 @@ if (sealPath) {
   const seal = JSON.parse(readFileSync(sealPath, 'utf8')) as { sealedAt?: string; files?: Record<string, { sha256?: string; bytes?: number }> };
   const labelsHash = sha256File(labelsPath);
   const expected = seal.files?.[basename(labelsPath)]?.sha256;
-  if (expected && expected !== labelsHash) fail(`Sealed review labels changed: expected ${expected}, got ${labelsHash}`);
+  if (!expected) fail(`Seal ${sealPath} does not contain a hash for ${basename(labelsPath)}`);
+  if (expected !== labelsHash) fail(`Sealed review labels changed: expected ${expected}, got ${labelsHash}`);
   const evidencePath = argValue('evidence');
   if (evidencePath) {
     const evidenceHash = sha256File(evidencePath);
     const expectedEvidence = seal.files?.[basename(evidencePath)]?.sha256;
-    if (expectedEvidence && expectedEvidence !== evidenceHash) fail(`Sealed evidence changed: expected ${expectedEvidence}, got ${evidenceHash}`);
+    if (!expectedEvidence) fail(`Seal ${sealPath} does not contain a hash for ${basename(evidencePath)}`);
+    if (expectedEvidence !== evidenceHash) fail(`Sealed evidence changed: expected ${expectedEvidence}, got ${evidenceHash}`);
   }
   sealReport = { path: sealPath, sealedAt: seal.sealedAt || null, labelsSha256: labelsHash, verified: true };
 }
@@ -446,4 +460,3 @@ const md = [
 ].join('\n');
 const mdOut = argValue('md-out');
 if (mdOut) writeFileSync(mdOut, md);
-console.log(md);
