@@ -652,6 +652,17 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
     })),
   });
   assert.equal(hasDecisiveTradingShare(namedTrader, citations), true);
+
+  const genericTrader = evidence({
+    name: 'Channel X',
+    bio: 'Weekly videos.',
+    videos: Array.from({ length: 10 }, (_, index) => ({
+      title: index < 6 ? 'NQ futures trade recap' : `Lifestyle video ${index}`,
+      description: index < 6 ? 'Futures trading recap.' : 'Unrelated.',
+    })),
+  });
+  const genericCitations = Array.from({ length: 6 }, (_, index) => citation('video_title', 'NQ futures trade recap', index, 'TRADING'));
+  assert.equal(hasDecisiveTradingShare(genericTrader, genericCitations), true);
 });
 
 test('mid-quote ellipses are accepted only when every segment is exact and in order', () => {
@@ -688,6 +699,19 @@ test('mid-quote ellipses are accepted only when every segment is exact and in or
     }),
   });
   assert.notEqual(fabricated.decision, 'ADMIT');
+
+  const shortSegments = decideAdmission({
+    evidence: trader,
+    judgment: judgment({
+      subject: 'TRADING',
+      focus: 1,
+      citations: [
+        citation('bio', 'a ... b ... c', undefined, 'TRADING'),
+        citation('video_title', 'Analisis semanal del mercado', 0, 'TRADING'),
+      ],
+    }),
+  });
+  assert.notEqual(shortSegments.decision, 'ADMIT');
 });
 
 test('deterministic strict rejection requires three matches across two independent sources', () => {

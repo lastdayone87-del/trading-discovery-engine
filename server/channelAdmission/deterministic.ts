@@ -142,7 +142,7 @@ function tradingCitations(evidence: AdmissionEvidence, decision: VerificationDec
       citations.push(citation);
     }
   }
-  return citations.slice(0, 6);
+  return citations.slice(0, 15);
 }
 
 interface RejectSource {
@@ -242,7 +242,7 @@ export function evaluateStrictRejection(evidence: AdmissionEvidence): {
  * This prevents a music/lifestyle channel with a few trading uploads from
  * bypassing the semantic judge.
  */
-const CREATOR_TRADING_SIGNAL = /\b(?:trades?|trader|trading|fx|forex|futures?|options?|stocks?|equit(?:y|ies)|markets?|invest(?:ing|or|ment|issements?)?|portfolios?|dividends?|etfs?|nq|mnq|es|gc|mcl|nasdaq|s&p|xauusd|xagusd|btc|bitcoin|crypto|charts?|charting|pips?|scalp(?:er|ing)?|bookmap|volume\s*profile|order\s*flow|metatrader|watchlist|securities|bourse|courtier|financ(?:e|ial|ière)|wealth|証券|投资|株|주식|بورس|سرمایه)\b/iu;
+const CREATOR_TRADING_SIGNAL = /\b(?:trades?|trader|trading|fx|forex|futures?|options?|stocks?|equit(?:y|ies)|invest(?:ing|or|ment|issements?|ir)?|portfolios?|dividends?|etfs?|nq|mnq|nasdaq|s&p|xauusd|xagusd|btc|bitcoin|crypto|pips?|scalp(?:er|ing)?|bookmap|volume\s*profile|order\s*flow|metatrader|watchlist|securities|bourse|courtier|financ(?:e|ial|ière)|wealth|証券|投资|株|주식|بورس|سرمایه)\b/iu;
 
 function creatorSignalsTrading(evidence: AdmissionEvidence): boolean {
   const text = `${evidence.channelName}\n${evidence.description}`;

@@ -112,13 +112,19 @@ function textContainsCitation(text: string, quote: string): boolean {
   const segments = quote.split(/(?:\.\.\.|…)+/).map(segment => segment.trim()).filter(Boolean);
   if (!segments.length) return false;
   let cursor = 0;
+  let matchedSegments = 0;
+  let matchedChars = 0;
   for (const segment of segments) {
     if (segment.length < 4) continue;
     const index = normalizedText.indexOf(segment, cursor);
     if (index < 0) return false;
+    matchedSegments += 1;
+    matchedChars += segment.length;
     cursor = index + segment.length;
   }
-  return true;
+  // A quote made only of short ellipsis-separated tokens must not pass by
+  // matching nothing. Require at least one substantive exact segment.
+  return matchedSegments > 0 && matchedChars >= 8;
 }
 
 function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): string | null {
