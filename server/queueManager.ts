@@ -148,6 +148,13 @@ import {
   type ClassificationBackpressureState,
   type ClassificationJobPayload,
 } from './classificationDecoupling';
+import { enqueueAdmissionVerification, getAdmissionMode, hasActiveAdmissionJob, upsertAdmissionCandidate } from './channelAdmission/store';
+import { admissionRediscoveryDisposition, isWaitingAdmissionStatus } from './channelAdmission/types';
+import { ADMISSION_VERIFICATION_JOB_TYPE, processAdmissionVerificationJob } from './channelAdmission/worker';
+import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
+import { allRoutesCoolingDown, groqFallbackCoolingDown } from './channelAdmission/routeHealth';
+export { allRoutesCoolingDown, groqFallbackCoolingDown, judgeRoutePoolHealthy } from './channelAdmission/routeHealth';
+import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery } from './channelAdmission/store';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
@@ -323,26 +330,12 @@ export function semanticCooldownProbeAllowed(lastProbeAt: number, now = Date.now
   return lastProbeAt <= 0 || now - lastProbeAt >= Math.max(1_000, intervalMs);
 }
 
-/**
- * Groq fallback cooldown composition for the ENRICH claim gate.
- * Groq is usable as a fallback only when BOTH cooldown mechanisms are clear:
- * the persisted shared cooldown (cross-replica ledger) AND the current
- * process's local in-process cooldown. Either one alone blocks the fallback
- * claim so a 429 whose ledger write failed cannot recreate a claim/defer loop.
- * Pure and unit-testable; callers pass the two existing mechanism reads.
- */
-export function groqFallbackCoolingDown(persistedCooldownActive: boolean, localCooldownRemainingMs: number): boolean {
-  return persistedCooldownActive || localCooldownRemainingMs > 0;
-}
-
-/**
- * Pool-level cooling composition over independent routes/orgs: the pool is
- * cooling only when every known route is cooling (fail-closed on an empty
- * list). One healthy account keeps enrichment claimable while the others
- * cool. Pure and unit-testable; async ledger reads stay at the call site.
- */
-export function allRoutesCoolingDown(perRouteCooling: boolean[]): boolean {
-  return perRouteCooling.length === 0 || perRouteCooling.every(Boolean);
+/** True only for the pre-migration semantic-admission schema. */
+function isMissingAdmissionSchemaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const namesAdmissionRelation = /semantic_admission_(candidates|decisions|sightings|model_calls)/i.test(message);
+  const missingRelation = /relation ["']?[^"']*["']? does not exist/i.test(message);
+  return namesAdmissionRelation && ((error as { code?: unknown })?.code === '42P01' || missingRelation);
 }
 
 /**
@@ -923,7 +916,7 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
  * provider profile, same tick lifecycle) behind its own settings gate, so no
  * new worker architecture is required for continuous canary consumption.
  */
-export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
+export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastSemanticCooldownEnrichProbeAt = 0;
@@ -1173,6 +1166,21 @@ export function classificationPendingOutcome(
  * until tomorrow. Enqueue failure also falls back inline: the discovery is
  * never lost to a queue write error.
  */
+function admissionPendingOutcome(raw: DiscoveredChannelRaw): ProcessDiscoveredChannelOutcome {
+  return {
+    channelId: raw.channelId,
+    channelName: raw.channelName,
+    isNew: true,
+    wasKnown: false,
+    persisted: false,
+    countryStatus: 'UNCERTAIN',
+    tradingStatus: 'UNCERTAIN',
+    discordStatus: 'UNCERTAIN',
+    discordInvite: null,
+    channelRecord: undefined,
+  };
+}
+
 export async function admitDiscoveredChannel(input: {
   raw: DiscoveredChannelRaw;
   targetCountry: string;
@@ -1183,11 +1191,76 @@ export async function admitDiscoveredChannel(input: {
   discoveryJobId: string;
   catalogPin?: unknown;
   forceExtraction: boolean;
+  pageNumber?: number;
+  resultRank?: number;
   backpressure: ClassificationBackpressureState;
   existing?: ChannelRecord | null;
 }): Promise<{ outcome: ProcessDiscoveredChannelOutcome | null; pending: boolean }> {
   const { raw, targetCountry, source, backpressure } = input;
   const existing = input.existing === undefined ? await getChannelById(raw.channelId) : input.existing;
+  // New creators are admitted by the semantic gate before any channels row is
+  // written. Existing rows keep their normal preservation/recheck path.
+  if (!existing && (await getAdmissionMode()) === 'ACTIVE') {
+    try {
+      const row = await upsertAdmissionCandidate({
+        candidate: raw,
+        targetCountry,
+        source,
+        query: input.query,
+        queryId: input.queryId,
+        queryRunId: input.queryRunId,
+        discoveryJobId: input.discoveryJobId,
+        pageNumber: input.pageNumber,
+        resultRank: input.resultRank,
+      });
+      const disposition = admissionRediscoveryDisposition(row.status, await hasActiveAdmissionJob(raw.channelId));
+      if (disposition === 'TERMINAL') {
+        return { outcome: admissionPendingOutcome(raw), pending: false };
+      }
+      if (disposition === 'ACTIVE_JOB') {
+        return { outcome: admissionPendingOutcome(raw), pending: true };
+      }
+      const candidateInput = {
+        candidate: raw,
+        targetCountry,
+        source,
+        query: input.query,
+        queryId: input.queryId,
+        queryRunId: input.queryRunId,
+        discoveryJobId: input.discoveryJobId,
+        pageNumber: input.pageNumber,
+        resultRank: input.resultRank,
+      };
+      if (disposition === 'RESUME_ADMITTED') {
+        // The admission decision exists but the channel write was interrupted.
+        // Resume the admission lifecycle; never fall through to the ungated
+        // legacy path.
+        await enqueueAdmissionVerification({
+          candidate: candidateInput,
+          attempt: Math.max(2, Number(row.attempts || 0) + 1),
+        });
+        return { outcome: admissionPendingOutcome(raw), pending: true };
+      }
+      const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
+      await enqueueAdmissionVerification({
+        candidate: candidateInput,
+        ...(waiting ? {
+          runAfter: row.next_check_at as string,
+          attempt: Math.max(2, Number(row.attempts || 0) + 1),
+          retryKind: row.status === 'PROVIDER_DEFERRED' ? 'provider' as const : 'evidence' as const,
+        } : {}),
+      });
+      return { outcome: admissionPendingOutcome(raw), pending: true };
+    } catch (error) {
+      if (!isMissingAdmissionSchemaError(error)) throw error;
+      console.warn(JSON.stringify({
+        event: 'channel_admission_unavailable_legacy_fallback',
+        channelId: raw.channelId,
+        reason: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+        timestamp: new Date().toISOString(),
+      }));
+    }
+  }
   // A confirmed trading row must not be classified again, but an unresolved
   // creator country still gets the deterministic Gate-1 pass through the
   // normal pipeline. This keeps country policy current without semantic spend.
@@ -1251,6 +1324,7 @@ export async function admitDiscoveredChannel(input: {
     forceExtraction: input.forceExtraction,
     jobId: input.discoveryJobId,
     runId: input.queryRunId,
+    admissionBypass: true,
   });
   // A durable job already owns this channel. Check it before the backpressure
   // decision: at a cap, rediscovery must reuse the in-flight work instead of
@@ -1370,7 +1444,9 @@ export async function processNextSearchJob(
   // process-local cooldown still allows the claim so jobs can reach the
   // already-working fallback.
   let enrichProbeOnly = false;
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
+  const admissionModeActive = (await getAdmissionMode()) === 'ACTIVE';
+  const admissionSemanticClaimable = admissionModeActive;
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
     const geminiRoutes = !groqSelected && !geminiFreeSelected ? configuredGeminiRoutes() : [];
@@ -1404,7 +1480,7 @@ export async function processNextSearchJob(
       : 0;
     const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
     enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable;
-    if (enrichmentFullyClaimable || enrichmentProbe) {
+    if ((enrichmentFullyClaimable || enrichmentProbe) && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
       claimableTypes.push('ENRICH_CHANNEL');
       // Classification jobs require the semantic decision and remain gated
       // while every semantic route is cooling. ENRICH is allowed as a bounded
@@ -1413,6 +1489,7 @@ export async function processNextSearchJob(
       if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE))) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
   }
+  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
@@ -1594,6 +1671,11 @@ export async function processNextSearchJob(
         }
       }
       await completeJob(job.id); return true;
+    }
+    if (job.type === ADMISSION_VERIFICATION_JOB_TYPE) {
+      await processAdmissionVerificationJob(job);
+      await completeJob(job.id);
+      return true;
     }
     if (job.type === CLASSIFICATION_JOB_TYPE) {
       await processClassificationJob(job);
@@ -2210,6 +2292,8 @@ export async function processNextSearchJob(
             discoveryJobId: job.id,
             catalogPin: job.payload.catalogPin,
             forceExtraction: isRepairEligibleRetry(job),
+            pageNumber,
+            resultRank: index + 1,
             backpressure: classificationBackpressure,
           });
         },
@@ -2244,7 +2328,8 @@ export async function processNextSearchJob(
             : (outcome.detectedCountry || outcome.channelRecord?.country || raw.locationTag || null),
           rejectionReason: outcome.countryStatus === 'REJECTED' ? (outcome.rejectionReason || outcome.channelRecord?.inspection_trail?.find(t => t.step === 'COUNTRY_VALIDATION')?.details || undefined) : undefined,
           retrievalLane,
-          searchOrdering
+          searchOrdering,
+          matchedDocument: raw.matchedDocument || null
         }
       });
     }
@@ -2440,7 +2525,46 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      if (shouldContinueSearchAfterConsistency({
+      const [admissionOutcomes, admissionPageOutcomes] = await Promise.all([
+        getAdmissionRunOutcomes(queryRunId).catch(error => {
+          if (isMissingAdmissionSchemaError(error)) return null;
+          throw error;
+        }),
+        getAdmissionPageOutcomes(queryRunId, pageNumber).catch(error => {
+          if (isMissingAdmissionSchemaError(error)) return null;
+          throw error;
+        }),
+      ]);
+      const admissionGuard = admissionOutcomes && admissionPageOutcomes && Number(admissionPageOutcomes.pending || 0) === 0
+        ? evaluateQueryAdmissionGuard({
+            pageNumber,
+            outcomes: admissionOutcomes,
+            tradingPrecision: metrics.tradingPrecision,
+            qualityChannels: metrics.qualityChannels,
+            tradingConfirmed: metrics.tradingConfirmed,
+            classificationPending: metrics.classificationPending,
+            priorZeroQualityPages: prior.v2Streaks.lowValue,
+          })
+        : { stop: false, quarantine: false, reasonCodes: [] as string[] };
+      if (admissionGuard.stop) {
+        await (await getDb()).query(
+          `UPDATE autonomous_query_page_observations SET stopping_reason=$3,decision_reason_codes=COALESCE(decision_reason_codes,'[]'::jsonb)||$4::jsonb WHERE query_run_id=$1 AND page_number=$2`,
+          [queryRunId, pageNumber, 'ADMISSION_CONTAMINATION', JSON.stringify(admissionGuard.reasonCodes)],
+        ).catch(error => console.warn('[AdmissionGuard] failed to record page stop reason:', error));
+        if (admissionGuard.quarantine && queryId) {
+          await quarantineQuery(queryId, admissionGuard.reasonCodes).catch(error => console.warn('[AdmissionGuard] failed to quarantine query:', error));
+        }
+        console.warn(JSON.stringify({
+          event: 'query_admission_contamination',
+          queryRunId,
+          queryId: queryId || null,
+          pageNumber,
+          reasonCodes: admissionGuard.reasonCodes,
+          outcomes: admissionOutcomes,
+          timestamp: new Date().toISOString(),
+        }));
+      }
+      if (!admissionGuard.stop && shouldContinueSearchAfterConsistency({
         queryResultHold,
         continuationEnabled,
         decisionShouldContinue: decision.shouldContinue === true,
@@ -3233,6 +3357,43 @@ export async function processDiscoveredChannel(
   source: DiscoverySource,
   options?: PipelineExecutionOptions
 ): Promise<ProcessDiscoveredChannelOutcome> {
+  // The semantic gate is the admission boundary for every discovery source,
+  // not only the decoupled search-page path. Callers that already own an
+  // admission decision pass admissionBypass.
+  if (!options?.admissionBypass && (await getAdmissionMode()) === 'ACTIVE') {
+    const existing = await getChannelById(raw.channelId);
+    if (!existing) {
+      try {
+        const row = await upsertAdmissionCandidate({
+          candidate: raw,
+          targetCountry,
+          source,
+        });
+        const disposition = admissionRediscoveryDisposition(row.status, await hasActiveAdmissionJob(raw.channelId));
+        if (disposition === 'RESUME_ADMITTED') {
+          // A prior admission decision exists but its channel write was
+          // interrupted. Retry with a fresh key instead of bypassing the gate.
+          await enqueueAdmissionVerification({
+            candidate: { candidate: raw, targetCountry, source },
+            attempt: Math.max(2, Number(row.attempts || 0) + 1),
+          });
+        } else if (disposition === 'ENQUEUE') {
+          const waiting = isWaitingAdmissionStatus(row.status) && row.next_check_at && Date.parse(row.next_check_at) > Date.now();
+          await enqueueAdmissionVerification({
+            candidate: { candidate: raw, targetCountry, source },
+            ...(waiting ? {
+              runAfter: row.next_check_at as string,
+              attempt: Math.max(2, Number(row.attempts || 0) + 1),
+              retryKind: row.status === 'PROVIDER_DEFERRED' ? 'provider' as const : 'evidence' as const,
+            } : {}),
+          });
+        }
+        return admissionPendingOutcome(raw);
+      } catch (error) {
+        if (!isMissingAdmissionSchemaError(error)) throw error;
+      }
+    }
+  }
   return processChannelThroughPipeline(raw, targetCountry, source, false, false, options);
 }
 
@@ -3298,6 +3459,10 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
       jobType: 'CLASSIFY_DISCOVERED_CHANNEL',
     },
   );
+  if (payload.candidate.admissionNewlyCreated === true) {
+    outcome.isNew = true;
+    outcome.wasKnown = false;
+  }
   const channel = outcome.channelRecord || await getChannelById(channelId);
   if (!outcome.persisted || !channel) {
     // Retrieval triage or a non-persisted policy rejection leaves no semantic
@@ -5200,7 +5365,7 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
   }
   const enrichmentSplit = resolveEnrichmentWorkerSplit(Math.min(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers), decoupling.enabled);
   setRunningEnrichmentWorkerCount(enrichmentSplit.classificationWorkers + enrichmentSplit.enrichmentOnlyWorkers);
-  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE], 'enrich_channel_shared');
+  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE], 'enrich_channel_shared');
   if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
     startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
   }

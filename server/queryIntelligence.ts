@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import { assessExtractedQueryAdmission } from './channelAdmission/policy';
 import { ChannelRecord, CountryVocabulary, DiscoverySource, QualityScoreBreakdown, QueryRecord, QueryCollection, ExtractedTermRecord } from '../src/types';
 import {
   getDb,
@@ -1869,15 +1870,28 @@ function buildSelectionResult(
  * rows are rotated without consuming the bounded extracted-query offer.
  */
 export function isOfferableExtractedCandidate(
-  candidate: { candidateText: string; language: string },
+  candidate: {
+    candidateText: string;
+    language: string;
+    sourceTitle?: string | null;
+    sourceKind?: string | null;
+    duplicateSources?: Array<{ title?: string | null }>;
+  },
   country: string,
 ): boolean {
-  return !isForbiddenProseQuery(candidate.candidateText)
-    && isExtractedStandaloneQuery({
-      term: candidate.candidateText,
-      country,
-      language: candidate.language,
-    });
+  if (isForbiddenProseQuery(candidate.candidateText)) return false;
+  const admission = assessExtractedQueryAdmission({
+    candidateText: candidate.candidateText,
+    sourceTitle: candidate.sourceTitle || '',
+    sourceTitles: (candidate.duplicateSources || []).map(source => source?.title || null),
+    sourceKind: candidate.sourceKind || '',
+  });
+  if (!admission.eligible) return false;
+  return isExtractedStandaloneQuery({
+    term: candidate.candidateText,
+    country,
+    language: candidate.language,
+  });
 }
 
 /** Generates auditable, compact candidates led by retrieval atoms and proven terminology. */

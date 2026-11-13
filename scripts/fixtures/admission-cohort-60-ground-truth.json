@@ -1,0 +1,251 @@
+{
+  "_meta": {
+    "reviewer": "OpenCode agent — manual evidence review",
+    "method": "Blind review of fresh public YouTube bio and up to 8 recent video titles/descriptions. Labels were assigned from actual channel content, not from prior admission decisions. The source manifest contained prior outcomes, but they were not used as the label.",
+    "reviewedAt": "2026-11-12",
+    "evidenceSource": "Public InnerTube about data and channel RSS captured for the 60-channel cohort; notes record the decisive evidence for each label.",
+    "limitations": "Single independent reviewer; not sealed multi-adjudicator ground truth. Metrics are evidence-review labels."
+  },
+  "labels": {
+    "UCobhfNuSjKfI5bOzMTvXllg": {
+      "label": "TRADING",
+      "note": "Live forex trading sessions plus trading education; mixed money/business content."
+    },
+    "UCxgqXhwUi9q0GWsrfv9jlBg": {
+      "label": "TRADING",
+      "note": "Stock-market education, order blocks, entry and liquidity analysis."
+    },
+    "UCi8qEExCCcTulhBI8YqW1GQ": {
+      "label": "TRADING",
+      "note": "Live NQ/Gold day trading and volume-profile analysis."
+    },
+    "UCboU4TB_AAR6i_oV0z0ArVw": {
+      "label": "TRADING",
+      "note": "Live gold, Bitcoin and Nasdaq trading with trade analysis."
+    },
+    "UCOLorTAoZcQ_-JjP8uWQSBQ": {
+      "label": "UNRELATED",
+      "note": "Web development, Facebook ads and performance marketing."
+    },
+    "UCzU5j4_HXhWv3UEOLpDq3Rw": {
+      "label": "UNRELATED",
+      "note": "School exam education; 'retail trade' is a vocational exam subject, not markets."
+    },
+    "UCEStzb6eeKPg__voFAWvWPg": {
+      "label": "TRADING",
+      "note": "Nasdaq futures day trading, price action and trade recaps."
+    },
+    "UCj4lUjOuvsJaLOT_2cn8EHw": {
+      "label": "UNRELATED",
+      "note": "Music label and song releases."
+    },
+    "UCaZn1hfp827RwU5B1Tr9E2w": {
+      "label": "TRADING",
+      "note": "Structured learn-to-trade course and live market execution."
+    },
+    "UCyTHNB7OSQnk9_99ZhQuP8w": {
+      "label": "TRADING",
+      "note": "NQ trade breakdowns, market outlook and trading education."
+    },
+    "UC3MYiuLMk2mty5HKEcE3J4Q": {
+      "label": "TRADING",
+      "note": "Live stocks/crypto analysis, price action and technical analysis."
+    },
+    "UCTX_jFOSDOo0JU0lwD38wAA": {
+      "label": "UNRELATED",
+      "note": "Consumer tech reviews and product unboxings."
+    },
+    "UCDuvxWdPBAWGP4jm4GnoRoA": {
+      "label": "UNRELATED",
+      "note": "Anime and short-drama recaps."
+    },
+    "UCnnjUrZHnpuFUIiOIEZv_lw": {
+      "label": "TRADING",
+      "note": "Forex, gold/silver and crude market analysis with levels."
+    },
+    "UCG-J2_z3TY01ccmS9bOkW8Q": {
+      "label": "UNRELATED",
+      "note": "Gardening and greenhouse growing."
+    },
+    "UCpxJwZDyPji2oHqxPFF-DJw": {
+      "label": "TRADING",
+      "note": "ICT/SMC trading, live NQ futures execution and trade recaps."
+    },
+    "UCmCXWl47EntgeM9Bqo-0wZw": {
+      "label": "TRADING",
+      "note": "Crypto/BTC trading analysis, VWAP and volume-profile education."
+    },
+    "UCnorhjQR4zJkT7AVNhu395Q": {
+      "label": "UNRELATED",
+      "note": "Home renovation and DIY construction."
+    },
+    "UCCFR29J1QTwjSjPRd-5aJmA": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Long-term value investing, business quality and portfolio education."
+    },
+    "UCJbKbCS45TQX8vsQz4nu7iQ": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Speculative stock commentary and short-squeeze predictions, not trading execution/education."
+    },
+    "UCbpjCru7OE-fhxfbGqtjWPw": {
+      "label": "UNRELATED",
+      "note": "Fictional short dramas."
+    },
+    "UCm2aoTO1QVowAFwQ9j1a-sg": {
+      "label": "TRADING",
+      "note": "NQ futures scalping and trade execution recaps."
+    },
+    "UCyw_mtuNzMhpNFBY8huBxIw": {
+      "label": "UNRELATED",
+      "note": "Consumer tech and gadgets."
+    },
+    "UC6gBlcfMlAXOpiRxEthaBsw": {
+      "label": "TRADING",
+      "note": "Live NQ futures execution and ICT trading."
+    },
+    "UC7mpgMQ1_ILJnl1LxUBzZJg": {
+      "label": "UNRELATED",
+      "note": "Guitar performance, lessons and gear."
+    },
+    "UCtAtltZN996ISsfv7x5QCpw": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Personal finance, brokers, ETFs and long-term investing."
+    },
+    "UCygkVnqn4g2qKZZPWSuxzvA": {
+      "label": "TRADING",
+      "note": "Options/GEX education and live gold order-flow trading."
+    },
+    "UCdlBNdKHU84IWWRDMRCyCGQ": {
+      "label": "UNRELATED",
+      "note": "Cooking and recipes."
+    },
+    "UCsXVk37bltHxD1rDPwtNM8Q": {
+      "label": "UNRELATED",
+      "note": "Science and general-education animation."
+    },
+    "UCzj5K6SzyQlo-AXxbIb3Baw": {
+      "label": "TRADING",
+      "note": "SMC/ICT trading education and funded-trader coaching."
+    },
+    "UCXuqSBlHAE6Xw-yeJA0Tunw": {
+      "label": "UNRELATED",
+      "note": "Consumer technology."
+    },
+    "UC9BgKWUwwYmR9pDoAPElUFg": {
+      "label": "UNRELATED",
+      "note": "College football and ACC sports."
+    },
+    "UCi88vVNm9D32___wWW2ADqg": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Billionaire mindset, business and investing lifestyle content; not trading execution."
+    },
+    "UC3oXQquBWN1MpapjrJrgwrA": {
+      "label": "TRADING",
+      "note": "Live crypto/gold trading, price action and risk-management education."
+    },
+    "UC_pT_Iz6XjuM-eMTlXghdfw": {
+      "label": "UNRELATED",
+      "note": "Food and restaurant content."
+    },
+    "UCMiJRAwDNSNzuYeN2uWa0pA": {
+      "label": "UNRELATED",
+      "note": "Consumer technology."
+    },
+    "UCaXkIU1QidjPwiAYu6GcHjg": {
+      "label": "UNRELATED",
+      "note": "General news, politics and current affairs."
+    },
+    "UCG2CL6EUjG8TVT1Tpl9nJdg": {
+      "label": "UNRELATED",
+      "note": "Toddler learning and nursery rhymes."
+    },
+    "UC6giZlZkfhMSKUbihaWTgfg": {
+      "label": "TRADING",
+      "note": "Nifty/Bank Nifty technical analysis and trading education."
+    },
+    "UCScjvxZ5QgvryokTSo2yV7Q": {
+      "label": "UNRELATED",
+      "note": "AI music tools and music-production tutorials."
+    },
+    "UCHDbB9Fxum78f_mukEamfmQ": {
+      "label": "TRADING",
+      "note": "Forex trading, risk/reward and trade execution shorts."
+    },
+    "UCe6l8E8WG-eYRadxxWzL9Ag": {
+      "label": "TRADING",
+      "note": "Nasdaq futures market reviews, technical analysis and trading strategy."
+    },
+    "UCHJgLYD96B0g1gtJO8BI3JA": {
+      "label": "UNRELATED",
+      "note": "Nintendo/Zelda gaming guides."
+    },
+    "UCCOrp7GPgZA8EGrbOcIAsyQ": {
+      "label": "UNRELATED",
+      "note": "Phone repair, teardown and consumer tech."
+    },
+    "UCILA5ddHcuN1h1rxysnW1uQ": {
+      "label": "TRADING",
+      "note": "Forex trading classes, signals and liquidity analysis."
+    },
+    "UC7HAOdk0vxU7LBnw8OaPVTQ": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Personal finance, investing and wealth education."
+    },
+    "UCmchVnisWDY9eiuN-B4-jmA": {
+      "label": "TRADING",
+      "note": "XAUUSD technical analysis, live trades and SMC recaps."
+    },
+    "UCSijDEjKohusFYRpabWmXSw": {
+      "label": "UNRELATED",
+      "note": "Cooking and recipes."
+    },
+    "UC4j1TURvdUslOlZgHOTXIxw": {
+      "label": "TRADING",
+      "note": "Forex trading, risk management and live account recaps."
+    },
+    "UCCEhLxldbW1mCNzEQDshbAA": {
+      "label": "UNRELATED",
+      "note": "Guitar amps, gear and tone reviews."
+    },
+    "UCUztEmUBhFSyynB13ypKtLg": {
+      "label": "UNRELATED",
+      "note": "Manhwa recaps and fiction."
+    },
+    "UCi0eSaquYdVzeGXxG_82TrA": {
+      "label": "TRADING",
+      "note": "Futures funded-account trading challenge."
+    },
+    "UCwK9pBa_8dRMhPVyveEzyug": {
+      "label": "UNRELATED",
+      "note": "Home coffee and espresso equipment."
+    },
+    "UCI-c7NbzlzXahM4Pqb3vvGQ": {
+      "label": "TRADING",
+      "note": "Trading education, live trading and technical market reviews."
+    },
+    "UC-8vl66ViRzN6-WzHzfA1Pg": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Long-term investing, stock-market education and financial literacy."
+    },
+    "UCfdNM3NAhaBOXCafH7krzrA": {
+      "label": "UNRELATED",
+      "note": "General infographics/animation; finance is one topic among many."
+    },
+    "UC2zdAZeihqvLsUsNx3et8gQ": {
+      "label": "TRADING",
+      "note": "Live gold and crypto trading sessions."
+    },
+    "UCtxdfwb9wfkoGocVUAJ-Bmg": {
+      "label": "UNRELATED",
+      "note": "Music artist releases."
+    },
+    "UCQeATpqXibLGWqpckNsA7SQ": {
+      "label": "FINANCE_ADJACENT",
+      "note": "Historical investing simulations and long-term market charts, not active trading."
+    },
+    "UCfr9EbZIU3B1kF4i8-7lGqA": {
+      "label": "TRADING",
+      "note": "Supply/demand trading education and live futures analysis."
+    }
+  }
+}

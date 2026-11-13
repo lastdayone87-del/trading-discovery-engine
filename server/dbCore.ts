@@ -842,6 +842,9 @@ export function rowToChannel(row: any): ChannelRecord {
     discord_invite_revalidation_uncertain: hasRetainedLastKnownGoodDiscordInvite(row),
     scan_status: row.scan_status,
     scan_attempts: row.scan_attempts || 0,
+    admitted_at: iso(row.admitted_at),
+    admission_status: ['ADMITTED','ADMITTED_AMBIGUOUS','LEGACY_ADMITTED','LEGACY_HOLD'].includes(row.admission_status) ? row.admission_status : null,
+    admission_decision_id: row.admission_decision_id || null,
     discovery_source: row.discovery_source,
     quota_origin: row.quota_origin === 'PROBE' ? 'PROBE' : 'NORMAL',
     first_seen: iso(row.first_seen) || new Date().toISOString(),
@@ -1068,6 +1071,7 @@ export const RECENT_INVITE_ORDER_SQL = 'discord_invite_first_validated_at DESC N
 export const OPERATOR_VISIBLE_CHANNEL_SQL = `country_status <> 'REJECTED'
   AND scan_status <> 'SKIPPED_EXCLUDED'
   AND scan_status <> 'CLASSIFICATION_PENDING'
+  AND scan_status <> 'INTAKE_DEFERRED'
   AND trading_status <> 'NON_TRADING'
   AND NOT EXISTS (
     SELECT 1 FROM excluded_countries excluded
@@ -1093,7 +1097,9 @@ async function dashboardServingPredicate(db:InstanceType<typeof Pool>):Promise<{
     WHERE s.setting_key='release5_dashboard_serving_mode'`);
   const control=result.rows[0];
   if(!control||control.setting_value==='OFF'||control.setting_value!==control.mode||control.decision!=='PROMOTE')return {predicate:OPERATOR_VISIBLE_CHANNEL_SQL,scope:'ELIGIBLE_OPERATOR_VISIBLE_CHANNELS'};
-  const projected=`EXISTS(SELECT 1 FROM dashboard_corpus_projection dcp WHERE dcp.channel_id=channels.channel_id AND dcp.corpus IN('CONFIRMED','REVIEW'))`;
+  const projected=`scan_status <> 'INTAKE_DEFERRED'
+    AND scan_status <> 'CLASSIFICATION_PENDING'
+    AND EXISTS(SELECT 1 FROM dashboard_corpus_projection dcp WHERE dcp.channel_id=channels.channel_id AND dcp.corpus IN('CONFIRMED','REVIEW'))`;
   if(control.mode==='ACTIVE')return {predicate:projected,scope:'RELEASE5_ACTIVE_DASHBOARD_CORPUS'};
   const assigned=`EXISTS(SELECT 1 FROM release5_serving_assignments rsa WHERE rsa.capability='DASHBOARD_CORPUS' AND rsa.channel_id=channels.channel_id AND rsa.activation_id=(SELECT activation_id FROM release5_rollout_projection WHERE capability='DASHBOARD_CORPUS') AND rsa.assigned=true)`;
   return {predicate:`((${assigned}) AND (${projected}) OR (NOT (${assigned}) AND (${OPERATOR_VISIBLE_CHANNEL_SQL})))`,scope:'RELEASE5_CANARY_DASHBOARD_CORPUS'};
@@ -1122,7 +1128,8 @@ export function buildChannelListingWhere(defaultServing:{predicate:string;scope:
   const viewingNonTradingSlice = !args.diagnosticsOnly && !args.includeRejected && args.tradingStatus === 'NON_TRADING';
   const viewingSkippedExcludedSlice = !args.diagnosticsOnly && !args.includeRejected && args.scanStatus === 'SKIPPED_EXCLUDED';
   const viewingClassificationPendingSlice = !args.diagnosticsOnly && !args.includeRejected && args.scanStatus === 'CLASSIFICATION_PENDING';
-  const viewingDiagnosticSlice = viewingRejectedSlice || viewingNonTradingSlice || viewingSkippedExcludedSlice || viewingClassificationPendingSlice;
+  const viewingIntakeDeferredSlice = !args.diagnosticsOnly && !args.includeRejected && args.scanStatus === 'INTAKE_DEFERRED';
+  const viewingDiagnosticSlice = viewingRejectedSlice || viewingNonTradingSlice || viewingSkippedExcludedSlice || viewingClassificationPendingSlice || viewingIntakeDeferredSlice;
   const clauses=[(args.diagnosticsOnly || viewingDiagnosticSlice)?`NOT (${defaultServing.predicate})`:args.includeRejected?'TRUE':`(${defaultServing.predicate})`]; const values:string[]=[];
   const explicitlyViewingLowAudience=args.scanStatus==='SKIPPED_LOW_AUDIENCE';
   // Diagnostic slices read the rejected corpus deliberately, so the audience
@@ -1147,7 +1154,7 @@ async function channelListingWhere(db:InstanceType<typeof Pool>,args:ChannelList
 export async function listChannelsPage(args:ChannelListingFilter&{limit:number;offset:number}):Promise<{items:ChannelRecord[];total:number;revision:string|null}> {
   const db=await getDb(); const limit=Math.min(250,Math.max(1,args.limit)); const offset=Math.max(0,args.offset);
   const {where,values}=await channelListingWhere(db,args);
-  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,discovery_source,quota_origin,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown - 'reasoning' - 'ai_prompt_payload' - 'ai_raw_response' AS trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
+  const columns=`channel_id,channel_name,youtube_url,country,country_status,scope_eligibility,confidence_score,discord_status,discord_invite,scan_status,scan_attempts,admitted_at,admission_status,admission_decision_id,discovery_source,quota_origin,first_seen,last_checked,inspection_trail,subscriber_count,channel_thumbnail_url,quality_score,trading_status,trading_confidence_score,trading_category,trading_relevance_breakdown - 'reasoning' - 'ai_prompt_payload' - 'ai_raw_response' AS trading_relevance_breakdown,country_metadata_status,country_metadata_checked_at,latest_upload_at,uploads_last_30_days,uploads_last_90_days,uploads_last_365_days,activity_band,activity_score,activity_observed_at,discord_discovery_status,discord_candidate_locator,discord_candidate_id,discord_candidate_raw_locator,discord_candidate_type,discord_resolution_status,discord_liveness_status,discord_relevance_status,discord_validation_status,community_discovery_status,community_intents,discord_duplicate_owner_channel_id,
     ${DISCORD_SELECTED_INVITE_CONFLICT_SQL} AS discord_selected_invite_conflict,
     (SELECT owner.channel_name FROM channels owner WHERE owner.channel_id=channels.discord_duplicate_owner_channel_id) discord_duplicate_owner_channel_name,
     ${DISCORD_INVITE_FIRST_VALIDATED_SQL} AS discord_invite_first_validated_at,

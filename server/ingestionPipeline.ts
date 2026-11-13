@@ -42,6 +42,8 @@ import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
 import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
+import { buildAdmissionConfirmedClassification } from './channelAdmission/confirmedTrading';
+import { getAdmissionMode } from './channelAdmission/store';
 import { evaluateLowAudienceGate, parseSubscriberCountNumber, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { validatedDiscordEvidenceInvite } from './discordEvidence';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery } from './communityRecovery';
@@ -208,6 +210,8 @@ export interface PipelineExecutionOptions {
   /** Discord-evidence reclassification must evaluate a previously COMPLETED
    * row once; confirmed rows remain terminal. */
   forceClassification?: boolean;
+  /** Internal: caller already passed the semantic admission decision. */
+  admissionBypass?: boolean;
 }
 
 /**
@@ -639,7 +643,13 @@ async function processChannelThroughPipelineInContext(
   // Discord work, require a cheap plausible trading hypothesis from the matched
   // retrieval document. Withheld candidates remain preserved in the nomination
   // ledger and can be rediscovered later by independent evidence.
-  const retrievalTriage = options?.forceClassification === true
+  // A semantic admission decision supersedes the legacy lexical intake gate.
+  // Admitted channels must not be re-deferred by the pre-admission heuristic.
+  const durableAdmission = Boolean(candidate.admissionDecisionId)
+    || existing?.admission_status === 'ADMITTED'
+    || existing?.admission_status === 'ADMITTED_AMBIGUOUS'
+    || Boolean(existing?.admission_decision_id);
+  const retrievalTriage = options?.forceClassification === true || durableAdmission
     ? null
     : triageAutonomousSearchCandidate(candidate, source, isEnrichmentPass);
   if (retrievalTriage && retrievalTriage.disposition === 'WITHHOLD_NO_PLAUSIBLE_HYPOTHESIS') {
@@ -1143,7 +1153,12 @@ async function processChannelThroughPipelineInContext(
     search_match_context:candidate.matchedDocument?{type:candidate.matchedDocument.type,provider_native_id:candidate.matchedDocument.providerNativeId,title:candidate.matchedDocument.title,description:candidate.matchedDocument.description,published_at:candidate.matchedDocument.publishedAt,locator:candidate.matchedDocument.locator}:undefined,
     activity_metadata:{latest_upload_at:candidate.latestUploadAt,uploads_last_30_days:candidate.uploadsLast30Days,uploads_last_90_days:candidate.uploadsLast90Days,uploads_last_365_days:candidate.uploadsLast365Days,activity_band:candidate.activityBand,activity_score:candidate.activityScore,observed_at:candidate.activityObservedAt}
   };
-  const productionClassification = await classifyTradingRelevanceDetailed(classifierInput);
+  const admissionShortcut = candidate.admissionConfirmedTrading === true
+    && Boolean(candidate.admissionDecisionId)
+    && (await getAdmissionMode()) === 'ACTIVE';
+  const productionClassification = admissionShortcut
+    ? buildAdmissionConfirmedClassification(classifierInput, candidate)
+    : await classifyTradingRelevanceDetailed(classifierInput);
   const classificationRouting = productionClassification.decision.deterministicRouting;
   const routingActive = resolveClassificationRoutingMode() === 'ACTIVE';
   const deterministicReview = routingActive && classificationRouting?.humanReview === true;

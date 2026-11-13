@@ -1,0 +1,139 @@
+name: Admission cohort evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      semantic_provider:
+        description: Provider for the manual semantic cohort
+        type: choice
+        options: [auto, gemini, gemini-free, groq]
+        default: auto
+      ai_delay_ms:
+        description: Delay between semantic calls (ms)
+        type: number
+        default: 45000
+      ai_retries:
+        description: Retries per semantic call
+        type: number
+        default: 1
+  pull_request:
+    paths:
+      - '.github/workflows/admission-cohort-eval.yml'
+      - 'scripts/runAdmissionCohort.ts'
+      - 'scripts/summarizeAdmissionCohort.ts'
+      - 'scripts/fixtures/admission-cohort-60-preserved.jsonl'
+      - 'scripts/fixtures/admission-cohort-60-ground-truth.json'
+      - 'scripts/fixtures/admission-cohort-60-evidence.jsonl'
+      - 'server/channelAdmission/**'
+      - 'server/evidenceEngine/**'
+      - 'server/classificationRouting/**'
+      - 'server/youtube.ts'
+permissions:
+  contents: read
+
+jobs:
+  deterministic-cohort:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run 60-channel deterministic cohort (no secrets)
+        run: >-
+          npx tsx scripts/runAdmissionCohort.ts
+          --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
+          --from-evidence=scripts/fixtures/admission-cohort-60-evidence.jsonl
+          --out=admission-cohort-ai.jsonl
+          --blind=admission-cohort-ai-blind.jsonl
+          --concurrency=2
+      - name: Summarize against independent evidence-review labels
+        run: >-
+          npx tsx scripts/summarizeAdmissionCohort.ts
+          --results=admission-cohort-ai.jsonl
+          --ground-truth=scripts/fixtures/admission-cohort-60-ground-truth.json
+          > admission-cohort-summary.json
+      - name: Upload cohort evidence and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-cohort-ai
+          path: |
+            admission-cohort-ai.jsonl
+            admission-cohort-ai-blind.jsonl
+            admission-cohort-summary.json
+          if-no-files-found: warn
+
+  semantic-cohort:
+    # Secret-backed semantic runs are manual only; pull requests must never
+    # receive repository provider credentials.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: admission_cohort
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d admission_cohort"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/admission_cohort
+      PGSSL: disable
+      NODE_ENV: test
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+      GEMINI_ORG_ID_2: ${{ secrets.GEMINI_ORG_ID_2 }}
+      GEMINI_FREE_API_KEY: ${{ secrets.GEMINI_FREE_API_KEY || secrets.GEMINI_API_KEY_2 }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      COHORT_SEMANTIC_PROVIDER: ${{ inputs.semantic_provider || 'auto' }}
+      COHORT_AI_DELAY_MS: ${{ inputs.ai_delay_ms }}
+      COHORT_AI_RETRIES: ${{ inputs.ai_retries }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply migrations to disposable telemetry database
+        run: npx tsx scripts/runMigrations.ts
+      - name: Run 60-channel semantic cohort
+        run: >-
+          npx tsx scripts/runAdmissionCohort.ts
+          --manifest=scripts/fixtures/admission-cohort-60-preserved.jsonl
+          --from-evidence=scripts/fixtures/admission-cohort-60-evidence.jsonl
+          --out=admission-cohort-ai.jsonl
+          --blind=admission-cohort-ai-blind.jsonl
+          --concurrency=1
+          --ai-delay-ms=$COHORT_AI_DELAY_MS
+          --ai-retries=$COHORT_AI_RETRIES
+      - name: Summarize against independent evidence-review labels
+        run: >-
+          npx tsx scripts/summarizeAdmissionCohort.ts
+          --results=admission-cohort-ai.jsonl
+          --ground-truth=scripts/fixtures/admission-cohort-60-ground-truth.json
+          > admission-cohort-summary.json
+      - name: Upload cohort evidence and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-cohort-ai
+          path: |
+            admission-cohort-ai.jsonl
+            admission-cohort-ai-blind.jsonl
+            admission-cohort-summary.json
+          if-no-files-found: warn

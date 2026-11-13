@@ -1,0 +1,104 @@
+name: Migration order validation
+
+on:
+  pull_request:
+    paths:
+      - 'server/db/migrations/**'
+      - 'scripts/runMigrations.ts'
+      - '.github/workflows/migration-order-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGPASSWORD: postgres
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Stage open-PR migrations in version order
+        run: |
+          git fetch origin +pull/633/head:pr633 +pull/634/head:pr634
+          git show pr633:server/db/migrations/181_subscriber_count_hidden.sql \
+            > server/db/migrations/181_subscriber_count_hidden.sql
+          git show pr634:server/db/migrations/183_pause_extracted_query_discovery.sql \
+            > server/db/migrations/183_pause_extracted_query_discovery.sql
+          ls server/db/migrations | sort | tail -8
+      - name: Fresh database — complete sequence
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fresh_sequence
+        run: |
+          psql -h localhost -U postgres -c "CREATE DATABASE fresh_sequence"
+          npx tsx scripts/runMigrations.ts
+      - name: Production-clone upgrade — 181 then 182/183
+        run: |
+          psql -h localhost -U postgres -c "CREATE DATABASE prod_clone"
+          # Simulate production: apply every migration through #633's 181 first,
+          # exactly as the normal runner would have applied it. 182/183 are held
+          # back, then applied in a second pass against the already-migrated DB.
+          mv server/db/migrations/182_channel_admission_gate.sql /tmp/182_channel_admission_gate.sql
+          mv server/db/migrations/183_pause_extracted_query_discovery.sql /tmp/183_pause_extracted_query_discovery.sql
+          DATABASE_URL=postgresql://postgres:postgres@localhost:5432/prod_clone npx tsx scripts/runMigrations.ts
+          mv /tmp/182_channel_admission_gate.sql server/db/migrations/182_channel_admission_gate.sql
+          mv /tmp/183_pause_extracted_query_discovery.sql server/db/migrations/183_pause_extracted_query_discovery.sql
+          DATABASE_URL=postgresql://postgres:postgres@localhost:5432/prod_clone npx tsx scripts/runMigrations.ts
+      - name: Assert schema and migration versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for db in fresh_sequence prod_clone; do
+            echo "== $db =="
+            versions=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
+              "SELECT string_agg(version::text, ',' ORDER BY version) FROM schema_migrations WHERE version IN (181,182,183)")
+            [ "$versions" = "181,182,183" ] || { echo "$db: expected 181,182,183, got '$versions'"; exit 1; }
+            duplicates=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
+              "SELECT string_agg(version::text, ',') FROM (SELECT version FROM schema_migrations GROUP BY version HAVING count(*) > 1) d")
+            [ -z "$duplicates" ] || { echo "$db: duplicate migration versions: $duplicates"; exit 1; }
+            subscriber=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
+              "SELECT column_name FROM information_schema.columns WHERE table_name='channels' AND column_name='subscriber_count_hidden'")
+            [ "$subscriber" = "subscriber_count_hidden" ] || { echo "$db: subscriber_count_hidden missing"; exit 1; }
+            admission=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
+              "SELECT to_regclass('public.semantic_admission_candidates')")
+            [ "$admission" = "semantic_admission_candidates" ] || { echo "$db: semantic_admission_candidates missing"; exit 1; }
+            setting=$(psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d "$db" -Atc \
+              "SELECT setting_value FROM app_settings WHERE setting_key='extracted_query_discovery_enabled'")
+            [ "$setting" = "false" ] || { echo "$db: extracted_query_discovery_enabled is not false ('$setting')"; exit 1; }
+            echo "$db: 181,182,183 + schema assertions passed"
+          done
+      - name: Reject duplicate migration versions
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const files = fs.readdirSync('server/db/migrations').filter(f => f.endsWith('.sql'));
+          const seen = new Map();
+          for (const file of files) {
+            const version = file.split('_')[0];
+            if (seen.has(version)) throw new Error(`Duplicate migration version ${version}: ${seen.get(version)} and ${file}`);
+            seen.set(version, file);
+          }
+          console.log(`Unique migration versions: ${seen.size}`);
+          NODE

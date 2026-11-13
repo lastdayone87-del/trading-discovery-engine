@@ -103,7 +103,7 @@ export interface TradingRelevanceBreakdown {
   /** True when a semantic provider was actually attempted, including abstention/failure. */
   semantic_attempted?: boolean;
   fast_heuristic_status?: 'FAST_ACCEPT' | 'FAST_REJECT' | 'UNCERTAIN';
-  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER' | 'SEMANTIC_ABSTAINED' | 'DETERMINISTIC_EVIDENCE' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
+  classification_method?: 'FAST_HEURISTIC_ACCEPT' | 'FAST_HEURISTIC_REJECT' | 'AI_SEMANTIC_CLASSIFIER' | 'SEMANTIC_ABSTAINED' | 'DETERMINISTIC_EVIDENCE' | 'SEMANTIC_ADMISSION' | 'HUMAN_REVIEW_ADMISSION' | 'HEURISTIC_ONLY' | 'DEGRADED_HEURISTIC';
   /** C3 display basis: never present a neutral prior as a measured score. */
   confidence_basis?: 'CALIBRATED' | 'NEUTRAL_PRIOR' | 'HEURISTIC' | 'NONE';
   ai_prompt_payload?: string;
@@ -253,6 +253,10 @@ export interface ChannelRecord {
   community_retry_job_reconciliation_reason?: string;
   scan_status: ScanStatus;
   scan_attempts: number;
+  /** Semantic-admission provenance. Null only for legacy rows awaiting revalidation. */
+  admitted_at?: string | null;
+  admission_status?: 'ADMITTED' | 'ADMITTED_AMBIGUOUS' | 'LEGACY_ADMITTED' | 'LEGACY_HOLD' | null;
+  admission_decision_id?: string | null;
   discovery_source: DiscoverySource;
   /** Sticky provenance marker for the official YouTube quota fence. */
   quota_origin?: QuotaOrigin;

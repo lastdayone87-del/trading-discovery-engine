@@ -259,7 +259,7 @@ export async function resolveCoolingGeminiOrgs(
   }));
   return new Set(states.filter(state => state.cooling).map(state => state.orgId));
 }
-function defaultClient(): SemanticModelClient | undefined {
+export function defaultClient(): SemanticModelClient | undefined {
   const routes = configuredGeminiRoutes();
   if (!routes.length) return undefined;
   const sdkFor = (route: GeminiRoute) => {
