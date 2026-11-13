@@ -137,6 +137,7 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
     videoTitles: Array.isArray(row.raw_observation?.videoTitles) ? row.raw_observation.videoTitles : [],
     videoDescriptions: Array.isArray(row.raw_observation?.videoDescriptions) ? row.raw_observation.videoDescriptions : [],
     matchedDocument: row.matched_document as unknown as DiscoveredChannelRaw['matchedDocument'],
+    relationshipProvenance: row.raw_observation?.relationshipProvenance as DiscoveredChannelRaw['relationshipProvenance'],
     locationTag: typeof row.raw_observation?.locationTag === 'string' ? row.raw_observation.locationTag : undefined,
     quotaOrigin: row.raw_observation?.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
   };

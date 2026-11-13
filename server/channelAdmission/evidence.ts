@@ -51,6 +51,7 @@ export async function fetchAdmissionEvidence(input: {
     subscriberCount: input.candidate.subscriberCount,
     videos: [],
     matchedDocument: input.candidate.matchedDocument as unknown as Record<string, unknown> | undefined,
+    relationshipProvenance: input.candidate.relationshipProvenance as unknown as Record<string, unknown> | undefined,
     query: input.query,
     queryId: input.queryId,
     queryRunId: input.queryRunId,
