@@ -1206,13 +1206,14 @@ test('Q6: dashboard slices to the row limit and reports truncation honestly', ()
   assert.equal(exact.truncated, false);
 });
 
-test('Q8: registry contracts stay 20 supported / 5 dormant / 15 default / 16 production', () => {
+test('Q8: registry contracts stay 20 supported / 5 dormant / 15 default / 17 production', () => {
   assert.equal(SUPPORTED_PRODUCTION_COUNTRIES.length, 20);
   assert.equal(SUPPORTED_DORMANT_COUNTRIES.length, 5);
   assert.equal(DEFAULT_NON_DORMANT_COUNTRIES.length, 15);
-  assert.equal(PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES.length, 16);
+  assert.equal(PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES.length, 17);
   assert.ok(PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES.includes('Norway'));
-  for (const absent of ['Italy', 'Japan', 'Spain', 'United Arab Emirates']) {
+  assert.ok((PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES as readonly string[]).includes('United Arab Emirates'));
+  for (const absent of ['Italy', 'Japan', 'Spain']) {
     assert.ok(!(PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES as readonly string[]).includes(absent));
   }
 });

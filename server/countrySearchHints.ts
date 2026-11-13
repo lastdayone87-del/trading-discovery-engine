@@ -1,144 +1,51 @@
+import { normalizeLanguageCode } from './languageCodes';
+import {
+  countryDiscoveryLanguageCandidates,
+  countryDiscoveryRegionCode,
+  getCountryDiscoveryProfile,
+} from './countryDiscoveryProfile';
+
+export { normalizeLanguageCode } from './languageCodes';
+
 export interface CountrySearchHints {
   regionCode?: string;
   relevanceLanguage?: string;
 }
 
-interface CountrySearchHintConfig extends CountrySearchHints {
-  relevanceLanguages?: string[];
-}
-
 /**
  * Retrieval hints only. They bias YouTube search toward the market we are
  * researching but MUST NOT be consumed as creator-country evidence.
+ *
+ * Country/language identity lives in `countryDiscoveryProfile.ts`. This module
+ * is a compatibility surface for the existing search and planner callers.
  */
-const COUNTRY_SEARCH_HINTS: Record<string, CountrySearchHintConfig> = {
-  'united states': { regionCode: 'US', relevanceLanguage: 'en' },
-  'united kingdom': { regionCode: 'GB', relevanceLanguage: 'en' },
-  germany: { regionCode: 'DE', relevanceLanguage: 'de' },
-  france: { regionCode: 'FR', relevanceLanguage: 'fr' },
-  spain: { regionCode: 'ES', relevanceLanguage: 'es' },
-  netherlands: { regionCode: 'NL', relevanceLanguage: 'nl' },
-  italy: { regionCode: 'IT', relevanceLanguage: 'it' },
-  switzerland: { regionCode: 'CH', relevanceLanguage: 'de', relevanceLanguages: ['de', 'fr', 'it'] },
-  austria: { regionCode: 'AT', relevanceLanguage: 'de' },
-  belgium: { regionCode: 'BE', relevanceLanguage: 'nl', relevanceLanguages: ['nl', 'fr', 'de'] },
-  australia: { regionCode: 'AU', relevanceLanguage: 'en' },
-  canada: { regionCode: 'CA', relevanceLanguage: 'en', relevanceLanguages: ['en', 'fr'] },
-  luxembourg: { regionCode: 'LU', relevanceLanguage: 'lb', relevanceLanguages: ['lb', 'fr', 'de'] },
-  japan: { regionCode: 'JP', relevanceLanguage: 'ja' },
-  'south korea': { regionCode: 'KR', relevanceLanguage: 'ko' },
-  singapore: { regionCode: 'SG', relevanceLanguage: 'en', relevanceLanguages: ['en', 'ms', 'zh', 'ta'] },
-  'united arab emirates': { regionCode: 'AE', relevanceLanguage: 'ar', relevanceLanguages: ['ar', 'en'] },
-  denmark: { regionCode: 'DK', relevanceLanguage: 'da' },
-  sweden: { regionCode: 'SE', relevanceLanguage: 'sv' },
-  norway: { regionCode: 'NO', relevanceLanguage: 'no' },
-  finland: { regionCode: 'FI', relevanceLanguage: 'fi' },
-  portugal: { regionCode: 'PT', relevanceLanguage: 'pt' },
-  ireland: { regionCode: 'IE', relevanceLanguage: 'en' },
-  'new zealand': { regionCode: 'NZ', relevanceLanguage: 'en' },
-  brazil: { regionCode: 'BR', relevanceLanguage: 'pt' },
-  mexico: { regionCode: 'MX', relevanceLanguage: 'es' },
-  turkey: { regionCode: 'TR', relevanceLanguage: 'tr' },
-  'south africa': { regionCode: 'ZA', relevanceLanguage: 'en' },
-  india: { regionCode: 'IN', relevanceLanguage: 'en' }
-};
-
-const LANGUAGE_CODES: Record<string, string> = {
-  english: 'en', french: 'fr', german: 'de', dutch: 'nl', italian: 'it',
-  danish: 'da', swedish: 'sv', norwegian: 'no', finnish: 'fi', portuguese: 'pt',
-  spanish: 'es', japanese: 'ja', korean: 'ko', arabic: 'ar', hindi: 'hi',
-  'mandarin chinese': 'zh', chinese: 'zh', malay: 'ms', tamil: 'ta', irish: 'ga',
-  maori: 'mi', 'māori': 'mi', luxembourgish: 'lb',
-  // Excluded-country languages (forensic: full language names previously
-  // normalized to '' and silently dropped from declared-language routing).
-  vietnamese: 'vi', tagalog: 'tl', filipino: 'tl', urdu: 'ur',
-  bengali: 'bn', bangla: 'bn', nepali: 'ne', sinhala: 'si', sinhalese: 'si',
-  indonesian: 'id', punjabi: 'pa', telugu: 'te', marathi: 'mr', thai: 'th'
-};
-
-const normalizeCountry = (country: string) => country.normalize('NFKC').trim().toLocaleLowerCase('en');
-
-const NON_INFORMATIVE_PRIMARIES = new Set(['und', 'mul', 'zxx']);
-
-/**
- * Platform-grounded registry check: the primary subtag is treated as assigned
- * when the locale resolves to itself instead of falling back to the default
- * locale. Unassigned codes (qzz, zzz, xx) and uncoded content fall back and
- * are rejected; assigned codes — including three-letter ISO 639-2/3 primaries
- * like fil, yue, or ckb — resolve to themselves. Codes without display data
- * (e.g. tlh) fail closed. Deterministic for a fixed ICU version.
- */
-function isAssignedLanguagePrimary(primary: string): boolean {
-  try {
-    const resolved = new Intl.DisplayNames([primary], { type: 'language' }).resolvedOptions().locale;
-    return resolved.toLowerCase().startsWith(primary);
-  } catch {
-    return false;
-  }
+export function countrySearchLanguageCandidates(countryName: string, _declaredLanguages: string[] = []): string[] {
+  return countryDiscoveryLanguageCandidates(countryName);
 }
 
-/**
- * Prototype-safe language-name lookup: plain-object indexing returns
- * inherited members (constructor, __proto__) for malformed tags, which are
- * truthy non-strings that downstream code could mistake for a language.
- */
-function lookupLanguageName(key: string): string {
-  if (!Object.hasOwn(LANGUAGE_CODES, key)) return '';
-  const mapped: unknown = LANGUAGE_CODES[key];
-  return typeof mapped === 'string' ? mapped : '';
-}
+export function countrySearchHints(
+  countryName: string,
+  declaredLanguages: string[] = [],
+  preferredLanguage?: string,
+): CountrySearchHints {
+  const profile = getCountryDiscoveryProfile(countryName);
+  if (!profile) return {};
 
-export function normalizeLanguageCode(value: string): string {
-  if (typeof value !== 'string') return '';
-  // Providers use hyphens and underscores interchangeably; BCP 47 is hyphens.
-  const dashed = value.trim().replace(/_/g, '-');
-  if (!dashed) return '';
-  // Named languages first (names contain spaces/scripts the tag rule rejects).
-  const lowered = dashed.toLocaleLowerCase('en');
-  const named = lookupLanguageName(lowered);
-  if (named) return named;
-  // Structural BCP 47: malformed tags (de-!!, de-12, trailing dashes) die
-  // here, while valid extensions (de-u-co-phonebk) and private use survive.
-  let canonical: string;
-  try {
-    canonical = Intl.getCanonicalLocales(dashed)[0];
-  } catch {
-    return '';
-  }
-  const primary = canonical.split('-')[0].toLowerCase();
-  // Specials carry no usable language signal for context selection.
-  if (NON_INFORMATIVE_PRIMARIES.has(primary)) return '';
-  if (!isAssignedLanguagePrimary(primary)) return '';
-  return primary;
-}
-
-export function countrySearchLanguageCandidates(countryName: string, declaredLanguages: string[] = []): string[] {
-  const configured = COUNTRY_SEARCH_HINTS[normalizeCountry(countryName)];
-  if (!configured) return [];
-  const configuredLanguages = configured.relevanceLanguages || (configured.relevanceLanguage ? [configured.relevanceLanguage] : []);
-  const declared = declaredLanguages.map(normalizeLanguageCode).filter(Boolean);
-  return [...new Set([...configuredLanguages, ...declared.filter(code => configuredLanguages.includes(code))])];
-}
-
-export function countrySearchHints(countryName: string, declaredLanguages: string[] = [], preferredLanguage?: string): CountrySearchHints {
-  const configured = COUNTRY_SEARCH_HINTS[normalizeCountry(countryName)];
-  if (!configured) return {};
-
+  const candidates = countryDiscoveryLanguageCandidates(countryName);
+  const preferred = preferredLanguage ? normalizeLanguageCode(preferredLanguage) : '';
   const fallbackLanguage = declaredLanguages
     .map(normalizeLanguageCode)
-    .find(language => /^[a-z]{2}$/.test(language));
-  const candidates = countrySearchLanguageCandidates(countryName, declaredLanguages);
-  const preferred = preferredLanguage ? normalizeLanguageCode(preferredLanguage) : '';
+    .find(language => candidates.includes(language));
   const relevanceLanguage = preferred && candidates.includes(preferred)
     ? preferred
-    : candidates[0] || configured.relevanceLanguage || fallbackLanguage;
+    : candidates[0] || fallbackLanguage || profile.primaryLanguage;
 
   return {
-    regionCode: configured.regionCode,
-    relevanceLanguage
+    regionCode: countryDiscoveryRegionCode(countryName),
+    relevanceLanguage,
   };
 }
 
 export function hasCountrySearchHint(countryName: string): boolean {
-  return !!COUNTRY_SEARCH_HINTS[normalizeCountry(countryName)];
+  return getCountryDiscoveryProfile(countryName) !== null;
 }

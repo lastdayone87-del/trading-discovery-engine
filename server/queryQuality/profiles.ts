@@ -3,16 +3,18 @@ import {
   SUPPORTED_DORMANT_COUNTRIES,
   SUPPORTED_PRODUCTION_COUNTRIES,
 } from '../../src/data/initial_countries';
+import { getCountryDiscoveryProfile } from '../countryDiscoveryProfile';
 import type { CountryMarketProfile } from './types';
 
 /**
- * Exact production-configured active-country fixture (2026-10-29).
+ * Production-configured active-country fixture.
  *
  * This is deliberately a code fixture, not a production `app_settings` read:
  * tests must detect scope drift and must never silently expand to all 20
- * supported countries or narrow to the 15 non-dormant defaults. Norway is
- * dormant in the registry but explicitly selected in production, so it is
- * present here.
+ * supported countries. Norway is dormant in the registry but explicitly
+ * selected in production, so it is present here. UAE is registry-dormant but
+ * explicitly selected in the current production scope (verified 2026-11-13),
+ * so it is included for the same reason.
  */
 export const PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES = [
   'France',
@@ -31,42 +33,21 @@ export const PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES = [
   'Singapore',
   'New Zealand',
   'Luxembourg',
+  'United Arab Emirates',
 ] as const;
 
 export const DEFAULT_NON_DORMANT_COUNTRIES = SUPPORTED_PRODUCTION_COUNTRIES.filter(
   country => !SUPPORTED_DORMANT_COUNTRIES.includes(country),
 );
 
-const LANGUAGE_BY_COUNTRY: Record<string, string[]> = {
-  'United States': ['en'],
-  'United Kingdom': ['en'],
-  Ireland: ['en'],
-  Canada: ['en', 'fr'],
-  Australia: ['en'],
-  'New Zealand': ['en'],
-  France: ['fr'],
-  // Search-hint registry projections: Belgium also retrieves German, and
-  // Luxembourg retrieves Luxembourgish alongside French/German. Keeping the
-  // profile narrower would reject governed planner surfaces as language
-  // mismatches.
-  Belgium: ['nl', 'fr', 'de'],
-  Netherlands: ['nl'],
-  Luxembourg: ['lb', 'fr', 'de'],
-  Germany: ['de'],
-  Switzerland: ['de', 'fr', 'it'],
-  Denmark: ['da'],
-  Sweden: ['sv'],
-  Norway: ['no'],
-  Singapore: ['en', 'ms', 'zh', 'ta'],
-  Italy: ['it'],
-  Japan: ['ja'],
-  Spain: ['es'],
-  'United Arab Emirates': ['ar', 'en'],
-};
+function discoveryLanguages(country: string): string[] {
+  return getCountryDiscoveryProfile(country)?.languages.map(language => language.code) || [];
+}
 
 const SCRIPT_BY_LANGUAGE: Record<string, string> = {
   en: 'Latn', fr: 'Latn', de: 'Latn', nl: 'Latn', lb: 'Latn', da: 'Latn', sv: 'Latn',
-  no: 'Latn', it: 'Latn', es: 'Latn', ms: 'Latn', ja: 'Jpan', zh: 'Hani', ar: 'Arab', ta: 'Taml',
+  no: 'Latn', it: 'Latn', es: 'Latn', ms: 'Latn', ga: 'Latn', mi: 'Latn',
+  ja: 'Jpan', zh: 'Hani', ar: 'Arab', ta: 'Taml',
 };
 
 const PRIMARY_MARKET: Record<string, string> = {
@@ -97,7 +78,7 @@ const vocabularyByCountry = new Map(INITIAL_COUNTRY_VOCABULARIES.map(vocabulary 
 export const COUNTRY_MARKET_PROFILES: Record<string, CountryMarketProfile> = Object.fromEntries(
   SUPPORTED_PRODUCTION_COUNTRIES.map(country => {
     const vocabulary = vocabularyByCountry.get(country);
-    const languages = LANGUAGE_BY_COUNTRY[country] || ['en'];
+    const languages = discoveryLanguages(country);
     return [country, {
       country,
       languages,
