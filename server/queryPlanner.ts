@@ -264,6 +264,8 @@ export function planCountryNativeProposalQuery(args: {
   language?: string | null;
   locale?: string | null;
   dominantLocale?: string | null;
+  generationSource?: 'LLM_NATIVE_QUERY' | 'YOUTUBE_AUTOCOMPLETE' | null;
+  generationProvenance?: Record<string, unknown> | null;
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
   // The country-native proposal path is separate from planDiverseQueries and
@@ -271,26 +273,92 @@ export function planCountryNativeProposalQuery(args: {
   // LEARNED atom or receives allocation lineage.
   if (isAmbiguousShortModifier(nativeTerm)) return null;
   const reviewedPhrase = isReviewedNativePhrase(nativeTerm);
-  // Unknown long surfaces stay rejected. A reviewed native phrase may exceed
-  // the normal three-token atom cap because it is a bounded whole query.
-  if (!nativeTerm || (!reviewedPhrase && queryTokenCount(nativeTerm) > 3)) return null;
-  const learned = atom(nativeTerm, 'LEARNED', (args.targetIntent || 'strategy') as QueryIntent, 2, 'LEARNED');
   const languageEvidence = [args.language, args.locale, args.dominantLocale]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
   const supportedLanguages = countrySearchLanguageCandidates(args.country, args.countryVocabulary?.languages || []);
   const preferredLanguage = languageEvidence
     .map(normalizeLanguageCode)
     .find(language => language && supportedLanguages.includes(language));
+  const generationSource = args.generationSource === 'LLM_NATIVE_QUERY' || args.generationSource === 'YOUTUBE_AUTOCOMPLETE'
+    ? args.generationSource
+    : null;
+  const tokenCount = queryTokenCount(nativeTerm);
+  const declaredLanguage = languageEvidence.map(normalizeLanguageCode).find(Boolean);
+  const generatedGate = generationSource && tokenCount >= 2 && tokenCount <= 6
+    ? isSearchableTradingTerm({
+        term: nativeTerm,
+        termType: 'PHRASE',
+        country: args.country,
+        language: declaredLanguage || supportedLanguages[0],
+        maxTokens: 6,
+        requireTradingSemantics: false,
+      })
+    : null;
+  const generatedNative = Boolean(
+    generationSource
+    && generatedGate?.eligible
+    && (!declaredLanguage || supportedLanguages.includes(declaredLanguage)),
+  );
+  // Unknown long surfaces stay rejected. Reviewed native phrases and generated
+  // 2-6 word native surfaces are bounded whole-query exceptions.
+  if (!nativeTerm || (!reviewedPhrase && !generatedNative && tokenCount > 3)) return null;
+  if (generationSource && !generatedNative) return null;
+  const learned = atom(nativeTerm, 'LEARNED', (args.targetIntent || 'strategy') as QueryIntent, 2, 'LEARNED');
   // The reviewed allowlist is language-owned. An Italian phrase must not be
   // authorized as a Japanese native surface merely because it is reviewed.
   const phraseLanguages = reviewedPhrase ? reviewedNativePhraseLanguages(nativeTerm) : [];
-  const declaredLanguage = languageEvidence.map(normalizeLanguageCode).find(Boolean);
   if (reviewedPhrase && (
     !phraseLanguages.some(language => supportedLanguages.includes(language))
     || (declaredLanguage && !phraseLanguages.includes(declaredLanguage))
   )) {
     return null;
   }
+  // Generated native surfaces are executed exactly as supplied. Prefixing a
+  // local anchor would change the search intention the model or autocomplete
+  // actually proposed, so the bounded whole phrase is the only allowed shape.
+  const generatedPolicy = {
+    ...learned.retrievalPolicy,
+    eligibility: 'STANDALONE' as const,
+    specificity: Math.max(learned.retrievalPolicy.specificity, 75),
+    ambiguity: Math.min(learned.retrievalPolicy.ambiguity, 25),
+    reasonCodes: [
+      ...new Set([
+        ...learned.retrievalPolicy.reasonCodes.filter(code => code !== 'EXPANSION_SURFACE_REQUIRES_TRADING_ANCHOR'),
+        generationSource === 'YOUTUBE_AUTOCOMPLETE' ? 'AUTOCOMPLETE_PHRASE' : 'LLM_NATIVE_PHRASE',
+      ]),
+    ],
+    requiredCompanionClasses: [],
+  };
+  const generatedWholePhrase = (): PlannedQuery => ({
+    query: nativeTerm,
+    intent: (args.targetIntent || 'strategy') as QueryIntent,
+    primaryTerm: nativeTerm,
+    knowledgeTiers: [2],
+    generationMode: 'EXPLORATION',
+    generationReason: generationSource === 'YOUTUBE_AUTOCOMPLETE'
+      ? 'YouTube Autocomplete phrase executed as its own bounded retrieval surface.'
+      : 'LLM-generated native phrase executed as its own bounded retrieval surface.',
+    discoveryObjective: 'Test a generated country-native search phrase while discovering relevant trading creators.',
+    metadata: {
+      country: args.country,
+      queryTemplate: generationSource === 'YOUTUBE_AUTOCOMPLETE' ? 'AUTOCOMPLETE_PHRASE' : 'LLM_NATIVE_PHRASE',
+      generatedNativePhrase: true,
+      retrievalOptimized: true,
+      tokenCount,
+      scriptValidated: true,
+      retrievalSpecificity: generatedPolicy,
+      atoms: [{ ...learned, retrievalPolicy: generatedPolicy, role: 'ANCHOR', position: 0 }],
+      localTier1Term: nativeTerm,
+      learnedTerm: nativeTerm,
+      countryNativeAllocation: args.allocationLineage,
+      generationProvenance: args.generationProvenance || undefined,
+      language: args.language || undefined,
+      locale: args.locale || undefined,
+      dominantLocale: args.dominantLocale || undefined,
+      preferredLanguage,
+    },
+  });
+  if (generatedNative) return generatedWholePhrase();
   // A reviewed phrase that cannot fit beside an authorized anchor runs whole.
   // Mark it STANDALONE in both the top-level and atom policy so execution
   // authority does not quarantine it as an unanchored expansion surface.

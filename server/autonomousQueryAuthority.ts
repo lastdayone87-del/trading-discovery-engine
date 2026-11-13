@@ -1,6 +1,6 @@
 import type { QueryRecord } from '../src/types';
 import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface } from './queryPlanner';
-import { isExtractedStandaloneQuery } from './terminologySearchability';
+import { isExtractedStandaloneQuery, isSearchableTradingTerm } from './terminologySearchability';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
 import { revalidateQueryRecordAdmission } from './queryQuality/admission';
 
@@ -211,10 +211,26 @@ export function evaluateAutonomousQueryAuthority(
     && metadata.extractedStandalone === true
     && Number.isSafeInteger(extractedCandidateId)
     && extractedCandidateId > 0;
+  const generatedNativeStandalone = (template === 'LLM_NATIVE_PHRASE' || template === 'AUTOCOMPLETE_PHRASE')
+    && atoms.length === 1
+    && metadata.generatedNativePhrase === true;
+  const generatedLanguage = typeof metadata.preferredLanguage === 'string'
+    ? metadata.preferredLanguage
+    : typeof metadata.language === 'string' ? metadata.language : undefined;
   const shapeOk = extractedStandalone
     ? !isForbiddenProseQuery(query.query)
       && isExtractedStandaloneQuery({ term: query.query, country: query.country, language: typeof metadata.extractedCandidateLanguage === 'string' ? metadata.extractedCandidateLanguage : undefined })
-    : isRetrievalOrientedQuery(query.country, query.query);
+    : generatedNativeStandalone
+      ? !isForbiddenProseQuery(query.query)
+        && isSearchableTradingTerm({
+          term: query.query,
+          termType: 'PHRASE',
+          country: query.country,
+          language: generatedLanguage,
+          maxTokens: 6,
+          requireTradingSemantics: false,
+        }).eligible
+      : isRetrievalOrientedQuery(query.country, query.query);
   if (!shapeOk) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_SHAPE_FAILED'] };
   // A persistent scope promotion is valid only while the operator still has
   // the country selected. Check this for every promoted shape, including
