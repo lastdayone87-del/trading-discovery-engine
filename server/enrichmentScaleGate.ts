@@ -95,6 +95,27 @@ export function enrichmentScaleGateEnabled(env: NodeJS.ProcessEnv = process.env)
 }
 
 /**
+ * The scale gate measures the provider that actually serves classification.
+ * Admission fallback traffic and other providers must not contaminate the
+ * classification success-rate sample.
+ */
+export function semanticScaleGateProvider(env: NodeJS.ProcessEnv = process.env): 'gemini' | 'gemini-free' | 'groq' {
+  if (env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return 'gemini';
+  const provider = String(env.SEMANTIC_PROVIDER || 'gemini');
+  if (provider === 'groq' && hasConfiguredGroqRoute(env)) return 'groq';
+  if (provider === 'gemini-free' && hasConfiguredGeminiFreeRoute(env)) return 'gemini-free';
+  return 'gemini';
+}
+
+function hasConfiguredGroqRoute(env: NodeJS.ProcessEnv): boolean {
+  return Object.keys(env).some(name => /^GROQ_API_KEY(_[1-9][0-9]*)?$/.test(name) && String(env[name] || '').trim().length > 0);
+}
+
+function hasConfiguredGeminiFreeRoute(env: NodeJS.ProcessEnv): boolean {
+  return Object.keys(env).some(name => /^GEMINI_FREE_API_KEY(_[2-9][0-9]*)?$/.test(name) && String(env[name] || '').trim().length > 0);
+}
+
+/**
  * Backlog stability from the one-hour creation/completion counters. Extracted
  * so the below-threshold case is behaviorally testable without a database.
  */
@@ -219,6 +240,7 @@ export async function loadEnrichmentScaleMetrics(
     ...(deps.signal ? { signal: deps.signal } : {}),
   });
   const thresholds = enrichmentScaleThresholds(env);
+  const scaleProvider = semanticScaleGateProvider(env);
   const [provider, backlog, throughput] = await Promise.all([
     runQuery(`SELECT
          COUNT(*)::int AS calls,
@@ -233,9 +255,15 @@ export async function loadEnrichmentScaleMetrics(
          -- would drag the success rate down and block legitimate scale.
          -- Lock-wait/deadline contention is NOT excluded: the scale gate must
          -- see calls that failed before reaching Google under load.
+         AND provider = '${scaleProvider}'
          AND COALESCE(request_metadata->>'geminiScaleGateDeferral','') <> 'true'
          AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true'
-         AND COALESCE(request_metadata->>'geminiFreeCooldownDeferral','') <> 'true'`),
+         AND COALESCE(request_metadata->>'geminiFreeCooldownDeferral','') <> 'true'
+         -- Local gate deferrals never reached the provider and must not
+         -- depress the success rate used to authorize more workers.
+         AND COALESCE(request_metadata->>'providerReasons','') NOT LIKE '%SEMANTIC_DEFERRED_RATE_PRESSURE%'
+         AND COALESCE(request_metadata->>'providerReasons','') NOT LIKE '%VOCABULARY_DEFERRED_RATE_PRESSURE%'
+         AND COALESCE(request_metadata->>'providerReasons','') NOT LIKE '%VOCABULARY_DEFERRED_SEMANTIC_PRIORITY%'`),
     runQuery(`SELECT COUNT(*)::int AS pending
        FROM jobs
        WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`),
