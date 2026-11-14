@@ -212,6 +212,9 @@ export interface PipelineExecutionOptions {
   forceClassification?: boolean;
   /** Internal: caller already passed the semantic admission decision. */
   admissionBypass?: boolean;
+  /** Short browser-gate wait for decision workers; rendered saturation defers
+   * to the dedicated community retry consumer. */
+  renderedFallbackMaxWaitMs?: number;
 }
 
 /**

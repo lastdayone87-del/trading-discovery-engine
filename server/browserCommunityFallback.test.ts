@@ -451,6 +451,21 @@ test('rendered browser launches are process-wide bounded', async () => {
   assert.deepEqual(gate.snapshot(), { active: 0, pending: 0, concurrency: 1, maxPending: 2 });
 });
 
+test('per-call gate wait defers a decision worker while the community lane keeps the global wait', async () => {
+  const gate = new RenderedFallbackGate(1, 4, undefined, 1_000);
+  let release!: () => void;
+  const blocker = new Promise<void>(resolve => { release = resolve; });
+  const first = gate.run(async () => blocker);
+  const startedAt = Date.now();
+  await assert.rejects(
+    gate.run(async () => undefined, 'DISCOVERY', { maxWaitMs: 20 }),
+    /RENDERED_FALLBACK_SATURATED/,
+  );
+  assert.ok(Date.now() - startedAt < 500, 'per-call wait must not fall back to the global 1s wait');
+  release();
+  await first;
+});
+
 test('rendered host backoff remains bounded by failure class and retry count', () => {
   assert.equal(renderedCrawlerHostBackoffMs('RATE_LIMITED', 0), 1_000);
   assert.equal(renderedCrawlerHostBackoffMs('RATE_LIMITED', 10), 8_000);
