@@ -5,7 +5,8 @@ import {
   createProposalDedupKey,
   generateCountryNativeProposals,
   generateCreatorDerivedProposals,
-  generateFrontierProposalsForCountry
+  generateFrontierProposalsForCountry,
+  rotateCachedSelection
 } from './discoveryProposalGenerators';
 
 test('Phase 6: Proposal dedup key is deterministic and unique across dimensions', () => {
@@ -143,4 +144,14 @@ test('creator-derived generator uses the channels schema and governed vocabulary
   assert.match(source, /pilotPolicyVersion: options\.pilotPolicyVersion/);
   assert.match(source, /dedupDiscriminator: options\.pilotAssignmentKey \|\| options\.pilotQuotaDay/);
   assert.doesNotMatch(source, /c\.title/);
+});
+
+test('cached generation selection rotates through the batch instead of repeating the first slots', () => {
+  const items = ['a', 'b', 'c', 'd'];
+  assert.deepEqual(rotateCachedSelection(items, 0, 2), { selected: ['a', 'b'], nextCursor: 2 });
+  assert.deepEqual(rotateCachedSelection(items, 2, 2), { selected: ['c', 'd'], nextCursor: 4 });
+  assert.deepEqual(rotateCachedSelection(items, 4, 2), { selected: ['a', 'b'], nextCursor: 6 });
+  assert.deepEqual(rotateCachedSelection(items, 3, 2), { selected: ['d', 'a'], nextCursor: 5 });
+  assert.deepEqual(rotateCachedSelection([], 5, 2), { selected: [], nextCursor: 5 });
+  assert.deepEqual(rotateCachedSelection(items, -2, 2), { selected: ['a', 'b'], nextCursor: 2 });
 });

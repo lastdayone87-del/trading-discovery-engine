@@ -673,7 +673,11 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
               decisionId: frontierAllocationInfo.decision.decisionId,
               proposalId: frontierAllocationInfo.decision.proposalId,
               targetNeighborhoodDimensions: frontierAllocationInfo.targetNeighborhoodDimensions,
-              proposalEvidenceSnapshot: nativeSnapshot
+              proposalEvidenceSnapshot: nativeSnapshot,
+              // Frontier allocation can move `country` away from the legacy
+              // country. Resolve promotion for the country actually being
+              // authorized, not the scheduler's starting country.
+              scopePromotionBasis: resolveScopePromotionForScope(scope, country, targetCountry)
             })
           : null;
         const nativeQuery = nativeAuthorization?.status === 'AUTHORIZED' ? nativeAuthorization.queryRecord : null;

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { GoogleGenAI } from '@google/genai';
 import { appendProviderCallEvent } from './db';
+import { generatedQueryShape } from './generatedQueryShape';
 import { detectLanguage } from './languageDetection';
 import {
   getCandidateMemory,
@@ -24,7 +25,7 @@ import {
   type QueryGenerationProvenance,
   type QueryGenerationSource,
 } from './queryGenerationProvenance';
-import { isForbiddenProseQuery } from './queryPlanner';
+import { hasGeneratedCtaOrPlatform, isForbiddenProseQuery } from './queryPlanner';
 import { isSearchableTradingTerm } from './terminologySearchability';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
 import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticProvider';
@@ -273,12 +274,11 @@ function assessCandidate(input: {
   const reasons: string[] = [];
   if (!query) reasons.push('EMPTY');
   if (query.length < 4 || query.length > 80) reasons.push('LENGTH');
-  const tokens = query.split(/\s+/u).filter(Boolean);
-  if (tokens.length < 2 || tokens.length > 6) reasons.push('TOKEN_COUNT');
+  if (!generatedQueryShape(query).bounded) reasons.push('TOKEN_COUNT');
   if (isForbiddenProseQuery(query)) reasons.push('FORBIDDEN_PROSE');
   if (/[@#]/u.test(query)) reasons.push('HASHTAG_OR_HANDLE');
   if (/(https?:\/\/|www\.)/iu.test(query)) reasons.push('URL');
-  if (/\b(subscribe|follow|like|comment|telegram|whatsapp|discord)\b/iu.test(query)) reasons.push('CTA_OR_PLATFORM');
+  if (hasGeneratedCtaOrPlatform(query)) reasons.push('CTA_OR_PLATFORM');
   const detected = detectLanguage(query, { countryHint: input.country });
   if (detected.language !== 'und' && detected.language !== input.language) {
     // Local trading vocabulary often contains English terms. Reject only when
@@ -358,7 +358,7 @@ async function callGemini(prompt: string): Promise<{ text: string; provider: str
         },
       },
       timeoutMs: Number(process.env.GEMINI_PROVIDER_TIMEOUT_MS || '45000'),
-      enabled: process.env.PROVIDER_DEADLINES_ENABLED === 'true',
+      enabled: process.env.PROVIDER_DEADLINES_ENABLED !== 'false',
       emit: appendProviderCallEvent,
       call: signal => ai.models.generateContent({
         model,
@@ -426,8 +426,11 @@ export async function generateNativeQueriesWithLlm(input: {
     // If memory removed cached candidates but the batch is still full enough,
     // reuse it. If the cache is underfilled because of real memory changes,
     // regenerate instead of returning a short batch for the full 14-day TTL.
-    // A batch that was simply provider-short (no duplicate loss) stays cached.
-    if (!shouldRegenerateCachedGeneration({
+    // An empty cached payload (for example a legacy all-invalid batch) always
+    // regenerates; otherwise a single bad provider reply suppresses generation
+    // for the whole TTL.
+    const cachedCandidateCount = cached.candidates.length;
+    if (cachedCandidateCount > 0 && !shouldRegenerateCachedGeneration({
       requested: count,
       accepted: refreshed.accepted.length,
       lostToMemory: refreshed.rejected.length,
@@ -499,6 +502,7 @@ export async function generateNativeQueriesWithLlm(input: {
   // must not corrupt novelty metrics. Use duplicate decisions only, over the
   // rows actually evaluated (early acceptance breaks stop consuming candidates).
   const duplicateRate = evaluated > 0 ? duplicateRejections / evaluated : 0;
+  const validationRejections = Math.max(0, rejected.length - duplicateRejections);
   // A replacement pass can return valid JSON with no usable candidates. Keep
   // the usable cached subset in that case instead of overwriting the cache
   // with an empty batch for the full TTL.
@@ -564,7 +568,12 @@ export async function generateNativeQueriesWithLlm(input: {
     duplicateRate: result.duplicateRate,
     acceptedCount: result.candidates.length,
     expiresAt: new Date(Date.now() + NATIVE_QUERY_BATCH_TTL_DAYS * 86_400_000).toISOString(),
-    status: result.candidates.length ? 'COMPLETED' : 'LOW_NOVELTY',
+    // A valid-JSON batch where every row failed validation is not 'low
+    // novelty'; mark it FAILED so the cache cannot suppress retries for the
+    // full TTL. Genuine all-duplicate batches remain LOW_NOVELTY.
+    status: result.candidates.length
+      ? 'COMPLETED'
+      : validationRejections > 0 ? 'FAILED' : 'LOW_NOVELTY',
   }).catch(() => undefined);
   return result;
 }

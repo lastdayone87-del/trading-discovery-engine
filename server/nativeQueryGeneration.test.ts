@@ -67,12 +67,15 @@ test('underfilled cache regenerates only when memory removed candidates', () => 
 });
 
 function inMemoryGenerationStore() {
-  const batches = new Map<string, Record<string, unknown>>();
+  const batches = new Map<string, { payload: Record<string, unknown>; status: string }>();
   return {
-    getGenerationBatch: async (key: string) => batches.get(key) || null,
+    getGenerationBatch: async (key: string) => {
+      const row = batches.get(key);
+      return row && (row.status === 'COMPLETED' || row.status === 'LOW_NOVELTY') ? row.payload : null;
+    },
     rememberQueryCandidates: async () => 0,
-    upsertGenerationBatch: async (input: { batchKey: string; payload: Record<string, unknown> }) => {
-      batches.set(input.batchKey, input.payload);
+    upsertGenerationBatch: async (input: { batchKey: string; payload: Record<string, unknown>; status?: string }) => {
+      batches.set(input.batchKey, { payload: input.payload, status: input.status || 'COMPLETED' });
     },
   };
 }
@@ -109,6 +112,55 @@ test('duplicateRate counts duplicate decisions only, not validation failures', a
   // One CTA was rejected by validation, but no candidate was rejected as a
   // duplicate. The old rejection-rate metric would have reported 1/3.
   assert.equal(result.duplicateRate, 0);
+});
+
+test('an all-invalid provider batch does not suppress regeneration from cache', async () => {
+  let calls = 0;
+  const memoryStore = inMemoryGenerationStore();
+  const context = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    existingQueries: [],
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const first = await generateNativeQueriesWithLlm({
+    context,
+    count: 2,
+    memoryStore,
+    generateText: async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({ queries: [{ query: 'subscribe to my trading channel', intent: 'education' }] }),
+        provider: 'test',
+        model: 'test',
+      };
+    },
+  });
+  assert.equal(first.candidates.length, 0);
+  const callsAfterFirst = calls;
+
+  const second = await generateNativeQueriesWithLlm({
+    context,
+    count: 2,
+    memoryStore,
+    generateText: async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({ queries: [
+          { query: 'analyse technique CAC 40', intent: 'market_analysis' },
+          { query: 'bourse direct avis', intent: 'strategy' },
+        ] }),
+        provider: 'test',
+        model: 'test',
+      };
+    },
+  });
+  assert.equal(second.candidates.length, 2);
+  assert.ok(calls > callsAfterFirst, 'the FAILED batch must not be reused from cache');
 });
 
 test('a failed replacement pass keeps the valid cached subset', async () => {

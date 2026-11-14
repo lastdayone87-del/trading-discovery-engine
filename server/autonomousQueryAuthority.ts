@@ -1,4 +1,5 @@
 import type { QueryRecord } from '../src/types';
+import { generatedQueryShape } from './generatedQueryShape';
 import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface } from './queryPlanner';
 import { isExtractedStandaloneQuery, isSearchableTradingTerm } from './terminologySearchability';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
@@ -222,7 +223,7 @@ export function evaluateAutonomousQueryAuthority(
       && isExtractedStandaloneQuery({ term: query.query, country: query.country, language: typeof metadata.extractedCandidateLanguage === 'string' ? metadata.extractedCandidateLanguage : undefined })
     : generatedNativeStandalone
       ? !isForbiddenProseQuery(query.query)
-        && query.query.normalize('NFKC').trim().split(/\s+/u).filter(Boolean).length >= 2
+        && generatedQueryShape(query.query).bounded
         && isSearchableTradingTerm({
           term: query.query,
           termType: 'PHRASE',

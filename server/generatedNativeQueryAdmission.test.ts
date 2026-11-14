@@ -3,13 +3,17 @@ import test from 'node:test';
 import { INITIAL_COUNTRY_VOCABULARIES } from '../src/data/initial_countries';
 import { admitQueryRecord } from './queryQuality/admission';
 import { buildFrontierProposal } from './discoveryProposalGenerators';
-import { planCountryNativeProposalQuery } from './queryPlanner';
+import { hasGeneratedCtaOrPlatform, planCountryNativeProposalQuery } from './queryPlanner';
 import { classifyCountryNativeAuthorizationInput } from './queryIntelligence';
 import { assessGeneratedNativeQuery, dedupeGeneratedCandidates } from './nativeQueryGeneration';
 import { allocateNativeGenerationSlots } from './discoveryProposalGenerators';
 
 const france = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'France');
+const italy = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'Italy');
+const japan = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'Japan');
 assert.ok(france);
+assert.ok(italy);
+assert.ok(japan);
 
 const provenance = {
   source: 'LLM' as const,
@@ -67,6 +71,77 @@ test('generated admission accepts a regional provenance tag for the same languag
   const admission = admitQueryRecord({
     query: planned.query,
     country: 'France',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+});
+
+test('a single unspaced Japanese surface is admitted as a bounded generated phrase', () => {
+  const japaneseProvenance = {
+    ...provenance,
+    batchId: 'batch-jp',
+    country: 'Japan',
+    language: 'ja',
+  };
+  assert.ok(assessGeneratedNativeQuery({
+    query: '日経225先物',
+    country: 'Japan',
+    language: 'ja',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test-model',
+    batchId: 'batch-jp',
+  }));
+  const planned = planCountryNativeProposalQuery({
+    country: 'Japan',
+    nativeTerm: '日経225先物',
+    countryVocabulary: japan,
+    targetIntent: 'futures',
+    allocationLineage: { decisionId: 'decision-jp', proposalId: 'proposal-jp' },
+    language: 'ja',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: japaneseProvenance,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  assert.ok(planned);
+  assert.equal(planned.metadata.tokenCount, 1);
+  assert.equal(planned.metadata.unspacedScript, true);
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'Japan',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+});
+
+test('scope promotion authorizes generated phrases for selected dormant countries', () => {
+  const italianProvenance = {
+    ...provenance,
+    batchId: 'batch-it',
+    country: 'Italy',
+    language: 'it',
+  };
+  const planned = planCountryNativeProposalQuery({
+    country: 'Italy',
+    nativeTerm: 'analisi tecnica FTSE MIB',
+    countryVocabulary: italy,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-it', proposalId: 'proposal-it' },
+    language: 'it',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: italianProvenance,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  assert.ok(planned);
+  assert.equal(planned.metadata.scopePromoted, true);
+  assert.equal(planned.metadata.promotionBasis, 'PERSISTENT_SCOPE_SELECTION');
+
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'Italy',
     primary_term: planned.primaryTerm,
     generation_metadata: planned.metadata,
   });
@@ -188,6 +263,37 @@ test('generated query validation rejects generic long and CTA surfaces', () => {
     model: 'test',
     batchId: 'b3',
   }), null);
+});
+
+test('CTA detection does not reject ordinary like/comment/follow words', () => {
+  assert.equal(hasGeneratedCtaOrPlatform('comment trader'), false);
+  assert.equal(hasGeneratedCtaOrPlatform('stocks like tesla'), false);
+  assert.equal(hasGeneratedCtaOrPlatform('follow the trend'), false);
+  assert.equal(hasGeneratedCtaOrPlatform('like and subscribe'), true);
+  assert.equal(hasGeneratedCtaOrPlatform('comment below'), true);
+  assert.equal(hasGeneratedCtaOrPlatform('follow me for more'), true);
+  assert.equal(hasGeneratedCtaOrPlatform('join my telegram'), true);
+
+  assert.ok(assessGeneratedNativeQuery({
+    query: 'comment trader',
+    country: 'France',
+    language: 'fr',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'test',
+    model: 'test',
+    batchId: 'cta-1',
+  }));
+  assert.ok(assessGeneratedNativeQuery({
+    query: 'stocks like tesla',
+    country: 'United States',
+    language: 'en',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'test',
+    model: 'test',
+    batchId: 'cta-2',
+  }));
 });
 
 test('generated batch dedupe removes repeats but keeps distinct intentions', () => {
