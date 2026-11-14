@@ -68,12 +68,17 @@ test('discovery profiles are deeply frozen', () => {
   assert.ok(profile.languages.every(language => Object.isFrozen(language)));
 });
 
-test('Tagalog aliases normalize to one canonical code', () => {
+test('Tagalog names and the Tagalog primary share one canonical code', () => {
   assert.equal(normalizeLanguageCode('Tagalog'), 'tl');
   assert.equal(normalizeLanguageCode('Filipino'), 'tl');
+  // ICU canonicalizes `tl` to `fil`; preserve the registry's `tl` primary so
+  // named and tagged Tagalog inputs cannot diverge.
   assert.equal(normalizeLanguageCode('tl'), 'tl');
-  assert.equal(normalizeLanguageCode('fil'), 'tl');
-  assert.equal(normalizeLanguageCode('fil-PH'), 'tl');
+  assert.equal(normalizeLanguageCode('tl-PH'), 'tl');
+  // `fil` is a distinct assigned primary (Filipino), not an alternate spelling
+  // of `tl`; the BCP 47 normalizer preserves it by contract.
+  assert.equal(normalizeLanguageCode('fil'), 'fil');
+  assert.equal(normalizeLanguageCode('fil-PH'), 'fil');
 });
 
 test('Irish and Māori generated trading phrases pass the semantic gate', () => {
