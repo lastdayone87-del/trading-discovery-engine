@@ -5,6 +5,9 @@ import { bumpOperationalEnrichmentRecoveryDuplicateEvent, bumpOperationalEnrichm
 
 export const OPERATIONAL_ENRICHMENT_RECOVERY_COOLDOWN_MS = 24 * 60 * 60_000;
 
+/** Operator-requested recovery work is high priority, but admission must stay above it. */
+export const OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY = 30;
+
 type RecoveryChannel = Pick<ChannelRecord,
   'channel_id' | 'scan_status' | 'trading_status' | 'country_status' | 'discord_validation_status' | 'last_checked'
 >;

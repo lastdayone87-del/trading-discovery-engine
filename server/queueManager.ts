@@ -1,4 +1,5 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
+import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from './operationalEnrichmentRecovery';
 import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetricsWithinDeadline, setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
 import {
   getDb,
@@ -4612,7 +4613,7 @@ export function buildOperationalEnrichmentRecoveryPayload(channel:Pick<ChannelRe
   return {channelId:channel.channel_id,targetCountry:channel.country,source:(channel.discovery_source||'recovery') as DiscoverySource,enrichmentStage:1,evidenceAction:'CHANNEL_RECENT_METADATA',candidate:{channelId:channel.channel_id,channelName:channel.channel_name,youtubeUrl:channel.youtube_url,locationTag:channel.country,description:'',videoTitles:[],channelLinks:[],subscriberCount:channel.subscriber_count,channelThumbnailUrl:channel.channel_thumbnail_url,enrichmentStage:0},recoveryReasonCodes:reasonCodes};
 }
 export async function enqueueOperationalEnrichmentRecoveryJob(channel:ChannelRecord,reasonCodes:string[],clientOverride?:any):Promise<boolean>{
-  const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:30,maxAttempts:4,clientOverride});
+  const job=await enqueueJob('ENRICH_CHANNEL',buildOperationalEnrichmentRecoveryPayload(channel,reasonCodes),{idempotencyKey:operationalEnrichmentRecoveryKey(channel.channel_id),priority:OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY,maxAttempts:4,clientOverride});
   if(job.reopen_blocked)return false;
   await (clientOverride||await getDb()).query(`UPDATE jobs SET first_transient_failure_at=NULL WHERE id=$1 AND status='PENDING'`,[job.id]);
   return true;

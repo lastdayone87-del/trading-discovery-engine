@@ -30,11 +30,11 @@ export const CLASSIFICATION_MAX_PENDING_DEFAULT = 500;
 export const CLASSIFICATION_MAX_PER_QUERY_DEFAULT = 50;
 
 /**
- * New discoveries outrank the default ENRICH_CHANNEL priority (10) so the
- * classification lane drains promptly, but stays below search continuations
- * (20) and manual/operator work.
+ * New discoveries outrank ENRICH backfill (10–20) and ordinary search (20).
+ * Admission verification is protected at 30, and high-priority manual/operator
+ * work at 25 remains above classification.
  */
-export const CLASSIFICATION_JOB_PRIORITY_DEFAULT = 15;
+export const CLASSIFICATION_JOB_PRIORITY_DEFAULT = 21;
 
 /** Classification + first ENRICH attempt per classification job. */
 export const CLASSIFICATION_JOB_MAX_ATTEMPTS_DEFAULT = 4;
@@ -142,7 +142,10 @@ export function resolveEnrichmentWorkerSplit(totalWorkers: number, decouplingEna
   // through the split rather than silently dropped.
   const total = positiveInt(totalWorkers, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT);
   if (total === 1) return { classificationWorkers: 1, enrichmentOnlyWorkers: 0 };
-  const classificationCap = decouplingEnabled ? 2 : 1;
+  // Admission and classification share this pool. Three classification-
+  // capable workers are safe only once the total pool grows; the baseline
+  // three-worker pool keeps the historical 2/1 split.
+  const classificationCap = decouplingEnabled ? 3 : 1;
   const classificationWorkers = Math.max(1, Math.min(classificationCap, total - 1));
   return {
     classificationWorkers,

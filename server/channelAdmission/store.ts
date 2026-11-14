@@ -178,6 +178,14 @@ export async function hasActiveAdmissionJob(channelId: string): Promise<boolean>
   return Boolean(result.rowCount);
 }
 
+export const ADMISSION_VERIFICATION_PRIORITY = 40;
+
+/** Admission retries inherit the protected priority even when a route-derived
+ * priority is lower; higher explicit priorities remain allowed. */
+export function admissionVerificationPriority(priority?: number | null): number {
+  return Math.max(priority ?? 0, ADMISSION_VERIFICATION_PRIORITY);
+}
+
 export async function enqueueAdmissionVerification(input: {
   candidate: AdmissionCandidateInput;
   runAfter?: string;
@@ -209,7 +217,7 @@ export async function enqueueAdmissionVerification(input: {
     resultRank: input.candidate.resultRank,
     attempt,
   }, {
-    priority: input.priority ?? 20,
+    priority: admissionVerificationPriority(input.priority),
     maxAttempts: 3,
     idempotencyKey: input.idempotencyKey || key,
     ...(input.runAfter ? { runAfter: input.runAfter } : {}),

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelRecord, DiscoverySource } from '../../src/types';
 import { getDb, getChannelById, hasActiveClassificationJob, insertChannelIfAbsent, upsertChannel, upsertChannelWithResult } from '../db';
-import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQueryScopeKey } from '../classificationDecoupling';
+import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQueryScopeKey, resolveClassificationDecouplingConfig } from '../classificationDecoupling';
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
 import { assertCountryAllowed } from '../countryExclusion';
@@ -117,7 +117,7 @@ async function enqueueClassificationAfterAdmission(input: {
     forceExtraction: false,
   });
   const job = await enqueueClassificationJobAtomic(input.candidate.channelId, payload, {
-    priority: 20,
+    priority: resolveClassificationDecouplingConfig().priority,
     maxAttempts: 4,
     idempotencyKey: `admission-classify:${input.candidate.channelId}:${input.admissionDecisionId || 'v1'}`,
     preventCompletedReopen: true,
