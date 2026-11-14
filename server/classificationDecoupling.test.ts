@@ -160,6 +160,8 @@ test('classification uses the short rendered wait and the dedicated community la
   assert.equal(canClaimCommunityRetry(['RETRY_COMMUNITY_ACQUISITION'], true), false);
   assert.equal(canClaimCommunityRetry(['RETRY_COMMUNITY_ACQUISITION'], false), true);
   assert.equal(canClaimCommunityRetry(['ENRICH_CHANNEL'], false), false);
+  assert.match(queue, /canClaimCommunityRetry\(claimableOverride, qStatus\.channelProcessing\.isPaused \|\| qStatus\.discordValidation\.isPaused\)/,
+    'the worker claim site must use the tested claim decision');
 });
 
 test('day-bucketed idempotency key is stable within a UTC day and changes next day', () => {

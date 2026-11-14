@@ -473,6 +473,7 @@ test('per-call gate wait defers a decision worker while the community lane keeps
     await first;
   }
   assert.ok(Date.now() - startedAt < 500, 'per-call wait must not fall back to the global 1s wait');
+  assert.ok(Number(saturation?.retryAt) > Date.now(), 'retry hint must be in the future');
   assert.ok(Number(saturation?.retryAt) - Date.now() < 500, 'retry hint must use the per-call wait, not the global wait');
 });
 
