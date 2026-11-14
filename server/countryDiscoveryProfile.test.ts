@@ -9,6 +9,8 @@ import {
 } from './countryDiscoveryProfile';
 import { countrySearchHints } from './countrySearchHints';
 import { detectLanguage } from './languageDetection';
+import { normalizeLanguageCode } from './languageCodes';
+import { isSearchableTradingTerm } from './terminologySearchability';
 import { PRODUCTION_CONFIGURED_ACTIVE_COUNTRIES } from './queryQuality/profiles';
 
 test('every supported country has one canonical discovery profile', () => {
@@ -56,4 +58,47 @@ test('language detection recognizes Malay, Irish and Māori trading vocabulary',
 test('secondary-language hints do not claim common English or Spanish phrases', () => {
   assert.notEqual(detectLanguage('take profit trading', { countryHint: 'New Zealand' }).language, 'mi');
   assert.equal(detectLanguage('cómo hacer trading', { countryHint: 'Spain' }).language, 'es');
+});
+
+test('discovery profiles are deeply frozen', () => {
+  const profile = getCountryDiscoveryProfile('Ireland');
+  assert.ok(profile);
+  assert.ok(Object.isFrozen(profile));
+  assert.ok(Object.isFrozen(profile.languages));
+  assert.ok(profile.languages.every(language => Object.isFrozen(language)));
+});
+
+test('Tagalog aliases normalize to one canonical code', () => {
+  assert.equal(normalizeLanguageCode('Tagalog'), 'tl');
+  assert.equal(normalizeLanguageCode('Filipino'), 'tl');
+  assert.equal(normalizeLanguageCode('tl'), 'tl');
+  assert.equal(normalizeLanguageCode('fil'), 'tl');
+  assert.equal(normalizeLanguageCode('fil-PH'), 'tl');
+});
+
+test('Irish and Māori generated trading phrases pass the semantic gate', () => {
+  assert.equal(isSearchableTradingTerm({
+    term: 'trádáil scaireanna',
+    termType: 'PHRASE',
+    country: 'Ireland',
+    language: 'ga',
+    maxTokens: 6,
+    requireTradingSemantics: true,
+  }).eligible, true);
+  assert.equal(isSearchableTradingTerm({
+    term: 'hokohoko haumi',
+    termType: 'PHRASE',
+    country: 'New Zealand',
+    language: 'mi',
+    maxTokens: 6,
+    requireTradingSemantics: true,
+  }).eligible, true);
+  assert.equal(isSearchableTradingTerm({
+    term: 'bia blasta',
+    termType: 'PHRASE',
+    country: 'Ireland',
+    language: 'ga',
+    maxTokens: 6,
+    requireTradingSemantics: true,
+  }).eligible, false);
 });

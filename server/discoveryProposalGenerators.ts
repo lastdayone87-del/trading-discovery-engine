@@ -9,6 +9,7 @@ import { countryDiscoveryLanguagesByWeight, countryDiscoveryRegionCode } from '.
 import { generateNativeQueriesWithLlm, NATIVE_QUERY_BATCH_SIZE, type NativeQueryCandidate } from './nativeQueryGeneration';
 import { generateAutocompleteQueries, getCachedAutocompleteSuggestions } from './youtubeAutocomplete';
 import { getCandidateMemory } from './queryGenerationMemory';
+import { dedupeCandidateBatch, type CandidateHistoryItem } from './queryDuplicateGuard';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -775,11 +776,22 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
       REAL_SIGNAL: [],
       GROUNDED: [],
     };
+    // All modes/languages share one history. A candidate accepted in the
+    // open-world batch must not be proposed again as real-signal or grounded.
+    const sharedHistory: CandidateHistoryItem[] = [...existingQueries];
 
     for (const language of selectedLanguages) {
       const memory = await getCandidateMemory(canonicalC, language.code).catch(() => []);
+      sharedHistory.push(...memory.map(row => ({
+        query: row.normalizedQuery,
+        country: canonicalC,
+        intent: null,
+      })));
       const autocompleteSuggestions = await getCachedAutocompleteSuggestions(canonicalC, language.code);
       for (const { mode, share } of NATIVE_GENERATION_MODES) {
+        // The approved generation portfolio is a full 60/25/15 batch. The
+        // per-family proposal cap limits what enters the frontier now, not the
+        // cached provider batch that supplies later cycles.
         const count = Math.max(1, Math.round(NATIVE_QUERY_BATCH_SIZE * share));
         try {
           const batch = await generateNativeQueriesWithLlm({
@@ -803,12 +815,23 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
       }
     }
 
+    const crossModeAccepted = dedupeCandidateBatch(
+      NATIVE_GENERATION_MODES.flatMap(({ mode }) => byMode[mode]),
+      sharedHistory,
+    ).accepted;
+    const dedupedByMode: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', NativeQueryCandidate[]> = {
+      OPEN_WORLD: [],
+      REAL_SIGNAL: [],
+      GROUNDED: [],
+    };
+    for (const candidate of crossModeAccepted) dedupedByMode[candidate.mode].push(candidate);
+
     const slots = allocateNativeGenerationSlots(limit, {
-      OPEN_WORLD: byMode.OPEN_WORLD.length,
-      REAL_SIGNAL: byMode.REAL_SIGNAL.length,
-      GROUNDED: byMode.GROUNDED.length,
+      OPEN_WORLD: dedupedByMode.OPEN_WORLD.length,
+      REAL_SIGNAL: dedupedByMode.REAL_SIGNAL.length,
+      GROUNDED: dedupedByMode.GROUNDED.length,
     });
-    const selected = NATIVE_GENERATION_MODES.flatMap(({ mode }) => byMode[mode].slice(0, slots[mode]));
+    const selected = NATIVE_GENERATION_MODES.flatMap(({ mode }) => dedupedByMode[mode].slice(0, slots[mode]));
     return selected.map(candidate => buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
       country: canonicalC,

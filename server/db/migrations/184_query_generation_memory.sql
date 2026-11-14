@@ -18,9 +18,13 @@ CREATE TABLE IF NOT EXISTS query_candidate_memory (
   batch_key TEXT,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(country, language, normalized_query)
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Country lookups are case-insensitive (`LOWER(country)`); uniqueness must be
+-- case-insensitive too, otherwise `France` and `france` create bypass rows.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_query_candidate_memory_unique
+  ON query_candidate_memory(LOWER(country), language, normalized_query);
 
 CREATE INDEX IF NOT EXISTS idx_query_candidate_memory_country
   ON query_candidate_memory(country, language, status, last_seen_at DESC);

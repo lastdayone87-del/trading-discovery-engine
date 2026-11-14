@@ -2081,7 +2081,8 @@ export type QueryIntelligenceAuthorizationCode =
   | 'QUERY_SPECIFICITY_REJECTED'
   | 'RETRIEVAL_ANCHOR_UNAVAILABLE'
   | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM'
-  | 'QUERY_ADMISSION_REJECTED';
+  | 'QUERY_ADMISSION_REJECTED'
+  | 'QUERY_HOLD_ACTIVE';
 
 export type QueryIntelligenceAuthorizationOutcome =
   | { status: 'AUTHORIZED'; code: 'AUTHORIZED'; queryRecord: QueryRecord }
@@ -2231,14 +2232,20 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
     // Persistence is not authorization. A native/LLM/autocomplete surface that
     // admission marked duplicate, speculative or otherwise ineligible must not
     // reach the scheduler merely because the proposal row was materialized.
-    const admission = parseGenerationMetadata(queryRecord.generation_metadata).queryAdmission as
+    const generationMetadata = parseGenerationMetadata(queryRecord.generation_metadata);
+    const admission = generationMetadata.queryAdmission as
       { eligible?: boolean } | undefined;
+    // A hold is a terminal quarantine. The upsert preserves the old
+    // queryAdmission metadata, so `eligible` can remain true after a hold makes
+    // the row REJECTED; the row state must also veto authorization.
+    const holdActive = queryRecord.collection === 'REJECTED' || generationMetadata.queryHold != null;
+    if (holdActive) {
+      return { status: 'REJECTED', code: 'QUERY_HOLD_ACTIVE', queryRecord: null };
+    }
     if (admission?.eligible !== true) {
       return { status: 'REJECTED', code: 'QUERY_ADMISSION_REJECTED', queryRecord: null };
     }
-    const provenance = parseQueryGenerationProvenance(
-      parseGenerationMetadata(queryRecord.generation_metadata).generationProvenance,
-    );
+    const provenance = parseQueryGenerationProvenance(generationMetadata.generationProvenance);
     if (provenance) {
       await rememberQueryCandidates([{
         country: queryRecord.country,

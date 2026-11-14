@@ -71,5 +71,9 @@ export function normalizeLanguageCode(value: string): string {
   // Specials carry no usable language signal for context selection.
   if (NON_INFORMATIVE_PRIMARIES.has(primary)) return '';
   if (!isAssignedLanguagePrimary(primary)) return '';
+  // `fil` and `tl` are both assigned BCP 47 primaries for Tagalog/Filipino.
+  // The registry stores `tl`; collapse the aliases so a provider tag cannot
+  // silently fail declared-language matching.
+  if (primary === 'fil') return 'tl';
   return primary;
 }

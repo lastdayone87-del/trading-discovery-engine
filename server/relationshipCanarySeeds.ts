@@ -1,6 +1,6 @@
 import { enqueueJob, getAppSetting, getDb, setAppSetting } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { canonicalCountry } from './countryInference';
+import { canonicalCountry, isKnownCountry } from './countryInference';
 import { DEFAULT_NON_DORMANT_COUNTRIES } from './queryQuality/profiles';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import {
@@ -64,7 +64,10 @@ export async function selectRelationshipCanarySeeds(
       `SELECT DISTINCT regexp_replace(a.normalized_target,'^playlist:','') AS playlist_id
        FROM discovery_actions a
        WHERE a.action_type='INSPECT_PLAYLIST'
-         AND a.lifecycle IN ('QUEUED','RUNNING','COMPLETED')
+         AND a.lifecycle='COMPLETED'
+         AND EXISTS (
+           SELECT 1 FROM discovery_action_outcomes o WHERE o.action_id=a.id
+         )
          AND UPPER(a.context->>'country')=UPPER($1)
          AND a.normalized_target LIKE 'playlist:%'
          AND NOT EXISTS (
@@ -86,14 +89,40 @@ export async function selectRelationshipCanarySeeds(
   return { country: canonical, seeds };
 }
 
-function selectedCountries(raw: string): string[] {
+export function parseSelectedCountries(raw: string): string[] {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map(String).map(canonicalCountry).filter(Boolean);
+    parsed = JSON.parse(raw);
   } catch {
-    return [];
+    throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
   }
+  if (!Array.isArray(parsed)) throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  // Match the authoritative parser: non-string entries are malformed, not
+  // coercion targets. Only registered country identities can become seeds.
+  if (parsed.some(entry => typeof entry !== 'string')) {
+    throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
+  }
+  return [...new Set((parsed as string[])
+    .map(canonicalCountry)
+    .filter(country => Boolean(country) && isKnownCountry(country)))];
+}
+
+/**
+ * Cursor/day outcome for one sweep window.
+ *
+ * - No failures: every selected country was processed (including empty seeds),
+ *   so close the day and advance the full window.
+ * - Partial failure: advance past completed countries but keep the day open so
+ *   the failed country is retried.
+ * - No progress: leave both cursor and day unchanged.
+ */
+export function relationshipSeedSweepProgress(input: {
+  selectedCount: number;
+  completed: number;
+  failures: number;
+}): { recordDay: boolean; cursorAdvance: number } {
+  if (input.failures === 0) return { recordDay: true, cursorAdvance: input.selectedCount };
+  return { recordDay: false, cursorAdvance: Math.max(0, input.completed) };
 }
 
 /**
@@ -102,7 +131,7 @@ function selectedCountries(raw: string): string[] {
  * relationship_canary_enabled is explicitly true.
  */
 export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
-  status: 'DISABLED' | 'ALREADY_RAN' | 'NO_COUNTRIES' | 'COMPLETED';
+  status: 'DISABLED' | 'ALREADY_RAN' | 'NO_COUNTRIES' | 'INVALID_SCOPE' | 'COMPLETED';
   queued: number;
   countries: string[];
 }> {
@@ -113,12 +142,19 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
   const lastDay = await getAppSetting('relationship_canary_seed_sweep_day', '');
   if (lastDay === day) return { status: 'ALREADY_RAN', queued: 0, countries: [] };
 
-  const scope = String(await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL') || 'GLOBAL').trim().toUpperCase();
-  const configured = scope === 'SELECTED_COUNTRIES'
-    ? selectedCountries(await getAppSetting('query_intelligence_selected_countries', ''))
-    : [];
-  if (scope === 'SELECTED_COUNTRIES' && !configured.length) {
-    return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
+  const rawScope = await getAppSetting('query_intelligence_discovery_scope', 'GLOBAL');
+  const scope = typeof rawScope === 'string' ? rawScope.trim().toUpperCase() : '';
+  if (scope !== 'GLOBAL' && scope !== 'SELECTED_COUNTRIES') {
+    return { status: 'INVALID_SCOPE', queued: 0, countries: [] };
+  }
+  let configured: string[] = [];
+  if (scope === 'SELECTED_COUNTRIES') {
+    try {
+      configured = parseSelectedCountries(await getAppSetting('query_intelligence_selected_countries', '[]'));
+    } catch {
+      return { status: 'INVALID_SCOPE', queued: 0, countries: [] };
+    }
+    if (!configured.length) return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
   }
   const countries = [...new Set(scope === 'SELECTED_COUNTRIES' ? configured : DEFAULT_NON_DORMANT_COUNTRIES)];
   if (!countries.length) return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
@@ -128,13 +164,20 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
   );
 
   let queued = 0;
+  let completed = 0;
   let failures = 0;
   const queuedCountries: string[] = [];
   for (const country of selected) {
     try {
       await assertCountryAllowed(country, 'relationship-canary:seed-sweep');
       const selection = await selectRelationshipCanarySeeds(country);
-      if (!selection.seeds.length) continue;
+      if (!selection.seeds.length) {
+        // A completed selection with no eligible/cooldown seeds must still
+        // advance the rotation; otherwise the sweep checks the same pair
+        // forever and never reaches later countries.
+        completed += 1;
+        continue;
+      }
       const cohortId = `seed:${country}:${day}`.normalize('NFKC').toLowerCase().replace(/[^a-z0-9:-]+/g, '-').slice(0, 80);
       const payload = validateRelationshipCanaryPayload({
         cohortId,
@@ -155,17 +198,29 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
         },
       );
       queued += 1;
+      completed += 1;
       queuedCountries.push(country);
-    } catch {
+    } catch (error: any) {
+      if (error?.code === 'COUNTRY_EXCLUDED') {
+        // Exclusion is permanent for this country; do not let it pin the
+        // cursor forever.
+        completed += 1;
+        continue;
+      }
       failures += 1;
       // A single country's provider/admission failure must not abort the sweep.
     }
   }
-  // Do not burn the day's sweep when every selected country failed before a
-  // durable enqueue. A later cycle may then retry the same cursor position.
-  if (queued > 0 && failures === 0) {
+  const progress = relationshipSeedSweepProgress({
+    selectedCount: selected.length,
+    completed,
+    failures,
+  });
+  if (progress.recordDay) {
     await setAppSetting('relationship_canary_seed_sweep_day', day).catch(() => undefined);
-    await setAppSetting('relationship_canary_seed_cursor', String(cursor + selected.length)).catch(() => undefined);
+  }
+  if (progress.cursorAdvance > 0) {
+    await setAppSetting('relationship_canary_seed_cursor', String(cursor + progress.cursorAdvance)).catch(() => undefined);
   }
   return { status: 'COMPLETED', queued, countries: queuedCountries };
 }

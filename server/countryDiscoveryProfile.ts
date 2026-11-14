@@ -6,9 +6,9 @@ import { normalizeLanguageCode } from './languageCodes';
  *
  * The supported-country registry and declared languages are authoritative.
  * Region codes are the only additional YouTube-specific fact. Discovery
- * language order is preserved for rotation, while weights are used only by
- * generation so a low-volume secondary language cannot crowd out the primary
- * market language.
+ * language order is preserved for rotation; every declared language gets an
+ * equal turn so a low-volume secondary language is not starved. Weights order
+ * generation prompts and break ties only.
  */
 export interface CountryDiscoveryLanguage {
   code: string;
@@ -88,7 +88,7 @@ function buildProfiles(): Record<string, CountryDiscoveryProfile> {
     // added to the registry without a weight, include it at a conservative
     // secondary weight instead of silently dropping it.
     const orderedCodes = [...new Set([...configured.map(([code]) => code), ...declared])];
-    const languages = orderedCodes.map((code, index) => ({
+    const languages = orderedCodes.map((code, index) => Object.freeze({
       code,
       weight: byCode.get(code) ?? (index === 0 ? 1 : 0.1),
     }));

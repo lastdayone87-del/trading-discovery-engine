@@ -12,6 +12,7 @@ import {
 import { getCountryMarketProfile } from './profiles';
 import { TERMINOLOGY_SEARCHABILITY_VERSION } from '../terminologySearchability';
 import { parseQueryGenerationProvenance } from '../queryGenerationProvenance';
+import { normalizeLanguageCode } from '../languageCodes';
 import type {
   QueryAdmission,
   QueryAtom,
@@ -233,11 +234,18 @@ export function candidateFromQueryRecord(
   const relation = TEMPLATE_RELATION[String(metadata.queryTemplate || '').toUpperCase()];
   const generatedProvenance = parseQueryGenerationProvenance(metadata.generationProvenance);
   const generatedProfile = getCountryMarketProfile(record.country);
+  const generatedLanguage = normalizeLanguageCode(generatedProvenance?.language || '');
+  const candidateLanguage = normalizeLanguageCode(language);
   const generatedNativePhrase = metadata.generatedNativePhrase === true
     && ['LLM_NATIVE_PHRASE', 'AUTOCOMPLETE_PHRASE'].includes(String(metadata.queryTemplate || '').toUpperCase())
     && (generatedProvenance?.source === 'LLM' || generatedProvenance?.source === 'AUTOCOMPLETE')
     && generatedProvenance?.country.toLowerCase() === record.country.toLowerCase()
-    && generatedProfile.languages.includes(generatedProvenance.language);
+    && generatedProfile.languages.includes(generatedProvenance.language)
+    // The generated phrase bypass is language-specific. A French provenance
+    // must not authorize a phrase being admitted as German (or vice versa)
+    // merely because both languages belong to the same country profile.
+    && Boolean(generatedLanguage)
+    && generatedLanguage === candidateLanguage;
   const candidate = buildQueryCandidate({
     query: record.query,
     country,

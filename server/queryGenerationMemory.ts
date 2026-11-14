@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { canonicalCountry } from './countryInference';
 import { getDb } from './db';
 import { semanticQueryKey } from './queryQuality/composition';
 import type { QueryGenerationMode, QueryGenerationSource } from './queryGenerationProvenance';
@@ -102,12 +103,27 @@ export async function getCandidateMemory(country: string, language: string, limi
   return result.rows.map(mapMemory);
 }
 
+const CANDIDATE_STATUS_RANK: Record<CandidateMemoryInput['status'], number> = {
+  GENERATED: 0,
+  DUPLICATE: 1,
+  REJECTED: 2,
+  PROPOSED: 3,
+  ADMITTED: 4,
+};
+
 export async function rememberQueryCandidates(candidates: CandidateMemoryInput[]): Promise<number> {
   const unique = new Map<string, CandidateMemoryInput>();
   for (const candidate of candidates) {
     const normalized = normalizeMemoryQuery(candidate.query);
     if (!normalized) continue;
-    unique.set(`${candidate.country}|${candidate.language}|${normalized}`, { ...candidate, query: normalized });
+    const country = canonicalCountry(candidate.country);
+    const key = `${country.toLocaleLowerCase('en')}|${candidate.language}|${normalized}`;
+    const existing = unique.get(key);
+    // Status is monotonic within one write set: an accepted proposal must not
+    // be downgraded by a later duplicate decision for the same surface.
+    if (!existing || CANDIDATE_STATUS_RANK[candidate.status] >= CANDIDATE_STATUS_RANK[existing.status]) {
+      unique.set(key, { ...candidate, country, query: normalized });
+    }
   }
   if (!unique.size) return 0;
   const db = await getDb();
@@ -119,16 +135,20 @@ export async function rememberQueryCandidates(candidates: CandidateMemoryInput[]
          country,language,source,mode,normalized_query,semantic_key,status,
          reason_codes,batch_key,metadata,first_seen_at,last_seen_at
        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,now(),now())
-       ON CONFLICT(country,language,normalized_query) DO UPDATE SET
+       ON CONFLICT(LOWER(country),language,normalized_query) DO UPDATE SET
          status=CASE
-           WHEN query_candidate_memory.status='ADMITTED' THEN query_candidate_memory.status
-           WHEN query_candidate_memory.status='PROPOSED' AND EXCLUDED.status='REJECTED' THEN 'PROPOSED'
+           WHEN query_candidate_memory.status='ADMITTED' THEN 'ADMITTED'
            WHEN EXCLUDED.status='ADMITTED' THEN 'ADMITTED'
-           WHEN query_candidate_memory.status='REJECTED' AND EXCLUDED.status NOT IN ('ADMITTED','REJECTED') THEN 'REJECTED'
+           WHEN query_candidate_memory.status='PROPOSED' THEN 'PROPOSED'
+           WHEN EXCLUDED.status='PROPOSED' THEN 'PROPOSED'
+           WHEN query_candidate_memory.status='REJECTED' THEN 'REJECTED'
+           WHEN EXCLUDED.status='REJECTED' THEN 'REJECTED'
            ELSE EXCLUDED.status
          END,
          reason_codes=CASE
            WHEN EXCLUDED.status='ADMITTED' THEN '[]'::jsonb
+           WHEN query_candidate_memory.status='ADMITTED' THEN query_candidate_memory.reason_codes
+           WHEN EXCLUDED.status='PROPOSED' THEN '[]'::jsonb
            WHEN query_candidate_memory.status='PROPOSED' AND EXCLUDED.status='REJECTED' THEN query_candidate_memory.reason_codes
            WHEN jsonb_array_length(EXCLUDED.reason_codes)>0 THEN EXCLUDED.reason_codes
            ELSE query_candidate_memory.reason_codes
