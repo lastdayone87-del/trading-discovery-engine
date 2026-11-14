@@ -5,7 +5,11 @@ import {
   createProposalDedupKey,
   generateCountryNativeProposals,
   generateCreatorDerivedProposals,
-  generateFrontierProposalsForCountry
+  generateFrontierProposalsForCountry,
+  cachedSelectionStart,
+  generationBatchIdentity,
+  generationSelectionKey,
+  rotateCachedSelection
 } from './discoveryProposalGenerators';
 
 test('Phase 6: Proposal dedup key is deterministic and unique across dimensions', () => {
@@ -143,4 +147,35 @@ test('creator-derived generator uses the channels schema and governed vocabulary
   assert.match(source, /pilotPolicyVersion: options\.pilotPolicyVersion/);
   assert.match(source, /dedupDiscriminator: options\.pilotAssignmentKey \|\| options\.pilotQuotaDay/);
   assert.doesNotMatch(source, /c\.title/);
+});
+
+test('cached generation selection rotates through the batch instead of repeating the first slots', () => {
+  const items = ['a', 'b', 'c', 'd'];
+  assert.deepEqual(rotateCachedSelection(items, 0, 2), { selected: ['a', 'b'], nextCursor: 2 });
+  assert.deepEqual(rotateCachedSelection(items, 2, 2), { selected: ['c', 'd'], nextCursor: 4 });
+  assert.deepEqual(rotateCachedSelection(items, 4, 2), { selected: ['a', 'b'], nextCursor: 6 });
+  assert.deepEqual(rotateCachedSelection(items, 3, 2), { selected: ['d', 'a'], nextCursor: 5 });
+  assert.deepEqual(rotateCachedSelection([], 5, 2), { selected: [], nextCursor: 5 });
+  assert.deepEqual(rotateCachedSelection(items, -2, 2), { selected: ['a', 'b'], nextCursor: 2 });
+});
+
+test('cached selection is keyed by stable batch identity, not by country alone', () => {
+  assert.equal(generationBatchIdentity([]), 'nocache');
+  assert.equal(generationBatchIdentity(['b', 'a']), generationBatchIdentity(['a', 'b']));
+  assert.notEqual(generationBatchIdentity(['a']), generationBatchIdentity(['b']));
+  assert.equal(generationBatchIdentity(['a', 'a']), generationBatchIdentity(['a']));
+});
+
+test('selection state is bounded by mode and language signature and resets per batch', () => {
+  assert.notEqual(
+    generationSelectionKey('OPEN_WORLD', ['en']),
+    generationSelectionKey('OPEN_WORLD', ['fr']),
+  );
+  assert.equal(
+    generationSelectionKey('OPEN_WORLD', ['fr', 'en']),
+    generationSelectionKey('OPEN_WORLD', ['en', 'fr']),
+  );
+  assert.equal(cachedSelectionStart({ batch: 'a', cursor: 7 }, 'a'), 7);
+  assert.equal(cachedSelectionStart({ batch: 'a', cursor: 7 }, 'b'), 0);
+  assert.equal(cachedSelectionStart(undefined, 'a'), 0);
 });

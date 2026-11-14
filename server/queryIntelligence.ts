@@ -47,7 +47,9 @@ import { assertCountryAllowed } from './countryExclusion';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { isTerminologyKillSwitchActive, TERMINOLOGY_KILL_SWITCH_KEY } from './terminologyKillSwitch';
 import { isForbiddenProseQuery, normalizeQuery, planCountryNativeProposalQuery, planDiverseQueries, planFrontierTargetedQuery, rotateAwayFromMostRecentIntent, reformulatePollutedQuery, shouldGenerateNativeQueries } from './queryPlanner';
-import { revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
+import { parseGenerationMetadata, revalidateQueryRecordAdmission, withQueryAdmission, type QueryRecordAdmission } from './queryQuality/admission';
+import { parseQueryGenerationProvenance } from './queryGenerationProvenance';
+import { rememberQueryCandidates } from './queryGenerationMemory';
 import { isRewardEligibleQuota } from './queryQuality/accounting';
 import { selectionHistoryFor } from './queryQuality/composition';
 import {
@@ -72,7 +74,7 @@ import { attributeTerminologyPerformance, buildNoveltyBaseline, classifyNativeCa
 import type { ExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
 import { canonicalCountry } from './countryInference';
 import { selectExplicitTerminologyLanguageContext } from './terminologyLanguageContext';
-import { isExtractedStandaloneQuery, isNuisanceVocabularySurface, reviewedNativePhraseLanguages } from './terminologySearchability';
+import { isExtractedStandaloneQuery, isNuisanceVocabularySurface, isSearchableTradingTerm, reviewedNativePhraseLanguages } from './terminologySearchability';
 import { assessLlmQueryCandidates, deriveDeterministicQueryCandidates, type ExtractedQueryCandidate, type ExtractedQuerySource } from './extractedQueryDiscovery';
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { executeProviderCall, resolveGeminiRouteId } from './providerResilience';
@@ -2078,7 +2080,9 @@ export type QueryIntelligenceAuthorizationCode =
   | 'EVIDENCE_CHECKSUM_MISSING'
   | 'QUERY_SPECIFICITY_REJECTED'
   | 'RETRIEVAL_ANCHOR_UNAVAILABLE'
-  | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM';
+  | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM'
+  | 'QUERY_ADMISSION_REJECTED'
+  | 'QUERY_HOLD_ACTIVE';
 
 export type QueryIntelligenceAuthorizationOutcome =
   | { status: 'AUTHORIZED'; code: 'AUTHORIZED'; queryRecord: QueryRecord }
@@ -2091,6 +2095,7 @@ type CountryNativeAuthorizationInput = {
   proposalId: string;
   targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
   proposalEvidenceSnapshot: Record<string, any>;
+  scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
 };
 
 export type QueryIntelligenceAuthorizationInputResult =
@@ -2115,9 +2120,34 @@ export function classifyCountryNativeAuthorizationInput(args: CountryNativeAutho
   if (!evidence.evidenceChecksum) return { status: 'REJECTED', code: 'EVIDENCE_CHECKSUM_MISSING' };
   const normalizedNativeTerm = nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const nativeTokenCount = normalizedNativeTerm.split(/\s+/).length;
+  const generatedProvenance = evidence.generationProvenance && typeof evidence.generationProvenance === 'object'
+    ? evidence.generationProvenance as Record<string, unknown>
+    : null;
+  const generatedNative = String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'LLM_NATIVE_QUERY'
+    || String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'YOUTUBE_AUTOCOMPLETE'
+    || generatedProvenance?.source === 'LLM'
+    || generatedProvenance?.source === 'AUTOCOMPLETE';
   // Reviewed native phrases are the only bounded exception to the three-token
-  // specificity cap; arbitrary long proposals still fail closed.
+  // specificity cap; arbitrary long proposals still fail closed. Generated
+  // native surfaces are a second bounded exception, but only after the same
+  // searchability and language checks used by the planner.
   if (nativeTokenCount > 3) {
+    const declaredLanguage = normalizeLanguageCode(String(evidence.language || evidence.locale || ''));
+    const supportedLanguages = countrySearchLanguageCandidates(args.country);
+    if (generatedNative && nativeTokenCount <= 6) {
+      const gate = isSearchableTradingTerm({
+        term: normalizedNativeTerm,
+        termType: 'PHRASE',
+        country: args.country,
+        language: declaredLanguage || supportedLanguages[0],
+        maxTokens: 6,
+        requireTradingSemantics: false,
+      });
+      if (!gate.eligible || (declaredLanguage && !supportedLanguages.includes(declaredLanguage))) {
+        return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
+      }
+      return { status: 'VALID', nativeTerm, evidence, targetKey };
+    }
     const phraseLanguages = reviewedNativePhraseLanguages(normalizedNativeTerm);
     if (!phraseLanguages.length) {
       return { status: 'REJECTED', code: 'QUERY_SPECIFICITY_REJECTED' };
@@ -2125,8 +2155,6 @@ export function classifyCountryNativeAuthorizationInput(args: CountryNativeAutho
     // The phrase's language must be compatible with the target country, and
     // with any explicit language evidence. This stops an Italian phrase from
     // being authorized as a Japanese native query.
-    const declaredLanguage = normalizeLanguageCode(String(evidence.language || evidence.locale || ''));
-    const supportedLanguages = countrySearchLanguageCandidates(args.country);
     const languageCompatible = declaredLanguage
       ? supportedLanguages.includes(declaredLanguage) && phraseLanguages.includes(declaredLanguage)
       : phraseLanguages.some(language => supportedLanguages.includes(language));
@@ -2172,8 +2200,19 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
         targetNeighborhoodDimensions: args.targetNeighborhoodDimensions,
         evidenceChecksum: evidence.evidenceChecksum,
         canonicalTermId: evidence.canonicalTermId ?? null,
-        evidenceRevision: evidence.evidenceRevision ?? null
-      }
+        evidenceRevision: evidence.evidenceRevision ?? null,
+        generationProvenance: evidence.generationProvenance ?? null,
+        sourceProvenanceFamily: evidence.sourceProvenanceFamily ?? null
+      },
+      generationSource: String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'YOUTUBE_AUTOCOMPLETE'
+        || evidence.generationProvenance?.source === 'AUTOCOMPLETE'
+        ? 'YOUTUBE_AUTOCOMPLETE'
+        : String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'LLM_NATIVE_QUERY'
+          || evidence.generationProvenance?.source === 'LLM'
+          ? 'LLM_NATIVE_QUERY'
+          : null,
+      generationProvenance: evidence.generationProvenance ?? null,
+      scopePromotionBasis: args.scopePromotionBasis
     });
     if (!planned) return { status: 'REJECTED', code: 'RETRIEVAL_ANCHOR_UNAVAILABLE', queryRecord: null };
     if (!planned.query.normalize('NFKC').toLocaleLowerCase('en').includes(nativeTerm.normalize('NFKC').toLocaleLowerCase('en'))) {
@@ -2192,6 +2231,35 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
       primaryTerm: planned.primaryTerm,
       generationMetadata: planned.metadata
     });
+    // Persistence is not authorization. A native/LLM/autocomplete surface that
+    // admission marked duplicate, speculative or otherwise ineligible must not
+    // reach the scheduler merely because the proposal row was materialized.
+    const generationMetadata = parseGenerationMetadata(queryRecord.generation_metadata);
+    const admission = generationMetadata.queryAdmission as
+      { eligible?: boolean } | undefined;
+    // A hold is a terminal quarantine. The upsert preserves the old
+    // queryAdmission metadata, so `eligible` can remain true after a hold makes
+    // the row REJECTED; the row state must also veto authorization.
+    const holdActive = queryRecord.collection === 'REJECTED' || generationMetadata.queryHold != null;
+    if (holdActive) {
+      return { status: 'REJECTED', code: 'QUERY_HOLD_ACTIVE', queryRecord: null };
+    }
+    if (admission?.eligible !== true) {
+      return { status: 'REJECTED', code: 'QUERY_ADMISSION_REJECTED', queryRecord: null };
+    }
+    const provenance = parseQueryGenerationProvenance(generationMetadata.generationProvenance);
+    if (provenance) {
+      await rememberQueryCandidates([{
+        country: queryRecord.country,
+        language: provenance.language,
+        source: provenance.source,
+        mode: provenance.mode,
+        query: queryRecord.query,
+        status: 'ADMITTED',
+        batchKey: provenance.batchId,
+        metadata: { intent: queryRecord.intent },
+      }]).catch(() => 0);
+    }
     return { status: 'AUTHORIZED', code: 'AUTHORIZED', queryRecord };
   } catch (error: any) {
     return {
@@ -2210,6 +2278,7 @@ export async function constructCountryNativeAllocationQuery(args: {
   proposalId: string;
   targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
   proposalEvidenceSnapshot: Record<string, any>;
+  scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
 }): Promise<QueryRecord | null> {
   const outcome = await authorizeCountryNativeAllocationQuery(args);
   return outcome.status === 'AUTHORIZED' ? outcome.queryRecord : null;

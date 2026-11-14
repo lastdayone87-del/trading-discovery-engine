@@ -1,0 +1,348 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { INITIAL_COUNTRY_VOCABULARIES } from '../src/data/initial_countries';
+import { admitQueryRecord } from './queryQuality/admission';
+import { buildFrontierProposal } from './discoveryProposalGenerators';
+import { hasGeneratedCtaOrPlatform, planCountryNativeProposalQuery } from './queryPlanner';
+import { classifyCountryNativeAuthorizationInput } from './queryIntelligence';
+import { assessGeneratedNativeQuery, dedupeGeneratedCandidates } from './nativeQueryGeneration';
+import { allocateNativeGenerationSlots } from './discoveryProposalGenerators';
+
+const france = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'France');
+const italy = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'Italy');
+const japan = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === 'Japan');
+assert.ok(france);
+assert.ok(italy);
+assert.ok(japan);
+
+const provenance = {
+  source: 'LLM' as const,
+  mode: 'OPEN_WORLD' as const,
+  provider: 'groq',
+  model: 'test-model',
+  promptVersion: 'native-query-v1',
+  batchId: 'batch-fr',
+  country: 'France',
+  language: 'fr',
+  persona: null,
+  scenario: null,
+  prefix: null,
+  generatedAt: '2026-11-13T00:00:00.000Z',
+};
+
+test('a genuine 4-6 word generated native phrase is admitted as a bounded standalone surface', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'France',
+    nativeTerm: 'analyse technique CAC 40',
+    countryVocabulary: france,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-1', proposalId: 'proposal-1' },
+    language: 'fr',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: provenance,
+  });
+  assert.ok(planned, 'generated phrase should plan');
+  assert.equal(planned.query, 'analyse technique CAC 40');
+  assert.equal(planned.metadata.queryTemplate, 'LLM_NATIVE_PHRASE');
+  assert.equal(planned.metadata.generatedNativePhrase, true);
+
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'France',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+  assert.notEqual(admission.admission.tier, 'SPECULATIVE');
+});
+
+test('generated admission accepts a regional provenance tag for the same language', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'France',
+    nativeTerm: 'analyse technique CAC 40',
+    countryVocabulary: france,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-region', proposalId: 'proposal-region' },
+    language: 'fr-FR',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: { ...provenance, language: 'fr-FR' },
+  });
+  assert.ok(planned);
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'France',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+});
+
+test('a single unspaced Japanese surface is admitted as a bounded generated phrase', () => {
+  const japaneseProvenance = {
+    ...provenance,
+    batchId: 'batch-jp',
+    country: 'Japan',
+    language: 'ja',
+  };
+  assert.ok(assessGeneratedNativeQuery({
+    query: '日経225先物',
+    country: 'Japan',
+    language: 'ja',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test-model',
+    batchId: 'batch-jp',
+  }));
+  assert.ok(assessGeneratedNativeQuery({
+    query: '板情報',
+    country: 'Japan',
+    language: 'ja',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test-model',
+    batchId: 'batch-jp-short',
+  }));
+  const shortPlanned = planCountryNativeProposalQuery({
+    country: 'Japan',
+    nativeTerm: '板情報',
+    countryVocabulary: japan,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-jp-short', proposalId: 'proposal-jp-short' },
+    language: 'ja',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: japaneseProvenance,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  assert.ok(shortPlanned);
+  assert.equal(admitQueryRecord({
+    query: shortPlanned.query,
+    country: 'Japan',
+    primary_term: shortPlanned.primaryTerm,
+    generation_metadata: shortPlanned.metadata,
+  }).eligible, true);
+  const planned = planCountryNativeProposalQuery({
+    country: 'Japan',
+    nativeTerm: '日経225先物',
+    countryVocabulary: japan,
+    targetIntent: 'futures',
+    allocationLineage: { decisionId: 'decision-jp', proposalId: 'proposal-jp' },
+    language: 'ja',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: japaneseProvenance,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  assert.ok(planned);
+  assert.equal(planned.metadata.tokenCount, 1);
+  assert.equal(planned.metadata.unspacedScript, true);
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'Japan',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+});
+
+test('scope promotion authorizes generated phrases for selected dormant countries', () => {
+  const italianProvenance = {
+    ...provenance,
+    batchId: 'batch-it',
+    country: 'Italy',
+    language: 'it',
+  };
+  const planned = planCountryNativeProposalQuery({
+    country: 'Italy',
+    nativeTerm: 'analisi tecnica FTSE MIB',
+    countryVocabulary: italy,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-it', proposalId: 'proposal-it' },
+    language: 'it',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: italianProvenance,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  assert.ok(planned);
+  assert.equal(planned.metadata.scopePromoted, true);
+  assert.equal(planned.metadata.promotionBasis, 'PERSISTENT_SCOPE_SELECTION');
+
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'Italy',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+});
+
+test('generated admission rejects provenance from a different language in the same country', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'France',
+    nativeTerm: 'analyse technique CAC 40',
+    countryVocabulary: france,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-lang', proposalId: 'proposal-lang' },
+    language: 'fr',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: { ...provenance, language: 'de' },
+  });
+  assert.ok(planned);
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'France',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  // The provenance's German tag must not authorize a French phrase as a
+  // generated whole-query exception.
+  assert.equal(admission.eligible, false);
+});
+
+test('native authorization accepts generated 4-6 word evidence but rejects >6 words', () => {
+  const proposal = buildFrontierProposal({
+    proposalFamily: 'COUNTRY_NATIVE',
+    country: 'France',
+    language: 'fr',
+    concept: 'analyse technique CAC 40',
+    intent: 'market_analysis',
+    sourceProvenance: 'llm_native_query:test',
+    supportingEvidence: {
+      nativeTerm: 'analyse technique CAC 40',
+      sourceProvenanceFamily: 'LLM_NATIVE_QUERY',
+      language: 'fr',
+      generationProvenance: provenance,
+    },
+    noveltyRationale: 'test',
+  });
+  const snapshot = {
+    proposalFamily: 'COUNTRY_NATIVE',
+    targetNeighborhoodKey: proposal.targetNeighborhoodKey,
+    targetDimensions: proposal.targetDimensions,
+    supportingEvidence: proposal.supportingEvidence,
+  };
+  assert.equal(classifyCountryNativeAuthorizationInput({
+    country: 'France',
+    decisionId: 'd1',
+    proposalId: 'p1',
+    targetNeighborhoodDimensions: proposal.targetDimensions,
+    proposalEvidenceSnapshot: snapshot,
+  }).status, 'VALID');
+
+  const tooLong = buildFrontierProposal({
+    proposalFamily: 'COUNTRY_NATIVE',
+    country: 'France',
+    language: 'fr',
+    concept: 'analyse technique CAC 40 pour les débutants',
+    intent: 'education',
+    sourceProvenance: 'llm_native_query:test',
+    supportingEvidence: {
+      nativeTerm: 'analyse technique CAC 40 pour les débutants',
+      sourceProvenanceFamily: 'LLM_NATIVE_QUERY',
+      language: 'fr',
+      generationProvenance: provenance,
+    },
+    noveltyRationale: 'test',
+  });
+  const tooLongResult = classifyCountryNativeAuthorizationInput({
+    country: 'France',
+    decisionId: 'd2',
+    proposalId: 'p2',
+    targetNeighborhoodDimensions: tooLong.targetDimensions,
+    proposalEvidenceSnapshot: {
+      proposalFamily: 'COUNTRY_NATIVE',
+      targetNeighborhoodKey: tooLong.targetNeighborhoodKey,
+      targetDimensions: tooLong.targetDimensions,
+      supportingEvidence: tooLong.supportingEvidence,
+    },
+  });
+  assert.equal(tooLongResult.status, 'REJECTED');
+  if (tooLongResult.status === 'REJECTED') assert.equal(tooLongResult.code, 'QUERY_SPECIFICITY_REJECTED');
+});
+
+test('generated query validation rejects generic long and CTA surfaces', () => {
+  assert.ok(assessGeneratedNativeQuery({
+    query: 'analyse technique CAC 40',
+    country: 'France',
+    language: 'fr',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test',
+    batchId: 'b1',
+  }));
+  assert.equal(assessGeneratedNativeQuery({
+    query: 'analyse technique CAC 40 pour les débutants aujourd hui',
+    country: 'France',
+    language: 'fr',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test',
+    batchId: 'b2',
+  }), null);
+  assert.equal(assessGeneratedNativeQuery({
+    query: 'subscribe to my trading channel',
+    country: 'France',
+    language: 'fr',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test',
+    batchId: 'b3',
+  }), null);
+});
+
+test('CTA detection does not reject ordinary like/comment/follow words', () => {
+  assert.equal(hasGeneratedCtaOrPlatform('comment trader'), false);
+  assert.equal(hasGeneratedCtaOrPlatform('stocks like tesla'), false);
+  assert.equal(hasGeneratedCtaOrPlatform('follow the trend'), false);
+  assert.equal(hasGeneratedCtaOrPlatform('like and subscribe'), true);
+  assert.equal(hasGeneratedCtaOrPlatform('comment below'), true);
+  assert.equal(hasGeneratedCtaOrPlatform('follow me for more'), true);
+  assert.equal(hasGeneratedCtaOrPlatform('join my telegram'), true);
+
+  assert.ok(assessGeneratedNativeQuery({
+    query: 'comment trader',
+    country: 'France',
+    language: 'fr',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'test',
+    model: 'test',
+    batchId: 'cta-1',
+  }));
+  assert.ok(assessGeneratedNativeQuery({
+    query: 'stocks like tesla',
+    country: 'United States',
+    language: 'en',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'test',
+    model: 'test',
+    batchId: 'cta-2',
+  }));
+});
+
+test('generated batch dedupe removes repeats but keeps distinct intentions', () => {
+  const result = dedupeGeneratedCandidates([
+    { query: 'DAX Analyse heute', country: 'Germany', intent: 'market_analysis' },
+    { query: 'DAX Analyse heute', country: 'Germany', intent: 'market_analysis' },
+    { query: 'DAX live trading', country: 'Germany', intent: 'live_trading' },
+  ]);
+  assert.deepEqual(result.accepted.map(item => item.query), ['DAX Analyse heute', 'DAX live trading']);
+  assert.equal(result.rejected.length, 1);
+});
+
+
+test('default proposal cap keeps all three generation modes visible', () => {
+  assert.deepEqual(allocateNativeGenerationSlots(5, { OPEN_WORLD: 10, REAL_SIGNAL: 10, GROUNDED: 10 }), {
+    OPEN_WORLD: 3,
+    REAL_SIGNAL: 1,
+    GROUNDED: 1,
+  });
+  const ten = allocateNativeGenerationSlots(10, { OPEN_WORLD: 10, REAL_SIGNAL: 10, GROUNDED: 10 });
+  assert.ok(ten.OPEN_WORLD > ten.REAL_SIGNAL);
+  assert.ok(ten.REAL_SIGNAL > 0);
+  assert.ok(ten.GROUNDED > 0);
+});

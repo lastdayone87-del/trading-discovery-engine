@@ -3,6 +3,7 @@ import test from 'node:test';
 import { INITIAL_COUNTRY_VOCABULARIES } from '../src/data/initial_countries';
 import { planDiverseQueries, shouldGenerateNativeQueries } from './queryPlanner';
 import { admitQueryRecord } from './queryQuality/admission';
+import { generateNativeQueriesWithLlm, shouldRegenerateCachedGeneration } from './nativeQueryGeneration';
 
 function vocabulary(country: string) {
   const found = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === country);
@@ -57,6 +58,199 @@ test('selected dormant countries can admit their native standalone surfaces', ()
     generation_metadata: native.metadata,
   });
   assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
+});
+
+test('underfilled cache regenerates only when memory removed candidates', () => {
+  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 4, lostToMemory: 6 }), true);
+  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 4, lostToMemory: 0 }), false);
+  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 10, lostToMemory: 0 }), false);
+});
+
+function inMemoryGenerationStore() {
+  const batches = new Map<string, { payload: Record<string, unknown>; status: string }>();
+  return {
+    getGenerationBatch: async (key: string) => {
+      const row = batches.get(key);
+      return row && (row.status === 'COMPLETED' || row.status === 'LOW_NOVELTY') ? row.payload : null;
+    },
+    rememberQueryCandidates: async () => 0,
+    upsertGenerationBatch: async (input: { batchKey: string; payload: Record<string, unknown>; status?: string }) => {
+      batches.set(input.batchKey, { payload: input.payload, status: input.status || 'COMPLETED' });
+    },
+  };
+}
+
+test('duplicateRate counts duplicate decisions only, not validation failures', async () => {
+  let call = 0;
+  const result = await generateNativeQueriesWithLlm({
+    memoryStore: inMemoryGenerationStore(),
+    context: {
+      country: 'France',
+      language: 'fr',
+      mode: 'OPEN_WORLD',
+      existingQueries: [],
+      candidateMemory: [],
+      coverageGaps: [],
+      autocompleteSuggestions: [],
+      localVocabulary: [],
+    },
+    count: 2,
+    generateText: async () => {
+      call += 1;
+      const queries = call === 1
+        ? [
+            { query: 'analyse technique CAC 40', intent: 'market_analysis', confidence: 0.8 },
+            { query: 'subscribe to my trading channel', intent: 'education', confidence: 0.8 },
+          ]
+        : [
+            { query: 'bourse direct avis', intent: 'strategy', confidence: 0.8 },
+          ];
+      return { text: JSON.stringify({ queries }), provider: 'test', model: 'test' };
+    },
+  });
+  assert.equal(result.candidates.length, 2);
+  // One CTA was rejected by validation, but no candidate was rejected as a
+  // duplicate. The old rejection-rate metric would have reported 1/3.
+  assert.equal(result.duplicateRate, 0);
+});
+
+test('an all-invalid provider batch does not suppress regeneration from cache', async () => {
+  let calls = 0;
+  const memoryStore = inMemoryGenerationStore();
+  const context = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    existingQueries: [],
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const first = await generateNativeQueriesWithLlm({
+    context,
+    count: 2,
+    memoryStore,
+    generateText: async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({ queries: [{ query: 'subscribe to my trading channel', intent: 'education' }] }),
+        provider: 'test',
+        model: 'test',
+      };
+    },
+  });
+  assert.equal(first.candidates.length, 0);
+  const callsAfterFirst = calls;
+
+  const second = await generateNativeQueriesWithLlm({
+    context,
+    count: 2,
+    memoryStore,
+    generateText: async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({ queries: [
+          { query: 'analyse technique CAC 40', intent: 'market_analysis' },
+          { query: 'bourse direct avis', intent: 'strategy' },
+        ] }),
+        provider: 'test',
+        model: 'test',
+      };
+    },
+  });
+  assert.equal(second.candidates.length, 2);
+  assert.ok(calls > callsAfterFirst, 'the FAILED batch must not be reused from cache');
+});
+
+test('an all-duplicate LOW_NOVELTY batch is reused without repeating provider work', async () => {
+  let calls = 0;
+  const memoryStore = inMemoryGenerationStore();
+  const context = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    existingQueries: [{ query: 'analyse technique CAC 40', country: 'France', intent: 'market_analysis' }],
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const generateText = async () => {
+    calls += 1;
+    return {
+      text: JSON.stringify({ queries: [{ query: 'analyse technique CAC 40', intent: 'market_analysis' }] }),
+      provider: 'test',
+      model: 'test',
+    };
+  };
+  const first = await generateNativeQueriesWithLlm({ context, count: 2, memoryStore, generateText });
+  assert.equal(first.candidates.length, 0);
+  const callsAfterFirst = calls;
+
+  const second = await generateNativeQueriesWithLlm({ context, count: 2, memoryStore, generateText });
+  assert.equal(second.candidates.length, 0);
+  assert.equal(second.cached, true);
+  assert.equal(calls, callsAfterFirst, 'all-duplicate LOW_NOVELTY batches must be reused from cache');
+});
+
+test('a failed replacement pass keeps the valid cached subset', async () => {
+  const memoryStore = inMemoryGenerationStore();
+  const context = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    existingQueries: [],
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const first = await generateNativeQueriesWithLlm({
+    context,
+    count: 2,
+    memoryStore,
+    generateText: async () => ({
+      text: JSON.stringify({ queries: [
+        { query: 'analyse technique CAC 40', intent: 'market_analysis', confidence: 0.8 },
+        { query: 'bourse direct avis', intent: 'strategy', confidence: 0.8 },
+      ] }),
+      provider: 'test',
+      model: 'test',
+    }),
+  });
+  assert.equal(first.candidates.length, 2);
+  const admitted = first.candidates[0];
+  const second = await generateNativeQueriesWithLlm({
+    context: {
+      ...context,
+      candidateMemory: [{
+        country: 'France',
+        language: 'fr',
+        source: 'LLM',
+        mode: 'OPEN_WORLD',
+        normalizedQuery: admitted.query,
+        semanticKey: admitted.query,
+        status: 'ADMITTED',
+        reasonCodes: [],
+        batchKey: first.batchId,
+        metadata: { intent: admitted.intent },
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      }],
+    },
+    count: 2,
+    memoryStore,
+    generateText: async () => ({
+      text: JSON.stringify({ queries: [{ query: 'subscribe to my trading channel', intent: 'education' }] }),
+      provider: 'test',
+      model: 'test',
+    }),
+  });
+  // The admitted candidate is removed, but the other cached candidate must
+  // survive the failed replacement pass instead of being replaced by an
+  // empty 14-day cache entry.
+  assert.deepEqual(second.candidates.map(candidate => candidate.query), [first.candidates[1].query]);
 });
 
 test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {

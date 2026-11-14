@@ -1,4 +1,5 @@
 import { apiFetch } from '../apiClient';
+import { formatQueryGenerationTooltip, parseQueryGenerationProvenance, queryGenerationLabel } from '../queryGenerationProvenance';
 import React, { useState, useEffect, useRef } from 'react';
 import { QueryRecord, QueryExecutionLog, CountryVocabulary, CanonicalTradingTerm } from '../types';
 import { SUPPORTED_DORMANT_COUNTRIES } from '../data/initial_countries';
@@ -832,13 +833,33 @@ export const QueryIntelligenceEngine: React.FC<Props> = ({ countryVocabularies }
                         ? 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-800/60'
                         : 'bg-rose-100 text-rose-800 border-rose-200 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-800/60';
 
+                    const provenance = parseQueryGenerationProvenance(q.generation_metadata?.generationProvenance);
+                    const provenanceTone = provenance?.source === 'AUTOCOMPLETE'
+                      ? 'bg-cyan-100 text-cyan-800 border-cyan-200 dark:bg-cyan-950 dark:text-cyan-300 dark:border-cyan-800/60'
+                      : provenance?.mode === 'OPEN_WORLD'
+                        ? 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-950 dark:text-indigo-300 dark:border-indigo-800/60'
+                        : provenance?.mode === 'REAL_SIGNAL'
+                          ? 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-300 dark:border-emerald-800/60'
+                          : 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-800/60';
                     return (
                       <tr key={q.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors">
                         <td className="p-3 font-semibold text-slate-900 dark:text-white">
                           <div className="font-mono text-xs">{q.query}</div>
-                          <span className="inline-block px-2 py-0.5 mt-1 text-[10px] font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 rounded-md">
-                            {q.intent.replace('_', ' ')}
-                          </span>
+                          <div className="mt-1 flex flex-wrap items-center gap-1">
+                            <span className="inline-block px-2 py-0.5 text-[10px] font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 rounded-md">
+                              {q.intent.replace('_', ' ')}
+                            </span>
+                            {provenance && (
+                              <span
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold border rounded-md ${provenanceTone}`}
+                                title={formatQueryGenerationTooltip(provenance)}
+                                aria-label={formatQueryGenerationTooltip(provenance)}
+                              >
+                                <Sparkles className="w-2.5 h-2.5" />
+                                {queryGenerationLabel(provenance)} · {provenance.language}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="p-3 font-medium text-slate-600 dark:text-slate-400">{q.country}</td>
                         <td className="p-3">

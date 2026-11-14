@@ -1,9 +1,15 @@
 import { createHash } from 'node:crypto';
-import { getDb } from './db';
+import { getAppSetting, getCountryVocabularies, getDb, getQueriesByCountry, setAppSetting } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
+import { assertCountryAllowed } from './countryExclusion';
+import { countryDiscoveryLanguagesByWeight, countryDiscoveryRegionCode } from './countryDiscoveryProfile';
+import { generateNativeQueriesWithLlm, NATIVE_QUERY_BATCH_SIZE, type NativeQueryCandidate } from './nativeQueryGeneration';
+import { generateAutocompleteQueries, getCachedAutocompleteSuggestions } from './youtubeAutocomplete';
+import { getCandidateMemory, type CandidateMemoryRow } from './queryGenerationMemory';
+import { dedupeCandidateBatch, type CandidateHistoryItem } from './queryDuplicateGuard';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -665,6 +671,379 @@ export function selectFairCountryNativeProposals(
   return selected;
 }
 
+// 5b. LLM NATIVE Generator
+export function allocateNativeGenerationSlots(
+  limit: number,
+  available: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number>,
+): Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number> {
+  const rows = NATIVE_GENERATION_MODES.map(({ mode, share }) => {
+    const exact = Math.max(0, limit) * share;
+    const base = Math.min(available[mode] || 0, Math.floor(exact));
+    return { mode, exact, count: base, remainder: exact - Math.floor(exact) };
+  });
+  let assigned = rows.reduce((sum, row) => sum + row.count, 0);
+  while (assigned < limit) {
+    const next = rows
+      .filter(row => row.count < (available[row.mode] || 0))
+      .sort((a, b) => (b.remainder - a.remainder) || a.mode.localeCompare(b.mode))[0];
+    if (!next) break;
+    next.count += 1;
+    next.remainder -= 1;
+    assigned += 1;
+  }
+  return Object.fromEntries(rows.map(row => [row.mode, row.count])) as Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number>;
+}
+
+// Generated surfaces enter the same COUNTRY_NATIVE proposal path as static
+// vocabulary. They are proposals, never executable query_library rows.
+const NATIVE_GENERATION_MODES: Array<{ mode: 'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED'; share: number }> = [
+  { mode: 'OPEN_WORLD', share: 0.6 },
+  { mode: 'REAL_SIGNAL', share: 0.25 },
+  { mode: 'GROUNDED', share: 0.15 },
+];
+
+/** Stable identity for the cached batch set backing one mode. */
+export function generationBatchIdentity(batchIds: Array<string | null | undefined>): string {
+  const ids = [...new Set(batchIds.filter((id): id is string => typeof id === 'string' && id.length > 0))].sort();
+  if (!ids.length) return 'nocache';
+  return createHash('sha256').update(ids.join('|')).digest('hex').slice(0, 16);
+}
+
+export interface CachedSelectionCursor {
+  batch: string;
+  cursor: number;
+}
+
+/**
+ * Bounded cursor key. There are only three modes and at most four supported
+ * languages, so the language signature set is small and stable. A batch change
+ * resets the cursor for that key instead of creating a new unbounded entry.
+ */
+export function generationSelectionKey(mode: string, languages: string[]): string {
+  const signature = [...new Set(languages.filter(Boolean).map(language => language.toLowerCase()))].sort().join('+') || 'none';
+  return `${mode}:${signature}`;
+}
+
+export function cachedSelectionStart(stored: CachedSelectionCursor | undefined, batchIdentity: string): number {
+  return stored && stored.batch === batchIdentity ? stored.cursor : 0;
+}
+
+/** Rotate through a cached mode batch so later cycles surface unused candidates. */
+export function rotateCachedSelection<T>(
+  items: readonly T[],
+  cursor: number,
+  count: number,
+): { selected: T[]; nextCursor: number } {
+  const base = Number.isFinite(cursor) ? Math.max(0, Math.trunc(cursor)) : 0;
+  if (!items.length || count <= 0) return { selected: [], nextCursor: base };
+  const start = base % items.length;
+  const selected = [...items.slice(start), ...items.slice(0, start)].slice(0, Math.min(count, items.length));
+  return { selected, nextCursor: base + selected.length };
+}
+
+async function nativeQueryCoverageGaps(country: string): Promise<string[]> {
+  try {
+    const db = await getDb();
+    const result = await db.query(
+      `SELECT segment_type, segment_key
+       FROM neighborhood_health_diagnostics
+       WHERE coverage_gap_identified = true
+         AND (
+           (segment_type = 'COUNTRY' AND UPPER(segment_key) = $1)
+           OR segment_type IN ('INTENT', 'INSTRUMENT', 'NEIGHBORHOOD')
+         )
+       ORDER BY underexplored_quota_percent ASC, calculated_at DESC
+       LIMIT 16`,
+      [country.toUpperCase()],
+    );
+    return result.rows.map(row => `${row.segment_type}:${row.segment_key}`);
+  } catch {
+    return [];
+  }
+}
+
+async function nativeQueryLocalVocabulary(country: string): Promise<string[]> {
+  try {
+    const vocabularies = await getCountryVocabularies();
+    const vocabulary = vocabularies.find(item => item.country.toLowerCase() === country.toLowerCase());
+    if (!vocabulary) return [];
+    return [...new Set([
+      ...(vocabulary.native_trading_terminology || []),
+      ...(vocabulary.popular_instruments || []),
+      ...(vocabulary.local_market_phrases || []),
+      ...(vocabulary.common_content_format_names || []),
+    ].map(String).filter(Boolean))].slice(0, 120);
+  } catch {
+    return [];
+  }
+}
+
+export interface GeneratedNativeProposalBatch {
+  proposals: DiscoveryFrontierProposal[];
+  /** Cursors to persist only after the returned proposals are persisted. */
+  nextSelectionCursors: Record<string, CachedSelectionCursor> | null;
+}
+
+export async function generateLlmNativeProposals(country: string, limit = 10): Promise<GeneratedNativeProposalBatch> {
+  try {
+    await assertCountryAllowed(country, 'native_query_generation');
+    const enabled = await getAppSetting(
+      'native_query_generation_enabled',
+      process.env.NODE_ENV === 'production' && (process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY) ? 'true' : 'false',
+    );
+    if (String(enabled).trim().toLowerCase() !== 'true') return { proposals: [], nextSelectionCursors: null };
+    const canonicalC = canonicalCountry(country);
+    const languages = countryDiscoveryLanguagesByWeight(canonicalC);
+    if (!languages.length) return { proposals: [], nextSelectionCursors: null };
+    const maxLanguages = Math.max(1, Math.min(4, Number(await getAppSetting('native_query_generation_languages_per_cycle', '1')) || 1));
+    const cursorKey = `native_query_generation_cursor:${canonicalC}`;
+    const cursor = Math.max(0, Number(await getAppSetting(cursorKey, '0')) || 0);
+    const selectedLanguages = Array.from({ length: Math.min(maxLanguages, languages.length) }, (_, index) =>
+      languages[(cursor + index) % languages.length],
+    );
+    const lastAttemptKey = `native_query_generation_last_attempt:${canonicalC}`;
+    const lastAttempt = Date.parse(await getAppSetting(lastAttemptKey, ''));
+    if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < 6 * 60 * 60 * 1000) return { proposals: [], nextSelectionCursors: null };
+    // Advance the language turn only when generation is actually attempted.
+    // Cooldown-only calls must not consume a language slot.
+    await setAppSetting(cursorKey, String(cursor + selectedLanguages.length)).catch(() => undefined);
+    await setAppSetting(lastAttemptKey, new Date().toISOString()).catch(() => undefined);
+
+    const existingQueries = (await getQueriesByCountry(canonicalC)).map(query => ({
+      query: query.query,
+      country: query.country,
+      intent: query.intent,
+    }));
+    const coverageGaps = await nativeQueryCoverageGaps(canonicalC);
+    const localVocabulary = await nativeQueryLocalVocabulary(canonicalC);
+    const byMode: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', NativeQueryCandidate[]> = {
+      OPEN_WORLD: [],
+      REAL_SIGNAL: [],
+      GROUNDED: [],
+    };
+    // All modes/languages share one history. A candidate accepted in the
+    // open-world batch must not be proposed again as real-signal or grounded.
+    const knownHistory: CandidateHistoryItem[] = [...existingQueries];
+    const memoryRows: CandidateMemoryRow[] = [];
+
+    for (const language of selectedLanguages) {
+      const memory = await getCandidateMemory(canonicalC, language.code).catch(() => []);
+      memoryRows.push(...memory);
+      const autocompleteSuggestions = await getCachedAutocompleteSuggestions(canonicalC, language.code);
+      for (const { mode, share } of NATIVE_GENERATION_MODES) {
+        // The approved generation portfolio is a full 60/25/15 batch. The
+        // per-family proposal cap limits what enters the frontier now, not the
+        // cached provider batch that supplies later cycles.
+        const count = Math.max(1, Math.round(NATIVE_QUERY_BATCH_SIZE * share));
+        try {
+          const batch = await generateNativeQueriesWithLlm({
+            context: {
+              country: canonicalC,
+              language: language.code,
+              regionCode: countryDiscoveryRegionCode(canonicalC),
+              mode,
+              existingQueries,
+              candidateMemory: memory,
+              coverageGaps,
+              autocompleteSuggestions,
+              localVocabulary,
+            },
+            count,
+          });
+          byMode[mode].push(...batch.candidates);
+        } catch {
+          // Provider failure is non-fatal; other families and the cache remain.
+        }
+      }
+    }
+
+    const modeCandidates = NATIVE_GENERATION_MODES.flatMap(({ mode }) => byMode[mode]);
+    // A cached batch's own pending rows are excluded by the inner generator,
+    // but the outer cross-mode dedupe sees them through candidate memory. If
+    // they are not filtered here, the cache rejects its own output and the
+    // frontier stays empty for the cache TTL. Admitted/rejected rows remain
+    // real history and are still applied.
+    const returnedBatchKeys = new Set(
+      modeCandidates
+        .map(candidate => candidate.batchId)
+        .filter((batchId): batchId is string => typeof batchId === 'string' && batchId.length > 0),
+    );
+    const sharedHistory: CandidateHistoryItem[] = [
+      ...knownHistory,
+      ...memoryRows
+        .filter(row => !(
+          row.batchKey
+          && returnedBatchKeys.has(row.batchKey)
+          && (row.status === 'PROPOSED' || row.status === 'GENERATED')
+        ))
+        .map(row => ({
+          query: row.normalizedQuery,
+          country: canonicalC,
+          intent: typeof row.metadata?.intent === 'string' ? row.metadata.intent : null,
+        })),
+    ];
+    const crossModeAccepted = dedupeCandidateBatch(modeCandidates, sharedHistory).accepted;
+    const dedupedByMode: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', NativeQueryCandidate[]> = {
+      OPEN_WORLD: [],
+      REAL_SIGNAL: [],
+      GROUNDED: [],
+    };
+    for (const candidate of crossModeAccepted) dedupedByMode[candidate.mode].push(candidate);
+
+    const slots = allocateNativeGenerationSlots(limit, {
+      OPEN_WORLD: dedupedByMode.OPEN_WORLD.length,
+      REAL_SIGNAL: dedupedByMode.REAL_SIGNAL.length,
+      GROUNDED: dedupedByMode.GROUNDED.length,
+    });
+    // A cached 60/25/15 batch is reused across cycles. Always slicing the
+    // first slots would surface the same five candidates forever; a persisted
+    // per-mode/per-batch cursor rotates through the rest of the cached batch.
+    // Keying by batch identity keeps alternating languages from consuming each
+    // other's offsets.
+    const selectionCursorKey = `native_query_generation_selection_cursor:${canonicalC}`;
+    const selectionCursors: Record<string, CachedSelectionCursor> = {};
+    try {
+      const parsed = JSON.parse(await getAppSetting(selectionCursorKey, '{}'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+          const row = value as Record<string, unknown>;
+          if (typeof row.batch === 'string' && typeof row.cursor === 'number'
+            && Number.isSafeInteger(row.cursor) && row.cursor >= 0) {
+            selectionCursors[key] = { batch: row.batch, cursor: row.cursor };
+          }
+        }
+      }
+    } catch {
+      // Start at the beginning of each batch if the cursor is malformed.
+    }
+    const selected: NativeQueryCandidate[] = [];
+    for (const { mode } of NATIVE_GENERATION_MODES) {
+      const batchIdentity = generationBatchIdentity(dedupedByMode[mode].map(candidate => candidate.batchId));
+      // Key by mode + language signature: bounded (at most 3 x 15 entries),
+      // and a new cached batch resets only that language/mode cursor.
+      const cursorKey = generationSelectionKey(mode, dedupedByMode[mode].map(candidate => candidate.language));
+      const start = cachedSelectionStart(selectionCursors[cursorKey], batchIdentity);
+      const rotation = rotateCachedSelection(dedupedByMode[mode], start, slots[mode]);
+      selectionCursors[cursorKey] = { batch: batchIdentity, cursor: rotation.nextCursor };
+      selected.push(...rotation.selected);
+    }
+    return {
+      nextSelectionCursors: selectionCursors,
+      proposals: selected.map(candidate => buildFrontierProposal({
+      proposalFamily: 'COUNTRY_NATIVE',
+      country: canonicalC,
+      preserveCountryIdentity: true,
+      language: candidate.language,
+      concept: candidate.query,
+      intent: candidate.intent,
+      primaryTermFamily: candidate.query,
+      retrievalLane: 'VIDEO',
+      sourceFamily: 'llm_native_query',
+      sourceProvenance: `llm_native_query:${candidate.provider || 'unknown'}:${candidate.model || 'unknown'}:${candidate.batchId || 'nocache'}`,
+      supportingEvidence: {
+        nativeTerm: candidate.query,
+        nativeEvidenceStatus: 'LLM_GENERATED',
+        sourceProvenanceFamily: 'LLM_NATIVE_QUERY',
+        provenanceType: 'llm_generated',
+        language: candidate.language,
+        market: canonicalC,
+        llmBatchId: candidate.batchId,
+        generationMode: candidate.mode,
+        generationProvenance: candidate.provenance,
+      },
+      confidence: Math.min(0.85, Math.max(0.45, candidate.confidence)),
+      ttlDays: 14,
+      noveltyRationale: `LLM ${candidate.mode.toLowerCase()} native query for ${canonicalC} (${candidate.language}); generated as a new search surface rather than a translation of an existing query.`,
+      })).slice(0, limit),
+    };
+  } catch {
+    return { proposals: [], nextSelectionCursors: null };
+  }
+}
+
+// 5c. YOUTUBE AUTOCOMPLETE Generator
+export async function generateAutocompleteProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+  try {
+    const canonicalC = canonicalCountry(country);
+    const result = await generateAutocompleteQueries({ country: canonicalC, limit: Math.max(limit * 3, 20) });
+    return result.candidates.slice(0, limit).map(candidate => buildFrontierProposal({
+      proposalFamily: 'COUNTRY_NATIVE',
+      country: canonicalC,
+      preserveCountryIdentity: true,
+      language: candidate.language,
+      concept: candidate.query,
+      intent: candidate.intent,
+      primaryTermFamily: candidate.query,
+      retrievalLane: 'VIDEO',
+      sourceFamily: 'youtube_autocomplete',
+      sourceProvenance: `youtube_autocomplete:${candidate.provenance.prefix || 'prefix'}:${candidate.batchId || 'cache'}`,
+      supportingEvidence: {
+        nativeTerm: candidate.query,
+        nativeEvidenceStatus: 'AUTOCOMPLETE_OBSERVED',
+        sourceProvenanceFamily: 'YOUTUBE_AUTOCOMPLETE',
+        provenanceType: 'youtube_autocomplete',
+        language: candidate.language,
+        market: canonicalC,
+        autocompletePrefix: candidate.provenance.prefix,
+        generationProvenance: candidate.provenance,
+      },
+      confidence: Math.min(0.85, Math.max(0.5, candidate.confidence)),
+      ttlDays: 14,
+      noveltyRationale: `YouTube Autocomplete observed this local search surface for ${canonicalC} (${candidate.language}) from prefix "${candidate.provenance.prefix || ''}".`,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+const generatedQueryCountriesInFlight = new Set<string>();
+
+/**
+ * Production entry point for the new query sources. The autonomous producer
+ * calls this once per cycle outside its scheduling deadline, so a slow
+ * provider cannot block the legacy query scheduler. The per-country cooldowns
+ * in the generators keep this from repeating every cycle.
+ */
+export async function materializeGeneratedQueryProposalsForCountry(country: string): Promise<{
+  generated: number;
+  persisted: number;
+  proposals: DiscoveryFrontierProposal[];
+}> {
+  const canonicalC = canonicalCountry(country);
+  if (!canonicalC || generatedQueryCountriesInFlight.has(canonicalC)) {
+    return { generated: 0, persisted: 0, proposals: [] };
+  }
+  generatedQueryCountriesInFlight.add(canonicalC);
+  try {
+    const [llmBatch, autocomplete] = await Promise.all([
+      generateLlmNativeProposals(canonicalC, 5).catch(() => ({ proposals: [], nextSelectionCursors: null })),
+      generateAutocompleteProposals(canonicalC, 5).catch(() => []),
+    ]);
+    const proposals = [...llmBatch.proposals, ...autocomplete];
+    if (!proposals.length) return { generated: 0, persisted: 0, proposals: [] };
+    const seen = new Set<string>();
+    const deduped = proposals.filter(proposal => {
+      if (seen.has(proposal.dedupKey)) return false;
+      seen.add(proposal.dedupKey);
+      return true;
+    });
+    const persisted = await persistFrontierProposals(deduped);
+    // Advance the cached-batch selection cursor only after persistence
+    // completed without throwing. A failed write keeps the previous cursor so
+    // the next cycle retries the same candidates instead of skipping them.
+    if (deduped.length > 0 && llmBatch.nextSelectionCursors) {
+      await setAppSetting(
+        `native_query_generation_selection_cursor:${canonicalC}`,
+        JSON.stringify(llmBatch.nextSelectionCursors),
+      ).catch(() => undefined);
+    }
+    return { generated: deduped.length, persisted, proposals: deduped };
+  } finally {
+    generatedQueryCountriesInFlight.delete(canonicalC);
+  }
+}
+
 // 6. COVERAGE_GAP Generator
 export async function generateCoverageGapProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
   const db = await getDb();
@@ -883,7 +1262,7 @@ export async function persistFrontierProposals(
 }
 
 /**
- * Runs all 7 proposal generators for a country, applying governance caps and deduplication.
+ * Runs all proposal generators for a country, applying governance caps and deduplication.
  */
 export async function generateFrontierProposalsForCountry(
   country: string,

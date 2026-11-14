@@ -287,6 +287,18 @@ const REVIEWED_LANGUAGE_SEMANTICS: Record<string, string[]> = {
   it: ['analisi ciclica', 'analisi tecnica borsa italiana'],
   nl: ['opties handelen'],
   ja: ['トレード', 'デイトレード', 'オーダーフロー', '板読み', '歩み値', '裁量トレード', 'システムトレード', 'スキャルピング', '東京セッション'],
+  // Declared secondary languages in the supported-country registry. These are
+  // curated trading-specific surfaces, not general-language words: generation
+  // rotates into `ga` and `mi`, so the semantic gate must recognize their
+  // trading vocabulary instead of rejecting every native candidate.
+  ga: [
+    'trádáil', 'trádála', 'scaireanna', 'scair', 'anailís theicniúil',
+    'stocmhalartán', 'infheistíocht', 'airgeadra', 'díorthach', 'brabús',
+  ],
+  mi: [
+    'hokohoko', 'haumi', 'pūtea haumi', 'mahere haumi', 'hokohoko pūtea',
+    'moni hokohoko', 'tāke hokohoko',
+  ],
 };
 
 /**

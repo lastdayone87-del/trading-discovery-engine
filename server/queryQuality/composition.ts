@@ -127,25 +127,33 @@ function requiresTradingSemantics(provenance: string | undefined): boolean {
 function gateAtom(
   atom: QueryAtom,
   extractedStandalone = false,
+  generatedStandalone = false,
 ): ReturnType<typeof isSearchableTradingTerm> {
   return isSearchableTradingTerm({
     term: atom.term,
     termType: gateTypeFor(atom.sense.type),
     country: atom.sense.country,
     language: atom.sense.language,
-    // Only a whole-query, single-atom extracted candidate carries its ledger
-    // proof. A mixed candidate with one tagged atom must not bypass semantics.
-    requireTradingSemantics: extractedStandalone ? false : requiresTradingSemantics(atom.provenance),
+    // Only a whole-query, single-atom extracted/generated candidate carries its
+    // producer proof. A mixed candidate with one tagged atom must not bypass
+    // semantics.
+    requireTradingSemantics: extractedStandalone || generatedStandalone ? false : requiresTradingSemantics(atom.provenance),
     // The legacy bridge uses the stored query as one atom; it may be longer
     // than a normal atom without becoming an unbounded term.
     allowExtendedTokens: atom.provenance === 'LEGACY_COMPATIBILITY',
-    maxTokens: extractedStandalone ? 6 : undefined,
+    maxTokens: extractedStandalone || generatedStandalone ? 6 : undefined,
   });
 }
 
 function isExtractedStandaloneCandidate(candidate: QueryCandidate): boolean {
   return candidate.atoms.length === 1
     && candidate.atoms[0].provenance === 'EXTRACTED_STANDALONE'
+    && normalizeCompositionTerm(candidate.atoms[0].term) === normalizeCompositionTerm(candidate.query);
+}
+
+function isGeneratedNativeStandaloneCandidate(candidate: QueryCandidate): boolean {
+  return candidate.generatedNativePhrase === true
+    && candidate.atoms.length === 1
     && normalizeCompositionTerm(candidate.atoms[0].term) === normalizeCompositionTerm(candidate.query);
 }
 
@@ -162,12 +170,13 @@ export function resolveCompositionTier(candidate: QueryCandidate, context: Compo
   const profile = context.profile || getCountryMarketProfile(candidate.country);
   const attestations = context.attestations || [];
   const extractedStandalone = isExtractedStandaloneCandidate(candidate);
+  const generatedStandalone = isGeneratedNativeStandaloneCandidate(candidate);
   const exact = candidate.atoms.every(atom => attestations.some(attestation => attestation.kind === 'EXACT' && attestationMatches(attestation, atom.sense, profile)));
   if (exact && candidate.atoms.length > 0) return 'ATTESTED_EXACT';
   const licensed = candidate.atoms.length > 0 && candidate.atoms.every(atom =>
     profile.languages.includes(atom.sense.language)
     && (atom.sense.country === candidate.country || atom.sense.country === 'GLOBAL')
-    && gateAtom(atom, extractedStandalone).eligible
+    && gateAtom(atom, extractedStandalone, generatedStandalone).eligible
   );
   if (licensed) return 'LICENSED_UNSEEN';
   return 'SPECULATIVE';
@@ -184,6 +193,8 @@ export interface BuildCandidateInput {
   compositionFamily?: string;
   /** Only the internal zero-atom migration bridge may use the legacy token allowance. */
   allowLegacyCompatibility?: boolean;
+  /** Bounded whole-query surface produced by LLM/autocomplete generation. */
+  generatedNativePhrase?: boolean;
 }
 
 /** Build a typed candidate from producer atoms, before any admission call. */
@@ -221,6 +232,7 @@ export function buildQueryCandidate(input: BuildCandidateInput): QueryCandidate 
     relation: input.relation,
     source: input.source,
     primaryTerm: atoms[0]?.term || input.query,
+    generatedNativePhrase: input.generatedNativePhrase === true,
   }, { profile });
   return {
     query: input.query.normalize('NFKC').trim().replace(/\s+/gu, ' '),
@@ -233,6 +245,7 @@ export function buildQueryCandidate(input: BuildCandidateInput): QueryCandidate 
     relation: input.relation,
     source: input.source,
     primaryTerm: atoms[0]?.term || input.query,
+    generatedNativePhrase: input.generatedNativePhrase === true,
   };
 }
 
@@ -250,6 +263,7 @@ export function candidateHash(candidate: QueryCandidate, tier: QueryCompositionT
     relation: candidate.relation,
     source: candidate.source,
     primaryTerm: candidate.primaryTerm,
+    generatedNativePhrase: candidate.generatedNativePhrase === true,
     atoms: candidate.atoms.map(atom => ({
       term: atom.sense.normalizedTerm,
       role: atom.role,
@@ -293,6 +307,7 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
     && isReviewedNativePhrase(normalized)
     && normalizeCompositionTerm(candidate.atoms[0].term) === normalized;
   const extractedStandalone = isExtractedStandaloneCandidate(candidate);
+  const generatedStandalone = isGeneratedNativeStandaloneCandidate(candidate);
 
   if (!isRegisteredCountry(candidate.country)) reasons.push('UNSUPPORTED_COUNTRY');
   // Registration only proves the country is known to the fixture. Dormant
@@ -304,11 +319,11 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
   if (!normalized || tokens.length === 0) reasons.push('EMPTY_QUERY');
   const tokenLimit = legacyCompatibility
     ? LEGACY_COMPATIBILITY_TOKEN_LIMIT
-    : (reviewedNativePhrase || extractedStandalone)
+    : (reviewedNativePhrase || extractedStandalone || generatedStandalone)
       ? 6
       : 3;
   if (tokens.length > tokenLimit) reasons.push('TOO_MANY_TOKENS');
-  if (normalized.length > (extractedStandalone ? 80 : 40)) reasons.push('TOO_LONG');
+  if (normalized.length > ((extractedStandalone || generatedStandalone) ? 80 : 40)) reasons.push('TOO_LONG');
   if (tokens.length === 1 && BARE_SHORT_TICKER.test(tokens[0])) reasons.push('BARE_SHORT_TICKER');
   if (candidate.atoms.length === 0) reasons.push('NO_TYPED_ATOMS');
   if (candidate.atoms.length > 3) reasons.push('TOO_MANY_ATOMS');
@@ -325,7 +340,7 @@ export function evaluateQueryComposition(candidate: QueryCandidate, context: Com
     if (!profile.languages.includes(candidate.language)) reasons.push('LANGUAGE_MISMATCH');
     if (atom.sense.market && !profile.markets.includes(atom.sense.market)) reasons.push('MARKET_MISMATCH');
     if (atom.sense.market && candidate.market && atom.sense.market !== candidate.market) reasons.push('CROSS_MARKET_ATOM');
-    const gate = gateAtom(atom, extractedStandalone);
+    const gate = gateAtom(atom, extractedStandalone, generatedStandalone);
     if (!gate.eligible) reasons.push(...gate.reasons.map(reason => `TERM_${reason.toUpperCase().replace(/-/g, '_')}`));
   }
 

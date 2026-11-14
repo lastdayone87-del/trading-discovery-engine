@@ -12,7 +12,7 @@
 
 export type SupportedLanguage =
   | 'en' | 'fr' | 'de' | 'nl' | 'da' | 'sv' | 'no' | 'es' | 'it' | 'pt' | 'lb'
-  | 'ja' | 'zh' | 'ar' | 'ko' | 'ru' | 'hi' | 'ta' | 'und';
+  | 'ja' | 'zh' | 'ar' | 'ko' | 'ru' | 'hi' | 'ta' | 'ms' | 'ga' | 'mi' | 'und';
 
 export type LanguageScript = 'Latn' | 'Jpan' | 'Hani' | 'Arab' | 'Hang' | 'Cyrl' | 'Deva' | 'Taml' | 'Zyyy';
 
@@ -61,6 +61,9 @@ const TOKENS: Partial<Record<SupportedLanguage, Set<string>>> = {
   no: new Set(['og', 'ikke', 'med', 'for', 'aksje', 'aksjer', 'teknisk', 'analyse', 'bors', 'børs', 'handel', 'strategi', 'risikostyring', 'obx', 'oslo', 'marked']),
   es: new Set(['el', 'la', 'los', 'las', 'de', 'del', 'y', 'para', 'con', 'en', 'analisis', 'análisis', 'tecnica', 'técnica', 'tecnico', 'técnico', 'bolsa', 'mercado', 'acciones', 'trading', 'intradia', 'intradía', 'velas', 'soporte', 'resistencia', 'apertura', 'fondos', 'apalancamiento']),
   it: new Set(['il', 'la', 'i', 'gli', 'di', 'del', 'e', 'per', 'con', 'in', 'analisi', 'tecnica', 'borsa', 'mercato', 'azioni', 'trading', 'intraday', 'candele', 'supporto', 'resistenza', 'apertura', 'ciclica', 'titoli']),
+  ms: new Set(['saham', 'pasaran', 'analisis', 'teknikal', 'dagangan', 'pelaburan', 'niaga', 'forex', 'komoditi', 'indeks', 'modal', 'untung', 'rugi']),
+  ga: new Set(['trádáil', 'trádála', 'scaireanna', 'scair', 'earraí', 'anailís', 'teicniúil', 'margadh', 'infheistíocht', 'brabús', 'stoc', 'malartán', 'airgead']),
+  mi: new Set(['hokohoko', 'moni', 'haumi', 'mahere', 'pūtea', 'putea', 'tāke', 'pakihi', 'utu', 'hoko', 'ohanga']),
   pt: new Set(['o', 'a', 'os', 'as', 'de', 'do', 'da', 'e', 'para', 'com', 'em', 'analise', 'análise', 'tecnica', 'técnica', 'bolsa', 'mercado', 'acoes', 'ações', 'negociacao', 'negociação', 'day', 'trade', 'mini', 'indice', 'índice', 'suporte', 'resistencia', 'resistência', 'abertura']),
 };
 
@@ -74,6 +77,7 @@ const DIACRITIC_HINTS: Partial<Record<SupportedLanguage, RegExp>> = {
   sv: /[åäö]/u,
   no: /[æøå]/u,
   nl: /[ëïé]/u,
+  mi: /[āēīōū]/u,
 };
 
 function normalize(text: string): string {
@@ -192,7 +196,7 @@ export function languageScript(language: string): LanguageScript {
     case 'hi': return 'Deva';
     case 'ta': return 'Taml';
     case 'en': case 'fr': case 'de': case 'nl': case 'da': case 'sv': case 'no':
-    case 'es': case 'it': case 'pt': case 'lb': return 'Latn';
+    case 'es': case 'it': case 'pt': case 'lb': case 'ms': case 'ga': case 'mi': return 'Latn';
     default: return 'Zyyy';
   }
 }
