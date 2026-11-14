@@ -920,6 +920,18 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
  */
 export type ClaimableSearchJobType = 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL' | 'RESOLVE_STAGED_CANDIDATE' | 'MANUAL_SEARCH_PAGE' | 'POST_APPROVAL_ENRICH' | 'FORCE_REVIEW_RESCAN' | 'RETRY_COMMUNITY_ACQUISITION' | 'TERM_HARVEST' | 'SCORE_CANDIDATES' | 'AI_ADJUDICATE_CANDIDATE' | 'PROPOSE_CONCEPT_RESOLUTION' | 'OFFLINE_CANDIDATE_EVALUATION' | 'INSPECT_PLAYLIST' | 'INSPECT_FEATURED_CHANNELS' | 'PERSISTENT_RESEARCH_EXTERNAL_PROVIDER' | 'COUNTRY_BOUNDARY_REPROCESS' | 'RELATIONSHIP_CANARY_EXPANSION';
 
+/**
+ * Browser-bound community retries belong to the dedicated consumer only.
+ * Generic search/enrichment/classification pools must never claim them while
+ * channel processing is paused or without an explicit override.
+ */
+export function canClaimCommunityRetry(
+  claimableOverride: ClaimableSearchJobType[] | undefined,
+  paused: boolean,
+): boolean {
+  return !paused && claimableOverride?.includes('RETRY_COMMUNITY_ACQUISITION') === true;
+}
+
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastSemanticCooldownEnrichProbeAt = 0;
 let lastAutonomousResumeSweepAt = 0;
@@ -1541,7 +1553,7 @@ export async function processNextSearchJob(
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
-  if (!qStatus.channelProcessing.isPaused && !qStatus.discordValidation.isPaused && claimableOverride?.includes('RETRY_COMMUNITY_ACQUISITION')) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
+  if (canClaimCommunityRetry(claimableOverride, qStatus.channelProcessing.isPaused || qStatus.discordValidation.isPaused)) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
   if(!claimableOverride||claimableOverride.includes('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER')){const db=await getDb();const c=await db.query(`SELECT 1 FROM external_provider_adapter_controls WHERE mode IN('CANARY','ACTIVE') AND NOT paused AND NOT kill_switch LIMIT 1`);if(c.rowCount)claimableTypes.push('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_FEATURED_CHANNELS')){const db=await getDb();const c=await db.query(`SELECT 1 FROM acquisition_adapter_controls adapter JOIN creator_search_canary_control authority ON authority.singleton=true WHERE adapter.adapter_type='INSPECT_FEATURED_CHANNELS' AND adapter.mode='CANARY' AND NOT adapter.paused AND NOT adapter.kill_switch AND authority.enabled AND NOT authority.kill_switch AND authority.serving_authority_enabled AND authority.featured_channel_authority_enabled AND authority.featured_channel_rollout_basis_points>0`);if(c.rowCount)claimableTypes.push('INSPECT_FEATURED_CHANNELS');}

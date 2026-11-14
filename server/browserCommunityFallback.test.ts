@@ -456,14 +456,24 @@ test('per-call gate wait defers a decision worker while the community lane keeps
   let release!: () => void;
   const blocker = new Promise<void>(resolve => { release = resolve; });
   const first = gate.run(async () => blocker);
+  const keepAlive = setTimeout(() => undefined, 1_000);
   const startedAt = Date.now();
-  await assert.rejects(
-    gate.run(async () => undefined, 'DISCOVERY', { maxWaitMs: 20 }),
-    /RENDERED_FALLBACK_SATURATED/,
-  );
+  let saturation: any;
+  try {
+    await assert.rejects(
+      gate.run(async () => undefined, 'DISCOVERY', { maxWaitMs: 20 }).catch(error => {
+        saturation = error;
+        throw error;
+      }),
+      /RENDERED_FALLBACK_SATURATED/,
+    );
+  } finally {
+    clearTimeout(keepAlive);
+    release();
+    await first;
+  }
   assert.ok(Date.now() - startedAt < 500, 'per-call wait must not fall back to the global 1s wait');
-  release();
-  await first;
+  assert.ok(Number(saturation?.retryAt) - Date.now() < 500, 'retry hint must use the per-call wait, not the global wait');
 });
 
 test('rendered host backoff remains bounded by failure class and retry count', () => {

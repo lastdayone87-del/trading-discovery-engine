@@ -3821,9 +3821,9 @@ export class RenderedFallbackGate {
     return Math.max(1, Math.ceil(this.maxPending * 0.35));
   }
 
-  private saturationError(gateWaitMs?: number): Error {
+  private saturationError(gateWaitMs?: number, waitMs: number = this.maxWaitMs): Error {
     return Object.assign(new Error('RENDERED_FALLBACK_SATURATED'), {
-      retryAt: Date.now() + this.maxWaitMs,
+      retryAt: Date.now() + waitMs,
       ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     });
   }
@@ -3871,8 +3871,8 @@ export class RenderedFallbackGate {
         if (index < 0) return; // granted concurrently; grant() cleared the timer
         this.waiters.splice(index, 1);
         const gateWaitMs = Math.max(0, Date.now() - waitStartedAt);
-        this.logWaitTimeout(lane);
-        reject(this.saturationError(gateWaitMs));
+        this.logWaitTimeout(lane, effectiveMaxWaitMs);
+        reject(this.saturationError(gateWaitMs, effectiveMaxWaitMs));
       }, effectiveMaxWaitMs);
       waiter.timer.unref?.();
       this.waiters.push(waiter);
@@ -3911,14 +3911,14 @@ export class RenderedFallbackGate {
     }));
   }
 
-  private logWaitTimeout(lane: AcquisitionLane): void {
+  private logWaitTimeout(lane: AcquisitionLane, waitMs: number = this.maxWaitMs): void {
     const now = Date.now();
     if (now - this.lastWaitTimeoutLogAtMs < 60_000) return;
     this.lastWaitTimeoutLogAtMs = now;
     console.warn(JSON.stringify({
       event: 'rendered_fallback_wait_timeout',
       lane,
-      waitMs: this.maxWaitMs,
+      waitMs,
       pending: this.waiters.length,
       timestamp: new Date(now).toISOString(),
     }));

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
+import { renderedWaitAttribution } from './ingestionPipeline';
+import { canClaimCommunityRetry } from './queueManager';
 import {
   CLASSIFICATION_JOB_TYPE,
   CLASSIFICATION_DECOUPLING_FLAG,
@@ -142,16 +144,22 @@ test('classification browser-gate wait defaults short and stays bounded', () => 
   assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: 'nonsense' } as any), 5_000);
   assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '0' } as any), 5_000);
   assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '31000' } as any), 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '1000' } as any), 1_000);
   assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '20000' } as any), 20_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '30000' } as any), 30_000);
 });
 
 test('classification uses the short rendered wait and the dedicated community lane', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
   assert.match(queue, /renderedFallbackMaxWaitMs: classificationRenderedFallbackMaxWaitMs\(\)/);
-  assert.match(queue, /claimableOverride\?\.includes\('RETRY_COMMUNITY_ACQUISITION'\)/);
-  assert.doesNotMatch(queue, /!claimableOverride \|\| claimableOverride\.includes\('RETRY_COMMUNITY_ACQUISITION'\)/);
-  assert.match(pipeline, /renderedFallbackMaxWaitMs/);
+  assert.match(pipeline, /\.\.\.renderedWaitAttribution\(options\?\.renderedFallbackMaxWaitMs\)/);
+  assert.deepEqual(renderedWaitAttribution(undefined), {});
+  assert.deepEqual(renderedWaitAttribution(5_000), { renderedFallbackMaxWaitMs: 5_000 });
+  assert.equal(canClaimCommunityRetry(undefined, false), false);
+  assert.equal(canClaimCommunityRetry(['RETRY_COMMUNITY_ACQUISITION'], true), false);
+  assert.equal(canClaimCommunityRetry(['RETRY_COMMUNITY_ACQUISITION'], false), true);
+  assert.equal(canClaimCommunityRetry(['ENRICH_CHANNEL'], false), false);
 });
 
 test('day-bucketed idempotency key is stable within a UTC day and changes next day', () => {

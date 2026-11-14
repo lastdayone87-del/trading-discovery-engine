@@ -217,6 +217,11 @@ export interface PipelineExecutionOptions {
   renderedFallbackMaxWaitMs?: number;
 }
 
+/** Forward a defined rendered wait without emitting an undefined key. */
+export function renderedWaitAttribution(renderedFallbackMaxWaitMs: number | undefined): { renderedFallbackMaxWaitMs?: number } {
+  return renderedFallbackMaxWaitMs === undefined ? {} : { renderedFallbackMaxWaitMs };
+}
+
 /**
  * Shared country-evidence hydration for the ordinary Gate-1 pass and the
  * confirmed-row country-only revalidation. A confirmed row skips trading
@@ -1630,6 +1635,7 @@ async function processChannelThroughPipelineInContext(
     ...(options?.jobType ? { jobType: options.jobType } : {}),
     ...(options?.jobId ? { jobId: options.jobId } : {}),
     slicePass: 1,
+    ...renderedWaitAttribution(options?.renderedFallbackMaxWaitMs),
   });
 
   const finalChannel = (await getChannelById(candidate.channelId)) || activeChannel;
