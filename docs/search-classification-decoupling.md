@@ -64,17 +64,30 @@ Worker counts are unchanged: 4 search workers and 3 enrichment workers.
 the historical 20-worker maximum before it is split so two pools cannot exceed
 the old single-pool ceiling.
 
-The 3 enrichment workers keep the total but split claim preference:
+The configured enrichment total is preserved but split into separate claim
+lanes once the pool has at least three workers:
 
-| Flag | Shared workers (`CLASSIFY` then `ENRICH`) | ENRICH-only workers |
-| --- | --- | --- |
-| on | 2 | 1 |
-| off (rollback drain) | 1 | 2 |
+| Total | Shared (`ADMISSION` + `CLASSIFY` + `PROCESS_DISCOVERED_CHANNEL` + `ENRICH`) | Admission (`ADMISSION` then `ENRICH`) | Classification (`CLASSIFY` + `PROCESS_DISCOVERED_CHANNEL` overflow then `ENRICH`) | ENRICH-only |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 0 | 0 | 0 |
+| 2 | 1 | 0 | 0 | 1 |
+| 3 | 0 | 1 | 1 | 1 |
+| 4 | 0 | 1 | 2 | 1 |
+| 5 | 0 | 1 | 3 | 1 |
+| 6 | 0 | 2 | 3 | 1 |
 
-Classification priority is 15: above the default ENRICH priority (10) so new
-discoveries drain promptly, below search continuations and operator work. The
-dedicated ENRICH worker prevents the pre-existing ~44-job backlog from starving
-behind new classifications.
+Admission priority is 40 and classification priority is 21. Separate lanes are
+required because a shared priority-ordered lane lets a large admission backlog
+monopolize every classification-capable worker. Admission scales by one lane
+per three total workers; classification takes the remaining lanes. The shared
+lane remains only for one- and two-worker pools and for the decoupling rollback
+path, which keeps one worker able to drain old classification jobs. With
+decoupling off at three or more workers, the split is one shared worker and
+`total - 1` ENRICH-only workers.
+
+At least one ENRICH-only worker remains for pools of two or more workers. The dedicated admission
+and classification lanes also fall back to ENRICH when their own queues are
+empty, so the ENRICH backlog is not limited to that one worker.
 
 Do not raise enrichment workers to 6 until semantic success rate is >90%, p95
 classification latency is <30s, and the backlog is stable (Phase 4 gate).

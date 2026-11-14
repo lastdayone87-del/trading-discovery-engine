@@ -89,26 +89,46 @@ test('worker counts stay at the measured 4/3 defaults and env overrides still wi
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '1e6' })), 20);
 });
 
-test('enrichment pool splits 2/1 when enabled and always leaves an ENRICH-only lane', () => {
-  assert.deepEqual(resolveEnrichmentWorkerSplit(3, true), { classificationWorkers: 2, enrichmentOnlyWorkers: 1 });
-  assert.deepEqual(resolveEnrichmentWorkerSplit(3, false), { classificationWorkers: 1, enrichmentOnlyWorkers: 2 });
-  assert.deepEqual(resolveEnrichmentWorkerSplit(1, true), { classificationWorkers: 1, enrichmentOnlyWorkers: 0 });
-  assert.deepEqual(resolveEnrichmentWorkerSplit(2, false), { classificationWorkers: 1, enrichmentOnlyWorkers: 1 });
-  // A two-worker pool must keep one lane on the existing ENRICH backlog even
-  // when the classification queue never empties.
-  assert.deepEqual(resolveEnrichmentWorkerSplit(2, true), { classificationWorkers: 1, enrichmentOnlyWorkers: 1 });
-  // Direct callers keep their configured total: there is no second 100-worker
-  // clamp inside the split. Startup applies the historical 20-worker cap in
-  // resolveEnrichmentWorkerCount before calling this function.
-  assert.deepEqual(resolveEnrichmentWorkerSplit(4, true), { classificationWorkers: 3, enrichmentOnlyWorkers: 1 });
-  assert.deepEqual(resolveEnrichmentWorkerSplit(5, true), { classificationWorkers: 3, enrichmentOnlyWorkers: 2 });
-  assert.deepEqual(resolveEnrichmentWorkerSplit(250, true), { classificationWorkers: 3, enrichmentOnlyWorkers: 247 });
+test('enrichment pool reserves separate admission and classification lanes', () => {
+  assert.deepEqual(resolveEnrichmentWorkerSplit(3, true), {
+    sharedWorkers: 0, admissionWorkers: 1, classificationWorkers: 1, enrichmentOnlyWorkers: 1,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(3, false), {
+    sharedWorkers: 1, admissionWorkers: 0, classificationWorkers: 0, enrichmentOnlyWorkers: 2,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(1, true), {
+    sharedWorkers: 1, admissionWorkers: 0, classificationWorkers: 0, enrichmentOnlyWorkers: 0,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(2, false), {
+    sharedWorkers: 1, admissionWorkers: 0, classificationWorkers: 0, enrichmentOnlyWorkers: 1,
+  });
+  // A two-worker pool keeps one shared lane plus one ENRICH-only lane; there is
+  // no room to reserve a third lane without dropping ENRICH coverage.
+  assert.deepEqual(resolveEnrichmentWorkerSplit(2, true), {
+    sharedWorkers: 1, admissionWorkers: 0, classificationWorkers: 0, enrichmentOnlyWorkers: 1,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(4, true), {
+    sharedWorkers: 0, admissionWorkers: 1, classificationWorkers: 2, enrichmentOnlyWorkers: 1,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(5, true), {
+    sharedWorkers: 0, admissionWorkers: 1, classificationWorkers: 3, enrichmentOnlyWorkers: 1,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(6, true), {
+    sharedWorkers: 0, admissionWorkers: 2, classificationWorkers: 3, enrichmentOnlyWorkers: 1,
+  });
+  assert.deepEqual(resolveEnrichmentWorkerSplit(250, true), {
+    sharedWorkers: 0, admissionWorkers: 83, classificationWorkers: 166, enrichmentOnlyWorkers: 1,
+  });
   // Total worker count is preserved for every split.
   for (const total of [1, 2, 3, 6, 250]) {
     for (const enabled of [true, false]) {
       const split = resolveEnrichmentWorkerSplit(total, enabled);
-      assert.equal(split.classificationWorkers + split.enrichmentOnlyWorkers, total);
+      assert.equal(split.sharedWorkers + split.admissionWorkers + split.classificationWorkers + split.enrichmentOnlyWorkers, total);
       if (total > 1) assert.ok(split.enrichmentOnlyWorkers > 0, 'the ENRICH backlog must retain a dedicated lane');
+      if (enabled && total >= 3) {
+        assert.ok(split.admissionWorkers >= 1, 'admission must have its own worker');
+        assert.ok(split.classificationWorkers >= 1, 'classification must have its own worker');
+      }
     }
   }
 });
@@ -254,15 +274,16 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   assert.match(queue, /decouplingEnabled: classificationDecoupling\.enabled/);
   assert.match(queue, /inline: \(\) => processDiscoveredChannelContained\(raw, country, source/);
   assert.match(queue, /return admitDiscoveredChannel\(\{/);
-  // Classification is claimed by shared enrichment workers and dispatched.
+  // Classification is claimed and dispatched; lane separation is exercised
+  // behaviorally in enrichmentWorkerLanes.test.ts.
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
-  assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers, \[CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE\]/);
+  assert.match(queue, /startEnrichmentWorkerLanes\(enrichmentSplit\)/);
   // Phase 4 startup clamps through the measured gate and the approved hard
   // ceiling before splitting into the two pools.
   assert.match(queue, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
   // The search run must not fail because a later classification failed.
-  assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE \? '' : String\(job\.payload\?\.queryRunId/);
+  assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE \|\| job\.type === 'PROCESS_DISCOVERED_CHANNEL' \? '' : String\(job\.payload\?\.queryRunId/);
   // Provisional rows are insert-only and classification reconciliation is durable.
   assert.match(db, /insertOnly\?: boolean/);
   assert.match(db, /ON CONFLICT\(channel_id\) DO NOTHING/);

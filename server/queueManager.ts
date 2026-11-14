@@ -5405,6 +5405,67 @@ function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEA
   }
 }
 
+export interface EnrichmentWorkerLane {
+  concurrency: number;
+  extraClaimableTypes: ClaimableSearchJobType[];
+  workerPrefix: string;
+}
+
+/**
+ * Pure lane plan for startup. Admission and classification never share a lane
+ * once the pool is large enough for three lanes; both dedicated lanes retain
+ * ENRICH as their base fallback so an empty own-queue does not idle them.
+ */
+export function enrichmentWorkerLanes(split: ReturnType<typeof resolveEnrichmentWorkerSplit>): EnrichmentWorkerLane[] {
+  const lanes: EnrichmentWorkerLane[] = [];
+  if (split.sharedWorkers > 0) {
+    lanes.push({
+      concurrency: split.sharedWorkers,
+      extraClaimableTypes: [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'],
+      workerPrefix: 'enrich_channel_shared',
+    });
+  }
+  if (split.admissionWorkers > 0) {
+    lanes.push({
+      concurrency: split.admissionWorkers,
+      extraClaimableTypes: [ADMISSION_VERIFICATION_JOB_TYPE],
+      workerPrefix: 'enrich_channel_admission',
+    });
+  }
+  if (split.classificationWorkers > 0) {
+    lanes.push({
+      concurrency: split.classificationWorkers,
+      extraClaimableTypes: [CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'],
+      workerPrefix: 'enrich_channel_classification',
+    });
+  }
+  if (split.enrichmentOnlyWorkers > 0) {
+    lanes.push({
+      concurrency: split.enrichmentOnlyWorkers,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_backlog',
+    });
+  }
+  return lanes;
+}
+
+type EnrichmentWorkerLauncher = (
+  type: 'ENRICH_CHANNEL',
+  concurrency: number,
+  extraClaimableTypes: ClaimableSearchJobType[],
+  workerPrefix?: string,
+) => void;
+
+/** Start exactly the lanes in the plan. Injected in tests to observe startup. */
+export function startEnrichmentWorkerLanes(
+  split: ReturnType<typeof resolveEnrichmentWorkerSplit>,
+  start: EnrichmentWorkerLauncher = startWorkerPool,
+): void {
+  for (const lane of enrichmentWorkerLanes(split)) {
+    start('ENRICH_CHANNEL', lane.concurrency, lane.extraClaimableTypes, lane.workerPrefix);
+  }
+}
+
 let workersStarted = false;
 
 /**
@@ -5415,11 +5476,12 @@ let workersStarted = false;
  * deadline-bounded, so a stalled query delays startup by at most that bound
  * before the baseline of 3 starts; it never leaves the pool stopped.
  *
- * The split itself keeps the total unchanged:
- *   2 shared workers claim CLASSIFY_DISCOVERED_CHANNEL first (priority 15),
- *   then ENRICH_CHANNEL; the remainder claim ENRICH_CHANNEL only.
- * With decoupling off, one shared worker still drains old classification jobs
- * while the other workers keep the pre-existing ENRICH backlog moving.
+ * The split itself keeps the total unchanged. Pools of three or more start
+ * one admission-only lane, one classification/overflow lane, and one
+ * ENRICH-only lane; admission scales one lane per three total workers and
+ * classification takes the remaining lanes. One- and two-worker pools retain
+ * the shared fallback, and the decoupling rollback keeps one shared worker to
+ * drain old classification jobs.
  */
 async function startGatedEnrichmentWorkers(): Promise<void> {
   const requested = resolveEnrichmentWorkerCount();
@@ -5442,11 +5504,15 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
     }
   }
   const enrichmentSplit = resolveEnrichmentWorkerSplit(Math.min(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers), decoupling.enabled);
-  setRunningEnrichmentWorkerCount(enrichmentSplit.classificationWorkers + enrichmentSplit.enrichmentOnlyWorkers);
-  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], 'enrich_channel_shared');
-  if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
-    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
-  }
+  setRunningEnrichmentWorkerCount(
+    enrichmentSplit.sharedWorkers
+      + enrichmentSplit.admissionWorkers
+      + enrichmentSplit.classificationWorkers
+      + enrichmentSplit.enrichmentOnlyWorkers,
+  );
+  // Admission and classification use separate claim lanes. A combined lane
+  // lets admission priority 40 monopolize every classification-capable worker.
+  startEnrichmentWorkerLanes(enrichmentSplit);
 }
 
 /**
