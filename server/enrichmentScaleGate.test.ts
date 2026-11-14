@@ -186,7 +186,7 @@ test('worker startup routes every above-baseline request through the measured ga
   assert.match(source, /evaluateEnrichmentScaleGate\(metrics, enrichmentScaleThresholds\(\), requested\)/);
   assert.match(source, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
   assert.match(source, /setRunningEnrichmentWorkerCount\(/);
-  assert.match(source, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers/);
+  assert.match(source, /startEnrichmentWorkerLanes\(enrichmentSplit\)/);
 });
 
 test('diagnostics separate the live decision from the running worker count', () => {

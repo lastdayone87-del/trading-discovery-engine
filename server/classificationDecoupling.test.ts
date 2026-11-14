@@ -133,20 +133,6 @@ test('enrichment pool reserves separate admission and classification lanes', () 
   }
 });
 
-test('startup wires admission and classification into separate claim lanes', () => {
-  const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  const admissionStart = source.indexOf("startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.admissionWorkers");
-  const classificationStart = source.indexOf("startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers");
-  assert.ok(admissionStart >= 0, 'admission lane must be started');
-  assert.ok(classificationStart >= 0, 'classification lane must be started');
-  const admissionBlock = source.slice(admissionStart, admissionStart + 180);
-  const classificationBlock = source.slice(classificationStart, classificationStart + 220);
-  assert.match(admissionBlock, /\[ADMISSION_VERIFICATION_JOB_TYPE\]/);
-  assert.doesNotMatch(admissionBlock, /CLASSIFICATION_JOB_TYPE/);
-  assert.match(classificationBlock, /\[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'\]/);
-  assert.doesNotMatch(classificationBlock, /ADMISSION_VERIFICATION_JOB_TYPE/);
-});
-
 test('day-bucketed idempotency key is stable within a UTC day and changes next day', () => {
   const morning = Date.UTC(2026, 10, 7, 1, 0, 0);
   const evening = Date.UTC(2026, 10, 7, 23, 59, 0);
@@ -288,12 +274,11 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   assert.match(queue, /decouplingEnabled: classificationDecoupling\.enabled/);
   assert.match(queue, /inline: \(\) => processDiscoveredChannelContained\(raw, country, source/);
   assert.match(queue, /return admitDiscoveredChannel\(\{/);
-  // Classification and admission have separate claim lanes; both still fall
-  // back to ENRICH work when their own queues are empty.
+  // Classification is claimed and dispatched; lane separation is exercised
+  // behaviorally in enrichmentWorkerLanes.test.ts.
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
-  assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.admissionWorkers, \[ADMISSION_VERIFICATION_JOB_TYPE\]/);
-  assert.match(queue, /startWorkerPool\('ENRICH_CHANNEL', enrichmentSplit\.classificationWorkers, \[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'\]/);
+  assert.match(queue, /startEnrichmentWorkerLanes\(enrichmentSplit\)/);
   // Phase 4 startup clamps through the measured gate and the approved hard
   // ceiling before splitting into the two pools.
   assert.match(queue, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
