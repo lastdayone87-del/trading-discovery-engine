@@ -5488,9 +5488,10 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
   const decoupling = resolveClassificationDecouplingConfig();
   let effectiveWorkers = requested;
   if (requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled()) {
-    // Never hold startup open on a stalled metrics query: each attempt is
-    // wall-clock bounded and the gate fails closed to the baseline of 3. The
-    // bounded retry lets the database pool finish warming up after a restart.
+    // Never hold startup open on a stalled metrics query: the retry helper
+    // shares one startup-wide budget (ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS,
+    // default 10s), aborts expired attempts, and fails closed to the baseline
+    // of 3 when the budget expires.
     let metrics;
     try {
       metrics = await loadEnrichmentScaleMetricsWithRetry();

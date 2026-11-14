@@ -191,9 +191,11 @@ clamped to 3 unless **all** pass:
 | Backlog stability (1 h completed/created) | at least 0.9, or no creations and pending within cap |
 
 On success the effective count is capped at 6. Any metrics/query error fails
-closed to 3, and the metrics wait itself is bounded by
-`ENRICHMENT_SCALE_METRICS_TIMEOUT_MS` (default 5000 ms): a stalled query or
-connection resolves to baseline workers instead of leaving the pool stopped.
+closed to 3. Each attempt is bounded by `ENRICHMENT_SCALE_METRICS_TIMEOUT_MS`
+(default 5000 ms), and all retry attempts share one startup-wide budget
+(`ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS`, default 10000 ms). Expired attempts
+are aborted before starting new queries, so a stalled query or connection cannot
+delay even the baseline pool beyond that total budget.
 The gate is re-evaluated on each process start; a running process
 never changes its worker count. `ENRICHMENT_SCALE_GATE_ENABLED=false` is the
 operator rollback that restores the raw explicit environment value (skipping
@@ -225,7 +227,8 @@ currently running pool.
 | `ENRICHMENT_SCALE_MIN_SAMPLE` | `50` | Gate sample floor. |
 | `ENRICHMENT_SCALE_MAX_PENDING` | `500` | Gate backlog cap. |
 | `ENRICHMENT_SCALE_MIN_COMPLETION_RATIO` | `0.9` | Gate stability ratio. |
-| `ENRICHMENT_SCALE_METRICS_TIMEOUT_MS` | `5000` | Startup bound on the gate's metrics read; timeout falls back to 3 workers. |
+| `ENRICHMENT_SCALE_METRICS_TIMEOUT_MS` | `5000` | Per-attempt bound on the gate's metrics read. |
+| `ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS` | `10000` | Total startup budget across retry attempts; exhausted budget falls back to 3 workers. |
 | `ENRICHMENT_SCALE_METRICS_WINDOW_HOURS` | `2` | Provider sample window for success rate/p95; clamped 1–24. Widen when traffic is sparse; a fixed 24 h window keeps old outages in the denominator after recovery. |
 
 Production defaults at merge time: Groq remains the primary semantic provider,

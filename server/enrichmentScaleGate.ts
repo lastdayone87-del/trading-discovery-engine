@@ -244,6 +244,9 @@ export async function loadEnrichmentScaleMetrics(
   if (!query) {
     const { getDb } = await import('./db');
     const db = await getDb();
+    if (deps.signal?.aborted) {
+      throw Object.assign(new Error('Enrichment scale metrics deadline expired.'), { name: 'AbortError' });
+    }
     // The pool wrapper is typed for text-only queries; node-postgres accepts
     // the config object and honors query_timeout. `signal` is not a pg option,
     // so it is stripped here; query_timeout performs the actual cancellation.
@@ -253,11 +256,16 @@ export async function loadEnrichmentScaleMetrics(
     if (deps.deadlineAtMs == null) return timeoutMs;
     return Math.max(1, Math.min(timeoutMs, deps.deadlineAtMs - Date.now()));
   };
-  const runQuery = (text: string) => query({
-    text,
-    query_timeout: queryBudget(),
-    ...(deps.signal ? { signal: deps.signal } : {}),
-  });
+  const runQuery = (text: string) => {
+    if (deps.signal?.aborted) {
+      throw Object.assign(new Error('Enrichment scale metrics deadline expired.'), { name: 'AbortError' });
+    }
+    return query({
+      text,
+      query_timeout: queryBudget(),
+      ...(deps.signal ? { signal: deps.signal } : {}),
+    });
+  };
   const thresholds = enrichmentScaleThresholds(env);
   const scaleProvider = semanticScaleGateProvider(env);
   const windowHours = enrichmentScaleMetricsWindowHours(env);
@@ -326,8 +334,11 @@ export async function loadEnrichmentScaleMetricsWithinDeadline(
     signal,
     deadlineAtMs: Date.now() + enrichmentScaleMetricsTimeoutMs(env),
   }),
+  overallDeadlineAtMs?: number,
 ): Promise<EnrichmentScaleMetrics | undefined> {
-  const timeoutMs = enrichmentScaleMetricsTimeoutMs(env);
+  const timeoutMs = overallDeadlineAtMs == null
+    ? enrichmentScaleMetricsTimeoutMs(env)
+    : Math.max(1, Math.min(enrichmentScaleMetricsTimeoutMs(env), overallDeadlineAtMs - Date.now()));
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -358,22 +369,51 @@ export async function loadEnrichmentScaleMetricsWithinDeadline(
  */
 export const DEFAULT_ENRICHMENT_SCALE_METRICS_ATTEMPTS = 3;
 export const DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_DELAY_MS = 2_000;
+export const DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS = 10_000;
+
+export function enrichmentScaleMetricsRetryBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1_000 || value > 60_000) return DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  return Math.floor(value);
+}
+
+function boundedOption(value: unknown, fallback: number, min: number, max: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(numeric)));
+}
 
 export async function loadEnrichmentScaleMetricsWithRetry(
-  load: () => Promise<EnrichmentScaleMetrics | undefined> = loadEnrichmentScaleMetricsWithinDeadline,
+  load: (deadlineAtMs: number) => Promise<EnrichmentScaleMetrics | undefined> = deadlineAtMs =>
+    loadEnrichmentScaleMetricsWithinDeadline(
+      Date.now(),
+      process.env,
+      signal => loadEnrichmentScaleMetrics(Date.now(), process.env, { signal, deadlineAtMs }),
+      deadlineAtMs,
+    ),
   options: {
     attempts?: number;
     delayMs?: number;
+    budgetMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
   } = {},
 ): Promise<EnrichmentScaleMetrics | undefined> {
-  const attempts = Math.min(5, Math.max(1, Math.floor(options.attempts ?? DEFAULT_ENRICHMENT_SCALE_METRICS_ATTEMPTS)));
-  const delayMs = Math.min(5_000, Math.max(0, Math.floor(options.delayMs ?? DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_DELAY_MS)));
+  const budgetMs = boundedOption(options.budgetMs, enrichmentScaleMetricsRetryBudgetMs(), 1_000, 60_000);
+  const attempts = boundedOption(options.attempts, DEFAULT_ENRICHMENT_SCALE_METRICS_ATTEMPTS, 1, 5);
+  const delayMs = boundedOption(options.delayMs, DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_DELAY_MS, 0, 5_000);
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const now = options.now ?? Date.now;
+  const deadlineAtMs = now() + budgetMs;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const metrics = await load().catch(() => undefined);
+    if (now() >= deadlineAtMs) break;
+    const metrics = await load(deadlineAtMs).catch(() => undefined);
     if (metrics) return metrics;
-    if (attempt + 1 < attempts && delayMs > 0) await sleep(delayMs);
+    const remainingMs = deadlineAtMs - now();
+    if (remainingMs <= 0 || attempt + 1 >= attempts) break;
+    await sleep(Math.min(delayMs, remainingMs));
   }
   return undefined;
 }

@@ -350,6 +350,59 @@ test('startup metrics retry fails closed after the bounded attempt count', async
   assert.deepEqual(sleeps, [50, 50]);
 });
 
+test('retry attempts stop at the shared startup budget', async () => {
+  let clock = 0;
+  let calls = 0;
+  const metrics = await loadEnrichmentScaleMetricsWithRetry(
+    async () => {
+      calls += 1;
+      return undefined;
+    },
+    {
+      attempts: 5,
+      delayMs: 600,
+      budgetMs: 1_000,
+      now: () => clock,
+      sleep: async ms => { clock += ms; },
+    },
+  );
+  assert.equal(metrics, undefined);
+  assert.equal(calls, 2);
+  assert.equal(clock, 1_000);
+});
+
+test('NaN retry options fall back to the bounded defaults', async () => {
+  let calls = 0;
+  const sleeps: number[] = [];
+  const metrics = await loadEnrichmentScaleMetricsWithRetry(
+    async () => {
+      calls += 1;
+      return undefined;
+    },
+    { attempts: Number.NaN, delayMs: Number.NaN, budgetMs: Number.NaN, sleep: async ms => { sleeps.push(ms); } },
+  );
+  assert.equal(metrics, undefined);
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [2_000, 2_000]);
+});
+
+test('an already-aborted metrics attempt does not start any query', async () => {
+  let queries = 0;
+  const controller = new AbortController();
+  controller.abort(new Error('deadline'));
+  await assert.rejects(
+    loadEnrichmentScaleMetrics(0, {} as any, {
+      signal: controller.signal,
+      query: async () => {
+        queries += 1;
+        return { rows: [{}] };
+      },
+    }),
+    /deadline expired/i,
+  );
+  assert.equal(queries, 0);
+});
+
 test('present startup metrics are not retried', async () => {
   let calls = 0;
   const sleeps: number[] = [];
