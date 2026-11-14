@@ -109,22 +109,82 @@ export function parseSelectedCountries(raw: string): string[] {
     .filter(country => Boolean(country) && supported.has(country)))];
 }
 
+export interface RelationshipSeedRetryEntry {
+  country: string;
+  attempts: number;
+}
+
+export type RelationshipSeedSweepOutcome = {
+  country: string;
+  status: 'COMPLETED' | 'FAILED';
+};
+
 /**
- * Cursor/day outcome for one sweep window.
- *
- * - No failures: every selected country was processed (including empty seeds),
- *   so close the day and advance the full window.
- * - Partial failure: advance past completed countries but keep the day open so
- *   the failed country is retried.
- * - No progress: leave both cursor and day unchanged.
+ * Strict parser for the internal retry ledger. A malformed ledger is ignored
+ * by the sweep (and replaced on the next successful write) rather than
+ * blocking seed expansion forever.
  */
-export function relationshipSeedSweepProgress(input: {
-  selectedCount: number;
-  completed: number;
-  failures: number;
-}): { recordDay: boolean; cursorAdvance: number } {
-  if (input.failures === 0) return { recordDay: true, cursorAdvance: input.selectedCount };
-  return { recordDay: false, cursorAdvance: Math.max(0, input.completed) };
+export function parseSeedRetryEntries(raw: string): RelationshipSeedRetryEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('RELATIONSHIP_SEED_RETRY_MALFORMED');
+  }
+  if (!Array.isArray(parsed)) throw new Error('RELATIONSHIP_SEED_RETRY_MALFORMED');
+  const supported = new Set(SUPPORTED_PRODUCTION_COUNTRIES.map(canonicalCountry));
+  const entries = new Map<string, RelationshipSeedRetryEntry>();
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('RELATIONSHIP_SEED_RETRY_MALFORMED');
+    }
+    const row = entry as Record<string, unknown>;
+    if (typeof row.country !== 'string') throw new Error('RELATIONSHIP_SEED_RETRY_MALFORMED');
+    const country = canonicalCountry(row.country);
+    if (!supported.has(country)) continue;
+    const attempts = Number.isSafeInteger(row.attempts) && Number(row.attempts) > 0
+      ? Number(row.attempts)
+      : 0;
+    entries.set(country, { country, attempts });
+  }
+  return [...entries.values()];
+}
+
+/**
+ * One daily sweep window. The rotation cursor always advances past the
+ * countries that were actually in the rotation window; failed countries are
+ * carried in the retry ledger instead of being skipped. Retry countries are
+ * processed before new rotation countries, and are dropped after a bounded
+ * number of attempts so a permanently broken country cannot pin the sweep.
+ *
+ * Recording the day on every window preserves the daily bound. A failed
+ * country is retried on the next day (not every autonomous cycle).
+ */
+export function nextSeedSweepState(input: {
+  currentRetry: RelationshipSeedRetryEntry[];
+  rotationCountries: string[];
+  outcomes: RelationshipSeedSweepOutcome[];
+  maxRetryAttempts?: number;
+}): { cursorAdvance: number; retry: RelationshipSeedRetryEntry[] } {
+  const maxAttempts = Math.max(1, Math.min(10, Math.trunc(input.maxRetryAttempts ?? 3)));
+  const currentAttempts = new Map(input.currentRetry.map(entry => [entry.country, entry.attempts]));
+  const retry = new Map(input.currentRetry.map(entry => [entry.country, entry]));
+  for (const outcome of input.outcomes) {
+    if (outcome.status === 'COMPLETED') {
+      retry.delete(outcome.country);
+      continue;
+    }
+    const attempts = (currentAttempts.get(outcome.country) ?? 0) + 1;
+    if (attempts < maxAttempts) {
+      retry.set(outcome.country, { country: outcome.country, attempts });
+    } else {
+      retry.delete(outcome.country);
+    }
+  }
+  return {
+    cursorAdvance: input.rotationCountries.length,
+    retry: [...retry.values()],
+  };
 }
 
 /**
@@ -161,23 +221,38 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
   const countries = [...new Set(scope === 'SELECTED_COUNTRIES' ? configured : DEFAULT_NON_DORMANT_COUNTRIES)];
   if (!countries.length) return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
   const cursor = Math.max(0, Number(await getAppSetting('relationship_canary_seed_cursor', '0')) || 0);
-  const selected = Array.from({ length: Math.min(RELATIONSHIP_SEED_SWEEP_MAX_COUNTRIES, countries.length) }, (_, index) =>
-    countries[(cursor + index) % countries.length],
-  );
+  const retryKey = 'relationship_canary_seed_retry';
+  let currentRetry: RelationshipSeedRetryEntry[] = [];
+  try {
+    currentRetry = parseSeedRetryEntries(await getAppSetting(retryKey, '[]'));
+  } catch {
+    // Internal retry state is not operator input; a corrupt value must not
+    // block the sweep. Replace it after this window.
+    currentRetry = [];
+  }
+  // Prune retry entries for countries that are no longer in scope.
+  const scopedRetry = currentRetry.filter(entry => countries.includes(entry.country));
+  const retryCountries = scopedRetry.map(entry => entry.country);
+  const usingRetry = retryCountries.length > 0;
+  const rotationSelected = usingRetry
+    ? []
+    : Array.from({ length: Math.min(RELATIONSHIP_SEED_SWEEP_MAX_COUNTRIES, countries.length) }, (_, index) =>
+        countries[(cursor + index) % countries.length],
+      );
+  const selected = usingRetry
+    ? retryCountries.slice(0, RELATIONSHIP_SEED_SWEEP_MAX_COUNTRIES)
+    : rotationSelected;
 
   let queued = 0;
-  let completed = 0;
-  let failures = 0;
+  const outcomes: RelationshipSeedSweepOutcome[] = [];
   const queuedCountries: string[] = [];
   for (const country of selected) {
     try {
       await assertCountryAllowed(country, 'relationship-canary:seed-sweep');
       const selection = await selectRelationshipCanarySeeds(country);
       if (!selection.seeds.length) {
-        // A completed selection with no eligible/cooldown seeds must still
-        // advance the rotation; otherwise the sweep checks the same pair
-        // forever and never reaches later countries.
-        completed += 1;
+        // A completed selection with no eligible/cooldown seeds is progress.
+        outcomes.push({ country, status: 'COMPLETED' });
         continue;
       }
       const cohortId = `seed:${country}:${day}`.normalize('NFKC').toLowerCase().replace(/[^a-z0-9:-]+/g, '-').slice(0, 80);
@@ -200,29 +275,31 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
         },
       );
       queued += 1;
-      completed += 1;
       queuedCountries.push(country);
+      outcomes.push({ country, status: 'COMPLETED' });
     } catch (error: any) {
       if (error?.code === 'COUNTRY_EXCLUDED') {
         // Exclusion is permanent for this country; do not let it pin the
-        // cursor forever.
-        completed += 1;
+        // cursor or retry ledger forever.
+        outcomes.push({ country, status: 'COMPLETED' });
         continue;
       }
-      failures += 1;
-      // A single country's provider/admission failure must not abort the sweep.
+      // A single country's provider/admission failure must not abort the
+      // sweep, but it is recorded for a future day's retry window.
+      outcomes.push({ country, status: 'FAILED' });
     }
   }
-  const progress = relationshipSeedSweepProgress({
-    selectedCount: selected.length,
-    completed,
-    failures,
+  const next = nextSeedSweepState({
+    currentRetry: scopedRetry,
+    rotationCountries: rotationSelected,
+    outcomes,
   });
-  if (progress.recordDay) {
-    await setAppSetting('relationship_canary_seed_sweep_day', day).catch(() => undefined);
-  }
-  if (progress.cursorAdvance > 0) {
-    await setAppSetting('relationship_canary_seed_cursor', String(cursor + progress.cursorAdvance)).catch(() => undefined);
+  // Persist retry state first: if this write fails, leave the day unrecorded
+  // so the next cycle can retry rather than silently dropping the failures.
+  await setAppSetting(retryKey, JSON.stringify(next.retry));
+  await setAppSetting('relationship_canary_seed_sweep_day', day).catch(() => undefined);
+  if (next.cursorAdvance > 0) {
+    await setAppSetting('relationship_canary_seed_cursor', String(cursor + next.cursorAdvance)).catch(() => undefined);
   }
   return { status: 'COMPLETED', queued, countries: queuedCountries };
 }

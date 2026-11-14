@@ -6,6 +6,7 @@ import {evaluateRetrievalSpecificity,type RetrievalSpecificityDecision} from './
 import { countrySearchLanguageCandidates, normalizeLanguageCode } from './countrySearchHints';
 import { capFreeSignalCandidates, type FreeSignalQueryCandidate, type FreeSignalType } from './freeQuerySignals';
 import { isAmbiguousShortModifier, isExtractedStandaloneQuery, isReviewedNativePhrase, isSearchableTradingTerm, reviewedNativePhraseLanguages, TERMINOLOGY_SEARCHABILITY_VERSION } from './terminologySearchability';
+import { generatedQueryShape } from './generatedQueryShape';
 import { isProductionConfiguredCountry } from './queryQuality/profiles';
 
 export type QueryKnowledgeTier = 1 | 2 | 3;
@@ -181,6 +182,20 @@ export function isForbiddenProseQuery(query: string): boolean {
   return FORBIDDEN_PROSE.test(query.normalize('NFKC').trim().replace(/\s+/g, ' '));
 }
 
+/**
+ * Promotional/platform surfaces that are never useful discovery queries.
+ *
+ * `like` and `comment` are ordinary words in English and French
+ * (`stocks like tesla`, `comment trader`), so they are only rejected inside
+ * explicit CTA phrases. `follow the trend` is likewise a legitimate query;
+ * only direct follow requests are CTA.
+ */
+const GENERATED_CTA_PATTERN = /\b(?:subscribe|telegram|whatsapp|discord|link\s+in\s+bio)\b|\b(?:like\s+and\s+subscribe|smash\s+(?:that\s+)?like|comment\s+below|comment\s+your|follow\s+(?:me|us|for\s+more|my))\b/iu;
+
+export function hasGeneratedCtaOrPlatform(term: string): boolean {
+  return GENERATED_CTA_PATTERN.test(String(term || '').normalize('NFKC'));
+}
+
 export function isRetrievalOrientedQuery(country: string, query: string, languageContext?: GlobalLanguageContext & { governed?: boolean }): boolean {
   const normalized = query.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const scriptCompatible = languageContext?.governed
@@ -266,6 +281,7 @@ export function planCountryNativeProposalQuery(args: {
   dominantLocale?: string | null;
   generationSource?: 'LLM_NATIVE_QUERY' | 'YOUTUBE_AUTOCOMPLETE' | null;
   generationProvenance?: Record<string, unknown> | null;
+  scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
 }): PlannedQuery | null {
   const nativeTerm = args.nativeTerm.normalize('NFKC').trim().replace(/\s+/g, ' ');
   // The country-native proposal path is separate from planDiverseQueries and
@@ -282,10 +298,11 @@ export function planCountryNativeProposalQuery(args: {
   const generationSource = args.generationSource === 'LLM_NATIVE_QUERY' || args.generationSource === 'YOUTUBE_AUTOCOMPLETE'
     ? args.generationSource
     : null;
-  const tokenCount = queryTokenCount(nativeTerm);
+  const phraseShape = generatedQueryShape(nativeTerm);
+  const tokenCount = phraseShape.tokens;
   const declaredLanguage = languageEvidence.map(normalizeLanguageCode).find(Boolean);
-  const generatedCta = /\b(subscribe|follow|like|comment|telegram|whatsapp|discord|link\s+in\s+bio)\b/iu.test(nativeTerm);
-  const generatedGate = generationSource && !generatedCta && supportedLanguages.length > 0 && tokenCount >= 2 && tokenCount <= 6
+  const generatedCta = hasGeneratedCtaOrPlatform(nativeTerm);
+  const generatedGate = generationSource && !generatedCta && supportedLanguages.length > 0 && phraseShape.bounded
     ? isSearchableTradingTerm({
         term: nativeTerm,
         termType: 'PHRASE',
@@ -346,12 +363,20 @@ export function planCountryNativeProposalQuery(args: {
       generatedNativePhrase: true,
       retrievalOptimized: true,
       tokenCount,
+      characterCount: phraseShape.characters,
+      unspacedScript: phraseShape.unspaced,
       scriptValidated: true,
       retrievalSpecificity: generatedPolicy,
       atoms: [{ ...learned, retrievalPolicy: generatedPolicy, role: 'ANCHOR', position: 0 }],
       localTier1Term: nativeTerm,
       learnedTerm: nativeTerm,
       countryNativeAllocation: args.allocationLineage,
+      // A generated phrase for an operator-selected dormant country needs the
+      // same live scope-promotion marker as static native surfaces; otherwise
+      // admission rejects it with COUNTRY_NOT_PRODUCTION_CONFIGURED.
+      ...(args.scopePromotionBasis != null && !isProductionConfiguredCountry(args.country)
+        ? { scopePromoted: true, promotionBasis: args.scopePromotionBasis }
+        : {}),
       generationProvenance: args.generationProvenance || undefined,
       language: args.language || undefined,
       locale: args.locale || undefined,

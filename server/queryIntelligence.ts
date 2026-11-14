@@ -2095,6 +2095,7 @@ type CountryNativeAuthorizationInput = {
   proposalId: string;
   targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
   proposalEvidenceSnapshot: Record<string, any>;
+  scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
 };
 
 export type QueryIntelligenceAuthorizationInputResult =
@@ -2210,7 +2211,8 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
           || evidence.generationProvenance?.source === 'LLM'
           ? 'LLM_NATIVE_QUERY'
           : null,
-      generationProvenance: evidence.generationProvenance ?? null
+      generationProvenance: evidence.generationProvenance ?? null,
+      scopePromotionBasis: args.scopePromotionBasis
     });
     if (!planned) return { status: 'REJECTED', code: 'RETRIEVAL_ANCHOR_UNAVAILABLE', queryRecord: null };
     if (!planned.query.normalize('NFKC').toLocaleLowerCase('en').includes(nativeTerm.normalize('NFKC').toLocaleLowerCase('en'))) {
@@ -2276,6 +2278,7 @@ export async function constructCountryNativeAllocationQuery(args: {
   proposalId: string;
   targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
   proposalEvidenceSnapshot: Record<string, any>;
+  scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
 }): Promise<QueryRecord | null> {
   const outcome = await authorizeCountryNativeAllocationQuery(args);
   return outcome.status === 'AUTHORIZED' ? outcome.queryRecord : null;

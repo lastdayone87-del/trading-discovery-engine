@@ -702,6 +702,19 @@ const NATIVE_GENERATION_MODES: Array<{ mode: 'OPEN_WORLD' | 'REAL_SIGNAL' | 'GRO
   { mode: 'GROUNDED', share: 0.15 },
 ];
 
+/** Rotate through a cached mode batch so later cycles surface unused candidates. */
+export function rotateCachedSelection<T>(
+  items: readonly T[],
+  cursor: number,
+  count: number,
+): { selected: T[]; nextCursor: number } {
+  const base = Number.isFinite(cursor) ? Math.max(0, Math.trunc(cursor)) : 0;
+  if (!items.length || count <= 0) return { selected: [], nextCursor: base };
+  const start = base % items.length;
+  const selected = [...items.slice(start), ...items.slice(0, start)].slice(0, Math.min(count, items.length));
+  return { selected, nextCursor: base + selected.length };
+}
+
 async function nativeQueryCoverageGaps(country: string): Promise<string[]> {
   try {
     const db = await getDb();
@@ -850,7 +863,33 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
       REAL_SIGNAL: dedupedByMode.REAL_SIGNAL.length,
       GROUNDED: dedupedByMode.GROUNDED.length,
     });
-    const selected = NATIVE_GENERATION_MODES.flatMap(({ mode }) => dedupedByMode[mode].slice(0, slots[mode]));
+    // A cached 60/25/15 batch is reused across cycles. Always slicing the
+    // first slots would surface the same five candidates forever; a persisted
+    // per-mode cursor rotates through the rest of the cached batch.
+    const selectionCursorKey = `native_query_generation_selection_cursor:${canonicalC}`;
+    let selectionCursors: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', number> = {
+      OPEN_WORLD: 0,
+      REAL_SIGNAL: 0,
+      GROUNDED: 0,
+    };
+    try {
+      const parsed = JSON.parse(await getAppSetting(selectionCursorKey, '{}'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const { mode } of NATIVE_GENERATION_MODES) {
+          const value = (parsed as Record<string, unknown>)[mode];
+          selectionCursors[mode] = typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
+        }
+      }
+    } catch {
+      // Start at the beginning of each mode batch if the cursor is malformed.
+    }
+    const selected: NativeQueryCandidate[] = [];
+    for (const { mode } of NATIVE_GENERATION_MODES) {
+      const rotation = rotateCachedSelection(dedupedByMode[mode], selectionCursors[mode], slots[mode]);
+      selectionCursors[mode] = rotation.nextCursor;
+      selected.push(...rotation.selected);
+    }
+    await setAppSetting(selectionCursorKey, JSON.stringify(selectionCursors)).catch(() => undefined);
     return selected.map(candidate => buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
       country: canonicalC,
