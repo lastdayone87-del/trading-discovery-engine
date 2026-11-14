@@ -5,6 +5,7 @@ import {
   CLASSIFICATION_JOB_TYPE,
   CLASSIFICATION_DECOUPLING_FLAG,
   CLASSIFICATION_JOB_PRIORITY_DEFAULT,
+  CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS_DEFAULT,
   ENRICHMENT_WORKER_CONCURRENCY_DEFAULT,
   SEARCH_WORKER_CONCURRENCY_DEFAULT,
   buildClassificationJobPayload,
@@ -13,6 +14,7 @@ import {
   classificationDayBucket,
   classificationJobIdempotencyKey,
   classificationQueryScopeKey,
+  classificationRenderedFallbackMaxWaitMs,
   enrichmentJobIdempotencyKey,
   mapClassificationOutcomeToFunnelOutcome,
   resolveClassificationDecouplingConfig,
@@ -131,6 +133,25 @@ test('enrichment pool reserves separate admission and classification lanes', () 
       }
     }
   }
+});
+
+test('classification browser-gate wait defaults short and stays bounded', () => {
+  assert.equal(CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS_DEFAULT, 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({} as any), 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '' } as any), 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: 'nonsense' } as any), 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '0' } as any), 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '31000' } as any), 5_000);
+  assert.equal(classificationRenderedFallbackMaxWaitMs({ CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS: '20000' } as any), 20_000);
+});
+
+test('classification uses the short rendered wait and the dedicated community lane', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(queue, /renderedFallbackMaxWaitMs: classificationRenderedFallbackMaxWaitMs\(\)/);
+  assert.match(queue, /claimableOverride\?\.includes\('RETRY_COMMUNITY_ACQUISITION'\)/);
+  assert.doesNotMatch(queue, /!claimableOverride \|\| claimableOverride\.includes\('RETRY_COMMUNITY_ACQUISITION'\)/);
+  assert.match(pipeline, /renderedFallbackMaxWaitMs/);
 });
 
 test('day-bucketed idempotency key is stable within a UTC day and changes next day', () => {
