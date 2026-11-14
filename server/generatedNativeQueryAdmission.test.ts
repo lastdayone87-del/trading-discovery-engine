@@ -52,6 +52,29 @@ test('a genuine 4-6 word generated native phrase is admitted as a bounded standa
   assert.notEqual(admission.admission.tier, 'SPECULATIVE');
 });
 
+test('generated admission rejects provenance from a different language in the same country', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'France',
+    nativeTerm: 'analyse technique CAC 40',
+    countryVocabulary: france,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-lang', proposalId: 'proposal-lang' },
+    language: 'fr',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: { ...provenance, language: 'de' },
+  });
+  assert.ok(planned);
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'France',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  // The provenance's German tag must not authorize a French phrase as a
+  // generated whole-query exception.
+  assert.equal(admission.eligible, false);
+});
+
 test('native authorization accepts generated 4-6 word evidence but rejects >6 words', () => {
   const proposal = buildFrontierProposal({
     proposalFamily: 'COUNTRY_NATIVE',

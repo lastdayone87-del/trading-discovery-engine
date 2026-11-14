@@ -127,6 +127,33 @@ function contextDigest(context: NativeQueryGenerationContext): string {
   })).digest('hex');
 }
 
+/**
+ * A cache hit is reusable unless memory removed candidates and left the batch
+ * underfilled. A provider-short batch (no duplicate loss) stays cached.
+ */
+export function shouldRegenerateCachedGeneration(input: {
+  requested: number;
+  accepted: number;
+  lostToMemory: number;
+}): boolean {
+  return input.accepted < input.requested && input.lostToMemory > 0;
+}
+
+function candidateMemoryHistory(
+  context: NativeQueryGenerationContext,
+  batchKey: string,
+): CandidateHistoryItem[] {
+  return [
+    ...context.existingQueries,
+    ...context.candidateMemory
+      // Pending rows from this same batch are the cache's own output and must
+      // not reject it. Admitted/rejected rows from this batch are real history
+      // and must still participate.
+      .filter(row => row.batchKey !== batchKey || row.status === 'ADMITTED' || row.status === 'REJECTED')
+      .map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
+  ];
+}
+
 function buildPrompt(context: NativeQueryGenerationContext, persona: string, scenario: string, rejected: string[], count: number): string {
   const existing = context.existingQueries.map(item => item.query).filter(Boolean).slice(0, 100);
   const gaps = context.coverageGaps.slice(0, 16);
@@ -350,17 +377,15 @@ export async function generateNativeQueriesWithLlm(input: {
     promptVersion: NATIVE_QUERY_PROMPT_VERSION,
     contextDigest: digest,
   });
-  const cachedHistory: CandidateHistoryItem[] = [
-    ...context.existingQueries,
-    ...context.candidateMemory.filter(row => row.batchKey !== batchKey).map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
-  ];
+  const cachedHistory = candidateMemoryHistory(context, batchKey);
   const cached = await getGenerationBatch(batchKey).catch(() => null);
+  let cachedFallback: NativeQueryGenerationResult | null = null;
   if (cached && Array.isArray(cached.candidates)) {
     // Memory may have changed since the batch was written (for example a
     // query was admitted elsewhere or a prompt was rejected). Re-apply the
     // exact/semantic guard instead of trusting the old cache blindly.
     const refreshed = dedupeCandidateBatch(cached.candidates as NativeQueryCandidate[], cachedHistory);
-    return {
+    cachedFallback = {
       candidates: refreshed.accepted.slice(0, count),
       rejected: [
         ...(Array.isArray(cached.rejected) ? cached.rejected as Array<{ query: string; reasons: string[] }> : []),
@@ -372,21 +397,31 @@ export async function generateNativeQueriesWithLlm(input: {
       cached: true,
       duplicateRate: Number(cached.duplicateRate || 0),
     };
+    // If memory removed cached candidates but the batch is still full enough,
+    // reuse it. If the cache is underfilled because of real memory changes,
+    // regenerate instead of returning a short batch for the full 14-day TTL.
+    // A batch that was simply provider-short (no duplicate loss) stays cached.
+    if (!shouldRegenerateCachedGeneration({
+      requested: count,
+      accepted: refreshed.accepted.length,
+      lostToMemory: refreshed.rejected.length,
+    })) {
+      return cachedFallback;
+    }
   }
 
   const generate = input.generateText || defaultGenerateText;
   const personas = PERSONAS[context.mode];
   const persona = personas[Math.abs(digest.charCodeAt(0) + digest.charCodeAt(1)) % personas.length];
   const scenario = SCENARIOS[Math.abs(digest.charCodeAt(2) + digest.charCodeAt(3)) % SCENARIOS.length];
-  const history: CandidateHistoryItem[] = [
-    ...context.existingQueries,
-    ...context.candidateMemory.filter(row => row.batchKey !== batchKey).map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
-  ];
+  const history = candidateMemoryHistory(context, batchKey);
   const accepted: NativeQueryCandidate[] = [];
   const rejected: Array<{ query: string; reasons: string[] }> = [];
   let provider: string | null = null;
   let model: string | null = null;
   let lastText = '';
+  let evaluated = 0;
+  let duplicateRejections = 0;
 
   for (let pass = 0; pass < 2; pass += 1) {
     const prompt = buildPrompt(context, persona, scenario, rejected.map(item => item.query), count);
@@ -398,6 +433,7 @@ export async function generateNativeQueriesWithLlm(input: {
     model = response.model;
     lastText = response.text;
     for (const row of parsed) {
+      evaluated += 1;
       const assessed = assessCandidate({
         query: row.query,
         country: context.country,
@@ -421,6 +457,7 @@ export async function generateNativeQueriesWithLlm(input: {
         history,
       );
       if (duplicate.duplicate) {
+        duplicateRejections += 1;
         rejected.push({ query: assessed.candidate.query, reasons: [duplicate.class || 'DUPLICATE'] });
         continue;
       }
@@ -432,7 +469,10 @@ export async function generateNativeQueriesWithLlm(input: {
     if (!rejected.length) break;
   }
 
-  const duplicateRate = parsedCount(lastText) > 0 ? rejected.length / parsedCount(lastText) : 0;
+  // Rejection rate is not duplicate rate: validation/language/gate failures
+  // must not corrupt novelty metrics. Use duplicate decisions only, over the
+  // rows actually evaluated (early acceptance breaks stop consuming candidates).
+  const duplicateRate = evaluated > 0 ? duplicateRejections / evaluated : 0;
   const result: NativeQueryGenerationResult = {
     candidates: accepted.slice(0, count),
     rejected,
@@ -444,8 +484,9 @@ export async function generateNativeQueriesWithLlm(input: {
   };
   // A provider outage is not a low-novelty result. Do not cache an empty
   // batch for the full TTL, otherwise a transient key/network failure would
-  // suppress generation for two weeks.
-  if (!lastText) return result;
+  // suppress generation for two weeks. If a cache existed, return its
+  // still-valid subset rather than dropping known-good candidates.
+  if (!lastText) return cachedFallback || result;
   await rememberQueryCandidates([
     ...accepted.map(candidate => ({
       country: context.country,
@@ -492,10 +533,6 @@ export async function generateNativeQueriesWithLlm(input: {
     status: accepted.length ? 'COMPLETED' : 'LOW_NOVELTY',
   }).catch(() => undefined);
   return result;
-}
-
-function parsedCount(text: string): number {
-  return parseResponse(text).length;
 }
 
 /** Exposed for tests and the autocomplete generator to use the same validator. */

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { INITIAL_COUNTRY_VOCABULARIES } from '../src/data/initial_countries';
 import { planDiverseQueries, shouldGenerateNativeQueries } from './queryPlanner';
 import { admitQueryRecord } from './queryQuality/admission';
+import { generateNativeQueriesWithLlm, shouldRegenerateCachedGeneration } from './nativeQueryGeneration';
 
 function vocabulary(country: string) {
   const found = INITIAL_COUNTRY_VOCABULARIES.find(item => item.country === country);
@@ -57,6 +58,45 @@ test('selected dormant countries can admit their native standalone surfaces', ()
     generation_metadata: native.metadata,
   });
   assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
+});
+
+test('underfilled cache regenerates only when memory removed candidates', () => {
+  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 4, lostToMemory: 6 }), true);
+  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 4, lostToMemory: 0 }), false);
+  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 10, lostToMemory: 0 }), false);
+});
+
+test('duplicateRate counts duplicate decisions only, not validation failures', async () => {
+  let call = 0;
+  const result = await generateNativeQueriesWithLlm({
+    context: {
+      country: 'France',
+      language: 'fr',
+      mode: 'OPEN_WORLD',
+      existingQueries: [],
+      candidateMemory: [],
+      coverageGaps: [],
+      autocompleteSuggestions: [],
+      localVocabulary: [],
+    },
+    count: 2,
+    generateText: async () => {
+      call += 1;
+      const queries = call === 1
+        ? [
+            { query: 'analyse technique CAC 40', intent: 'market_analysis', confidence: 0.8 },
+            { query: 'subscribe to my trading channel', intent: 'education', confidence: 0.8 },
+          ]
+        : [
+            { query: 'bourse direct avis', intent: 'strategy', confidence: 0.8 },
+          ];
+      return { text: JSON.stringify({ queries }), provider: 'test', model: 'test' };
+    },
+  });
+  assert.equal(result.candidates.length, 2);
+  // One CTA was rejected by validation, but no candidate was rejected as a
+  // duplicate. The old rejection-rate metric would have reported 1/3.
+  assert.equal(result.duplicateRate, 0);
 });
 
 test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {
