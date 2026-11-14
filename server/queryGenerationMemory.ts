@@ -143,6 +143,7 @@ export async function rememberQueryCandidates(candidates: CandidateMemoryInput[]
            WHEN EXCLUDED.status='PROPOSED' THEN 'PROPOSED'
            WHEN query_candidate_memory.status='REJECTED' THEN 'REJECTED'
            WHEN EXCLUDED.status='REJECTED' THEN 'REJECTED'
+           WHEN query_candidate_memory.status='DUPLICATE' THEN 'DUPLICATE'
            ELSE EXCLUDED.status
          END,
          reason_codes=CASE

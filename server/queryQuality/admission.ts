@@ -240,7 +240,7 @@ export function candidateFromQueryRecord(
     && ['LLM_NATIVE_PHRASE', 'AUTOCOMPLETE_PHRASE'].includes(String(metadata.queryTemplate || '').toUpperCase())
     && (generatedProvenance?.source === 'LLM' || generatedProvenance?.source === 'AUTOCOMPLETE')
     && generatedProvenance?.country.toLowerCase() === record.country.toLowerCase()
-    && generatedProfile.languages.includes(generatedProvenance.language)
+    && generatedProfile.languages.includes(generatedLanguage)
     // The generated phrase bypass is language-specific. A French provenance
     // must not authorize a phrase being admitted as German (or vice versa)
     // merely because both languages belong to the same country profile.

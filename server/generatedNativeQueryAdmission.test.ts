@@ -52,6 +52,27 @@ test('a genuine 4-6 word generated native phrase is admitted as a bounded standa
   assert.notEqual(admission.admission.tier, 'SPECULATIVE');
 });
 
+test('generated admission accepts a regional provenance tag for the same language', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'France',
+    nativeTerm: 'analyse technique CAC 40',
+    countryVocabulary: france,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-region', proposalId: 'proposal-region' },
+    language: 'fr-FR',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: { ...provenance, language: 'fr-FR' },
+  });
+  assert.ok(planned);
+  const admission = admitQueryRecord({
+    query: planned.query,
+    country: 'France',
+    primary_term: planned.primaryTerm,
+    generation_metadata: planned.metadata,
+  });
+  assert.equal(admission.eligible, true, admission.reasonCodes.join(', '));
+});
+
 test('generated admission rejects provenance from a different language in the same country', () => {
   const planned = planCountryNativeProposalQuery({
     country: 'France',

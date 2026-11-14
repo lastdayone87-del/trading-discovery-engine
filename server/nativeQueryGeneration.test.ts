@@ -66,9 +66,21 @@ test('underfilled cache regenerates only when memory removed candidates', () => 
   assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 10, lostToMemory: 0 }), false);
 });
 
+function inMemoryGenerationStore() {
+  const batches = new Map<string, Record<string, unknown>>();
+  return {
+    getGenerationBatch: async (key: string) => batches.get(key) || null,
+    rememberQueryCandidates: async () => 0,
+    upsertGenerationBatch: async (input: { batchKey: string; payload: Record<string, unknown> }) => {
+      batches.set(input.batchKey, input.payload);
+    },
+  };
+}
+
 test('duplicateRate counts duplicate decisions only, not validation failures', async () => {
   let call = 0;
   const result = await generateNativeQueriesWithLlm({
+    memoryStore: inMemoryGenerationStore(),
     context: {
       country: 'France',
       language: 'fr',
@@ -97,6 +109,65 @@ test('duplicateRate counts duplicate decisions only, not validation failures', a
   // One CTA was rejected by validation, but no candidate was rejected as a
   // duplicate. The old rejection-rate metric would have reported 1/3.
   assert.equal(result.duplicateRate, 0);
+});
+
+test('a failed replacement pass keeps the valid cached subset', async () => {
+  const memoryStore = inMemoryGenerationStore();
+  const context = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    existingQueries: [],
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const first = await generateNativeQueriesWithLlm({
+    context,
+    count: 2,
+    memoryStore,
+    generateText: async () => ({
+      text: JSON.stringify({ queries: [
+        { query: 'analyse technique CAC 40', intent: 'market_analysis', confidence: 0.8 },
+        { query: 'bourse direct avis', intent: 'strategy', confidence: 0.8 },
+      ] }),
+      provider: 'test',
+      model: 'test',
+    }),
+  });
+  assert.equal(first.candidates.length, 2);
+  const admitted = first.candidates[0];
+  const second = await generateNativeQueriesWithLlm({
+    context: {
+      ...context,
+      candidateMemory: [{
+        country: 'France',
+        language: 'fr',
+        source: 'LLM',
+        mode: 'OPEN_WORLD',
+        normalizedQuery: admitted.query,
+        semanticKey: admitted.query,
+        status: 'ADMITTED',
+        reasonCodes: [],
+        batchKey: first.batchId,
+        metadata: { intent: admitted.intent },
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      }],
+    },
+    count: 2,
+    memoryStore,
+    generateText: async () => ({
+      text: JSON.stringify({ queries: [{ query: 'subscribe to my trading channel', intent: 'education' }] }),
+      provider: 'test',
+      model: 'test',
+    }),
+  });
+  // The admitted candidate is removed, but the other cached candidate must
+  // survive the failed replacement pass instead of being replaced by an
+  // empty 14-day cache entry.
+  assert.deepEqual(second.candidates.map(candidate => candidate.query), [first.candidates[1].query]);
 });
 
 test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {

@@ -1,6 +1,7 @@
+import { SUPPORTED_PRODUCTION_COUNTRIES } from '../src/data/initial_countries';
 import { enqueueJob, getAppSetting, getDb, setAppSetting } from './db';
 import { assertCountryAllowed } from './countryExclusion';
-import { canonicalCountry, isKnownCountry } from './countryInference';
+import { canonicalCountry } from './countryInference';
 import { DEFAULT_NON_DORMANT_COUNTRIES } from './queryQuality/profiles';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import {
@@ -102,9 +103,10 @@ export function parseSelectedCountries(raw: string): string[] {
   if (parsed.some(entry => typeof entry !== 'string')) {
     throw new Error('DISCOVERY_SCOPE_SELECTION_MALFORMED');
   }
+  const supported = new Set(SUPPORTED_PRODUCTION_COUNTRIES.map(canonicalCountry));
   return [...new Set((parsed as string[])
     .map(canonicalCountry)
-    .filter(country => Boolean(country) && isKnownCountry(country)))];
+    .filter(country => Boolean(country) && supported.has(country)))];
 }
 
 /**
