@@ -142,10 +142,12 @@ export function parseSeedRetryEntries(raw: string): RelationshipSeedRetryEntry[]
     if (typeof row.country !== 'string') throw new Error('RELATIONSHIP_SEED_RETRY_MALFORMED');
     const country = canonicalCountry(row.country);
     if (!supported.has(country)) continue;
-    const attempts = Number.isSafeInteger(row.attempts) && Number(row.attempts) > 0
-      ? Number(row.attempts)
-      : 0;
-    entries.set(country, { country, attempts });
+    // The ledger is internal state. A missing/non-positive/non-integer attempt
+    // count is corruption, not a reason to reset that country's retry budget.
+    if (!Number.isSafeInteger(row.attempts) || Number(row.attempts) <= 0) {
+      throw new Error('RELATIONSHIP_SEED_RETRY_MALFORMED');
+    }
+    entries.set(country, { country, attempts: Number(row.attempts) });
   }
   return [...entries.values()];
 }
