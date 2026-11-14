@@ -81,7 +81,29 @@ export function claimQueueAgeOrderColumn(env: NodeJS.ProcessEnv = process.env): 
   return acquisitionJobClockV2Enabled(env) ? 'first_enqueued_at' : 'created_at';
 }
 
-export function claimOrderByClause(env: NodeJS.ProcessEnv = process.env): string {
+export interface ClaimOrderOptions {
+  /**
+   * Rotate community-retry claims by last touch instead of the immutable
+   * enqueue age. Capacity deferrals refund the attempt counter and deliberately
+   * leave `first_enqueued_at` untouched, so strict FIFO lets a
+   * capacity-saturated cohort stay at the head indefinitely and starve
+   * never-claimed work. `updated_at` is refreshed by every claim, completion,
+   * and attempt-free deferral, so a deferred job yields its turn while the
+   * original queue age (and failure budget) stays intact.
+   */
+  communityRetryFairness?: boolean;
+}
+
+/** True only for the dedicated community-retry consumer's single-type claim. */
+export function isCommunityRetryOnlyClaim(types?: string[]): boolean {
+  return types?.length === 1 && types[0] === 'RETRY_COMMUNITY_ACQUISITION';
+}
+
+export function claimOrderByClause(
+  env: NodeJS.ProcessEnv = process.env,
+  options: ClaimOrderOptions = {},
+): string {
+  if (options.communityRetryFairness) return 'priority DESC,updated_at ASC,id ASC';
   return `priority DESC,${claimQueueAgeOrderColumn(env)} ASC`;
 }
 
