@@ -372,18 +372,25 @@ test('retry attempts stop at the shared startup budget', async () => {
 });
 
 test('NaN retry options fall back to the bounded defaults', async () => {
-  let calls = 0;
-  const sleeps: number[] = [];
-  const metrics = await loadEnrichmentScaleMetricsWithRetry(
-    async () => {
-      calls += 1;
-      return undefined;
-    },
-    { attempts: Number.NaN, delayMs: Number.NaN, budgetMs: Number.NaN, sleep: async ms => { sleeps.push(ms); } },
-  );
-  assert.equal(metrics, undefined);
-  assert.equal(calls, 3);
-  assert.deepEqual(sleeps, [2_000, 2_000]);
+  const previousBudget = process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  delete process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  try {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const metrics = await loadEnrichmentScaleMetricsWithRetry(
+      async () => {
+        calls += 1;
+        return undefined;
+      },
+      { attempts: Number.NaN, delayMs: Number.NaN, budgetMs: Number.NaN, sleep: async ms => { sleeps.push(ms); } },
+    );
+    assert.equal(metrics, undefined);
+    assert.equal(calls, 3);
+    assert.deepEqual(sleeps, [2_000, 2_000]);
+  } finally {
+    if (previousBudget === undefined) delete process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+    else process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS = previousBudget;
+  }
 });
 
 test('an already-aborted metrics attempt does not start any query', async () => {
