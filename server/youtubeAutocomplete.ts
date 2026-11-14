@@ -35,6 +35,7 @@ export async function fetchYouTubeAutocomplete(
   url.searchParams.set('client', 'firefox');
   url.searchParams.set('ds', 'yt');
   url.searchParams.set('q', clean);
+  url.searchParams.set('ie', 'utf-8');
   url.searchParams.set('oe', 'utf-8');
   url.searchParams.set('hl', options.language);
   if (options.regionCode) url.searchParams.set('gl', options.regionCode);
@@ -46,7 +47,18 @@ export async function fetchYouTubeAutocomplete(
       headers: { 'User-Agent': 'TradingDiscoveryEngine/1.0 (+https://github.com/lastdayone87-del/trading-discovery-engine)' },
     });
     if (!response.ok) return [];
-    return parseAutocompleteJson(await response.text());
+    // `response.text()` always decodes as UTF-8. The suggest endpoint can
+    // return another declared charset for some locales, so honor the response
+    // charset and fall back to UTF-8 when it is absent or unsupported.
+    const bytes = await response.arrayBuffer();
+    const charset = /charset=([^;]+)/i.exec(response.headers.get('content-type') || '')?.[1]?.trim().toLowerCase();
+    let text: string;
+    try {
+      text = new TextDecoder(charset || 'utf-8').decode(bytes);
+    } catch {
+      text = new TextDecoder('utf-8').decode(bytes);
+    }
+    return parseAutocompleteJson(text);
   } catch {
     return [];
   } finally {
