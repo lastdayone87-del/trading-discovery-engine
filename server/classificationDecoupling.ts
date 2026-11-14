@@ -39,6 +39,22 @@ export const CLASSIFICATION_JOB_PRIORITY_DEFAULT = 21;
 /** Classification + first ENRICH attempt per classification job. */
 export const CLASSIFICATION_JOB_MAX_ATTEMPTS_DEFAULT = 4;
 
+/**
+ * Decision workers check the rendered browser gate briefly. If the dedicated
+ * community consumer owns the single browser slot, classification defers instead
+ * of occupying a worker for the global 90s wait. The community lane retains the
+ * full wait and performs the deferred rendered work.
+ */
+export const CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS_DEFAULT = 5_000;
+
+export function classificationRenderedFallbackMaxWaitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS_DEFAULT;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1_000 || value > 30_000) return CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS_DEFAULT;
+  return Math.floor(value);
+}
+
 /** Measured production search width; kept as a pure default for diagnostics. */
 export const SEARCH_WORKER_CONCURRENCY_DEFAULT = 4;
 /** Measured production enrichment width; Phase 3 preserves three workers. */

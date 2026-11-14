@@ -451,6 +451,32 @@ test('rendered browser launches are process-wide bounded', async () => {
   assert.deepEqual(gate.snapshot(), { active: 0, pending: 0, concurrency: 1, maxPending: 2 });
 });
 
+test('per-call gate wait defers a decision worker while the community lane keeps the global wait', async () => {
+  const gate = new RenderedFallbackGate(1, 4, undefined, 1_000);
+  let release!: () => void;
+  const blocker = new Promise<void>(resolve => { release = resolve; });
+  const first = gate.run(async () => blocker);
+  const keepAlive = setTimeout(() => undefined, 1_000);
+  const startedAt = Date.now();
+  let saturation: any;
+  try {
+    await assert.rejects(
+      gate.run(async () => undefined, 'DISCOVERY', { maxWaitMs: 20 }).catch(error => {
+        saturation = error;
+        throw error;
+      }),
+      /RENDERED_FALLBACK_SATURATED/,
+    );
+  } finally {
+    clearTimeout(keepAlive);
+    release();
+    await first;
+  }
+  assert.ok(Date.now() - startedAt < 500, 'per-call wait must not fall back to the global 1s wait');
+  assert.ok(Number(saturation?.retryAt) > Date.now(), 'retry hint must be in the future');
+  assert.ok(Number(saturation?.retryAt) - Date.now() < 500, 'retry hint must use the per-call wait, not the global wait');
+});
+
 test('rendered host backoff remains bounded by failure class and retry count', () => {
   assert.equal(renderedCrawlerHostBackoffMs('RATE_LIMITED', 0), 1_000);
   assert.equal(renderedCrawlerHostBackoffMs('RATE_LIMITED', 10), 8_000);

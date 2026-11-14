@@ -212,6 +212,14 @@ export interface PipelineExecutionOptions {
   forceClassification?: boolean;
   /** Internal: caller already passed the semantic admission decision. */
   admissionBypass?: boolean;
+  /** Short browser-gate wait for decision workers; rendered saturation defers
+   * to the dedicated community retry consumer. */
+  renderedFallbackMaxWaitMs?: number;
+}
+
+/** Forward a defined rendered wait without emitting an undefined key. */
+export function renderedWaitAttribution(renderedFallbackMaxWaitMs: number | undefined): { renderedFallbackMaxWaitMs?: number } {
+  return renderedFallbackMaxWaitMs === undefined ? {} : { renderedFallbackMaxWaitMs };
 }
 
 /**
@@ -1627,6 +1635,7 @@ async function processChannelThroughPipelineInContext(
     ...(options?.jobType ? { jobType: options.jobType } : {}),
     ...(options?.jobId ? { jobId: options.jobId } : {}),
     slicePass: 1,
+    ...renderedWaitAttribution(options?.renderedFallbackMaxWaitMs),
   });
 
   const finalChannel = (await getChannelById(candidate.channelId)) || activeChannel;

@@ -77,6 +77,10 @@ export interface BrowserFallbackBudget {
   /** Acquisition lane for the Phase 2 admission governor. Optional/additive:
    * direct callers default to UNKNOWN at the gate. */
   admissionLane?: AcquisitionLane;
+  /** Per-call gate wait override. Classification uses a short budget so a busy
+   * browser lane defers to the dedicated community consumer instead of blocking
+   * a decision worker for the full global wait. */
+  maxGateWaitMs?: number;
   /**
    * Test-only seam for the full-crawler browser fixtures. Production callers
    * must omit this: the default is the production loopback egress proxy,
@@ -3817,14 +3821,15 @@ export class RenderedFallbackGate {
     return Math.max(1, Math.ceil(this.maxPending * 0.35));
   }
 
-  private saturationError(gateWaitMs?: number): Error {
+  private saturationError(gateWaitMs?: number, waitMs: number = this.maxWaitMs): Error {
     return Object.assign(new Error('RENDERED_FALLBACK_SATURATED'), {
-      retryAt: Date.now() + this.maxWaitMs,
+      retryAt: Date.now() + waitMs,
       ...(gateWaitMs !== undefined ? { gateWaitMs } : {}),
     });
   }
 
-  private acquire(lane: AcquisitionLane): Promise<() => void> {
+  private acquire(lane: AcquisitionLane, maxWaitMs: number = this.maxWaitMs): Promise<() => void> {
+    const effectiveMaxWaitMs = Math.min(this.maxWaitMs, Math.max(1, Math.floor(maxWaitMs) || this.maxWaitMs));
     if (this.active >= this.concurrency) {
       // Discovery may use a small extra queue reserve so a full non-discovery
       // queue cannot hide discovery demand from the floor governor.
@@ -3866,9 +3871,9 @@ export class RenderedFallbackGate {
         if (index < 0) return; // granted concurrently; grant() cleared the timer
         this.waiters.splice(index, 1);
         const gateWaitMs = Math.max(0, Date.now() - waitStartedAt);
-        this.logWaitTimeout(lane);
-        reject(this.saturationError(gateWaitMs));
-      }, this.maxWaitMs);
+        this.logWaitTimeout(lane, effectiveMaxWaitMs);
+        reject(this.saturationError(gateWaitMs, effectiveMaxWaitMs));
+      }, effectiveMaxWaitMs);
       waiter.timer.unref?.();
       this.waiters.push(waiter);
     });
@@ -3906,14 +3911,14 @@ export class RenderedFallbackGate {
     }));
   }
 
-  private logWaitTimeout(lane: AcquisitionLane): void {
+  private logWaitTimeout(lane: AcquisitionLane, waitMs: number = this.maxWaitMs): void {
     const now = Date.now();
     if (now - this.lastWaitTimeoutLogAtMs < 60_000) return;
     this.lastWaitTimeoutLogAtMs = now;
     console.warn(JSON.stringify({
       event: 'rendered_fallback_wait_timeout',
       lane,
-      waitMs: this.maxWaitMs,
+      waitMs,
       pending: this.waiters.length,
       timestamp: new Date(now).toISOString(),
     }));
@@ -3922,10 +3927,10 @@ export class RenderedFallbackGate {
   async run<T>(
     operation: (admittedAtMs: number) => Promise<T>,
     lane: AcquisitionLane = 'UNKNOWN',
-    options: { isWorkStarted?: (result: T) => boolean } = {},
+    options: { isWorkStarted?: (result: T) => boolean; maxWaitMs?: number } = {},
   ): Promise<T> {
     const queuedDemand = this.active >= this.concurrency;
-    const release = await this.acquire(lane);
+    const release = await this.acquire(lane, options.maxWaitMs);
     const decision = this.admissionGovernor.admit(lane, this.pendingLanes(), queuedDemand);
     if (!decision.admitted) {
       this.logDenied(decision);
@@ -6397,7 +6402,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           await egressProxy?.close().catch(() => undefined);
         }
       }
-    }), limits.admissionLane || 'UNKNOWN', { isWorkStarted: renderedCrawlStarted });
+    }), limits.admissionLane || 'UNKNOWN', { isWorkStarted: renderedCrawlStarted, maxWaitMs: limits.maxGateWaitMs });
   } catch (error:any) {
     if (!telemetry.crawlFinishedAt) telemetry.crawlFinishedAt = new Date().toISOString();
     const candidates=mergeDiscordCandidates(discovered);
