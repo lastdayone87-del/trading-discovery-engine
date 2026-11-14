@@ -30,10 +30,11 @@ export function enrichmentScaleMetricsWindowHours(env: NodeJS.ProcessEnv = proce
   if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS;
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 1 || value > 24) return DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS;
-  return Math.floor(value);
+  return value;
 }
 
 export interface EnrichmentScaleMetrics {
+  semanticWindowHours: number;
   semanticCalls: number;
   semanticSuccesses: number;
   semanticSuccessRate: number;
@@ -300,6 +301,7 @@ export async function loadEnrichmentScaleMetrics(
   const pending = Number(backlog.rows[0]?.pending || 0);
   const backlogStable = evaluateBacklogStability(createdLastHour, completedLastHour, pending, thresholds);
   return {
+    semanticWindowHours: windowHours,
     semanticCalls: calls,
     semanticSuccesses: successes,
     semanticSuccessRate: calls > 0 ? successes / calls : 0,
