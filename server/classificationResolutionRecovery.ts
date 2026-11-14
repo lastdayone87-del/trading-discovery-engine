@@ -207,7 +207,7 @@ export async function reconcileClassificationResolutionGaps(
        LEFT JOIN LATERAL (
          SELECT job.id,job.status,job.terminal_failure_class,job.attempts,job.updated_at
            FROM jobs job
-          WHERE job.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
+          WHERE job.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN')
             AND job.payload->>'channelId'=c.channel_id
           ORDER BY job.updated_at DESC NULLS LAST,job.created_at DESC NULLS LAST,job.id DESC
           LIMIT 1
@@ -225,7 +225,7 @@ export async function reconcileClassificationResolutionGaps(
         AND NOT EXISTS(
           SELECT 1 FROM jobs active
            WHERE active.payload->>'channelId'=c.channel_id
-             AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+             AND active.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
              AND active.status IN('PENDING','PROCESSING')
         )
         AND ($3::boolean OR NOT (
@@ -292,7 +292,7 @@ export async function reconcileClassificationResolutionGaps(
         continue;
       }
       if (decision.action === 'PROJECT_PERMANENT_FAILURE') {
-        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND date_trunc('milliseconds', last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds', $2::timestamptz) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
+        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND date_trunc('milliseconds', last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds', $2::timestamptz) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
         if (projected.rowCount) permanentFailures += 1;
         else skipped += 1;
         continue;

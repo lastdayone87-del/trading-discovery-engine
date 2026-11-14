@@ -207,14 +207,14 @@ export async function getClassificationResolutionOverview(dbOverride?: { query: 
     db.query(
       `SELECT status AS key,count(*)::int AS count,
               COALESCE(MAX(EXTRACT(EPOCH FROM(now()-run_after))/3600) FILTER (WHERE status='PENDING' AND run_after<=now()),0) AS oldest_due_hours
-         FROM jobs WHERE type='ENRICH_CHANNEL' AND (status IN('PENDING','PROCESSING') OR updated_at>=now()-interval '24 hours')
+         FROM jobs WHERE type IN ('ENRICH_CHANNEL','PROCESS_DISCOVERED_CHANNEL') AND (status IN('PENDING','PROCESSING') OR updated_at>=now()-interval '24 hours')
         GROUP BY status`,
     ),
     db.query(
       `SELECT count(*)::int AS count
          FROM channels c
         WHERE c.trading_status='UNCERTAIN' AND c.scan_status='ENRICHMENT_PENDING'
-          AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=c.channel_id AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`,
+          AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=c.channel_id AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`,
     ),
     db.query(
       `SELECT count(*)::int AS count

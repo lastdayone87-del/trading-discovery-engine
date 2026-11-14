@@ -1539,7 +1539,7 @@ export async function enqueueClassificationJobAtomic(
   channelId: string,
   payload: any,
   opts: Parameters<typeof enqueueJob>[2] = {},
-  deps: { client?: any } = {},
+  deps: { client?: any; jobType?: typeof CLASSIFICATION_JOB_TYPE | 'PROCESS_DISCOVERED_CHANNEL' } = {},
 ): Promise<DurableJob | null> {
   // The helper owns the transaction. `deps.client` exists only so tests can
   // drive the locking/admission branches; production callers must not pass a
@@ -1550,14 +1550,14 @@ export async function enqueueClassificationJobAtomic(
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`classification-admit:${channelId}`]);
     const active = await client.query(
-      `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
-      [CLASSIFICATION_JOB_TYPE, channelId],
+      `SELECT 1 FROM jobs WHERE type=ANY($1::text[]) AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+      [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], channelId],
     );
     if (active.rowCount) {
       await client.query('COMMIT');
       return null;
     }
-    const job = await enqueueJob(CLASSIFICATION_JOB_TYPE, payload, { ...opts, clientOverride: client });
+    const job = await enqueueJob(deps.jobType || CLASSIFICATION_JOB_TYPE, payload, { ...opts, clientOverride: client });
     await client.query('COMMIT');
     return job;
   } catch (error) {
@@ -1572,8 +1572,8 @@ export async function enqueueClassificationJobAtomic(
 export async function hasActiveClassificationJob(channelId: string): Promise<boolean> {
   const db = await getDb();
   const result = await db.query(
-    `SELECT 1 FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
-    [CLASSIFICATION_JOB_TYPE, channelId],
+    `SELECT 1 FROM jobs WHERE type=ANY($1::text[]) AND status IN ('PENDING','PROCESSING') AND payload->>'channelId'=$2 LIMIT 1`,
+    [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], channelId],
   );
   return (result.rowCount || 0) > 0;
 }
@@ -1732,7 +1732,7 @@ export async function reconcileStaleClassificationSightings(limit = 200): Promis
           AND c.scan_status <> 'CLASSIFICATION_PENDING'
           AND NOT EXISTS (
             SELECT 1 FROM jobs j
-             WHERE j.type=$2 AND j.status IN ('PENDING','PROCESSING')
+             WHERE j.type=ANY($2::text[]) AND j.status IN ('PENDING','PROCESSING')
                AND j.payload->>'channelId'=s.channel_id
           )
         ORDER BY s.observed_at, s.id
@@ -1751,7 +1751,7 @@ export async function reconcileStaleClassificationSightings(limit = 200): Promis
             metadata=s.metadata||jsonb_build_object('classificationReconciledAt',now()::text,'reconciledBy','MAINTENANCE_SWEEP')
        FROM stale, channels c
       WHERE s.id=stale.id AND c.channel_id=s.channel_id`,
-    [String(bounded), CLASSIFICATION_JOB_TYPE],
+    [String(bounded), [CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL', 'ENRICH_CHANNEL']],
   );
   // A withheld candidate has no channel row by design (the search worker's
   // placeholder is deleted). Reconcile those after a grace period once no
@@ -1766,7 +1766,7 @@ export async function reconcileStaleClassificationSightings(limit = 200): Promis
           AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.channel_id=s.channel_id)
           AND NOT EXISTS (
             SELECT 1 FROM jobs j
-             WHERE j.type=$1 AND j.status IN ('PENDING','PROCESSING')
+             WHERE j.type=ANY($1::text[]) AND j.status IN ('PENDING','PROCESSING')
                AND j.payload->>'channelId'=s.channel_id
           )
         ORDER BY s.observed_at, s.id
@@ -1777,7 +1777,7 @@ export async function reconcileStaleClassificationSightings(limit = 200): Promis
             metadata=s.metadata||jsonb_build_object('classificationReconciledAt',now()::text,'reconciledBy','MAINTENANCE_SWEEP')
        FROM orphans
       WHERE s.id=orphans.id`,
-    [CLASSIFICATION_JOB_TYPE, String(bounded)],
+    [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL', 'ENRICH_CHANNEL'], String(bounded)],
   );
   return { reconciled: stale.rowCount || 0, orphaned: orphaned.rowCount || 0 };
 }
@@ -1840,9 +1840,9 @@ async function loadQueueStatus(): Promise<QueueStatus> {
   const [classificationRows, searchWorkerRows] = await Promise.all([
     db.query(
       `SELECT status, COALESCE(payload->>'source','UNKNOWN') AS source, COUNT(*)::int AS count, MIN(created_at) AS oldest_created_at
-         FROM jobs WHERE type=$1 AND status IN ('PENDING','PROCESSING')
+         FROM jobs WHERE type=ANY($1::text[]) AND status IN ('PENDING','PROCESSING')
         GROUP BY status, COALESCE(payload->>'source','UNKNOWN')`,
-      [CLASSIFICATION_JOB_TYPE],
+      [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL']],
     ),
     db.query(`SELECT COUNT(DISTINCT locked_by)::int AS busy FROM jobs WHERE status='PROCESSING' AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE')`),
   ]);
@@ -1914,7 +1914,7 @@ export async function getQueueStatusFresh(): Promise<QueueStatus> {
  */
 export async function getProductionBacklogDepth(): Promise<number> {
   const db=await getDb();
-  const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL',$1)`,[CLASSIFICATION_JOB_TYPE]);
+  const res=await db.query(`SELECT COUNT(*)::int AS count FROM jobs WHERE status IN ('PENDING','PROCESSING') AND type IN ('SEARCH_YOUTUBE','MANUAL_SEARCH_PAGE','AUTONOMOUS_DISCOVERY_CYCLE','PROCESS_CHANNEL','ENRICH_CHANNEL',$1,'PROCESS_DISCOVERED_CHANNEL')`,[CLASSIFICATION_JOB_TYPE]);
   return Number(res.rows[0]?.count||0);
 }
 
@@ -1928,7 +1928,7 @@ export async function hasActiveEnrichmentJob(channelId: string, excludeJobId?: s
   const db = await getDb();
   const res = await db.query(
     `SELECT 1 FROM jobs
-      WHERE type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION',$2)
+      WHERE type IN ('ENRICH_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION','PROCESS_DISCOVERED_CHANNEL',$2)
         AND status IN ('PENDING','PROCESSING')
         AND payload->>'channelId'=$1
         AND ($3::uuid IS NULL OR id <> $3::uuid)

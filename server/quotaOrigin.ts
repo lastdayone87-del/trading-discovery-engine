@@ -178,8 +178,9 @@ function collectChannelIds(payload: any): string[] {
  * admission candidate (for pre-channel verification), and the authoritative
  * channel rows. Channel-keyed jobs with a missing or malformed row return
  * UNKNOWN and are failed closed by the queue dispatcher, except
- * INSPECT_FEATURED_CHANNELS and VERIFY_CHANNEL_ADMISSION, whose sources may
- * legitimately exist before a channels row. A database read failure throws
+ * INSPECT_FEATURED_CHANNELS, VERIFY_CHANNEL_ADMISSION and
+ * PROCESS_DISCOVERED_CHANNEL, whose sources may legitimately exist before a
+ * channels row. A database read failure throws
  * QuotaOriginUnavailableError so the dispatcher's normal retry lifecycle
  * applies instead of a terminal provenance failure.
  */
@@ -242,7 +243,8 @@ export async function resolveJobQuotaOrigin(
   // an existing PROBE row stays sticky. Other channel-keyed jobs still fail
   // closed when the row is missing.
   const missingRowIsNormal = job.type === 'INSPECT_FEATURED_CHANNELS'
-    || job.type === 'VERIFY_CHANNEL_ADMISSION';
+    || job.type === 'VERIFY_CHANNEL_ADMISSION'
+    || job.type === 'PROCESS_DISCOVERED_CHANNEL';
   let resolved: ResolvedQuotaOrigin = mergeQuotaOrigins(hinted ?? 'NORMAL', candidateOrigin) ?? 'NORMAL';
   if (resolved === 'PROBE') return 'PROBE';
   for (const channelId of channelIds) {
