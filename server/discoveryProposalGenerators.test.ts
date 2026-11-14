@@ -6,7 +6,9 @@ import {
   generateCountryNativeProposals,
   generateCreatorDerivedProposals,
   generateFrontierProposalsForCountry,
+  cachedSelectionStart,
   generationBatchIdentity,
+  generationSelectionKey,
   rotateCachedSelection
 } from './discoveryProposalGenerators';
 
@@ -162,4 +164,18 @@ test('cached selection is keyed by stable batch identity, not by country alone',
   assert.equal(generationBatchIdentity(['b', 'a']), generationBatchIdentity(['a', 'b']));
   assert.notEqual(generationBatchIdentity(['a']), generationBatchIdentity(['b']));
   assert.equal(generationBatchIdentity(['a', 'a']), generationBatchIdentity(['a']));
+});
+
+test('selection state is bounded by mode and language signature and resets per batch', () => {
+  assert.notEqual(
+    generationSelectionKey('OPEN_WORLD', ['en']),
+    generationSelectionKey('OPEN_WORLD', ['fr']),
+  );
+  assert.equal(
+    generationSelectionKey('OPEN_WORLD', ['fr', 'en']),
+    generationSelectionKey('OPEN_WORLD', ['en', 'fr']),
+  );
+  assert.equal(cachedSelectionStart({ batch: 'a', cursor: 7 }, 'a'), 7);
+  assert.equal(cachedSelectionStart({ batch: 'a', cursor: 7 }, 'b'), 0);
+  assert.equal(cachedSelectionStart(undefined, 'a'), 0);
 });
