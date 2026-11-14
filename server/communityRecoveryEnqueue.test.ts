@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { communityAcquisitionRetryKey, enqueueCommunityAcquisitionRetry, persistCommunityRetryClickOffsets } from './queueManager';
+import { communityAcquisitionRetryKey, enqueueCommunityAcquisitionRetry, enqueueDeferredCommunityInspection, persistCommunityRetryClickOffsets } from './queueManager';
 import { operationsTelemetrySnapshot, resetOperationsTelemetry } from './operationsTelemetry';
 
 const jobRow = {
@@ -152,4 +152,70 @@ test('retry worker counts saturation on the attempt-free deferral branch', () =>
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(queue, /includes\('RENDERED_FALLBACK_SATURATED'\)\)bumpCommunitySaturationDeferral\(\)/);
   assert.match(queue, /directive\.retryReason===COMMUNITY_RETRY_REASON\.BROWSER_RUNTIME_UNAVAILABLE/);
+});
+
+
+test('deferred community inspection reuses an existing owner and reopens a failed one', async () => {
+  const enqueued: string[] = [];
+  const enqueue = async (channelId: string) => {
+    enqueued.push(channelId);
+    return true;
+  };
+  for (const status of ['PENDING', 'PROCESSING', 'COMPLETED'] as const) {
+    assert.equal(await enqueueDeferredCommunityInspection('chan-owned', {
+      getExisting: async () => ({ status } as any),
+      enqueue,
+    }), true);
+  }
+  assert.deepEqual(enqueued, []);
+  assert.equal(await enqueueDeferredCommunityInspection('chan-failed', {
+    getExisting: async () => ({ status: 'FAILED' } as any),
+    enqueue,
+  }), true);
+  assert.deepEqual(enqueued, ['chan-failed']);
+  assert.equal(await enqueueDeferredCommunityInspection('chan-new', {
+    getExisting: async () => null,
+    enqueue,
+  }), true);
+  assert.deepEqual(enqueued, ['chan-failed', 'chan-new']);
+});
+
+test('deferred community inspection reports an enqueue refusal instead of dropping silently', async () => {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (value: unknown) => { warnings.push(String(value)); };
+  try {
+    assert.equal(await enqueueDeferredCommunityInspection('chan-blocked', {
+      getExisting: async () => null,
+      enqueue: async () => false,
+    }), false);
+  } finally {
+    console.warn = original;
+  }
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /deferred_community_inspection_blocked/);
+  assert.match(warnings[0], /chan-blocked/);
+});
+
+test('classification defers community inspection but keeps inline inspection as the fallback', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  assert.match(queue, /jobType: 'CLASSIFY_DISCOVERED_CHANNEL',\s*deferCommunityInspection: true/);
+  assert.match(queue, /jobType: job\.type,\s*deferCommunityInspection: true/);
+  assert.match(pipeline, /if \(options\?\.deferCommunityInspection\) \{\s*await enqueueDeferredCommunityInspection\(activeChannel\.channel_id\);/);
+  assert.match(pipeline, /\} else \{\s*await inspectAndValidateChannel\(activeChannel, candidate/);
+});
+
+
+test('community/browser retry jobs are claimed only by the dedicated consumer', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /claimableOverride\?\.includes\('RETRY_COMMUNITY_ACQUISITION'\)/);
+  assert.doesNotMatch(queue, /!claimableOverride \|\| claimableOverride\.includes\('RETRY_COMMUNITY_ACQUISITION'\)/);
+});
+
+test('classification verdicts are persisted before community/browser inspection is deferred', () => {
+  const pipeline = readFileSync(new URL('./ingestionPipeline.ts', import.meta.url), 'utf8');
+  const persisted = pipeline.indexOf("activeChannel.trading_confidence_score = tradingVal.confidenceScore");
+  const deferred = pipeline.indexOf('if (options?.deferCommunityInspection)');
+  assert.ok(persisted >= 0 && deferred > persisted, 'trading/country verdict must be durable before deferral');
 });

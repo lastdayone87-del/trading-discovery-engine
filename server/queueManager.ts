@@ -69,6 +69,7 @@ import {
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
   isRetryableInfrastructureFailure,
+  getJobByIdempotencyKey,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -1540,7 +1541,7 @@ export async function processNextSearchJob(
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
-  if (!qStatus.discordValidation.isPaused && (!claimableOverride || claimableOverride.includes('RETRY_COMMUNITY_ACQUISITION'))) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
+  if (!qStatus.discordValidation.isPaused && claimableOverride?.includes('RETRY_COMMUNITY_ACQUISITION')) claimableTypes.push('RETRY_COMMUNITY_ACQUISITION');
   if(!claimableOverride||claimableOverride.includes('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER')){const db=await getDb();const c=await db.query(`SELECT 1 FROM external_provider_adapter_controls WHERE mode IN('CANARY','ACTIVE') AND NOT paused AND NOT kill_switch LIMIT 1`);if(c.rowCount)claimableTypes.push('PERSISTENT_RESEARCH_EXTERNAL_PROVIDER');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_PLAYLIST')){const db=await getDb();const c=await db.query(`SELECT mode,paused,kill_switch FROM acquisition_adapter_controls WHERE adapter_type='INSPECT_PLAYLIST'`);if(c.rows[0]?.mode==='CANARY'&&!c.rows[0].paused&&!c.rows[0].kill_switch)claimableTypes.push('INSPECT_PLAYLIST');}
   if(!claimableOverride||claimableOverride.includes('INSPECT_FEATURED_CHANNELS')){const db=await getDb();const c=await db.query(`SELECT 1 FROM acquisition_adapter_controls adapter JOIN creator_search_canary_control authority ON authority.singleton=true WHERE adapter.adapter_type='INSPECT_FEATURED_CHANNELS' AND adapter.mode='CANARY' AND NOT adapter.paused AND NOT adapter.kill_switch AND authority.enabled AND NOT authority.kill_switch AND authority.serving_authority_enabled AND authority.featured_channel_authority_enabled AND authority.featured_channel_rollout_basis_points>0`);if(c.rowCount)claimableTypes.push('INSPECT_FEATURED_CHANNELS');}
@@ -1673,6 +1674,7 @@ export async function processNextSearchJob(
         runId: typeof p.queryRunId === 'string' ? p.queryRunId : undefined,
         lane: 'DISCOVERY',
         jobType: job.type,
+        deferCommunityInspection: true,
       });
       if (!outcome) {
         // A contained probe refusal is replayed by a durable ENRICH job. The
@@ -3535,6 +3537,7 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
       forceClassification: payload.forceClassification === true,
       lane: 'DISCOVERY',
       jobType: 'CLASSIFY_DISCOVERED_CHANNEL',
+      deferCommunityInspection: true,
     },
   );
   if (payload.candidate.admissionNewlyCreated === true) {
@@ -4319,6 +4322,36 @@ export async function inspectAndValidateChannel(
 }
 
 export function communityAcquisitionRetryKey(channelId:string):string{return `community-acquisition-retry:${channelId}`;}
+
+/**
+ * Deferred community/browser inspection for a classified channel. The
+ * dedicated community retry consumer owns the browser lease, so classification
+ * can persist its trading/country verdict without waiting for rendered
+ * surfaces. A pending/processing/completed community owner already covers the
+ * channel; a failed owner reopens through the ordinary retry path. Enqueue
+ * failures are returned to the caller (which retries the classification job)
+ * rather than being silently discarded.
+ */
+export async function enqueueDeferredCommunityInspection(
+  channelId: string,
+  deps: {
+    getExisting?: typeof getJobByIdempotencyKey;
+    enqueue?: typeof enqueueCommunityAcquisitionRetry;
+  } = {},
+): Promise<boolean> {
+  const key = communityAcquisitionRetryKey(channelId);
+  const existing = await (deps.getExisting || getJobByIdempotencyKey)(key);
+  if (existing && existing.status !== 'FAILED') return true;
+  const enqueued = await (deps.enqueue || enqueueCommunityAcquisitionRetry)(channelId);
+  if (!enqueued) {
+    console.warn(JSON.stringify({
+      event: 'deferred_community_inspection_blocked',
+      channelId,
+      timestamp: new Date().toISOString(),
+    }));
+  }
+  return enqueued;
+}
 
 /**
  * Operator-triggered bounded relationship-canary run. Validates the cohort

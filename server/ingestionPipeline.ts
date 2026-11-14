@@ -7,7 +7,7 @@ import type { AcquisitionLane } from './acquisitionLaneKeys';
 import { resolveScopeEligibility } from './scopeEligibility';
 import { classifyTradingRelevanceDetailed } from './tradingRelevanceClassifier';
 import { runAndRecordAdaptiveShadow } from './adaptiveTradingClassifier';
-import { inspectAndValidateChannel } from './queueManager';
+import { enqueueDeferredCommunityInspection, inspectAndValidateChannel } from './queueManager';
 import { hasEstablishedValidatedDiscordSelection, projectTradingReclassificationDiscordState } from './discordProjection';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData, shouldAttemptPublicAboutCountryFallback } from './youtubePublicAbout';
 import {
@@ -212,6 +212,12 @@ export interface PipelineExecutionOptions {
   forceClassification?: boolean;
   /** Internal: caller already passed the semantic admission decision. */
   admissionBypass?: boolean;
+  /**
+   * Classification/enrichment must not wait for browser/community surfaces.
+   * Persist the channel verdict first and let the dedicated community retry
+   * consumer own external/social/rendered acquisition.
+   */
+  deferCommunityInspection?: boolean;
 }
 
 /**
@@ -1622,12 +1628,22 @@ async function processChannelThroughPipelineInContext(
 
   // Run Discord Inspection Engine. Lane attribution is observational only and
   // defaults to the pipeline shape when the caller does not supply one.
-  await inspectAndValidateChannel(activeChannel, candidate, isManualScan, false, true, undefined, {
-    lane: options?.lane || (isManualScan ? 'MANUAL' : isEnrichmentPass ? 'ENRICHMENT' : 'DISCOVERY'),
-    ...(options?.jobType ? { jobType: options.jobType } : {}),
-    ...(options?.jobId ? { jobId: options.jobId } : {}),
-    slicePass: 1,
-  });
+  //
+  // Rendered website/social acquisition is browser-bound and must not hold a
+  // classification or enrichment worker. When the caller defers it, the
+  // dedicated community retry consumer performs the same inspection later and
+  // persists Discord/community evidence then. The channel verdict above is
+  // already durable, so deferring cannot lose the classification result.
+  if (options?.deferCommunityInspection) {
+    await enqueueDeferredCommunityInspection(activeChannel.channel_id);
+  } else {
+    await inspectAndValidateChannel(activeChannel, candidate, isManualScan, false, true, undefined, {
+      lane: options?.lane || (isManualScan ? 'MANUAL' : isEnrichmentPass ? 'ENRICHMENT' : 'DISCOVERY'),
+      ...(options?.jobType ? { jobType: options.jobType } : {}),
+      ...(options?.jobId ? { jobId: options.jobId } : {}),
+      slicePass: 1,
+    });
+  }
 
   const finalChannel = (await getChannelById(candidate.channelId)) || activeChannel;
 
