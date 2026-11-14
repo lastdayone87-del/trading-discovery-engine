@@ -123,17 +123,28 @@ export function resolveEnrichmentWorkerCount(env: NodeJS.ProcessEnv = process.en
 /**
  * Split the measured enrichment pool without changing its total size.
  *
- * New classifications must not starve the pre-existing ENRICH backlog, so at
- * most `total - 1` workers are classification-capable once the pool has more
- * than one worker. The shared workers claim classifications first and fall
- * back to ENRICH; at least one worker always remains ENRICH-only. With a
- * single worker there is no second lane, so that worker handles both.
+ * Admission verification and classification must not share one priority-ordered
+ * lane: admission sits at priority 40 while classification sits at 21, so a
+ * large admission backlog would otherwise consume every classification-capable
+ * worker. With three or more workers, the split reserves:
  *
- * After a rollback the flag is off but old PENDING classification jobs must
- * still drain, so one shared worker remains; the other workers stay dedicated
- * to the existing ENRICH backlog.
+ *   - at least one admission worker (also eligible for ENRICH fallback work);
+ *   - at least one classification worker (also eligible for overflow and
+ *     ENRICH fallback work);
+ *   - one ENRICH-only worker so the pre-existing backlog keeps moving.
+ *
+ * Admission scales by one lane per three total workers; classification takes
+ * the remaining lanes. The baseline three-worker pool is therefore 1/1/1,
+ * and a five-worker pool is 1/3/1.
+ *
+ * At one or two workers there is no room for three lanes; the shared worker
+ * keeps the historical combined admission/classification/ENRICH behavior.
+ * With decoupling disabled, one shared worker drains old classification jobs
+ * while the other workers stay dedicated to the ENRICH backlog.
  */
 export function resolveEnrichmentWorkerSplit(totalWorkers: number, decouplingEnabled = true): {
+  sharedWorkers: number;
+  admissionWorkers: number;
   classificationWorkers: number;
   enrichmentOnlyWorkers: number;
 } {
@@ -141,15 +152,18 @@ export function resolveEnrichmentWorkerSplit(totalWorkers: number, decouplingEna
   // 20-worker startup ceiling, and direct callers expect their total preserved
   // through the split rather than silently dropped.
   const total = positiveInt(totalWorkers, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT);
-  if (total === 1) return { classificationWorkers: 1, enrichmentOnlyWorkers: 0 };
-  // Admission and classification share this pool. Three classification-
-  // capable workers are safe only once the total pool grows; the baseline
-  // three-worker pool keeps the historical 2/1 split.
-  const classificationCap = decouplingEnabled ? 3 : 1;
-  const classificationWorkers = Math.max(1, Math.min(classificationCap, total - 1));
+  if (total <= 1) {
+    return { sharedWorkers: total, admissionWorkers: 0, classificationWorkers: 0, enrichmentOnlyWorkers: 0 };
+  }
+  if (!decouplingEnabled || total === 2) {
+    return { sharedWorkers: 1, admissionWorkers: 0, classificationWorkers: 0, enrichmentOnlyWorkers: total - 1 };
+  }
+  const admissionWorkers = Math.max(1, Math.floor(total / 3));
   return {
-    classificationWorkers,
-    enrichmentOnlyWorkers: total - classificationWorkers,
+    sharedWorkers: 0,
+    admissionWorkers,
+    classificationWorkers: total - admissionWorkers - 1,
+    enrichmentOnlyWorkers: 1,
   };
 }
 

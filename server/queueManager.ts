@@ -5442,8 +5442,24 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
     }
   }
   const enrichmentSplit = resolveEnrichmentWorkerSplit(Math.min(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers), decoupling.enabled);
-  setRunningEnrichmentWorkerCount(enrichmentSplit.classificationWorkers + enrichmentSplit.enrichmentOnlyWorkers);
-  startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], 'enrich_channel_shared');
+  setRunningEnrichmentWorkerCount(
+    enrichmentSplit.sharedWorkers
+      + enrichmentSplit.admissionWorkers
+      + enrichmentSplit.classificationWorkers
+      + enrichmentSplit.enrichmentOnlyWorkers,
+  );
+  // Keep admission and classification in separate claim lanes. Admission
+  // outranks classification, so a combined lane lets the admission backlog
+  // monopolize every classification-capable worker.
+  if (enrichmentSplit.sharedWorkers > 0) {
+    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.sharedWorkers, [CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], 'enrich_channel_shared');
+  }
+  if (enrichmentSplit.admissionWorkers > 0) {
+    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.admissionWorkers, [ADMISSION_VERIFICATION_JOB_TYPE], 'enrich_channel_admission');
+  }
+  if (enrichmentSplit.classificationWorkers > 0) {
+    startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.classificationWorkers, [CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], 'enrich_channel_classification');
+  }
   if (enrichmentSplit.enrichmentOnlyWorkers > 0) {
     startWorkerPool('ENRICH_CHANNEL', enrichmentSplit.enrichmentOnlyWorkers, [], 'enrich_channel_backlog');
   }
