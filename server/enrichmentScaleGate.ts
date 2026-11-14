@@ -348,3 +348,32 @@ export async function loadEnrichmentScaleMetricsWithinDeadline(
     if (timer) clearTimeout(timer);
   }
 }
+
+/**
+ * Startup can race the database pool warmup: the first metrics read may time
+ * out even though the same query completes in milliseconds once connections
+ * are live. Retry a bounded number of times before failing closed to the
+ * baseline. A present metrics object is returned immediately; only an
+ * unavailable/timeout result is retried.
+ */
+export const DEFAULT_ENRICHMENT_SCALE_METRICS_ATTEMPTS = 3;
+export const DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_DELAY_MS = 2_000;
+
+export async function loadEnrichmentScaleMetricsWithRetry(
+  load: () => Promise<EnrichmentScaleMetrics | undefined> = loadEnrichmentScaleMetricsWithinDeadline,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<EnrichmentScaleMetrics | undefined> {
+  const attempts = Math.min(5, Math.max(1, Math.floor(options.attempts ?? DEFAULT_ENRICHMENT_SCALE_METRICS_ATTEMPTS)));
+  const delayMs = Math.min(5_000, Math.max(0, Math.floor(options.delayMs ?? DEFAULT_ENRICHMENT_SCALE_METRICS_RETRY_DELAY_MS)));
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const metrics = await load().catch(() => undefined);
+    if (metrics) return metrics;
+    if (attempt + 1 < attempts && delayMs > 0) await sleep(delayMs);
+  }
+  return undefined;
+}

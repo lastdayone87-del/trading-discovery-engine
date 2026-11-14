@@ -1,6 +1,6 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
 import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from './operationalEnrichmentRecovery';
-import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetricsWithinDeadline, setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
+import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetricsWithRetry, setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
 import {
   getDb,
   enqueueJob,
@@ -5488,12 +5488,12 @@ async function startGatedEnrichmentWorkers(): Promise<void> {
   const decoupling = resolveClassificationDecouplingConfig();
   let effectiveWorkers = requested;
   if (requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled()) {
-    // Never hold startup open on a stalled metrics query: the wrapper resolves
-    // `undefined` at its wall-clock deadline and the gate then fails closed to
-    // the baseline of 3. The per-query timeout bounds the query itself too.
+    // Never hold startup open on a stalled metrics query: each attempt is
+    // wall-clock bounded and the gate fails closed to the baseline of 3. The
+    // bounded retry lets the database pool finish warming up after a restart.
     let metrics;
     try {
-      metrics = await loadEnrichmentScaleMetricsWithinDeadline();
+      metrics = await loadEnrichmentScaleMetricsWithRetry();
     } catch (error) {
       console.warn('[Queue] Enrichment scale metrics unavailable; staying at baseline.', error);
     }
