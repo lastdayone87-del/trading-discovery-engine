@@ -232,9 +232,12 @@ export function candidateFromQueryRecord(
   const atoms = typedAtoms(metadata, record, source, language);
   const relation = TEMPLATE_RELATION[String(metadata.queryTemplate || '').toUpperCase()];
   const generatedProvenance = parseQueryGenerationProvenance(metadata.generationProvenance);
+  const generatedProfile = getCountryMarketProfile(record.country);
   const generatedNativePhrase = metadata.generatedNativePhrase === true
     && ['LLM_NATIVE_PHRASE', 'AUTOCOMPLETE_PHRASE'].includes(String(metadata.queryTemplate || '').toUpperCase())
-    && (generatedProvenance?.source === 'LLM' || generatedProvenance?.source === 'AUTOCOMPLETE');
+    && (generatedProvenance?.source === 'LLM' || generatedProvenance?.source === 'AUTOCOMPLETE')
+    && generatedProvenance?.country.toLowerCase() === record.country.toLowerCase()
+    && generatedProfile.languages.includes(generatedProvenance.language);
   const candidate = buildQueryCandidate({
     query: record.query,
     country,

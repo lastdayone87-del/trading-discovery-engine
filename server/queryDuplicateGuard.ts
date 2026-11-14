@@ -53,10 +53,10 @@ export function classifyCandidateDuplicate(
   for (const item of history) {
     const other = normalizeCandidateText(item.aliasOf || item.query);
     if (!other) continue;
+    if (item.country && candidate.country && item.country !== candidate.country) continue;
     if (normalized === other) {
       return { duplicate: true, nearDuplicate: false, class: 'EXACT', similarity: 1, matchedQuery: item.query };
     }
-    if (item.country && candidate.country && item.country !== candidate.country) continue;
     const otherKey = semanticQueryKey(other);
     if (key && key === otherKey) {
       return { duplicate: true, nearDuplicate: false, class: 'SEMANTIC', similarity: 1, matchedQuery: item.query };
@@ -98,7 +98,7 @@ export function dedupeCandidateBatch<T extends CandidateHistoryItem>(
       continue;
     }
     accepted.push(candidate);
-    seen.push({ query: candidate.query, country: candidate.country, intent: candidate.intent });
+    seen.push({ query: candidate.query, country: candidate.country, intent: candidate.intent, aliasOf: candidate.aliasOf });
   }
   return { accepted, rejected };
 }

@@ -23,7 +23,7 @@ test('generation memory migration is additive and does not touch query_library',
   assert.match(sql, /CREATE TABLE IF NOT EXISTS query_candidate_memory/);
   assert.match(sql, /CREATE TABLE IF NOT EXISTS query_generation_batches/);
   assert.match(sql, /UNIQUE\(country, language, normalized_query\)/);
-  assert.match(sql, /UNIQUE|PRIMARY KEY \(batch_key\)/);
+  assert.match(sql, /batch_key TEXT PRIMARY KEY/);
   assert.doesNotMatch(sql, /DELETE\s+FROM\s+query_library/i);
   assert.doesNotMatch(sql, /TRUNCATE\s+query_library/i);
 });

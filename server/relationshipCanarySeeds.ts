@@ -64,6 +64,7 @@ export async function selectRelationshipCanarySeeds(
       `SELECT DISTINCT regexp_replace(a.normalized_target,'^playlist:','') AS playlist_id
        FROM discovery_actions a
        WHERE a.action_type='INSPECT_PLAYLIST'
+         AND a.lifecycle IN ('QUEUED','RUNNING','COMPLETED')
          AND UPPER(a.context->>'country')=UPPER($1)
          AND a.normalized_target LIKE 'playlist:%'
          AND NOT EXISTS (
@@ -106,7 +107,8 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
   countries: string[];
 }> {
   const enabled = String(await getAppSetting('relationship_canary_enabled', 'false')).trim().toLowerCase() === 'true';
-  if (!enabled) return { status: 'DISABLED', queued: 0, countries: [] };
+  const killSwitch = String(await getAppSetting('relationship_canary_kill_switch', 'true')).trim().toLowerCase() === 'true';
+  if (!enabled || killSwitch) return { status: 'DISABLED', queued: 0, countries: [] };
   const day = now.toISOString().slice(0, 10);
   const lastDay = await getAppSetting('relationship_canary_seed_sweep_day', '');
   if (lastDay === day) return { status: 'ALREADY_RAN', queued: 0, countries: [] };
@@ -115,7 +117,10 @@ export async function sweepRelationshipCanarySeeds(now = new Date()): Promise<{
   const configured = scope === 'SELECTED_COUNTRIES'
     ? selectedCountries(await getAppSetting('query_intelligence_selected_countries', ''))
     : [];
-  const countries = [...new Set(configured.length ? configured : DEFAULT_NON_DORMANT_COUNTRIES)];
+  if (scope === 'SELECTED_COUNTRIES' && !configured.length) {
+    return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
+  }
+  const countries = [...new Set(scope === 'SELECTED_COUNTRIES' ? configured : DEFAULT_NON_DORMANT_COUNTRIES)];
   if (!countries.length) return { status: 'NO_COUNTRIES', queued: 0, countries: [] };
   const cursor = Math.max(0, Number(await getAppSetting('relationship_canary_seed_cursor', '0')) || 0);
   const selected = Array.from({ length: Math.min(RELATIONSHIP_SEED_SWEEP_MAX_COUNTRIES, countries.length) }, (_, index) =>

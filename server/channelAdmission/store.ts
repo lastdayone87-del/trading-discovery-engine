@@ -125,7 +125,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
            THEN jsonb_set(
              CASE
                WHEN semantic_admission_candidates.raw_observation ? 'relationshipProvenance'
-                 AND NOT (EXCLUDED.raw_observation ? 'relationshipProvenance')
+                 AND (EXCLUDED.raw_observation->'relationshipProvenance' IS NULL OR EXCLUDED.raw_observation->'relationshipProvenance' = 'null'::jsonb)
                  THEN jsonb_set(EXCLUDED.raw_observation,'{relationshipProvenance}',semantic_admission_candidates.raw_observation->'relationshipProvenance',true)
                ELSE EXCLUDED.raw_observation
              END,
@@ -133,7 +133,7 @@ export async function upsertAdmissionCandidate(input: AdmissionCandidateInput): 
            )
          ELSE CASE
            WHEN semantic_admission_candidates.raw_observation ? 'relationshipProvenance'
-             AND NOT (EXCLUDED.raw_observation ? 'relationshipProvenance')
+             AND (EXCLUDED.raw_observation->'relationshipProvenance' IS NULL OR EXCLUDED.raw_observation->'relationshipProvenance' = 'null'::jsonb)
              THEN jsonb_set(EXCLUDED.raw_observation,'{relationshipProvenance}',semantic_admission_candidates.raw_observation->'relationshipProvenance',true)
            ELSE EXCLUDED.raw_observation
          END

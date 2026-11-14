@@ -44,8 +44,8 @@ function stringOrNull(value: unknown): string | null {
 export function parseQueryGenerationProvenance(value: unknown): QueryGenerationProvenance | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  const source = String(row.source || '').toUpperCase() as QueryGenerationSource;
-  const mode = String(row.mode || '').toUpperCase() as QueryGenerationMode;
+  const source = typeof row.source === 'string' ? row.source.toUpperCase() as QueryGenerationSource : '' as QueryGenerationSource;
+  const mode = typeof row.mode === 'string' ? row.mode.toUpperCase() as QueryGenerationMode : '' as QueryGenerationMode;
   const country = stringOrNull(row.country);
   const language = stringOrNull(row.language);
   const generatedAt = stringOrNull(row.generatedAt);

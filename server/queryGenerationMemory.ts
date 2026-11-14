@@ -122,11 +122,17 @@ export async function rememberQueryCandidates(candidates: CandidateMemoryInput[]
        ON CONFLICT(country,language,normalized_query) DO UPDATE SET
          status=CASE
            WHEN query_candidate_memory.status='ADMITTED' THEN query_candidate_memory.status
+           WHEN query_candidate_memory.status='PROPOSED' AND EXCLUDED.status='REJECTED' THEN 'PROPOSED'
            WHEN EXCLUDED.status='ADMITTED' THEN 'ADMITTED'
            WHEN query_candidate_memory.status='REJECTED' AND EXCLUDED.status NOT IN ('ADMITTED','REJECTED') THEN 'REJECTED'
            ELSE EXCLUDED.status
          END,
-         reason_codes=CASE WHEN jsonb_array_length(EXCLUDED.reason_codes)>0 THEN EXCLUDED.reason_codes ELSE query_candidate_memory.reason_codes END,
+         reason_codes=CASE
+           WHEN EXCLUDED.status='ADMITTED' THEN '[]'::jsonb
+           WHEN query_candidate_memory.status='PROPOSED' AND EXCLUDED.status='REJECTED' THEN query_candidate_memory.reason_codes
+           WHEN jsonb_array_length(EXCLUDED.reason_codes)>0 THEN EXCLUDED.reason_codes
+           ELSE query_candidate_memory.reason_codes
+         END,
          batch_key=COALESCE(EXCLUDED.batch_key,query_candidate_memory.batch_key),
          metadata=query_candidate_memory.metadata || EXCLUDED.metadata,
          last_seen_at=now()

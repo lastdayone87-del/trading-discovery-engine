@@ -1152,8 +1152,6 @@ export async function generateFrontierProposalsForCountry(
     neighborhood,
     playlist,
     native,
-    llmNative,
-    autocomplete,
     coverageGap,
     temporal
   ] = await Promise.all([
@@ -1162,8 +1160,6 @@ export async function generateFrontierProposalsForCountry(
     generateCreatorNeighborhoodProposals(country, perFamilyCap).catch(() => []),
     generatePlaylistTopicProposals(country, perFamilyCap).catch(() => []),
     generateCountryNativeProposals(country, perFamilyCap).catch(() => []),
-    settleBeforeDeadline(generateLlmNativeProposals(country, perFamilyCap), 2_500, []).catch(() => []),
-    settleBeforeDeadline(generateAutocompleteProposals(country, perFamilyCap), 2_500, []).catch(() => []),
     generateCoverageGapProposals(country, perFamilyCap).catch(() => []),
     generateTemporalProposals(country, perFamilyCap).catch(() => [])
   ]);
@@ -1174,8 +1170,6 @@ export async function generateFrontierProposalsForCountry(
     ...neighborhood,
     ...playlist,
     ...native,
-    ...llmNative,
-    ...autocomplete,
     ...coverageGap,
     ...temporal
   ];
