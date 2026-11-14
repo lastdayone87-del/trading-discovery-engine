@@ -284,7 +284,8 @@ export function planCountryNativeProposalQuery(args: {
     : null;
   const tokenCount = queryTokenCount(nativeTerm);
   const declaredLanguage = languageEvidence.map(normalizeLanguageCode).find(Boolean);
-  const generatedGate = generationSource && tokenCount >= 2 && tokenCount <= 6
+  const generatedCta = /\b(subscribe|follow|like|comment|telegram|whatsapp|discord|link\s+in\s+bio)\b/iu.test(nativeTerm);
+  const generatedGate = generationSource && !generatedCta && supportedLanguages.length > 0 && tokenCount >= 2 && tokenCount <= 6
     ? isSearchableTradingTerm({
         term: nativeTerm,
         termType: 'PHRASE',

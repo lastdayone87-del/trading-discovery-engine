@@ -2203,8 +2203,10 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
         sourceProvenanceFamily: evidence.sourceProvenanceFamily ?? null
       },
       generationSource: String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'YOUTUBE_AUTOCOMPLETE'
+        || evidence.generationProvenance?.source === 'AUTOCOMPLETE'
         ? 'YOUTUBE_AUTOCOMPLETE'
         : String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'LLM_NATIVE_QUERY'
+          || evidence.generationProvenance?.source === 'LLM'
           ? 'LLM_NATIVE_QUERY'
           : null,
       generationProvenance: evidence.generationProvenance ?? null

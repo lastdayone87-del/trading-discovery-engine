@@ -232,6 +232,7 @@ export function buildQueryCandidate(input: BuildCandidateInput): QueryCandidate 
     relation: input.relation,
     source: input.source,
     primaryTerm: atoms[0]?.term || input.query,
+    generatedNativePhrase: input.generatedNativePhrase === true,
   }, { profile });
   return {
     query: input.query.normalize('NFKC').trim().replace(/\s+/gu, ' '),

@@ -162,13 +162,14 @@ export async function generateAutocompleteQueries(input: {
     ? [...allPrefixes.slice(prefixCursor % allPrefixes.length), ...allPrefixes.slice(0, prefixCursor % allPrefixes.length)]
     : allPrefixes;
   const prefixes = rotated.slice(0, YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES);
-  if (prefixes.length) await setAppSetting(prefixCursorKey, String(prefixCursor + prefixes.length)).catch(() => undefined);
   const regionCode = countryDiscoveryRegionCode(country);
   const fetchAutocomplete = input.fetchAutocomplete || fetchYouTubeAutocomplete;
   const accepted: NativeQueryCandidate[] = [];
   let cacheHits = 0;
+  let prefixesAttempted = 0;
 
   for (const prefix of prefixes) {
+    prefixesAttempted += 1;
     const prefixDigest = JSON.stringify({ country, language: language.code, regionCode: regionCode || null, prefix });
     const batchKey = queryGenerationBatchKey({
       country,
@@ -179,9 +180,11 @@ export async function generateAutocompleteQueries(input: {
       contextDigest: prefixDigest,
     });
     let suggestions: string[] = [];
+    let cachedGeneratedAt: string | null = null;
     const cached = await getGenerationBatch(batchKey).catch(() => null);
     if (cached && Array.isArray(cached.suggestions)) {
       suggestions = cached.suggestions.map(String);
+      cachedGeneratedAt = typeof cached.generatedAt === 'string' ? cached.generatedAt : null;
       cacheHits += 1;
     } else {
       suggestions = await fetchAutocomplete(prefix, { language: language.code, regionCode });
@@ -199,7 +202,7 @@ export async function generateAutocompleteQueries(input: {
           model: null,
           promptVersion: 'youtube-autocomplete-v1',
           inputFingerprint: prefixDigest,
-          payload: { suggestions, prefix, regionCode: regionCode || null },
+          payload: { suggestions, prefix, regionCode: regionCode || null, generatedAt: new Date().toISOString() },
           acceptedCount: 0,
           expiresAt: new Date(Date.now() + YOUTUBE_AUTOCOMPLETE_TTL_DAYS * 86_400_000).toISOString(),
           status: 'COMPLETED',
@@ -222,6 +225,8 @@ export async function generateAutocompleteQueries(input: {
         persona: null,
         scenario: `autocomplete prefix: ${prefix}`,
         prefix,
+        promptVersion: 'youtube-autocomplete-v1',
+        generatedAt: cachedGeneratedAt,
       });
       if (candidate) assessed.push(candidate);
     }
@@ -263,9 +268,12 @@ export async function generateAutocompleteQueries(input: {
     if (accepted.length >= Math.max(1, input.limit ?? 20)) break;
   }
 
+  if (prefixesAttempted > 0) {
+    await setAppSetting(prefixCursorKey, String(prefixCursor + prefixesAttempted)).catch(() => undefined);
+  }
   return {
     candidates: accepted.slice(0, Math.max(1, input.limit ?? 20)),
-    prefixesAttempted: prefixes.length,
+    prefixesAttempted,
     cacheHits,
   };
 }

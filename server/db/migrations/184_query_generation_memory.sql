@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS query_candidate_memory (
 
 CREATE INDEX IF NOT EXISTS idx_query_candidate_memory_country
   ON query_candidate_memory(country, language, status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_query_candidate_memory_lower_country
+  ON query_candidate_memory(LOWER(country), language, status, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_query_candidate_memory_semantic
   ON query_candidate_memory(country, semantic_key);
 CREATE INDEX IF NOT EXISTS idx_query_candidate_memory_batch
@@ -49,5 +51,7 @@ CREATE TABLE IF NOT EXISTS query_generation_batches (
 
 CREATE INDEX IF NOT EXISTS idx_query_generation_batches_lookup
   ON query_generation_batches(country, language, source, mode, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_query_generation_batches_lower_country
+  ON query_generation_batches(LOWER(country), language, source, mode, expires_at DESC);
 CREATE INDEX IF NOT EXISTS idx_query_generation_batches_expiry
   ON query_generation_batches(expires_at) WHERE expires_at IS NOT NULL;

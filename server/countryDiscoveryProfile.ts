@@ -18,7 +18,7 @@ export interface CountryDiscoveryLanguage {
 export interface CountryDiscoveryProfile {
   country: string;
   regionCode: string;
-  languages: CountryDiscoveryLanguage[];
+  languages: ReadonlyArray<CountryDiscoveryLanguage>;
   primaryLanguage: string;
 }
 
@@ -93,12 +93,12 @@ function buildProfiles(): Record<string, CountryDiscoveryProfile> {
       weight: byCode.get(code) ?? (index === 0 ? 1 : 0.1),
     }));
     if (!languages.length) continue;
-    profiles[vocabulary.country] = {
+    profiles[vocabulary.country] = Object.freeze({
       country: vocabulary.country,
       regionCode,
-      languages,
+      languages: Object.freeze(languages),
       primaryLanguage: languages[0].code,
-    };
+    });
   }
   return profiles;
 }

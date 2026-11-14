@@ -216,6 +216,8 @@ function assessCandidate(input: {
   persona: string | null;
   scenario: string | null;
   prefix?: string | null;
+  promptVersion?: string | null;
+  generatedAt?: string | null;
 }): { candidate: NativeQueryCandidate | null; reasons: string[] } {
   const query = input.query.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const reasons: string[] = [];
@@ -240,7 +242,7 @@ function assessCandidate(input: {
       country: input.country,
       language: input.language,
       maxTokens: 6,
-      requireTradingSemantics: false,
+      requireTradingSemantics: true,
     });
     if (!gate.eligible) reasons.push(...gate.reasons.map(reason => `GATE_${reason.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`));
   }
@@ -250,14 +252,14 @@ function assessCandidate(input: {
     mode: input.mode,
     provider: input.provider,
     model: input.model,
-    promptVersion: NATIVE_QUERY_PROMPT_VERSION,
+    promptVersion: input.promptVersion || NATIVE_QUERY_PROMPT_VERSION,
     batchId: input.batchId,
     country: input.country,
     language: input.language,
     persona: input.persona,
     scenario: input.scenario,
     prefix: input.prefix || null,
-    generatedAt: new Date().toISOString(),
+    generatedAt: input.generatedAt || new Date().toISOString(),
   };
   return {
     candidate: {
@@ -269,7 +271,7 @@ function assessCandidate(input: {
       mode: input.mode,
       provider: input.provider,
       model: input.model,
-      promptVersion: NATIVE_QUERY_PROMPT_VERSION,
+      promptVersion: input.promptVersion || NATIVE_QUERY_PROMPT_VERSION,
       batchId: input.batchId,
       persona: input.persona,
       scenario: input.scenario,
@@ -359,7 +361,7 @@ export async function generateNativeQueriesWithLlm(input: {
     // exact/semantic guard instead of trusting the old cache blindly.
     const refreshed = dedupeCandidateBatch(cached.candidates as NativeQueryCandidate[], cachedHistory);
     return {
-      candidates: refreshed.accepted,
+      candidates: refreshed.accepted.slice(0, count),
       rejected: [
         ...(Array.isArray(cached.rejected) ? cached.rejected as Array<{ query: string; reasons: string[] }> : []),
         ...refreshed.rejected.map(item => ({ query: item.candidate.query, reasons: [item.decision.class || 'DUPLICATE'] })),
@@ -511,12 +513,16 @@ export function assessGeneratedNativeQuery(input: {
   persona?: string | null;
   scenario?: string | null;
   prefix?: string | null;
+  promptVersion?: string | null;
+  generatedAt?: string | null;
 }): NativeQueryCandidate | null {
   return assessCandidate({
     ...input,
     persona: input.persona || null,
     scenario: input.scenario || null,
     prefix: input.prefix || null,
+    promptVersion: input.promptVersion || null,
+    generatedAt: input.generatedAt || null,
   }).candidate;
 }
 
