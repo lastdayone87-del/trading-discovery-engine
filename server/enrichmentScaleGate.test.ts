@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   DEFAULT_ENRICHMENT_SCALE_METRICS_TIMEOUT_MS,
+  DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS,
   DEFAULT_ENRICHMENT_SCALE_THRESHOLDS,
   ENRICHMENT_WORKER_BASELINE,
   ENRICHMENT_WORKER_SCALE_CEILING,
   enrichmentScaleMetricsTimeoutMs,
+  enrichmentScaleMetricsWindowHours,
   enrichmentScaleThresholds,
   evaluateBacklogStability,
   evaluateEnrichmentScaleGate,
@@ -17,6 +19,7 @@ import {
 } from './enrichmentScaleGate';
 
 const healthy: EnrichmentScaleMetrics = {
+  semanticWindowHours: 2,
   semanticCalls: 200,
   semanticSuccesses: 190,
   semanticSuccessRate: 0.95,
@@ -220,6 +223,18 @@ test('the metrics deadline defaults safely and clamps explicit values', () => {
   assert.equal(enrichmentScaleMetricsTimeoutMs({ ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '999999' } as any), 60_000);
 });
 
+test('scale-gate health window defaults to two hours and stays operator-bounded', () => {
+  assert.equal(DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS, 2);
+  assert.equal(enrichmentScaleMetricsWindowHours({} as any), 2);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '' } as any), 2);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: 'nonsense' } as any), 2);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '0' } as any), 2);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '25' } as any), 2);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '4' } as any), 4);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '1.5' } as any), 1.5);
+  assert.equal(enrichmentScaleMetricsWindowHours({ ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '24' } as any), 24);
+});
+
 test('every scale-metrics query carries the configured query timeout', async () => {
   const seen: number[] = [];
   const statements: string[] = [];
@@ -241,9 +256,48 @@ test('every scale-metrics query carries the configured query timeout', async () 
   assert.match(statements[0], /geminiFreeCooldownDeferral/, 'local free-Gemini deferrals must not count as semantic failures');
   assert.match(statements[0], /COALESCE\(request_metadata->>'providerReasons',''\) NOT LIKE '%SEMANTIC_DEFERRED_RATE_PRESSURE%'/, 'local semantic deferrals must be excluded, not merely named');
   assert.match(statements[0], /COALESCE\(request_metadata->>'providerReasons',''\) NOT LIKE '%VOCABULARY_DEFERRED_RATE_PRESSURE%'/, 'local vocabulary deferrals must be excluded, not merely named');
+  assert.match(statements[0], /now\(\) - \(2 \* interval '1 hour'\)/, 'the gate must measure recent provider health, not a full day of stale failures');
+  assert.equal(metrics.semanticWindowHours, 2);
   assert.equal(metrics.semanticCalls, 100);
   assert.equal(metrics.semanticSuccesses, 95);
   assert.equal(metrics.backlogStable, true);
+});
+
+test('scale-gate health window can be widened for sparse traffic', async () => {
+  const statements: string[] = [];
+  let call = 0;
+  await loadEnrichmentScaleMetrics(0, {
+    ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '4',
+    ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '1500',
+  } as any, {
+    query: async config => {
+      statements.push(config.text);
+      call += 1;
+      if (call === 1) return { rows: [{ calls: 10, successes: 9, p95: 1000 }] };
+      if (call === 2) return { rows: [{ pending: 1 }] };
+      return { rows: [{ created_last_hour: 1, completed_last_hour: 1 }] };
+    },
+  });
+  assert.match(statements[0], /now\(\) - \(4 \* interval '1 hour'\)/);
+});
+
+test('fractional health windows reach the provider query unchanged', async () => {
+  const statements: string[] = [];
+  let call = 0;
+  const metrics = await loadEnrichmentScaleMetrics(0, {
+    ENRICHMENT_SCALE_METRICS_WINDOW_HOURS: '1.5',
+    ENRICHMENT_SCALE_METRICS_TIMEOUT_MS: '1500',
+  } as any, {
+    query: async config => {
+      statements.push(config.text);
+      call += 1;
+      if (call === 1) return { rows: [{ calls: 10, successes: 9, p95: 1000 }] };
+      if (call === 2) return { rows: [{ pending: 1 }] };
+      return { rows: [{ created_last_hour: 1, completed_last_hour: 1 }] };
+    },
+  });
+  assert.match(statements[0], /now\(\) - \(1\.5 \* interval '1 hour'\)/);
+  assert.equal(metrics.semanticWindowHours, 1.5);
 });
 
 test('metrics query follows an explicitly configured non-default provider', async () => {

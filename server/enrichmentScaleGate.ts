@@ -15,7 +15,26 @@ export const ENRICHMENT_SCALE_GATE_VERSION = 'enrichment-scale-gate-v1';
 export const ENRICHMENT_WORKER_BASELINE = 3;
 export const ENRICHMENT_WORKER_SCALE_CEILING = 6;
 
+/**
+ * Provider health is a recent signal. A full-day window keeps yesterday's
+ * outage in the success-rate denominator long after service has recovered,
+ * preventing the gate from authorizing the worker count the current provider
+ * can actually sustain. Two hours is long enough for a representative sample
+ * and short enough to recover after an outage; operators may widen it up to
+ * 24 hours when traffic is sparse.
+ */
+export const DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS = 2;
+
+export function enrichmentScaleMetricsWindowHours(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.ENRICHMENT_SCALE_METRICS_WINDOW_HOURS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1 || value > 24) return DEFAULT_ENRICHMENT_SCALE_METRICS_WINDOW_HOURS;
+  return value;
+}
+
 export interface EnrichmentScaleMetrics {
+  semanticWindowHours: number;
   semanticCalls: number;
   semanticSuccesses: number;
   semanticSuccessRate: number;
@@ -241,6 +260,7 @@ export async function loadEnrichmentScaleMetrics(
   });
   const thresholds = enrichmentScaleThresholds(env);
   const scaleProvider = semanticScaleGateProvider(env);
+  const windowHours = enrichmentScaleMetricsWindowHours(env);
   const [provider, backlog, throughput] = await Promise.all([
     runQuery(`SELECT
          COUNT(*)::int AS calls,
@@ -249,7 +269,7 @@ export async function loadEnrichmentScaleMetrics(
            FILTER (WHERE status='SUCCESS'),0) AS p95
        FROM provider_call_events
        WHERE operation='multilingual-semantic-classification'
-         AND occurred_at > now() - interval '24 hours'
+         AND occurred_at > now() - (${windowHours} * interval '1 hour')
          AND status <> 'CANCELLED'
          -- Local deferral echoes never reached the provider. Counting them
          -- would drag the success rate down and block legitimate scale.
@@ -281,6 +301,7 @@ export async function loadEnrichmentScaleMetrics(
   const pending = Number(backlog.rows[0]?.pending || 0);
   const backlogStable = evaluateBacklogStability(createdLastHour, completedLastHour, pending, thresholds);
   return {
+    semanticWindowHours: windowHours,
     semanticCalls: calls,
     semanticSuccesses: successes,
     semanticSuccessRate: calls > 0 ? successes / calls : 0,

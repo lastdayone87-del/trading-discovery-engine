@@ -184,7 +184,7 @@ clamped to 3 unless **all** pass:
 
 | Measurement | Threshold |
 |-------------|-----------|
-| Semantic sample (24 h, non-cancelled) | at least 50 calls |
+| Semantic sample (configured health window, default 2 h, non-cancelled) | at least 50 calls |
 | Semantic success rate | strictly > 90 % |
 | Semantic p95 latency (successful calls) | strictly < 30 s |
 | ENRICH pending + processing | at most 500 |
@@ -226,6 +226,7 @@ currently running pool.
 | `ENRICHMENT_SCALE_MAX_PENDING` | `500` | Gate backlog cap. |
 | `ENRICHMENT_SCALE_MIN_COMPLETION_RATIO` | `0.9` | Gate stability ratio. |
 | `ENRICHMENT_SCALE_METRICS_TIMEOUT_MS` | `5000` | Startup bound on the gate's metrics read; timeout falls back to 3 workers. |
+| `ENRICHMENT_SCALE_METRICS_WINDOW_HOURS` | `2` | Provider sample window for success rate/p95; clamped 1–24. Widen when traffic is sparse; a fixed 24 h window keeps old outages in the denominator after recovery. |
 
 Production defaults at merge time: Groq remains the primary semantic provider,
 cache on, prefilter shadow, batching off, scale gate on, and enrichment at 3.
@@ -270,7 +271,9 @@ SELECT provider,
              FILTER (WHERE status='SUCCESS'))::int AS p95_ms
 FROM provider_call_events
 WHERE operation='multilingual-semantic-classification'
-  AND occurred_at > now() - interval '24 hours'
+  -- Match the gate's configured health window (default 2 h). Use
+  -- ENRICHMENT_SCALE_METRICS_WINDOW_HOURS to widen it.
+  AND occurred_at > now() - interval '2 hours'
   AND status <> 'CANCELLED'
 GROUP BY provider
 ORDER BY calls DESC;
