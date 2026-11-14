@@ -11,6 +11,7 @@ import {
   claimOrderByClause,
   claimQueueAgeOrderColumn,
   isCapacityLeaseFailure,
+  isCommunityRetryOnlyClaim,
   isQuotaCapacityFailure,
   normalizeCapacityLeaseRunAfter,
   reopenClockUpdateSql,
@@ -27,6 +28,24 @@ test('clock v2 is default-off and opt-in only', () => {
   assert.equal(claimQueueAgeOrderColumn({ [ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV]: 'true' }), 'first_enqueued_at');
   assert.equal(claimOrderByClause({}), 'priority DESC,created_at ASC');
   assert.equal(claimOrderByClause({ [ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV]: 'true' }), 'priority DESC,first_enqueued_at ASC');
+});
+
+test('community-retry claims rotate by last touch without closing work', () => {
+  assert.equal(isCommunityRetryOnlyClaim(['RETRY_COMMUNITY_ACQUISITION']), true);
+  assert.equal(isCommunityRetryOnlyClaim(['RETRY_COMMUNITY_ACQUISITION', 'ENRICH_CHANNEL']), false);
+  assert.equal(isCommunityRetryOnlyClaim(['ENRICH_CHANNEL']), false);
+  assert.equal(isCommunityRetryOnlyClaim(undefined), false);
+  // Capacity deferrals refund the attempt counter and leave first_enqueued_at
+  // immutable, so the strict-FIFO column would keep the same saturated cohort
+  // at the head forever. updated_at is the fair last-touch rotation clock.
+  assert.equal(
+    claimOrderByClause({}, { communityRetryFairness: true }),
+    'priority DESC,updated_at ASC,id ASC',
+  );
+  assert.equal(
+    claimOrderByClause({ [ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV]: 'true' }, { communityRetryFairness: true }),
+    'priority DESC,updated_at ASC,id ASC',
+  );
 });
 
 test('capacity waits are separated from genuine retryable failures', () => {

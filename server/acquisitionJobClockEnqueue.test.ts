@@ -92,6 +92,8 @@ test('preventReopen never adds reopen bookkeeping even when the flag is on', asy
 
 test('claim ordering uses the flag-gated queue column in both candidate queries', () => {
   const source = fs.readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
-  assert.equal((source.match(/claimOrderByClause\(\)/g) || []).length, 2);
+  assert.equal((source.match(/claimOrderByClause\(/g) || []).length, 1);
+  assert.match(source, /communityRetryFairness:isCommunityRetryOnlyClaim\(types\)/);
+  assert.equal((source.match(/\$\{claimOrder\}/g) || []).length, 2);
   assert.match(source, /reopenClockUpdateSql\(acquisitionJobClockV2Enabled\(\)\)/);
 });
