@@ -8,7 +8,9 @@ import {
   queryGenerationBatchKey,
   rememberQueryCandidates,
   upsertGenerationBatch,
+  type CandidateMemoryInput,
   type CandidateMemoryRow,
+  type GenerationBatchInput,
 } from './queryGenerationMemory';
 import {
   classifyCandidateDuplicate,
@@ -31,6 +33,23 @@ export const NATIVE_QUERY_PROMPT_VERSION = 'native-query-v1';
 export const NATIVE_QUERY_BATCH_SIZE = 100;
 export const NATIVE_QUERY_BATCH_TTL_DAYS = 14;
 export const NATIVE_QUERY_REPLACEMENT_THRESHOLD = 0.6;
+
+/**
+ * Persistence seam for generation memory. Production uses the database-backed
+ * functions below; tests can inject an in-memory store so fixed candidates do
+ * not read or write a shared PostgreSQL database.
+ */
+export interface NativeQueryGenerationMemoryStore {
+  getGenerationBatch(batchKey: string): Promise<Record<string, unknown> | null>;
+  rememberQueryCandidates(candidates: CandidateMemoryInput[]): Promise<number>;
+  upsertGenerationBatch(input: GenerationBatchInput): Promise<void>;
+}
+
+const defaultMemoryStore: NativeQueryGenerationMemoryStore = {
+  getGenerationBatch,
+  rememberQueryCandidates,
+  upsertGenerationBatch,
+};
 
 export interface NativeQueryGenerationContext {
   country: string;
@@ -150,7 +169,11 @@ function candidateMemoryHistory(
       // not reject it. Admitted/rejected rows from this batch are real history
       // and must still participate.
       .filter(row => row.batchKey !== batchKey || row.status === 'ADMITTED' || row.status === 'REJECTED')
-      .map(row => ({ query: row.normalizedQuery, country: context.country, intent: null })),
+      .map(row => ({
+        query: row.normalizedQuery,
+        country: context.country,
+        intent: typeof row.metadata?.intent === 'string' ? row.metadata.intent : null,
+      })),
   ];
 }
 
@@ -365,8 +388,11 @@ export async function generateNativeQueriesWithLlm(input: {
   count?: number;
   /** Deterministic test seam; production uses Groq then Gemini. */
   generateText?: TextGenerator;
+  /** Deterministic test seam; production uses the database-backed store. */
+  memoryStore?: NativeQueryGenerationMemoryStore;
 }): Promise<NativeQueryGenerationResult> {
   const context = input.context;
+  const memoryStore = input.memoryStore || defaultMemoryStore;
   const count = Math.max(1, Math.min(NATIVE_QUERY_BATCH_SIZE, Math.trunc(input.count ?? NATIVE_QUERY_BATCH_SIZE)));
   const digest = contextDigest(context);
   const batchKey = queryGenerationBatchKey({
@@ -378,7 +404,7 @@ export async function generateNativeQueriesWithLlm(input: {
     contextDigest: digest,
   });
   const cachedHistory = candidateMemoryHistory(context, batchKey);
-  const cached = await getGenerationBatch(batchKey).catch(() => null);
+  const cached = await memoryStore.getGenerationBatch(batchKey).catch(() => null);
   let cachedFallback: NativeQueryGenerationResult | null = null;
   if (cached && Array.isArray(cached.candidates)) {
     // Memory may have changed since the batch was written (for example a
@@ -473,8 +499,15 @@ export async function generateNativeQueriesWithLlm(input: {
   // must not corrupt novelty metrics. Use duplicate decisions only, over the
   // rows actually evaluated (early acceptance breaks stop consuming candidates).
   const duplicateRate = evaluated > 0 ? duplicateRejections / evaluated : 0;
+  // A replacement pass can return valid JSON with no usable candidates. Keep
+  // the usable cached subset in that case instead of overwriting the cache
+  // with an empty batch for the full TTL.
+  const fallbackCandidates = cachedFallback?.candidates || [];
+  const mergedAccepted = fallbackCandidates.length
+    ? dedupeCandidateBatch([...accepted, ...fallbackCandidates], cachedHistory).accepted.slice(0, count)
+    : accepted.slice(0, count);
   const result: NativeQueryGenerationResult = {
-    candidates: accepted.slice(0, count),
+    candidates: mergedAccepted,
     rejected,
     batchId: batchKey,
     provider,
@@ -487,8 +520,9 @@ export async function generateNativeQueriesWithLlm(input: {
   // suppress generation for two weeks. If a cache existed, return its
   // still-valid subset rather than dropping known-good candidates.
   if (!lastText) return cachedFallback || result;
-  await rememberQueryCandidates([
-    ...accepted.map(candidate => ({
+  if (!mergedAccepted.length && cachedFallback) return cachedFallback;
+  await memoryStore.rememberQueryCandidates([
+    ...mergedAccepted.map(candidate => ({
       country: context.country,
       language: context.language,
       source: 'LLM' as const,
@@ -509,7 +543,7 @@ export async function generateNativeQueriesWithLlm(input: {
       batchKey,
     })),
   ]).catch(() => 0);
-  await upsertGenerationBatch({
+  await memoryStore.upsertGenerationBatch({
     batchKey,
     country: context.country,
     language: context.language,
@@ -530,7 +564,7 @@ export async function generateNativeQueriesWithLlm(input: {
     duplicateRate: result.duplicateRate,
     acceptedCount: result.candidates.length,
     expiresAt: new Date(Date.now() + NATIVE_QUERY_BATCH_TTL_DAYS * 86_400_000).toISOString(),
-    status: accepted.length ? 'COMPLETED' : 'LOW_NOVELTY',
+    status: result.candidates.length ? 'COMPLETED' : 'LOW_NOVELTY',
   }).catch(() => undefined);
   return result;
 }

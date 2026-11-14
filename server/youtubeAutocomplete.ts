@@ -51,7 +51,9 @@ export async function fetchYouTubeAutocomplete(
     // return another declared charset for some locales, so honor the response
     // charset and fall back to UTF-8 when it is absent or unsupported.
     const bytes = await response.arrayBuffer();
-    const charset = /charset=([^;]+)/i.exec(response.headers.get('content-type') || '')?.[1]?.trim().toLowerCase();
+    const rawCharset = /charset\s*=\s*([^;]+)/i.exec(response.headers.get('content-type') || '')?.[1]?.trim().toLowerCase();
+    // Quoted charset values are valid HTTP syntax: charset="iso-8859-1".
+    const charset = rawCharset?.replace(/^["']+|["']+$/g, '');
     let text: string;
     try {
       text = new TextDecoder(charset || 'utf-8').decode(bytes);
@@ -246,7 +248,11 @@ export async function generateAutocompleteQueries(input: {
       ...existing,
       ...memory
         .filter(row => row.batchKey !== batchKey)
-        .map(row => ({ query: row.normalizedQuery, country, intent: null })),
+        .map(row => ({
+          query: row.normalizedQuery,
+          country,
+          intent: typeof row.metadata?.intent === 'string' ? row.metadata.intent : null,
+        })),
       ...acceptedHistory,
     ];
     const deduped = dedupeCandidateBatch(assessed, prefixHistory);

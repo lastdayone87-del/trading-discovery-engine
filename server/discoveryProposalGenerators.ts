@@ -8,7 +8,7 @@ import { assertCountryAllowed } from './countryExclusion';
 import { countryDiscoveryLanguagesByWeight, countryDiscoveryRegionCode } from './countryDiscoveryProfile';
 import { generateNativeQueriesWithLlm, NATIVE_QUERY_BATCH_SIZE, type NativeQueryCandidate } from './nativeQueryGeneration';
 import { generateAutocompleteQueries, getCachedAutocompleteSuggestions } from './youtubeAutocomplete';
-import { getCandidateMemory } from './queryGenerationMemory';
+import { getCandidateMemory, type CandidateMemoryRow } from './queryGenerationMemory';
 import { dedupeCandidateBatch, type CandidateHistoryItem } from './queryDuplicateGuard';
 
 export type ProposalFamily =
@@ -778,15 +778,12 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     };
     // All modes/languages share one history. A candidate accepted in the
     // open-world batch must not be proposed again as real-signal or grounded.
-    const sharedHistory: CandidateHistoryItem[] = [...existingQueries];
+    const knownHistory: CandidateHistoryItem[] = [...existingQueries];
+    const memoryRows: CandidateMemoryRow[] = [];
 
     for (const language of selectedLanguages) {
       const memory = await getCandidateMemory(canonicalC, language.code).catch(() => []);
-      sharedHistory.push(...memory.map(row => ({
-        query: row.normalizedQuery,
-        country: canonicalC,
-        intent: null,
-      })));
+      memoryRows.push(...memory);
       const autocompleteSuggestions = await getCachedAutocompleteSuggestions(canonicalC, language.code);
       for (const { mode, share } of NATIVE_GENERATION_MODES) {
         // The approved generation portfolio is a full 60/25/15 batch. The
@@ -815,10 +812,32 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
       }
     }
 
-    const crossModeAccepted = dedupeCandidateBatch(
-      NATIVE_GENERATION_MODES.flatMap(({ mode }) => byMode[mode]),
-      sharedHistory,
-    ).accepted;
+    const modeCandidates = NATIVE_GENERATION_MODES.flatMap(({ mode }) => byMode[mode]);
+    // A cached batch's own pending rows are excluded by the inner generator,
+    // but the outer cross-mode dedupe sees them through candidate memory. If
+    // they are not filtered here, the cache rejects its own output and the
+    // frontier stays empty for the cache TTL. Admitted/rejected rows remain
+    // real history and are still applied.
+    const returnedBatchKeys = new Set(
+      modeCandidates
+        .map(candidate => candidate.batchId)
+        .filter((batchId): batchId is string => typeof batchId === 'string' && batchId.length > 0),
+    );
+    const sharedHistory: CandidateHistoryItem[] = [
+      ...knownHistory,
+      ...memoryRows
+        .filter(row => !(
+          row.batchKey
+          && returnedBatchKeys.has(row.batchKey)
+          && (row.status === 'PROPOSED' || row.status === 'GENERATED')
+        ))
+        .map(row => ({
+          query: row.normalizedQuery,
+          country: canonicalC,
+          intent: typeof row.metadata?.intent === 'string' ? row.metadata.intent : null,
+        })),
+    ];
+    const crossModeAccepted = dedupeCandidateBatch(modeCandidates, sharedHistory).accepted;
     const dedupedByMode: Record<'OPEN_WORLD' | 'REAL_SIGNAL' | 'GROUNDED', NativeQueryCandidate[]> = {
       OPEN_WORLD: [],
       REAL_SIGNAL: [],

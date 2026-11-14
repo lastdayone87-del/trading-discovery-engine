@@ -28,7 +28,7 @@ test('autocomplete honors a non-UTF-8 response charset', async () => {
     regionCode: 'DE',
     fetchImpl: (async () => new Response(latin1, {
       status: 200,
-      headers: { 'content-type': 'application/json; charset=iso-8859-1' },
+      headers: { 'content-type': 'application/json; charset="iso-8859-1"' },
     })) as typeof fetch,
   });
   assert.deepEqual(suggestions, ['dax grüße']);

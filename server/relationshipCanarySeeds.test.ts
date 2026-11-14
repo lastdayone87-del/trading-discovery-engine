@@ -13,6 +13,10 @@ test('relationship seed selection rejects malformed or non-string settings', () 
   assert.throws(() => parseSelectedCountries('["Ireland",{"country":"France"}]'), /DISCOVERY_SCOPE_SELECTION_MALFORMED/);
   assert.deepEqual(parseSelectedCountries('["Ireland","ireland"]'), ['Ireland']);
   assert.deepEqual(parseSelectedCountries('["Not A Country"]'), []);
+  // Known inference countries outside the supported production registry must
+  // not become seed-sweep targets.
+  assert.deepEqual(parseSelectedCountries('["South Korea"]'), []);
+  assert.deepEqual(parseSelectedCountries('["Brazil","India"]'), []);
 });
 
 test('empty successful selections advance the sweep rotation', () => {
