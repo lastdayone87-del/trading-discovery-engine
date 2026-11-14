@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import { buildAdmissionConfirmedClassification } from './confirmedTrading';
+import { buildAdmissionConfirmedClassification, normalizeAdmissionTradingConfidence } from './confirmedTrading';
+import { normalizeTradingFocus } from './confidence';
+import { normalizeSemanticJudgment } from './policy';
 import { parseAdmissionReviewAction } from './index';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
@@ -43,6 +45,74 @@ test('confident admission produces a first-class TRADING_CONFIRMED result withou
   assert.equal(built.decision.classificationMethod, 'SEMANTIC_ADMISSION');
   assert.equal(built.decision.recognitionState, 'DECISIVE_TRADING');
   assert.equal(built.decision.confidenceScore, 93);
+});
+
+test('fractional semantic admission confidence is normalized to an integer percentage', () => {
+  assert.equal(normalizeAdmissionTradingConfidence(0.9), 90);
+  assert.equal(normalizeAdmissionTradingConfidence(0.85), 85);
+  assert.equal(normalizeAdmissionTradingConfidence(0.95), 95);
+  assert.equal(normalizeAdmissionTradingConfidence(0.5), 50);
+  assert.equal(normalizeAdmissionTradingConfidence(0.01), 1);
+  assert.equal(normalizeAdmissionTradingConfidence(85.5), 86);
+  assert.equal(normalizeAdmissionTradingConfidence(1), 1, 'exactly 1 on the percentage scale must not become 100');
+  assert.equal(normalizeAdmissionTradingConfidence(93), 93);
+  assert.equal(normalizeAdmissionTradingConfidence(0), 0);
+  assert.equal(normalizeAdmissionTradingConfidence(150), 100);
+  assert.equal(normalizeAdmissionTradingConfidence('0.85'), 85);
+  assert.equal(normalizeAdmissionTradingConfidence(''), 0);
+  assert.equal(normalizeAdmissionTradingConfidence(undefined), 0);
+  assert.equal(normalizeAdmissionTradingConfidence(true), 0);
+  assert.equal(normalizeAdmissionTradingConfidence([0.9]), 0);
+  assert.equal(normalizeAdmissionTradingConfidence({ value: 0.9 }), 0);
+
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Fractional Trader', description: 'gold technical analysis', country: 'France' },
+    {
+      channelId: 'UC-fractional',
+      channelName: 'Fractional Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-fractional',
+      description: 'gold technical analysis',
+      videoTitles: ['Gold weekly analysis'],
+      admissionDecisionId: 'decision-fractional',
+      admissionStatus: 'ADMITTED',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 0.9,
+      admissionCategory: 'General Trading',
+      admissionModel: 'gemini/gemini-3.6-flash',
+      admissionProvider: 'gemini_semantic',
+      admissionCitations: [
+        { field: 'bio', quote: 'gold technical analysis', supports: 'TRADING' },
+        { field: 'video_title', index: 0, quote: 'Gold weekly analysis', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.confidenceScore, 90);
+  assert.equal(built.decision.confidenceScore, 90);
+  assert.ok(Number.isInteger(built.result.confidenceScore));
+  assert.ok(Number.isInteger(built.decision.confidenceScore));
+});
+
+test('semantic judgment focus is normalized before policy thresholds', () => {
+  assert.equal(normalizeTradingFocus(0.9, 'TRADING'), 90);
+  assert.equal(normalizeTradingFocus(0.9, 'MIXED'), 90);
+  assert.equal(normalizeTradingFocus(0.9, 'UNRELATED'), 1, 'an unrelated low focus must stay low');
+  assert.equal(normalizeTradingFocus(0.9, 'FINANCE_ADJACENT'), 1);
+  assert.equal(normalizeTradingFocus(1, 'TRADING'), 1);
+  assert.equal(normalizeTradingFocus(85.5, 'TRADING'), 86);
+
+  const trading = normalizeSemanticJudgment({
+    main_subject: 'TRADING',
+    trading_focus: 0.9,
+    evidence_citations: [],
+  });
+  assert.equal(trading?.tradingFocus, 90);
+  const unrelated = normalizeSemanticJudgment({
+    main_subject: 'UNRELATED',
+    trading_focus: 0.9,
+    unrelated_domains: [{ domain: 'COOKING', confidence: 0.9 }],
+    evidence_citations: [],
+  });
+  assert.equal(unrelated?.tradingFocus, 1);
 });
 
 test('confirmed admission branch precedes the legacy classifier in the pipeline slice', () => {

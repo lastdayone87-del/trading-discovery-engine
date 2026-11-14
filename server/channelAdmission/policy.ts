@@ -4,6 +4,7 @@ import type {
   SemanticCitation,
   SemanticJudgment,
 } from './types';
+import { normalizeTradingFocus } from './confidence';
 
 export const ADMISSION_POLICY_VERSION = 'semantic-admission-v1';
 
@@ -401,7 +402,7 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
     : Array.isArray(raw.incidentalTradingMentions) ? raw.incidentalTradingMentions : [];
   return {
     mainSubject: mainSubject as SemanticJudgment['mainSubject'],
-    tradingFocus: Math.max(0, Math.min(100, Number(raw.trading_focus ?? raw.tradingFocus ?? 0) || 0)),
+    tradingFocus: normalizeTradingFocus(raw.trading_focus ?? raw.tradingFocus ?? 0, mainSubject),
     unrelatedDomains: unrelatedDomains.map((item: any) => ({
       domain: String(item?.domain || item?.name || 'UNKNOWN').toUpperCase(),
       confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),

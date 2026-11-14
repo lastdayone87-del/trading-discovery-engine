@@ -1,6 +1,16 @@
 import type { EvidenceItem, RawChannelInput, VerificationDecision } from '../evidenceEngine';
 import type { TradingClassificationResult } from '../../src/types';
 import type { DiscoveredChannelRaw } from '../youtube';
+import { normalizeTradingFocus } from './confidence';
+
+/**
+ * Legacy admission rows can still carry a 0–1 semantic confidence. Confirmed
+ * admission is a positive-trading subject, so fractions below 1 are scaled to
+ * percentages here before they reach integer channel columns.
+ */
+export function normalizeAdmissionTradingConfidence(value: unknown, mainSubject?: string | null): number {
+  return normalizeTradingFocus(value, mainSubject || 'TRADING');
+}
 
 /**
  * A confident semantic admission is a first-class classification result. It
@@ -11,8 +21,7 @@ export function buildAdmissionConfirmedClassification(
   input: RawChannelInput,
   candidate: DiscoveredChannelRaw,
 ): { result: TradingClassificationResult; decision: VerificationDecision; input: RawChannelInput } {
-  const rawConfidence = Number(candidate.admissionTradingConfidence);
-  const confidence = Number.isFinite(rawConfidence) ? Math.max(0, Math.min(100, rawConfidence)) : 0;
+  const confidence = normalizeAdmissionTradingConfidence(candidate.admissionTradingConfidence);
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
