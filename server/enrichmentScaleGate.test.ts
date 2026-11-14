@@ -14,6 +14,7 @@ import {
   evaluateEnrichmentScaleGate,
   loadEnrichmentScaleMetrics,
   loadEnrichmentScaleMetricsWithinDeadline,
+  loadEnrichmentScaleMetricsWithRetry,
   semanticScaleGateProvider,
   type EnrichmentScaleMetrics,
 } from './enrichmentScaleGate';
@@ -204,12 +205,12 @@ test('the disabled gate skips the metrics load entirely', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
   assert.match(source, /requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled\(\)/);
   const disabledBranch = source.slice(source.indexOf('async function startGatedEnrichmentWorkers'));
-  assert.ok(disabledBranch.indexOf('enrichmentScaleGateEnabled()') < disabledBranch.indexOf('loadEnrichmentScaleMetricsWithinDeadline()'));
+  assert.ok(disabledBranch.indexOf('enrichmentScaleGateEnabled()') < disabledBranch.indexOf('loadEnrichmentScaleMetricsWithRetry()'));
 });
 
 test('startup uses the deadline-bounded metrics loader', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
-  assert.match(source, /metrics = await loadEnrichmentScaleMetricsWithinDeadline\(\)/);
+  assert.match(source, /metrics = await loadEnrichmentScaleMetricsWithRetry\(\)/);
   assert.doesNotMatch(source, /metrics = await loadEnrichmentScaleMetrics\(\)/);
 });
 
@@ -317,6 +318,111 @@ test('metrics query follows an explicitly configured non-default provider', asyn
     },
   });
   assert.match(statements[0], /provider = 'groq'/);
+});
+
+test('startup metrics retry recovers after transient database unavailability', async () => {
+  let calls = 0;
+  const sleeps: number[] = [];
+  const metrics = await loadEnrichmentScaleMetricsWithRetry(
+    async () => {
+      calls += 1;
+      return calls < 3 ? undefined : healthy;
+    },
+    { attempts: 3, delayMs: 100, sleep: async ms => { sleeps.push(ms); } },
+  );
+  assert.equal(metrics, healthy);
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [100, 100]);
+});
+
+test('startup metrics retry fails closed after the bounded attempt count', async () => {
+  let calls = 0;
+  const sleeps: number[] = [];
+  const metrics = await loadEnrichmentScaleMetricsWithRetry(
+    async () => {
+      calls += 1;
+      throw new Error('pool warming');
+    },
+    { attempts: 3, delayMs: 50, sleep: async ms => { sleeps.push(ms); } },
+  );
+  assert.equal(metrics, undefined);
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [50, 50]);
+});
+
+test('retry attempts stop at the shared startup budget', async () => {
+  let clock = 0;
+  let calls = 0;
+  const metrics = await loadEnrichmentScaleMetricsWithRetry(
+    async () => {
+      calls += 1;
+      return undefined;
+    },
+    {
+      attempts: 5,
+      delayMs: 600,
+      budgetMs: 1_000,
+      now: () => clock,
+      sleep: async ms => { clock += ms; },
+    },
+  );
+  assert.equal(metrics, undefined);
+  assert.equal(calls, 2);
+  assert.equal(clock, 1_000);
+});
+
+test('NaN retry options fall back to the bounded defaults', async () => {
+  const previousBudget = process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  delete process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+  try {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const metrics = await loadEnrichmentScaleMetricsWithRetry(
+      async () => {
+        calls += 1;
+        return undefined;
+      },
+      { attempts: Number.NaN, delayMs: Number.NaN, budgetMs: Number.NaN, sleep: async ms => { sleeps.push(ms); } },
+    );
+    assert.equal(metrics, undefined);
+    assert.equal(calls, 3);
+    assert.deepEqual(sleeps, [2_000, 2_000]);
+  } finally {
+    if (previousBudget === undefined) delete process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS;
+    else process.env.ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS = previousBudget;
+  }
+});
+
+test('an already-aborted metrics attempt does not start any query', async () => {
+  let queries = 0;
+  const controller = new AbortController();
+  controller.abort(new Error('deadline'));
+  await assert.rejects(
+    loadEnrichmentScaleMetrics(0, {} as any, {
+      signal: controller.signal,
+      query: async () => {
+        queries += 1;
+        return { rows: [{}] };
+      },
+    }),
+    /deadline expired/i,
+  );
+  assert.equal(queries, 0);
+});
+
+test('present startup metrics are not retried', async () => {
+  let calls = 0;
+  const sleeps: number[] = [];
+  const metrics = await loadEnrichmentScaleMetricsWithRetry(
+    async () => {
+      calls += 1;
+      return healthy;
+    },
+    { attempts: 3, delayMs: 100, sleep: async ms => { sleeps.push(ms); } },
+  );
+  assert.equal(metrics, healthy);
+  assert.equal(calls, 1);
+  assert.deepEqual(sleeps, []);
 });
 
 test('a stalled metrics load resolves at the deadline so startup can use baseline', async () => {
