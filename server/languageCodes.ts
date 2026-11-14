@@ -71,9 +71,11 @@ export function normalizeLanguageCode(value: string): string {
   // Specials carry no usable language signal for context selection.
   if (NON_INFORMATIVE_PRIMARIES.has(primary)) return '';
   if (!isAssignedLanguagePrimary(primary)) return '';
-  // `fil` and `tl` are both assigned BCP 47 primaries for Tagalog/Filipino.
-  // The registry stores `tl`; collapse the aliases so a provider tag cannot
-  // silently fail declared-language matching.
-  if (primary === 'fil') return 'tl';
+  // ICU canonicalizes the ISO 639-1 `tl` primary to `fil`. The registry and
+  // the named language map use `tl` for Tagalog, so preserve that primary to
+  // avoid equivalent Tagalog inputs normalizing to different codes. `fil` is
+  // a distinct assigned primary and remains `fil`.
+  const requestedPrimary = dashed.split('-')[0].toLowerCase();
+  if (requestedPrimary === 'tl') return 'tl';
   return primary;
 }
