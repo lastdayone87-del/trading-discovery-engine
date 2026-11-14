@@ -163,6 +163,37 @@ test('an all-invalid provider batch does not suppress regeneration from cache', 
   assert.ok(calls > callsAfterFirst, 'the FAILED batch must not be reused from cache');
 });
 
+test('an all-duplicate LOW_NOVELTY batch is reused without repeating provider work', async () => {
+  let calls = 0;
+  const memoryStore = inMemoryGenerationStore();
+  const context = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    existingQueries: [{ query: 'analyse technique CAC 40', country: 'France', intent: 'market_analysis' }],
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const generateText = async () => {
+    calls += 1;
+    return {
+      text: JSON.stringify({ queries: [{ query: 'analyse technique CAC 40', intent: 'market_analysis' }] }),
+      provider: 'test',
+      model: 'test',
+    };
+  };
+  const first = await generateNativeQueriesWithLlm({ context, count: 2, memoryStore, generateText });
+  assert.equal(first.candidates.length, 0);
+  const callsAfterFirst = calls;
+
+  const second = await generateNativeQueriesWithLlm({ context, count: 2, memoryStore, generateText });
+  assert.equal(second.candidates.length, 0);
+  assert.equal(second.cached, true);
+  assert.equal(calls, callsAfterFirst, 'all-duplicate LOW_NOVELTY batches must be reused from cache');
+});
+
 test('a failed replacement pass keeps the valid cached subset', async () => {
   const memoryStore = inMemoryGenerationStore();
   const context = {

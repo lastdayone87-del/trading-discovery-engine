@@ -29,6 +29,11 @@ test('seed retry ledger is strict, supported-country scoped, and deduplicated', 
   assert.throws(() => parseSeedRetryEntries('{'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
   assert.throws(() => parseSeedRetryEntries('{}'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
   assert.throws(() => parseSeedRetryEntries('[{"country":42}]'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
+  assert.throws(() => parseSeedRetryEntries('[{"country":"Ireland"}]'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
+  assert.throws(() => parseSeedRetryEntries('[{"country":"Ireland","attempts":0}]'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
+  assert.throws(() => parseSeedRetryEntries('[{"country":"Ireland","attempts":-1}]'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
+  assert.throws(() => parseSeedRetryEntries('[{"country":"Ireland","attempts":1.5}]'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
+  assert.throws(() => parseSeedRetryEntries('[{"country":"Ireland","attempts":"1"}]'), /RELATIONSHIP_SEED_RETRY_MALFORMED/);
 });
 
 test('a failed rotation country is retried without holding the cursor', () => {

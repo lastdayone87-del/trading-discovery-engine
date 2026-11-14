@@ -272,9 +272,13 @@ function assessCandidate(input: {
 }): { candidate: NativeQueryCandidate | null; reasons: string[] } {
   const query = input.query.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const reasons: string[] = [];
+  const shape = generatedQueryShape(query);
   if (!query) reasons.push('EMPTY');
-  if (query.length < 4 || query.length > 80) reasons.push('LENGTH');
-  if (!generatedQueryShape(query).bounded) reasons.push('TOKEN_COUNT');
+  // The four-character minimum is a Latin/whitespace heuristic. A bounded
+  // unspaced CJK surface such as `板情報` is a complete query at three
+  // characters and must reach the script/semantics gates.
+  if (query.length > 80 || (query.length < 4 && !(shape.unspaced && shape.bounded))) reasons.push('LENGTH');
+  if (!shape.bounded) reasons.push('TOKEN_COUNT');
   if (isForbiddenProseQuery(query)) reasons.push('FORBIDDEN_PROSE');
   if (/[@#]/u.test(query)) reasons.push('HASHTAG_OR_HANDLE');
   if (/(https?:\/\/|www\.)/iu.test(query)) reasons.push('URL');
@@ -426,11 +430,10 @@ export async function generateNativeQueriesWithLlm(input: {
     // If memory removed cached candidates but the batch is still full enough,
     // reuse it. If the cache is underfilled because of real memory changes,
     // regenerate instead of returning a short batch for the full 14-day TTL.
-    // An empty cached payload (for example a legacy all-invalid batch) always
-    // regenerates; otherwise a single bad provider reply suppresses generation
-    // for the whole TTL.
-    const cachedCandidateCount = cached.candidates.length;
-    if (cachedCandidateCount > 0 && !shouldRegenerateCachedGeneration({
+    // Empty LOW_NOVELTY batches are genuine all-duplicate results and are
+    // reused to avoid repeating paid provider work. Validation-only empties
+    // are written as FAILED and never reach this cache-hit path.
+    if (!shouldRegenerateCachedGeneration({
       requested: count,
       accepted: refreshed.accepted.length,
       lostToMemory: refreshed.rejected.length,

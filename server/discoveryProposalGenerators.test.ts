@@ -6,6 +6,7 @@ import {
   generateCountryNativeProposals,
   generateCreatorDerivedProposals,
   generateFrontierProposalsForCountry,
+  generationBatchIdentity,
   rotateCachedSelection
 } from './discoveryProposalGenerators';
 
@@ -154,4 +155,11 @@ test('cached generation selection rotates through the batch instead of repeating
   assert.deepEqual(rotateCachedSelection(items, 3, 2), { selected: ['d', 'a'], nextCursor: 5 });
   assert.deepEqual(rotateCachedSelection([], 5, 2), { selected: [], nextCursor: 5 });
   assert.deepEqual(rotateCachedSelection(items, -2, 2), { selected: ['a', 'b'], nextCursor: 2 });
+});
+
+test('cached selection is keyed by stable batch identity, not by country alone', () => {
+  assert.equal(generationBatchIdentity([]), 'nocache');
+  assert.equal(generationBatchIdentity(['b', 'a']), generationBatchIdentity(['a', 'b']));
+  assert.notEqual(generationBatchIdentity(['a']), generationBatchIdentity(['b']));
+  assert.equal(generationBatchIdentity(['a', 'a']), generationBatchIdentity(['a']));
 });

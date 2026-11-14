@@ -94,6 +94,34 @@ test('a single unspaced Japanese surface is admitted as a bounded generated phra
     model: 'test-model',
     batchId: 'batch-jp',
   }));
+  assert.ok(assessGeneratedNativeQuery({
+    query: '板情報',
+    country: 'Japan',
+    language: 'ja',
+    source: 'LLM',
+    mode: 'OPEN_WORLD',
+    provider: 'groq',
+    model: 'test-model',
+    batchId: 'batch-jp-short',
+  }));
+  const shortPlanned = planCountryNativeProposalQuery({
+    country: 'Japan',
+    nativeTerm: '板情報',
+    countryVocabulary: japan,
+    targetIntent: 'market_analysis',
+    allocationLineage: { decisionId: 'decision-jp-short', proposalId: 'proposal-jp-short' },
+    language: 'ja',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: japaneseProvenance,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+  });
+  assert.ok(shortPlanned);
+  assert.equal(admitQueryRecord({
+    query: shortPlanned.query,
+    country: 'Japan',
+    primary_term: shortPlanned.primaryTerm,
+    generation_metadata: shortPlanned.metadata,
+  }).eligible, true);
   const planned = planCountryNativeProposalQuery({
     country: 'Japan',
     nativeTerm: '日経225先物',
