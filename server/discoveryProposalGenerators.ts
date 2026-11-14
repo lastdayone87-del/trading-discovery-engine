@@ -709,6 +709,25 @@ export function generationBatchIdentity(batchIds: Array<string | null | undefine
   return createHash('sha256').update(ids.join('|')).digest('hex').slice(0, 16);
 }
 
+export interface CachedSelectionCursor {
+  batch: string;
+  cursor: number;
+}
+
+/**
+ * Bounded cursor key. There are only three modes and at most four supported
+ * languages, so the language signature set is small and stable. A batch change
+ * resets the cursor for that key instead of creating a new unbounded entry.
+ */
+export function generationSelectionKey(mode: string, languages: string[]): string {
+  const signature = [...new Set(languages.filter(Boolean).map(language => language.toLowerCase()))].sort().join('+') || 'none';
+  return `${mode}:${signature}`;
+}
+
+export function cachedSelectionStart(stored: CachedSelectionCursor | undefined, batchIdentity: string): number {
+  return stored && stored.batch === batchIdentity ? stored.cursor : 0;
+}
+
 /** Rotate through a cached mode batch so later cycles surface unused candidates. */
 export function rotateCachedSelection<T>(
   items: readonly T[],
@@ -762,7 +781,7 @@ async function nativeQueryLocalVocabulary(country: string): Promise<string[]> {
 export interface GeneratedNativeProposalBatch {
   proposals: DiscoveryFrontierProposal[];
   /** Cursors to persist only after the returned proposals are persisted. */
-  nextSelectionCursors: Record<string, number> | null;
+  nextSelectionCursors: Record<string, CachedSelectionCursor> | null;
 }
 
 export async function generateLlmNativeProposals(country: string, limit = 10): Promise<GeneratedNativeProposalBatch> {
@@ -882,13 +901,16 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     // Keying by batch identity keeps alternating languages from consuming each
     // other's offsets.
     const selectionCursorKey = `native_query_generation_selection_cursor:${canonicalC}`;
-    const selectionCursors: Record<string, number> = {};
+    const selectionCursors: Record<string, CachedSelectionCursor> = {};
     try {
       const parsed = JSON.parse(await getAppSetting(selectionCursorKey, '{}'));
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-          if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
-            selectionCursors[key] = value;
+          if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+          const row = value as Record<string, unknown>;
+          if (typeof row.batch === 'string' && typeof row.cursor === 'number'
+            && Number.isSafeInteger(row.cursor) && row.cursor >= 0) {
+            selectionCursors[key] = { batch: row.batch, cursor: row.cursor };
           }
         }
       }
@@ -898,9 +920,12 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     const selected: NativeQueryCandidate[] = [];
     for (const { mode } of NATIVE_GENERATION_MODES) {
       const batchIdentity = generationBatchIdentity(dedupedByMode[mode].map(candidate => candidate.batchId));
-      const cursorKey = `${mode}:${batchIdentity}`;
-      const rotation = rotateCachedSelection(dedupedByMode[mode], selectionCursors[cursorKey] ?? 0, slots[mode]);
-      selectionCursors[cursorKey] = rotation.nextCursor;
+      // Key by mode + language signature: bounded (at most 3 x 15 entries),
+      // and a new cached batch resets only that language/mode cursor.
+      const cursorKey = generationSelectionKey(mode, dedupedByMode[mode].map(candidate => candidate.language));
+      const start = cachedSelectionStart(selectionCursors[cursorKey], batchIdentity);
+      const rotation = rotateCachedSelection(dedupedByMode[mode], start, slots[mode]);
+      selectionCursors[cursorKey] = { batch: batchIdentity, cursor: rotation.nextCursor };
       selected.push(...rotation.selected);
     }
     return {
