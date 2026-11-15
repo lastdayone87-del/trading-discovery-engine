@@ -15,9 +15,11 @@ test('admission secondary fallback is independent of the Groq classification def
   assert.equal(DEFAULT_ADMISSION_SECONDARY_MODEL, 'openai/gpt-oss-120b');
 });
 
-test('admission model resolvers prefer runtime overrides', () => {
+test('admission model resolvers prefer trimmed runtime overrides', () => {
   assert.equal(resolveAdmissionPrimaryModel({}), 'gemini-flash-lite-latest');
   assert.equal(resolveAdmissionSecondaryModel({}), 'openai/gpt-oss-120b');
-  assert.equal(resolveAdmissionPrimaryModel({ ADMISSION_PRIMARY_MODEL: 'custom-primary' }), 'custom-primary');
-  assert.equal(resolveAdmissionSecondaryModel({ ADMISSION_SECONDARY_MODEL: 'custom-secondary' }), 'custom-secondary');
+  assert.equal(resolveAdmissionPrimaryModel({ ADMISSION_PRIMARY_MODEL: ' custom-primary ' }), 'custom-primary');
+  assert.equal(resolveAdmissionSecondaryModel({ ADMISSION_SECONDARY_MODEL: ' custom-secondary ' }), 'custom-secondary');
+  assert.equal(resolveAdmissionPrimaryModel({ ADMISSION_PRIMARY_MODEL: '   ' }), 'gemini-flash-lite-latest');
+  assert.equal(resolveAdmissionSecondaryModel({ ADMISSION_SECONDARY_MODEL: '   ' }), 'openai/gpt-oss-120b');
 });

@@ -47,6 +47,10 @@ The verifier checks:
    manifest.
 3. Required secrets and provider-key minimum counts.
 
+`ADMISSION_SECONDARY_MODEL` is intentionally `null` in the manifest (no
+runtime override). The verifier checks its code fallback
+(`openai/gpt-oss-120b`) as a separate literal check.
+
 It exits non-zero on drift. Useful flags:
 
 ```bash

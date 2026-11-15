@@ -25,9 +25,9 @@ export const DEFAULT_ADMISSION_PRIMARY_MODEL = 'gemini-flash-lite-latest';
 export const DEFAULT_ADMISSION_SECONDARY_MODEL = 'openai/gpt-oss-120b';
 
 export function resolveAdmissionPrimaryModel(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL;
+  return String(env.ADMISSION_PRIMARY_MODEL || '').trim() || DEFAULT_ADMISSION_PRIMARY_MODEL;
 }
 
 export function resolveAdmissionSecondaryModel(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ADMISSION_SECONDARY_MODEL || DEFAULT_ADMISSION_SECONDARY_MODEL;
+  return String(env.ADMISSION_SECONDARY_MODEL || '').trim() || DEFAULT_ADMISSION_SECONDARY_MODEL;
 }

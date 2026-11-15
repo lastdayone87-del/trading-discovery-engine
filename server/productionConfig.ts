@@ -92,7 +92,6 @@ export function parseProductionConfig(raw: unknown): ProductionConfigManifest {
   for (const [key, value] of Object.entries(raw.environment)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key)) invalid(`environment key is not a valid env name: ${key}`);
     if (!ALLOWED_MANIFEST_ENV_KEYS.has(key)) invalid(`environment.${key} is not an allowed non-secret setting`);
-    if (SENSITIVE_ENV_KEY.test(key)) invalid(`environment.${key} looks secret; use requiredSecrets/secretGroups instead`);
     if (value === null) {
       environment[key] = null;
       continue;
@@ -141,13 +140,19 @@ function normalizedEnvValue(value: unknown): string | null {
   return text === '' ? null : text;
 }
 
+function rawEnvValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const text = String(value);
+  return text === '' ? null : text;
+}
+
 /** Compare the manifest environment against a process-style env object. */
 export function compareEnvironment(
   manifest: ProductionConfigManifest,
   env: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): ConfigCheck[] {
   return Object.entries(manifest.environment).map(([key, expected]) => {
-    const actualRaw = normalizedEnvValue(env[key]);
+    const actualRaw = rawEnvValue(env[key]);
     const actual = actualRaw === null ? null : (SENSITIVE_ENV_KEY.test(key) ? '<redacted>' : actualRaw);
     return {
       source: 'environment',

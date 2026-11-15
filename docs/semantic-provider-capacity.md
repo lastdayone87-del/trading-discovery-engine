@@ -194,7 +194,7 @@ server/evidenceEngine/providers/GeminiSemanticProvider.test.ts`) cover:
   `contextTruncated=true`; very large evidence sets may classify with less
   descriptive detail instead of failing the whole batch.
 - **Groq free-tier limits still apply.** Seven routes do not create unlimited
-  throughput; pacing and per-org cooldowns remain, and worker counts stay at 4/3
+  throughput; pacing and per-org cooldowns remain, and worker counts stay at 2/3
   until measurements show headroom.
 - **Expected improvement:** no more all-429 loops from shared labels, failover
   across independent Groq/Gemini accounts, daily quota windows respected, and

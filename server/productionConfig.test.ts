@@ -116,6 +116,11 @@ test('environment comparison distinguishes unset overrides, drift, and redacted 
   } as NodeJS.ProcessEnv);
   assert.equal(drift[0]?.ok, false);
   assert.equal(drift[1]?.ok, false);
+
+  const padded = compareEnvironment(manifest, {
+    ADMISSION_PRIMARY_MODEL: ' gemini-flash-lite-latest ',
+  } as NodeJS.ProcessEnv);
+  assert.equal(padded[0]?.ok, false, 'raw padded values must not compare equal');
 });
 
 test('secret checks use canonical provider slots and deduplicate values', () => {
@@ -149,7 +154,9 @@ test('secret checks use canonical provider slots and deduplicate values', () => 
     GROQ_API_KEY_9007199254740992: 'ignored-unsafe-slot',
     DATABASE_URL: 'postgres://example',
   } as NodeJS.ProcessEnv;
-  assert.equal(checkSecretGroups(manifest, env).every(check => check.ok), true);
+  const groups = checkSecretGroups(manifest, env);
+  assert.deepEqual(groups.map(check => check.actual), ['2', '1', '2']);
+  assert.equal(groups.every(check => check.ok), true);
   assert.equal(checkRequiredSecrets(manifest, env).every(check => check.ok), true);
 
   const missing = checkSecretGroups(manifest, {

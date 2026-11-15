@@ -6,7 +6,7 @@ Autonomous search pages were spending almost all worker wall time inside the
 per-channel ingestion pipeline. Production measurement from the approved plan:
 a search job averaged ~615s, of which ~606s was channel processing and only
 ~3.8s retrieval. One page of 21 channels recorded 11.34M ms of processing against
-14.3s of retrieval (~540s/channel). Four search workers were therefore
+14.3s of retrieval (~540s/channel). Historically, four search workers were therefore
 head-of-line blocked by semantic provider waits, even though retrieval and
 YouTube quota were not saturated.
 
