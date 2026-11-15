@@ -8,6 +8,8 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node --require ./server/secretSafeLogging.cjs dist/server.cjs",
     "clean": "rm -rf dist server.cjs",
+    "config:verify": "tsx scripts/verifyProductionConfig.ts",
+    "config:apply": "tsx scripts/applyProductionConfig.ts",
     "lint": "tsc --noEmit",
     "test": "find server tests scripts -name '*.test.ts' -exec node --import tsx --test {} +",
     "migrate": "tsx scripts/runMigrations.ts",

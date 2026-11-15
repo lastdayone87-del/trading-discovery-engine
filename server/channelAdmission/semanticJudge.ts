@@ -2,13 +2,13 @@ import { createHash } from 'node:crypto';
 import { getDb } from '../db';
 import type { SemanticModelClient } from '../evidenceEngine/providers/GeminiSemanticProvider';
 import {
-  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
   defaultClient as geminiDefaultClient,
 } from '../evidenceEngine/providers/GeminiSemanticProvider';
 import {
   DEFAULT_GROQ_CANDIDATE_MODEL,
   defaultClient as groqDefaultClient,
 } from '../evidenceEngine/providers/GroqSemanticProvider';
+import { DEFAULT_ADMISSION_PRIMARY_MODEL } from './admissionModels';
 import { independentCitationCount, normalizeSemanticJudgment } from './policy';
 import type { AdmissionEvidence, SemanticJudgment } from './types';
 
@@ -222,12 +222,12 @@ export async function readCachedAdmissionJudgment(
   const checksum = admissionEvidenceChecksum(evidence);
   const models: Array<[SemanticModelClient | undefined, string]> = role === 'PRIMARY'
     ? [
-        [geminiDefaultClient(), process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL],
+        [geminiDefaultClient(), process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL],
         [groqDefaultClient(), process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL],
       ]
     : [
         [groqDefaultClient(), process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL],
-        [geminiDefaultClient(), process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL],
+        [geminiDefaultClient(), process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL],
       ];
   for (const [client, model] of models) {
     if (!client) continue;
@@ -256,12 +256,12 @@ export class ProviderAdmissionJudge implements AdmissionJudge {
   async judge(evidence: AdmissionEvidence, role: 'PRIMARY' | 'SECOND'): Promise<SemanticJudgment> {
     const attempts = role === 'PRIMARY'
       ? [
-          { client: this.options.primaryClient ?? geminiDefaultClient(), model: this.options.primaryModel || process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL },
+          { client: this.options.primaryClient ?? geminiDefaultClient(), model: this.options.primaryModel || process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL },
           { client: this.options.secondaryClient ?? groqDefaultClient(), model: this.options.secondaryModel || process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL },
         ]
       : [
           { client: this.options.secondaryClient ?? groqDefaultClient(), model: this.options.secondaryModel || process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL },
-          { client: this.options.primaryClient ?? geminiDefaultClient(), model: this.options.primaryModel || process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL },
+          { client: this.options.primaryClient ?? geminiDefaultClient(), model: this.options.primaryModel || process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL },
         ];
     const checksum = admissionEvidenceChecksum(evidence);
     let lastError: unknown;

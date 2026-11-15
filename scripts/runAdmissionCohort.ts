@@ -14,9 +14,9 @@ import { Innertube } from 'youtubei.js';
 import { evaluateDeterministicAdmission } from '../server/channelAdmission/deterministic';
 import { decideAdmission, normalizeSemanticJudgment } from '../server/channelAdmission/policy';
 import { buildAdmissionPrompt, isSemanticDecisionFailure, needsSecondJudge, type AdmissionJudge } from '../server/channelAdmission/semanticJudge';
+import { DEFAULT_ADMISSION_PRIMARY_MODEL } from '../server/channelAdmission/admissionModels';
 import type { AdmissionEvidence, SemanticJudgment } from '../server/channelAdmission/types';
 import {
-  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
   defaultClient as geminiDefaultClient,
 } from '../server/evidenceEngine/providers/GeminiSemanticProvider';
 import {
@@ -295,7 +295,7 @@ function configuredJudge(): CohortJudge | null {
   const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }> = [];
   if (requested === 'auto' || requested === 'gemini') {
     const gemini = geminiDefaultClient();
-    if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, provider: 'gemini_semantic' });
+    if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL, provider: 'gemini_semantic' });
   }
   if (requested === 'auto' || requested === 'gemini-free') {
     const geminiFree = geminiFreeDefaultClient();
