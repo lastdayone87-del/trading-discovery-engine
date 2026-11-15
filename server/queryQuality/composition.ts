@@ -134,10 +134,15 @@ function gateAtom(
     termType: gateTypeFor(atom.sense.type),
     country: atom.sense.country,
     language: atom.sense.language,
-    // Only a whole-query, single-atom extracted/generated candidate carries its
-    // producer proof. A mixed candidate with one tagged atom must not bypass
-    // semantics.
-    requireTradingSemantics: extractedStandalone || generatedStandalone ? false : requiresTradingSemantics(atom.provenance),
+    // Extracted standalone candidates carry ledger proof of trading intent.
+    // Generated standalone candidates only carry provider metadata, which is
+    // not an admission proof at this boundary, so they still require governed
+    // trading semantics. A mixed candidate must not bypass either.
+    requireTradingSemantics: generatedStandalone
+      ? true
+      : extractedStandalone
+        ? false
+        : requiresTradingSemantics(atom.provenance),
     // The legacy bridge uses the stored query as one atom; it may be longer
     // than a normal atom without becoming an unbounded term.
     allowExtendedTokens: atom.provenance === 'LEGACY_COMPATIBILITY',

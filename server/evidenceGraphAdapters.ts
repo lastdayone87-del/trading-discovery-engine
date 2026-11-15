@@ -81,8 +81,8 @@ export async function proposePlaylistInspection(input:{programKey:string;playlis
     const key=playlistActionKey({programKey:input.programKey,playlistId:input.playlistId,validityStart:start.toISOString()});
     const result=await client.query(`INSERT INTO frontier_actions(program_id,action_type,semantic_action_key,normalized_target,validity_start,validity_end,lifecycle,mode,policy_version,parent_action_id,estimated_cost,payload_schema_version)
       VALUES($1,'INSPECT_PLAYLIST',$2,$3,$4,$5,'PROPOSED','SHADOW',$6,$7,$8,1)
-      ON CONFLICT(program_id,semantic_action_key,validity_start,validity_end) DO UPDATE SET semantic_action_key=excluded.semantic_action_key RETURNING id,semantic_action_key,lifecycle,mode`,
-      [program.rows[0].id,key,canonicalEvidenceKey('PLAYLIST',input.playlistId),start.toISOString(),end.toISOString(),PLAYLIST_ADAPTER_POLICY_VERSION,input.parentActionId,JSON.stringify({youtubeUnits:0,proposalOnly:true})]);
+      ON CONFLICT(program_id,semantic_action_key,validity_start,validity_end) DO UPDATE SET semantic_action_key=excluded.semantic_action_key, estimated_cost=frontier_actions.estimated_cost||excluded.estimated_cost RETURNING id,semantic_action_key,lifecycle,mode`,
+      [program.rows[0].id,key,canonicalEvidenceKey('PLAYLIST',input.playlistId),start.toISOString(),end.toISOString(),PLAYLIST_ADAPTER_POLICY_VERSION,input.parentActionId,JSON.stringify({youtubeUnits:0,proposalOnly:true,playlistId:input.playlistId})]);
     await client.query(`INSERT INTO evidence_program_visits(program_id,node_id,action_id,visit_key,depth,attribution_path,status,policy_version)
       VALUES($1,$2,$3,$4,$5,$6,'PROPOSED',$7) ON CONFLICT(program_id,visit_key) DO NOTHING`,[program.rows[0].id,input.sourceNodeId,result.rows[0].id,key,input.depth,JSON.stringify([input.parentActionId,result.rows[0].id]),PLAYLIST_ADAPTER_POLICY_VERSION]);
     await client.query('COMMIT');return {...result.rows[0],executionEnqueued:false,payloadVersion:ACQUISITION_PAYLOAD_VERSION};

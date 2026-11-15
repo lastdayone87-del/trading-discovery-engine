@@ -309,7 +309,10 @@ export function planCountryNativeProposalQuery(args: {
         country: args.country,
         language: declaredLanguage || supportedLanguages[0],
         maxTokens: 6,
-        requireTradingSemantics: false,
+        // Provider output is not an admission proof at this boundary. The
+        // generator already required semantics; re-check it here so a
+        // malformed stored proposal cannot smuggle arbitrary bounded text.
+        requireTradingSemantics: true,
       })
     : null;
   const generatedNative = Boolean(

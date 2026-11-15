@@ -253,6 +253,41 @@ test('a failed replacement pass keeps the valid cached subset', async () => {
   assert.deepEqual(second.candidates.map(candidate => candidate.query), [first.candidates[1].query]);
 });
 
+test('a replacement pass fills the requested batch past the old 60% threshold', async () => {
+  let calls = 0;
+  const result = await generateNativeQueriesWithLlm({
+    memoryStore: inMemoryGenerationStore(),
+    context: {
+      country: 'France',
+      language: 'fr',
+      mode: 'OPEN_WORLD',
+      existingQueries: [],
+      candidateMemory: [],
+      coverageGaps: [],
+      autocompleteSuggestions: [],
+      localVocabulary: [],
+    },
+    count: 5,
+    generateText: async () => {
+      calls += 1;
+      const queries = calls === 1
+        ? [
+            { query: 'analyse technique CAC 40', intent: 'market_analysis' },
+            { query: 'bourse direct avis', intent: 'strategy' },
+            { query: 'forex trading', intent: 'forex' },
+            { query: 'subscribe to my trading channel', intent: 'education' },
+          ]
+        : [
+            { query: 'options CAC 40', intent: 'options' },
+            { query: 'courtier bourse', intent: 'strategy' },
+          ];
+      return { text: JSON.stringify({ queries }), provider: 'test', model: 'test' };
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.candidates.length, 5);
+});
+
 test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {
   const now = new Date('2026-11-08T12:00:00.000Z');
   assert.equal(shouldGenerateNativeQueries({

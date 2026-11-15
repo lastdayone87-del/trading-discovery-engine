@@ -136,6 +136,8 @@ export async function rememberQueryCandidates(candidates: CandidateMemoryInput[]
          reason_codes,batch_key,metadata,first_seen_at,last_seen_at
        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,now(),now())
        ON CONFLICT(LOWER(country),language,normalized_query) DO UPDATE SET
+         source=EXCLUDED.source,
+         mode=EXCLUDED.mode,
          status=CASE
            WHEN query_candidate_memory.status='ADMITTED' THEN 'ADMITTED'
            WHEN EXCLUDED.status='ADMITTED' THEN 'ADMITTED'

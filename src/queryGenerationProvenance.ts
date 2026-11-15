@@ -49,7 +49,8 @@ export function parseQueryGenerationProvenance(value: unknown): QueryGenerationP
   const country = stringOrNull(row.country);
   const language = stringOrNull(row.language);
   const generatedAt = stringOrNull(row.generatedAt);
-  if (!SOURCES.has(source) || !MODES.has(mode) || !country || !language || !generatedAt) return null;
+  if (!SOURCES.has(source) || !MODES.has(mode) || !country || !language || !generatedAt
+    || !Number.isFinite(Date.parse(generatedAt))) return null;
   return {
     source,
     mode,
@@ -105,5 +106,6 @@ export function formatQueryGenerationTooltip(provenance: QueryGenerationProvenan
     provenance.persona ? `Persona: ${provenance.persona}` : null,
     provenance.scenario ? `Scenario: ${provenance.scenario}` : null,
     provenance.prefix ? `Prefix: ${provenance.prefix}` : null,
+    `Generated: ${provenance.generatedAt}`,
   ].filter(Boolean).join('\n');
 }

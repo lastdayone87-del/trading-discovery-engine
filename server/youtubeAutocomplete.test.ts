@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fetchYouTubeAutocomplete } from './youtubeAutocomplete';
+import { generateAutocompleteProposals } from './discoveryProposalGenerators';
 
 test('YouTube autocomplete sends language and region and parses suggestions', async () => {
   let called = '';
@@ -41,4 +42,9 @@ test('autocomplete failure is a cache miss, not discovery failure', async () => 
     fetchImpl: (async () => { throw new Error('network'); }) as typeof fetch,
   });
   assert.deepEqual(suggestions, []);
+});
+
+
+test('a negative proposal limit returns no proposals before any provider or DB work', async () => {
+  assert.deepEqual(await generateAutocompleteProposals('France', -1), []);
 });

@@ -14,9 +14,9 @@ CREATE TABLE IF NOT EXISTS query_candidate_memory (
   normalized_query TEXT NOT NULL,
   semantic_key TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('GENERATED', 'PROPOSED', 'ADMITTED', 'REJECTED', 'DUPLICATE')),
-  reason_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+  reason_codes JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(reason_codes)='array'),
   batch_key TEXT,
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata)='object'),
   first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS query_generation_batches (
   prompt_version TEXT,
   input_fingerprint TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('PENDING', 'COMPLETED', 'LOW_NOVELTY', 'FAILED')),
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload)='object'),
   duplicate_rate NUMERIC(8,4),
   accepted_count INTEGER NOT NULL DEFAULT 0,
   generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),

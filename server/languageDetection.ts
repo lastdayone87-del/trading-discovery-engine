@@ -77,7 +77,6 @@ const DIACRITIC_HINTS: Partial<Record<SupportedLanguage, RegExp>> = {
   sv: /[åäö]/u,
   no: /[æøå]/u,
   nl: /[ëïé]/u,
-  mi: /[āēīōū]/u,
 };
 
 function normalize(text: string): string {

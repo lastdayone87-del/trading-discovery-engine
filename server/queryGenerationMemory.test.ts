@@ -20,21 +20,26 @@ test('query generation cache keys are deterministic and context-sensitive', () =
 
 test('generation memory migration is additive and does not touch query_library', () => {
   const sql = readFileSync(new URL('./db/migrations/184_query_generation_memory.sql', import.meta.url), 'utf8');
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS query_candidate_memory/);
-  assert.match(sql, /CREATE TABLE IF NOT EXISTS query_generation_batches/);
-  assert.match(sql, /CREATE UNIQUE INDEX[^;]*query_candidate_memory\(LOWER\(country\), language, normalized_query\)/i);
+  // Strip comments before every assertion: the file legitimately explains that
+  // it is separate from query_library, and commented-out DDL must not satisfy
+  // the required-schema checks.
+  const stripped = sql
+    .replace(/--[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.match(stripped, /CREATE TABLE IF NOT EXISTS query_candidate_memory/);
+  assert.match(stripped, /CREATE TABLE IF NOT EXISTS query_generation_batches/);
+  assert.match(stripped, /CREATE UNIQUE INDEX[^;]*query_candidate_memory\(LOWER\(country\), language, normalized_query\)/i);
 
   // Scope the batch-key assertion to its table; a generic UNIQUE elsewhere in
   // the migration must not satisfy it.
-  const batchesTable = sql.match(
+  const batchesTable = stripped.match(
     /CREATE TABLE IF NOT EXISTS query_generation_batches\s*\(([\s\S]*?)\);/i,
   )?.[1] || '';
   assert.match(batchesTable, /batch_key TEXT PRIMARY KEY/);
 
-  // Strip SQL comments: the file legitimately explains that it is separate
-  // from query_library. Any remaining reference is a boundary violation.
-  const stripped = sql
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
   assert.doesNotMatch(stripped, /\bquery_library\b/i);
+  assert.doesNotMatch(stripped, /\b(?:DROP\s+TABLE|DROP\s+COLUMN|TRUNCATE)\b/i);
+  assert.match(stripped, /jsonb_typeof\(reason_codes\)\s*=\s*'array'/i);
+  assert.match(stripped, /jsonb_typeof\(metadata\)\s*=\s*'object'/i);
+  assert.match(stripped, /jsonb_typeof\(payload\)\s*=\s*'object'/i);
 });

@@ -62,7 +62,7 @@ export async function selectRelationshipCanarySeeds(
 
   if (maxPlaylists > 0 && seeds.length < maxSeeds) {
     const playlists = await db.query(
-      `SELECT DISTINCT regexp_replace(a.normalized_target,'^playlist:','') AS playlist_id
+      `SELECT DISTINCT COALESCE(NULLIF(a.context->>'playlistId',''), regexp_replace(a.normalized_target,'^playlist:','')) AS playlist_id
        FROM discovery_actions a
        WHERE a.action_type='INSPECT_PLAYLIST'
          AND a.lifecycle='COMPLETED'
@@ -75,12 +75,12 @@ export async function selectRelationshipCanarySeeds(
            SELECT 1 FROM jobs j
            WHERE j.type=$3
              AND j.created_at > now()-($4::text || ' days')::interval
-             AND j.payload->'seeds' @> jsonb_build_array(jsonb_build_object('kind','playlist','id',regexp_replace(a.normalized_target,'^playlist:','')))
+             AND j.payload->'seeds' @> jsonb_build_array(jsonb_build_object('kind','playlist','id',COALESCE(NULLIF(a.context->>'playlistId',''), regexp_replace(a.normalized_target,'^playlist:',''))))
          )
        ORDER BY playlist_id ASC
        LIMIT $2`,
       [canonical, Math.min(maxPlaylists, maxSeeds - seeds.length), RELATIONSHIP_CANARY_JOB_TYPE, String(cooldownDays)],
-    ).catch(() => ({ rows: [] as Array<Record<string, unknown>> }));
+    );
     for (const row of playlists.rows) {
       const id = String(row.playlist_id || '').trim();
       if (id) seeds.push({ kind: 'playlist', id });

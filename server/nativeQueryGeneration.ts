@@ -33,7 +33,6 @@ import { geminiOrgIdForSlot } from './evidenceEngine/providers/GeminiSemanticPro
 export const NATIVE_QUERY_PROMPT_VERSION = 'native-query-v1';
 export const NATIVE_QUERY_BATCH_SIZE = 100;
 export const NATIVE_QUERY_BATCH_TTL_DAYS = 14;
-export const NATIVE_QUERY_REPLACEMENT_THRESHOLD = 0.6;
 
 /**
  * Persistence seam for generation memory. Production uses the database-backed
@@ -497,8 +496,10 @@ export async function generateNativeQueriesWithLlm(input: {
       history.push({ query: assessed.candidate.query, country: context.country, intent: assessed.candidate.intent });
       if (accepted.length >= count) break;
     }
-    if (accepted.length >= Math.ceil(count * NATIVE_QUERY_REPLACEMENT_THRESHOLD)) break;
-    if (!rejected.length) break;
+    // Continue to the replacement pass whenever the requested batch is still
+    // underfilled. The two-pass cap bounds provider cost; the old 60% early
+    // stop permanently cached underfilled batches.
+    if (accepted.length >= count) break;
   }
 
   // Rejection rate is not duplicate rate: validation/language/gate failures

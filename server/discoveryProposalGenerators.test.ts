@@ -7,6 +7,7 @@ import {
   generateCreatorDerivedProposals,
   generateFrontierProposalsForCountry,
   cachedSelectionStart,
+  generateLlmNativeProposals,
   generationBatchIdentity,
   generationSelectionKey,
   rotateCachedSelection
@@ -178,4 +179,12 @@ test('selection state is bounded by mode and language signature and resets per b
   assert.equal(cachedSelectionStart({ batch: 'a', cursor: 7 }, 'a'), 7);
   assert.equal(cachedSelectionStart({ batch: 'a', cursor: 7 }, 'b'), 0);
   assert.equal(cachedSelectionStart(undefined, 'a'), 0);
+});
+
+
+test('a negative LLM proposal limit returns no proposals before any provider work', async () => {
+  assert.deepEqual(await generateLlmNativeProposals('France', -1), {
+    proposals: [],
+    nextSelectionCursors: null,
+  });
 });

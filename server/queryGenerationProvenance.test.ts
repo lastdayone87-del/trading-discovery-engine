@@ -29,6 +29,12 @@ test('malformed provenance never renders as a false AI label', () => {
   assert.equal(parseQueryGenerationProvenance(null), null);
   assert.equal(parseQueryGenerationProvenance({ source: 'UNKNOWN', mode: 'OPEN_WORLD' }), null);
   assert.equal(parseQueryGenerationProvenance({ source: 'LLM', mode: 'OPEN_WORLD', country: 'France' }), null);
+  assert.equal(parseQueryGenerationProvenance({
+    source: 'LLM', mode: 'OPEN_WORLD', country: 'France', language: 'fr', generatedAt: 'not-a-date',
+  }), null);
+  assert.equal(parseQueryGenerationProvenance({
+    source: 'LLM', mode: 'OPEN_WORLD', country: 'France', language: 'fr', generatedAt: '2026-13-40T00:00:00.000Z',
+  }), null);
 });
 
 test('tooltip preserves country, language, model and prompt provenance', () => {
@@ -49,4 +55,5 @@ test('tooltip preserves country, language, model and prompt provenance', () => {
   assert.match(tooltip, /Country: France/);
   assert.match(tooltip, /Language: fr/);
   assert.match(tooltip, /Prompt: native-query-v1/);
+  assert.match(tooltip, /Generated: 2026-11-13T00:00:00\.000Z/);
 });

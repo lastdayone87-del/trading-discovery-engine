@@ -4,6 +4,7 @@ import { assertCountryAllowed } from './countryExclusion';
 import { assessGeneratedNativeQuery, type NativeQueryCandidate } from './nativeQueryGeneration';
 import { getCandidateMemory, getGenerationBatch, queryGenerationBatchKey, rememberQueryCandidates, upsertGenerationBatch } from './queryGenerationMemory';
 import { dedupeCandidateBatch, normalizeCandidateText, type CandidateHistoryItem } from './queryDuplicateGuard';
+import { normalizeRotationCursor } from './rotationCursor';
 
 export const YOUTUBE_AUTOCOMPLETE_PROVIDER = 'youtube-autocomplete';
 export const YOUTUBE_AUTOCOMPLETE_TTL_DAYS = 7;
@@ -151,7 +152,7 @@ export async function generateAutocompleteQueries(input: {
   const languages = countryDiscoveryLanguagesByWeight(country);
   if (!languages.length) return { candidates: [], prefixesAttempted: 0, cacheHits: 0 };
   const cursorKey = `youtube_autocomplete_cursor:${country}`;
-  const cursor = Math.max(0, Number(await getAppSetting(cursorKey, '0')) || 0);
+  const cursor = normalizeRotationCursor(await getAppSetting(cursorKey, '0'));
   const language = languages[cursor % languages.length];
   const lastAttemptKey = `youtube_autocomplete_last_attempt:${country}`;
   const lastAttempt = Date.parse(await getAppSetting(lastAttemptKey, ''));

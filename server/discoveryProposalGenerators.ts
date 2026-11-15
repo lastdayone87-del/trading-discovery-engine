@@ -10,6 +10,7 @@ import { generateNativeQueriesWithLlm, NATIVE_QUERY_BATCH_SIZE, type NativeQuery
 import { generateAutocompleteQueries, getCachedAutocompleteSuggestions } from './youtubeAutocomplete';
 import { getCandidateMemory, type CandidateMemoryRow } from './queryGenerationMemory';
 import { dedupeCandidateBatch, type CandidateHistoryItem } from './queryDuplicateGuard';
+import { normalizeRotationCursor } from './rotationCursor';
 
 export type ProposalFamily =
   | 'LEARNED'
@@ -785,6 +786,8 @@ export interface GeneratedNativeProposalBatch {
 }
 
 export async function generateLlmNativeProposals(country: string, limit = 10): Promise<GeneratedNativeProposalBatch> {
+  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+  if (boundedLimit === 0) return { proposals: [], nextSelectionCursors: null };
   try {
     await assertCountryAllowed(country, 'native_query_generation');
     const enabled = await getAppSetting(
@@ -797,7 +800,7 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     if (!languages.length) return { proposals: [], nextSelectionCursors: null };
     const maxLanguages = Math.max(1, Math.min(4, Number(await getAppSetting('native_query_generation_languages_per_cycle', '1')) || 1));
     const cursorKey = `native_query_generation_cursor:${canonicalC}`;
-    const cursor = Math.max(0, Number(await getAppSetting(cursorKey, '0')) || 0);
+    const cursor = normalizeRotationCursor(await getAppSetting(cursorKey, '0'));
     const selectedLanguages = Array.from({ length: Math.min(maxLanguages, languages.length) }, (_, index) =>
       languages[(cursor + index) % languages.length],
     );
@@ -890,7 +893,7 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
     };
     for (const candidate of crossModeAccepted) dedupedByMode[candidate.mode].push(candidate);
 
-    const slots = allocateNativeGenerationSlots(limit, {
+    const slots = allocateNativeGenerationSlots(boundedLimit, {
       OPEN_WORLD: dedupedByMode.OPEN_WORLD.length,
       REAL_SIGNAL: dedupedByMode.REAL_SIGNAL.length,
       GROUNDED: dedupedByMode.GROUNDED.length,
@@ -955,7 +958,7 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
       confidence: Math.min(0.85, Math.max(0.45, candidate.confidence)),
       ttlDays: 14,
       noveltyRationale: `LLM ${candidate.mode.toLowerCase()} native query for ${canonicalC} (${candidate.language}); generated as a new search surface rather than a translation of an existing query.`,
-      })).slice(0, limit),
+      })).slice(0, boundedLimit),
     };
   } catch {
     return { proposals: [], nextSelectionCursors: null };
@@ -964,10 +967,12 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
 
 // 5c. YOUTUBE AUTOCOMPLETE Generator
 export async function generateAutocompleteProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+  if (boundedLimit === 0) return [];
   try {
     const canonicalC = canonicalCountry(country);
-    const result = await generateAutocompleteQueries({ country: canonicalC, limit: Math.max(limit * 3, 20) });
-    return result.candidates.slice(0, limit).map(candidate => buildFrontierProposal({
+    const result = await generateAutocompleteQueries({ country: canonicalC, limit: Math.max(boundedLimit * 3, 20) });
+    return result.candidates.slice(0, boundedLimit).map(candidate => buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
       country: canonicalC,
       preserveCountryIdentity: true,

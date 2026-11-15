@@ -56,6 +56,42 @@ test('a genuine 4-6 word generated native phrase is admitted as a bounded standa
   assert.notEqual(admission.admission.tier, 'SPECULATIVE');
 });
 
+test('planner rejects arbitrary bounded text even with generated provenance', () => {
+  const planned = planCountryNativeProposalQuery({
+    country: 'France',
+    nativeTerm: 'hello world',
+    countryVocabulary: france,
+    targetIntent: 'strategy',
+    allocationLineage: { decisionId: 'decision-arbitrary', proposalId: 'proposal-arbitrary' },
+    language: 'fr',
+    generationSource: 'LLM_NATIVE_QUERY',
+    generationProvenance: provenance,
+  });
+  assert.equal(planned, null);
+});
+
+test('generated admission rejects arbitrary bounded text without trading semantics', () => {
+  const admission = admitQueryRecord({
+    query: 'hello world',
+    country: 'France',
+    primary_term: 'hello world',
+    generation_metadata: {
+      queryTemplate: 'LLM_NATIVE_PHRASE',
+      generatedNativePhrase: true,
+      preferredLanguage: 'fr',
+      generationProvenance: provenance,
+      atoms: [{
+        term: 'hello world',
+        type: 'TERMINOLOGY',
+        provenance: 'COUNTRY_VOCABULARY',
+        role: 'ANCHOR',
+        position: 0,
+      }],
+    } as any,
+  });
+  assert.equal(admission.eligible, false);
+});
+
 test('generated admission accepts a regional provenance tag for the same language', () => {
   const planned = planCountryNativeProposalQuery({
     country: 'France',
