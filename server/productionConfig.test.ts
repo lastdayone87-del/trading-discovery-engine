@@ -106,7 +106,7 @@ test('environment comparison distinguishes unset overrides, drift, and redacted 
 
   const unsetAsEmpty = compareEnvironment(manifest, {
     ADMISSION_PRIMARY_MODEL: 'gemini-flash-lite-latest',
-    ADMISSION_SECONDARY_MODEL: '',
+    ADMISSION_SECONDARY_MODEL: '   ',
   } as NodeJS.ProcessEnv);
   assert.equal(unsetAsEmpty[1]?.ok, true);
 

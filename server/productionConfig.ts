@@ -143,7 +143,7 @@ function normalizedEnvValue(value: unknown): string | null {
 function rawEnvValue(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   const text = String(value);
-  return text === '' ? null : text;
+  return text.trim() === '' ? null : text;
 }
 
 /** Compare the manifest environment against a process-style env object. */
