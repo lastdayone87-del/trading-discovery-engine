@@ -148,7 +148,7 @@ function isCanonicalSecretSlot(kind: SecretGroupKind, name: string): boolean {
     return name === 'YOUTUBE_API_KEY' || /^YOUTUBE_API_KEY_[1-9][0-9]*$/.test(name);
   }
   if (kind === 'gemini') {
-    return name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name);
+    return name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name);
   }
   return name === 'GROQ_API_KEY' || /^GROQ_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name);
 }

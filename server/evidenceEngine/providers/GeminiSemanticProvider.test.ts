@@ -88,9 +88,9 @@ test('non-404 permanent failures do not invoke fallback model', async () => {
 
 test('configured Gemini routes are ordered, non-empty, and deduplicated without exposing values',async()=>{
   const {configuredGeminiRoutes}=await import('./GeminiSemanticProvider');
-  const routes=configuredGeminiRoutes({GEMINI_API_KEY:'a',GEMINI_API_KEY_2:'b',GEMINI_API_KEY_3:'a',GEMINI_API_KEY_4:'',GEMINI_API_KEY_5:'e',GEMINI_API_KEY_20:'z'});
-  assert.deepEqual(routes.map(route=>route.id),['gemini-1','gemini-2','gemini-5','gemini-20']);
-  assert.deepEqual(routes.map(route=>route.key),['a','b','e','z']);
+  const routes=configuredGeminiRoutes({GEMINI_API_KEY:'a',GEMINI_API_KEY_2:'b',GEMINI_API_KEY_3:'a',GEMINI_API_KEY_4:'',GEMINI_API_KEY_5:'e',GEMINI_API_KEY_10:'h',GEMINI_API_KEY_20:'z'});
+  assert.deepEqual(routes.map(route=>route.id),['gemini-1','gemini-2','gemini-5','gemini-10','gemini-20']);
+  assert.deepEqual(routes.map(route=>route.key),['a','b','e','h','z']);
 });
 
 test('Gemini batch output allowance scales with batch size and stays bounded',()=>{

@@ -155,6 +155,23 @@ test('production config commands run the compiled bundle, not development tsx', 
   assert.match(pkg.scripts['config:build'] || '', /scripts\/verifyProductionConfig\.ts/);
 });
 
+test('gemini canonical slots include 10-19 without accepting malformed names', () => {
+  const manifest = {
+    version: 1,
+    environment: {},
+    secretGroups: [{ kind: 'gemini', minimum: 2 }],
+    requiredSecrets: [],
+  } as ProductionConfigManifest;
+  const checks = checkSecretGroups(manifest, {
+    GEMINI_API_KEY: 'gemini-a',
+    GEMINI_API_KEY_10: 'gemini-b',
+    GEMINI_API_KEY_02: 'ignored-leading-zero',
+    GEMINI_API_KEY_19_METADATA: 'ignored-metadata',
+  } as NodeJS.ProcessEnv);
+  assert.equal(checks[0]?.actual, '2');
+  assert.equal(checks[0]?.ok, true);
+});
+
 test('code default and summary checks fail closed', () => {
   const ok = checkCodeDefault('ADMISSION_PRIMARY_MODEL', 'gemini-flash-lite-latest', 'gemini-flash-lite-latest');
   assert.equal(ok.ok, true);
