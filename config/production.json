@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "description": "Non-secret production runtime safety baseline. Only behavior settings that were changed or reverted are versioned here, with emphasis on the admission/classification model selection. Secrets are never stored here; only their required key names and minimum counts are declared. Operational state such as discovery pause and queue controls remains in the application database and the migration runbook, not in this manifest.",
+  "environment": {
+    "ADMISSION_PRIMARY_MODEL": "gemini-flash-lite-latest",
+    "ADMISSION_SECONDARY_MODEL": null,
+    "MULTILINGUAL_CANDIDATE_MODEL": "gemini-3.5-flash-lite",
+    "MULTILINGUAL_ADJUDICATOR_MODEL": "gemini-3.5-flash-lite",
+    "GROQ_CANDIDATE_MODEL": "openai/gpt-oss-20b",
+    "SEMANTIC_PROVIDER": "gemini",
+    "ENRICHMENT_WORKER_CONCURRENCY": "6",
+    "ENRICHMENT_SCALE_GATE_ENABLED": "true",
+    "CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS": "5000",
+    "SEARCH_WORKER_CONCURRENCY": "2",
+    "COMMUNITY_RETRY_WORKER_CONCURRENCY": "3",
+    "RENDERED_ADMISSION_GOVERNOR_ENABLED": "true",
+    "RENDERED_ADMISSION_NOMINAL_PER_HOUR": "40",
+    "RENDERED_ADMISSION_EMERGENCY_PER_HOUR": "48",
+    "RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT": "35",
+    "RENDERED_FALLBACK_MAX_WAIT_MS": "90000"
+  },
+  "secretGroups": [
+    { "prefix": "YOUTUBE_API_KEY_", "minimum": 58 },
+    { "prefix": "GEMINI_API_KEY", "minimum": 5 },
+    { "prefix": "GROQ_API_KEY", "minimum": 7 }
+  ],
+  "requiredSecrets": [
+    "DATABASE_URL",
+    "ADMIN_API_TOKEN",
+    "OPERATOR_API_TOKEN"
+  ]
+}
