@@ -20,9 +20,9 @@
     "RENDERED_FALLBACK_MAX_WAIT_MS": "90000"
   },
   "secretGroups": [
-    { "prefix": "YOUTUBE_API_KEY_", "minimum": 58 },
-    { "prefix": "GEMINI_API_KEY", "minimum": 5 },
-    { "prefix": "GROQ_API_KEY", "minimum": 7 }
+    { "kind": "youtube", "minimum": 58 },
+    { "kind": "gemini", "minimum": 5 },
+    { "kind": "groq", "minimum": 7 }
   ],
   "requiredSecrets": [
     "DATABASE_URL",

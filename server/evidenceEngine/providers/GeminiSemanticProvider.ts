@@ -13,8 +13,8 @@ import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultSh
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
-export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
-export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
+import { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from '../modelDefaults';
+export { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL };
 type SemanticLabel = SemanticResultLabel;
 
 export interface SemanticModelResult {

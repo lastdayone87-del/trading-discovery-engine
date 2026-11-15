@@ -10,5 +10,9 @@
  * Keep these as code defaults so a bare redeploy cannot silently fall back to
  * the classification model when the Coolify environment override is missing.
  * Operators can still override either value at runtime.
+ *
+ * `-latest` is a tracked alias. If Google retargets it, re-run the sealed
+ * admission cohort and bump `ADMISSION_PROMPT_VERSION` so cached admission
+ * judgments do not outlive the model behavior change.
  */
 export const DEFAULT_ADMISSION_PRIMARY_MODEL = 'gemini-flash-lite-latest';

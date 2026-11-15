@@ -1,5 +1,10 @@
 import { DEFAULT_ADMISSION_PRIMARY_MODEL } from '../server/channelAdmission/admissionModels';
 import {
+  DEFAULT_GROQ_CANDIDATE_MODEL,
+  DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+} from '../server/evidenceEngine/modelDefaults';
+import {
   checkCodeDefault,
   checkRequiredSecrets,
   checkSecretGroups,
@@ -52,6 +57,21 @@ function main(): number {
       manifest.environment.ADMISSION_PRIMARY_MODEL ?? DEFAULT_ADMISSION_PRIMARY_MODEL,
       DEFAULT_ADMISSION_PRIMARY_MODEL,
     ),
+    checkCodeDefault(
+      'MULTILINGUAL_CANDIDATE_MODEL',
+      manifest.environment.MULTILINGUAL_CANDIDATE_MODEL ?? DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+      DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+    ),
+    checkCodeDefault(
+      'MULTILINGUAL_ADJUDICATOR_MODEL',
+      manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL ?? DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+      DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+    ),
+    checkCodeDefault(
+      'GROQ_CANDIDATE_MODEL',
+      manifest.environment.GROQ_CANDIDATE_MODEL ?? DEFAULT_GROQ_CANDIDATE_MODEL,
+      DEFAULT_GROQ_CANDIDATE_MODEL,
+    ),
   ];
   if (!options.skipSecrets) {
     checks.push(...checkSecretGroups(manifest, process.env));
@@ -69,8 +89,9 @@ function main(): number {
 }
 
 try {
-  process.exit(main());
+  // Prefer an exit code over process.exit() so piped/JSON output is flushed.
+  process.exitCode = main();
 } catch (error) {
   console.error(`Production config verification failed: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
+  process.exitCode = 1;
 }

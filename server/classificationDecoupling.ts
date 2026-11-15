@@ -55,8 +55,8 @@ export function classificationRenderedFallbackMaxWaitMs(env: NodeJS.ProcessEnv =
   return Math.floor(value);
 }
 
-/** Measured production search width; kept as a pure default for diagnostics. */
-export const SEARCH_WORKER_CONCURRENCY_DEFAULT = 4;
+/** Production search width; kept as a pure default for diagnostics. */
+export const SEARCH_WORKER_CONCURRENCY_DEFAULT = 2;
 /** Measured production enrichment width; Phase 3 preserves three workers. */
 export const ENRICHMENT_WORKER_CONCURRENCY_DEFAULT = 3;
 

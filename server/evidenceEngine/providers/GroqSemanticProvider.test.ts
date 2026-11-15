@@ -233,7 +233,7 @@ test('groq availability reports missing keys and inapplicable inputs', () => {
 test('shared parser keeps taxonomy boundary identical across providers', () => {
   assert.equal(parseSemanticResult({ label: 'HYPE', confidence: 80, supportedLanguage: true }).label, 'HYPE');
   assert.equal(parseSemanticResult({ label: 'NOPE', confidence: 80, supportedLanguage: true }).label, 'AMBIGUOUS');
-  assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, 'openai/gpt-oss-120b');
+  assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, 'openai/gpt-oss-20b');
   assert.equal(DEFAULT_GROQ_ADJUDICATOR_MODEL, 'openai/gpt-oss-120b');
 });
 
@@ -331,7 +331,7 @@ test('groq-routed classifications populate the semantic audit trail with the ser
   const decision = new ConfigurableWeightedStrategy().evaluateDecision([item], context, 'United States', collection);
   // ai_reviewed expression from tradingRelevanceClassifier must hold for Groq.
   assert.ok(!!decision.geminiSemanticSummary);
-  assert.equal(decision.geminiSemanticSummary?.modelUsed, 'openai/gpt-oss-120b');
+  assert.equal(decision.geminiSemanticSummary?.modelUsed, 'openai/gpt-oss-20b');
   assert.equal(decision.geminiSemanticSummary?.isTrading, 'NO');
   assert.match(decision.geminiSemanticSummary?.reason || '', /UNRELATED/);
   assert.equal(decision.status, 'NON_TRADING');
@@ -1018,7 +1018,7 @@ test('A1 → A2 → B never retries the exhausted same-org sibling', async () =>
   assert.deepEqual(result, { route: 'groq-3' });
 });
 
-test('groq defaults adjudicate low-confidence results with two same-model calls', async () => {
+test('groq defaults adjudicate low-confidence results with the candidate and adjudicator defaults', async () => {
   const saved: Record<string, string | undefined> = {};
   for (const name of ['GROQ_CANDIDATE_MODEL', 'GROQ_ADJUDICATOR_MODEL', 'MULTILINGUAL_ADJUDICATION_ENABLED']) {
     saved[name] = process.env[name];
@@ -1034,7 +1034,8 @@ test('groq defaults adjudicate low-confidence results with two same-model calls'
     assert.ok(calls[0].prompt.includes('"task":"CANDIDATE"'));
     assert.ok(calls[1].prompt.includes('"task":"ADJUDICATION"'));
     assert.deepEqual(calls.map(call => call.model), [DEFAULT_GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_ADJUDICATOR_MODEL]);
-    assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_ADJUDICATOR_MODEL);
+    assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, 'openai/gpt-oss-20b');
+    assert.equal(DEFAULT_GROQ_ADJUDICATOR_MODEL, 'openai/gpt-oss-120b');
   } finally {
     for (const name of Object.keys(saved)) {
       if (saved[name] === undefined) delete process.env[name];

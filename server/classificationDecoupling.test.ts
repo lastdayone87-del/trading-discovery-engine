@@ -76,14 +76,14 @@ test('caps, priority, and attempts clamp to safe positives', () => {
   assert.equal(invalid.maxPerQuery, 50);
 });
 
-test('worker counts stay at the measured 4/3 defaults and env overrides still win', () => {
-  assert.equal(SEARCH_WORKER_CONCURRENCY_DEFAULT, 4);
+test('worker counts stay at the production 2/3 defaults and env overrides still win', () => {
+  assert.equal(SEARCH_WORKER_CONCURRENCY_DEFAULT, 2);
   assert.equal(ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, 3);
-  assert.equal(resolveSearchWorkerCount(env()), 4);
+  assert.equal(resolveSearchWorkerCount(env()), 2);
   assert.equal(resolveEnrichmentWorkerCount(env()), 3);
   assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: '2' })), 2);
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '5' })), 5);
-  assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: 'not-a-number' })), 4);
+  assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: 'not-a-number' })), 2);
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: 'NaN' })), 3);
   assert.equal(resolveSearchWorkerCount(env({ SEARCH_WORKER_CONCURRENCY: '0' })), 1);
   assert.equal(resolveEnrichmentWorkerCount(env({ ENRICHMENT_WORKER_CONCURRENCY: '0' })), 1);

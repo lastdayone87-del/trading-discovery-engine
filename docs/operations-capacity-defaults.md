@@ -9,7 +9,7 @@ dated 2026-07-29 and must keep its original values.
 
 | Setting | Default | Defined in | Precedence |
 |---|---|---|---|
-| `SEARCH_WORKER_CONCURRENCY` | `4` | `Dockerfile` (`ENV`), `server/queueManager.ts` (`SEARCH_WORKER_CONCURRENCY_DEFAULT` + `resolveSearchWorkerCount`), `.env.example` | Explicit runtime env wins; otherwise the baked default applies. There is **no** database override for this knob (env-only, read once at startup). |
+| `SEARCH_WORKER_CONCURRENCY` | `2` | `Dockerfile` (`ENV`), `server/queueManager.ts` (`SEARCH_WORKER_CONCURRENCY_DEFAULT` + `resolveSearchWorkerCount`), `.env.example`, `config/production.json` | Explicit runtime env wins; otherwise the baked default applies. There is **no** database override for this knob (env-only, read once at startup). |
 | `discovery_target_queue_depth` / `DISCOVERY_TARGET_QUEUE_DEPTH` | `30` | `server/autonomousDiscovery.ts` (`DISCOVERY_TARGET_QUEUE_DEPTH_DEFAULT` + `resolveDiscoveryTargetQueueDepth`), `.env.example` | Database `app_settings` first, environment second, code fallback last, clamped to [1, 500]. Production holds an explicit database value of `30`, which keeps winning over the fallback. |
 | `ACQUISITION_LANE_TELEMETRY_ENABLED` | `true` in the production image; code fallback `false` | `Dockerfile` (`ENV`), `.env.example`, `server/acquisitionLaneTelemetry.ts` | Environment only, read per inspection. Enables the append-only `acquisition_lane_events` baseline used by the Phase 2 40/48 rendered-browser-crawls-per-hour and 35% discovery-floor report. A write failure is observational and never changes an acquisition result; the write is not awaited on the acquisition path. |
 | `RENDERED_ADMISSION_GOVERNOR_ENABLED` | `true` in the production image; code fallback: only when `NODE_ENV=production` | `Dockerfile` (`ENV`), `.env.example`, `server/renderedAdmissionGovernor.ts` | Environment only, read at process start. Enforces the single browser-slot admission budget. Local/CI harnesses stay unthrottled unless explicitly enabled. |
@@ -18,15 +18,15 @@ dated 2026-07-29 and must keep its original values.
 | `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT` | `35` | `server/renderedAdmissionGovernor.ts`, `.env.example` | DISCOVERY share reserved whenever discovery work is queued; clamped to [0, 100], evaluated at 0.01% precision. |
 | `RENDERED_FALLBACK_MAX_WAIT_MS` | `90000` | `Dockerfile` (`ENV`), `server/browserCommunityFallback.ts`, `.env.example` | Maximum gate-queue wait for one rendered request; clamped to [1s, 300s] for both explicit and environment values. A timed-out waiter is removed and deferred as `RENDERED_FALLBACK_SATURATED` capacity. The admitted crawl's own total budget remains 60s. |
 
-Basis: previously authorized production capacity change (October 2026);
-`SEARCH_WORKER_CONCURRENCY=4` restores that change in code after it was lost
-by a container recreate, and depth `30` matches the standing production
-database value (verified read-only).
+Basis: the current production safety baseline keeps discovery paused and
+sets `SEARCH_WORKER_CONCURRENCY=2` so search cannot outrun admission capacity.
+Depth `30` matches the standing production database value (verified read-only).
+The value is also enforced by `config/production.json` and `npm run config:verify`.
 
 ## Post-deploy verification (read-only)
 
 - `docker inspect <app-container> --format '{{json .Config.Env}}'` shows
-  `SEARCH_WORKER_CONCURRENCY=4`, unless an explicit runtime override sets a
+  `SEARCH_WORKER_CONCURRENCY=2`, unless an explicit runtime override sets a
   different value — in that case `.Config.Env` shows the overridden value,
   which wins by design.
 - The same env output must show `ACQUISITION_LANE_TELEMETRY_ENABLED=true` and

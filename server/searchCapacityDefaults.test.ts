@@ -10,13 +10,13 @@ import {
   resolveDiscoveryTargetQueueDepth,
 } from './autonomousDiscovery';
 
-test('search worker code default is 4 (permanent default)', () => {
-  assert.equal(SEARCH_WORKER_CONCURRENCY_DEFAULT, 4);
+test('search worker code default is 2 (production safety baseline)', () => {
+  assert.equal(SEARCH_WORKER_CONCURRENCY_DEFAULT, 2);
 });
 
-test('unset SEARCH_WORKER_CONCURRENCY resolves to 4', () => {
-  assert.equal(resolveSearchWorkerCount({}), 4);
-  assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: '' }), 4);
+test('unset SEARCH_WORKER_CONCURRENCY resolves to 2', () => {
+  assert.equal(resolveSearchWorkerCount({}), 2);
+  assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: '' }), 2);
 });
 
 test('explicit SEARCH_WORKER_CONCURRENCY values keep prior validation', () => {
@@ -26,8 +26,8 @@ test('explicit SEARCH_WORKER_CONCURRENCY values keep prior validation', () => {
   // fallback applies only when the variable is unset/empty, and
   // Math.max(1, …) still guards explicitly supplied values.
   assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: '0' }), 1);
-  // Non-numeric input falls back to the measured default instead of NaN.
-  assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: 'abc' }), 4);
+  // Non-numeric input falls back to the production default instead of NaN.
+  assert.equal(resolveSearchWorkerCount({ SEARCH_WORKER_CONCURRENCY: 'abc' }), 2);
 });
 
 test('startSearchWorkers consumes the resolver (not a hardcoded 1)', () => {

@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_ADMISSION_PRIMARY_MODEL } from './channelAdmission/admissionModels';
+import {
+  DEFAULT_GROQ_CANDIDATE_MODEL,
+  DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+} from './evidenceEngine/modelDefaults';
 import {
   checkCodeDefault,
   checkRequiredSecrets,
@@ -15,14 +21,14 @@ import {
 
 const configPath = fileURLToPath(new URL('../config/production.json', import.meta.url));
 
-test('production manifest owns the measured admission model and revert baseline', () => {
+test('production manifest owns the measured model defaults and revert baseline', () => {
   const manifest = loadProductionConfig(configPath);
   assert.equal(manifest.version, 1);
   assert.equal(manifest.environment.ADMISSION_PRIMARY_MODEL, 'gemini-flash-lite-latest');
   assert.equal(manifest.environment.ADMISSION_PRIMARY_MODEL, DEFAULT_ADMISSION_PRIMARY_MODEL);
-  assert.equal(manifest.environment.MULTILINGUAL_CANDIDATE_MODEL, 'gemini-3.5-flash-lite');
-  assert.equal(manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-3.5-flash-lite');
-  assert.equal(manifest.environment.GROQ_CANDIDATE_MODEL, 'openai/gpt-oss-20b');
+  assert.equal(manifest.environment.MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_CANDIDATE_MODEL);
+  assert.equal(manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL);
+  assert.equal(manifest.environment.GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_CANDIDATE_MODEL);
   assert.equal(manifest.environment.SEMANTIC_PROVIDER, 'gemini');
   assert.equal(manifest.environment.ENRICHMENT_WORKER_CONCURRENCY, '6');
   assert.equal(manifest.environment.ENRICHMENT_SCALE_GATE_ENABLED, 'true');
@@ -31,10 +37,10 @@ test('production manifest owns the measured admission model and revert baseline'
   assert.equal(manifest.environment.COMMUNITY_RETRY_WORKER_CONCURRENCY, '3');
   assert.equal(manifest.environment.RENDERED_ADMISSION_GOVERNOR_ENABLED, 'true');
   assert.equal(manifest.environment.RENDERED_FALLBACK_MAX_WAIT_MS, '90000');
-  assert.ok(manifest.secretGroups.some(group => group.prefix === 'YOUTUBE_API_KEY_' && group.minimum === 58));
+  assert.ok(manifest.secretGroups.some(group => group.kind === 'youtube' && group.minimum === 58));
 });
 
-test('manifest parsing rejects malformed shapes instead of verifying a subset', () => {
+test('manifest parsing rejects malformed shapes and secret-like environment keys', () => {
   assert.throws(() => parseProductionConfig(null), /INVALID_PRODUCTION_CONFIG/);
   assert.throws(() => parseProductionConfig({ version: 2 }), /version must be 1/);
   assert.throws(() => parseProductionConfig({
@@ -46,17 +52,30 @@ test('manifest parsing rejects malformed shapes instead of verifying a subset', 
   assert.throws(() => parseProductionConfig({
     version: 1,
     environment: {},
-    secretGroups: [{ prefix: '', minimum: 1 }],
+    secretGroups: [{ kind: 'youtube', minimum: 0 }],
     requiredSecrets: [],
-  }), /secretGroups\[0\]\.prefix must be non-empty/);
+  }), /minimum must be an integer >= 1/);
+  assert.throws(() => parseProductionConfig({
+    version: 1,
+    environment: { DATABASE_URL: 'postgres://secret' },
+    secretGroups: [],
+    requiredSecrets: [],
+  }), /looks secret/);
+  assert.throws(() => parseProductionConfig({
+    version: 1,
+    environment: { GEMINI_API_KEY: 'secret' },
+    secretGroups: [],
+    requiredSecrets: [],
+  }), /looks secret/);
 });
 
-test('environment comparison distinguishes unset overrides from mismatches', () => {
+test('environment comparison distinguishes unset overrides, drift, and redacted values', () => {
   const manifest = {
     version: 1,
     environment: {
       ADMISSION_PRIMARY_MODEL: 'gemini-flash-lite-latest',
       ADMISSION_SECONDARY_MODEL: null,
+      DATABASE_URL: 'expected-placeholder',
     },
     secretGroups: [],
     requiredSecrets: [],
@@ -64,48 +83,76 @@ test('environment comparison distinguishes unset overrides from mismatches', () 
 
   const ok = compareEnvironment(manifest, {
     ADMISSION_PRIMARY_MODEL: 'gemini-flash-lite-latest',
+    DATABASE_URL: 'postgres://must-not-print',
   } as NodeJS.ProcessEnv);
-  assert.equal(ok.every(check => check.ok), true);
+  assert.equal(ok[0]?.ok, true);
+  assert.equal(ok[1]?.ok, true);
+  assert.equal(ok[2]?.actual, '<redacted>', 'secret-like values must never be printed');
+  assert.equal(ok[2]?.ok, false);
 
   const unsetAsEmpty = compareEnvironment(manifest, {
     ADMISSION_PRIMARY_MODEL: 'gemini-flash-lite-latest',
     ADMISSION_SECONDARY_MODEL: '',
   } as NodeJS.ProcessEnv);
-  assert.equal(unsetAsEmpty.every(check => check.ok), true);
+  assert.equal(unsetAsEmpty[1]?.ok, true);
 
   const drift = compareEnvironment(manifest, {
     ADMISSION_PRIMARY_MODEL: 'gemini-3.6-flash',
     ADMISSION_SECONDARY_MODEL: 'some-model',
   } as NodeJS.ProcessEnv);
-  assert.equal(drift.filter(check => !check.ok).length, 2);
+  assert.equal(drift[0]?.ok, false);
+  assert.equal(drift[1]?.ok, false);
 });
 
-test('secret checks verify presence and minimum pool sizes without exposing values', () => {
+test('secret checks use canonical provider slots and deduplicate values', () => {
   const manifest = {
     version: 1,
     environment: {},
     secretGroups: [
-      { prefix: 'YOUTUBE_API_KEY_', minimum: 2 },
-      { prefix: 'GEMINI_API_KEY', minimum: 1 },
+      { kind: 'youtube', minimum: 2 },
+      { kind: 'gemini', minimum: 1 },
+      { kind: 'groq', minimum: 2 },
     ],
     requiredSecrets: ['DATABASE_URL'],
   } as ProductionConfigManifest;
 
   const env = {
-    YOUTUBE_API_KEY_1: 'secret-a',
-    YOUTUBE_API_KEY_2: 'secret-b',
-    GEMINI_API_KEY: 'secret-c',
+    YOUTUBE_API_KEY: 'youtube-a',
+    YOUTUBE_API_KEY_1: 'youtube-b',
+    YOUTUBE_API_KEY_1_QUOTA_GROUP: 'project-a',
+    YOUTUBE_API_KEY_0: 'ignored-malformed',
+    YOUTUBE_API_KEY_2: 'youtube-a',
+    YOUTUBE_API_KEY_1000000_QUOTA_GROUP: 'ignored-metadata',
+    GEMINI_API_KEY: 'gemini-a',
+    GEMINI_API_KEY_2: 'gemini-a',
+    GEMINI_API_KEY_EXTRA: 'ignored-malformed',
+    GROQ_API_KEY: 'groq-a',
+    GROQ_API_KEY_2: 'groq-b',
+    GROQ_API_KEY_EXTRA: 'ignored-malformed',
+    GROQ_API_KEY_0: 'ignored-malformed',
     DATABASE_URL: 'postgres://example',
   } as NodeJS.ProcessEnv;
   assert.equal(checkSecretGroups(manifest, env).every(check => check.ok), true);
   assert.equal(checkRequiredSecrets(manifest, env).every(check => check.ok), true);
 
   const missing = checkSecretGroups(manifest, {
-    YOUTUBE_API_KEY_1: 'secret-a',
+    YOUTUBE_API_KEY_1_QUOTA_GROUP: 'project-a',
     GEMINI_API_KEY: '',
   } as NodeJS.ProcessEnv);
-  assert.equal(missing.filter(check => !check.ok).length, 2);
-  assert.equal(checkRequiredSecrets(manifest, {} as NodeJS.ProcessEnv)[0]?.ok, false);
+  assert.equal(missing[0]?.actual, '0');
+  assert.equal(missing[0]?.ok, false);
+  assert.equal(missing[1]?.ok, false);
+  assert.equal(missing[2]?.ok, false);
+});
+
+test('production config commands run the compiled bundle, not development tsx', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    scripts: Record<string, string>;
+  };
+  assert.match(pkg.scripts['config:verify'] || '', /^node dist\/config\/verifyProductionConfig\.cjs$/);
+  assert.match(pkg.scripts['config:apply'] || '', /^node dist\/config\/applyProductionConfig\.cjs$/);
+  assert.match(pkg.scripts.build || '', /config:build/);
+  assert.match(pkg.scripts['config:build'] || '', /scripts\/verifyProductionConfig\.ts/);
 });
 
 test('code default and summary checks fail closed', () => {

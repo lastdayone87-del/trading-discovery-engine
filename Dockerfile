@@ -9,10 +9,10 @@ FROM mcr.microsoft.com/playwright:v1.62.1-noble
 # within observed CPU/RAM headroom without touching the browser-lease,
 # retry policy, or queue ordering. Takes effect on next deploy only.
 # Search worker concurrency: SEARCH_WORKER_CONCURRENCY scales the
-# SEARCH_YOUTUBE pool in startSearchWorkers (default 4 per measured
-# capacity work, Oct 2026; production database holds no override for this
-# knob because it is env-only). Takes effect on next deploy only. An
-# explicit runtime value still overrides this baked default.
+# SEARCH_YOUTUBE pool in startSearchWorkers. The production safety baseline
+# is 2 (discovery remains paused; do not let search outrun admission).
+# Takes effect on next deploy only. An explicit runtime value still overrides
+# this baked default.
 # Phase 2 Option C: persist the append-only acquisition lane baseline so
 # crawls/hour, gate wait, and the discovery share are measurable. The writer
 # is observational only and can never change an acquisition result.
@@ -29,7 +29,7 @@ ENV NODE_ENV=production \
     RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48 \
     RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35 \
     RENDERED_FALLBACK_MAX_WAIT_MS=90000 \
-    SEARCH_WORKER_CONCURRENCY=4
+    SEARCH_WORKER_CONCURRENCY=2
 
 WORKDIR /app
 

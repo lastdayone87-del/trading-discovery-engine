@@ -13,13 +13,23 @@ import { readFileSync } from 'node:fs';
  * are represented only by key names/minimum counts so the verifier can fail
  * closed without printing a secret.
  */
+export type SecretGroupKind = 'youtube' | 'gemini' | 'groq';
+
 export interface ProductionConfigManifest {
   version: 1;
   description?: string;
   environment: Record<string, string | null>;
-  secretGroups: Array<{ prefix: string; minimum: number }>;
+  secretGroups: Array<{ kind: SecretGroupKind; minimum: number }>;
   requiredSecrets: string[];
 }
+
+/**
+ * Defense in depth: the manifest is for non-secret values only. A custom
+ * manifest supplied through --config must not be able to smuggle a credential
+ * into comparison output.
+ */
+const SENSITIVE_ENV_KEY = /(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD|DATABASE_URL|PRIVATE_KEY|CREDENTIALS?)(?:_|$)/i;
+const SECRET_GROUP_KINDS = new Set<SecretGroupKind>(['youtube', 'gemini', 'groq']);
 
 export type ConfigCheckSource = 'environment' | 'code' | 'secret';
 
@@ -61,6 +71,7 @@ export function parseProductionConfig(raw: unknown): ProductionConfigManifest {
   const environment: Record<string, string | null> = {};
   for (const [key, value] of Object.entries(raw.environment)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key)) invalid(`environment key is not a valid env name: ${key}`);
+    if (SENSITIVE_ENV_KEY.test(key)) invalid(`environment.${key} looks secret; use requiredSecrets/secretGroups instead`);
     if (value === null) {
       environment[key] = null;
       continue;
@@ -71,9 +82,11 @@ export function parseProductionConfig(raw: unknown): ProductionConfigManifest {
 
   const secretGroups = raw.secretGroups.map((group, index) => {
     if (!isRecord(group)) invalid(`secretGroups[${index}] must be an object`);
-    if (typeof group.prefix !== 'string' || !group.prefix.trim()) invalid(`secretGroups[${index}].prefix must be non-empty`);
+    if (typeof group.kind !== 'string' || !SECRET_GROUP_KINDS.has(group.kind as SecretGroupKind)) {
+      invalid(`secretGroups[${index}].kind must be one of youtube, gemini, groq`);
+    }
     if (!Number.isInteger(group.minimum) || Number(group.minimum) < 1) invalid(`secretGroups[${index}].minimum must be an integer >= 1`);
-    return { prefix: group.prefix, minimum: Number(group.minimum) };
+    return { kind: group.kind as SecretGroupKind, minimum: Number(group.minimum) };
   });
 
   const requiredSecrets = raw.requiredSecrets.map((key, index) => {
@@ -113,33 +126,63 @@ export function compareEnvironment(
   env: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): ConfigCheck[] {
   return Object.entries(manifest.environment).map(([key, expected]) => {
-    const actual = normalizedEnvValue(env[key]);
+    const actualRaw = normalizedEnvValue(env[key]);
+    const actual = actualRaw === null ? null : (SENSITIVE_ENV_KEY.test(key) ? '<redacted>' : actualRaw);
     return {
       source: 'environment',
       key,
       expected,
       actual,
-      ok: expected === null ? actual === null : actual === expected,
+      ok: expected === null ? actualRaw === null : actual === expected,
     };
   });
 }
 
 /**
- * Verify the minimum number of configured provider keys without exposing any
- * value. Prefix matching is intentional: key slots are added/removed at
- * runtime, while the manifest records the minimum expected pool size.
+ * Canonical provider key slots, matching the runtime loaders. This excludes
+ * metadata variables such as YOUTUBE_API_KEY_1_QUOTA_GROUP, malformed slots
+ * such as GROQ_API_KEY_EXTRA or *_0, and duplicate key values.
+ */
+function isCanonicalSecretSlot(kind: SecretGroupKind, name: string): boolean {
+  if (kind === 'youtube') {
+    return name === 'YOUTUBE_API_KEY' || /^YOUTUBE_API_KEY_[1-9][0-9]*$/.test(name);
+  }
+  if (kind === 'gemini') {
+    return name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name);
+  }
+  return name === 'GROQ_API_KEY' || /^GROQ_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name);
+}
+
+function countCanonicalSecretValues(
+  kind: SecretGroupKind,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): number {
+  const values = new Set<string>();
+  for (const [name, raw] of Object.entries(env)) {
+    if (!isCanonicalSecretSlot(kind, name)) continue;
+    const value = normalizedEnvValue(raw);
+    if (value === null) continue;
+    // The YouTube loader treats MY_* placeholders as unconfigured.
+    if (kind === 'youtube' && value.startsWith('MY_')) continue;
+    values.add(value);
+  }
+  return values.size;
+}
+
+/**
+ * Verify the minimum number of usable provider routes without exposing any
+ * value. Counts follow the provider loaders' canonical slot rules and
+ * deduplicate repeated key values.
  */
 export function checkSecretGroups(
   manifest: ProductionConfigManifest,
   env: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): ConfigCheck[] {
-  return manifest.secretGroups.map(({ prefix, minimum }) => {
-    const count = Object.entries(env)
-      .filter(([key, value]) => key.startsWith(prefix) && normalizedEnvValue(value) !== null)
-      .length;
+  return manifest.secretGroups.map(({ kind, minimum }) => {
+    const count = countCanonicalSecretValues(kind, env);
     return {
       source: 'secret',
-      key: prefix,
+      key: kind,
       expected: `>=${minimum}`,
       actual: String(count),
       ok: count >= minimum,
