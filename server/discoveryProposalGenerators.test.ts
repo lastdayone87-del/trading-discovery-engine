@@ -182,7 +182,7 @@ test('selection state is bounded by mode and language signature and resets per b
 });
 
 
-test('a negative LLM proposal limit returns no proposals before any provider work', async () => {
+test('a negative LLM proposal limit returns no proposals', async () => {
   assert.deepEqual(await generateLlmNativeProposals('France', -1), {
     proposals: [],
     nextSelectionCursors: null,

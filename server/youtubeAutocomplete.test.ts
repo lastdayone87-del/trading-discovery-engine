@@ -46,5 +46,13 @@ test('autocomplete failure is a cache miss, not discovery failure', async () => 
 
 
 test('a negative proposal limit returns no proposals before any provider or DB work', async () => {
-  assert.deepEqual(await generateAutocompleteProposals('France', -1), []);
+  let providerCalls = 0;
+  const result = await generateAutocompleteProposals('France', -1, {
+    generateAutocomplete: (async () => {
+      providerCalls += 1;
+      throw new Error('provider must not run for a negative limit');
+    }) as typeof import('./youtubeAutocomplete').generateAutocompleteQueries,
+  });
+  assert.deepEqual(result, []);
+  assert.equal(providerCalls, 0);
 });

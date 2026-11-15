@@ -966,12 +966,17 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
 }
 
 // 5c. YOUTUBE AUTOCOMPLETE Generator
-export async function generateAutocompleteProposals(country: string, limit = 10): Promise<DiscoveryFrontierProposal[]> {
+export async function generateAutocompleteProposals(
+  country: string,
+  limit = 10,
+  deps: { generateAutocomplete?: typeof generateAutocompleteQueries } = {},
+): Promise<DiscoveryFrontierProposal[]> {
   const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
   if (boundedLimit === 0) return [];
   try {
     const canonicalC = canonicalCountry(country);
-    const result = await generateAutocompleteQueries({ country: canonicalC, limit: Math.max(boundedLimit * 3, 20) });
+    const generateAutocomplete = deps.generateAutocomplete || generateAutocompleteQueries;
+    const result = await generateAutocomplete({ country: canonicalC, limit: Math.max(boundedLimit * 3, 20) });
     return result.candidates.slice(0, boundedLimit).map(candidate => buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
       country: canonicalC,
