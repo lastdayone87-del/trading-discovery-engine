@@ -106,9 +106,15 @@ test('environment comparison distinguishes unset overrides, drift, and redacted 
 
   const unsetAsEmpty = compareEnvironment(manifest, {
     ADMISSION_PRIMARY_MODEL: 'gemini-flash-lite-latest',
-    ADMISSION_SECONDARY_MODEL: '   ',
+    ADMISSION_SECONDARY_MODEL: '',
   } as NodeJS.ProcessEnv);
   assert.equal(unsetAsEmpty[1]?.ok, true);
+
+  const unsetAsWhitespace = compareEnvironment(manifest, {
+    ADMISSION_PRIMARY_MODEL: 'gemini-flash-lite-latest',
+    ADMISSION_SECONDARY_MODEL: '   ',
+  } as NodeJS.ProcessEnv);
+  assert.equal(unsetAsWhitespace[1]?.ok, true);
 
   const drift = compareEnvironment(manifest, {
     ADMISSION_PRIMARY_MODEL: 'gemini-3.6-flash',
