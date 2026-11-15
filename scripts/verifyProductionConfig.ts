@@ -1,4 +1,4 @@
-import { DEFAULT_ADMISSION_PRIMARY_MODEL } from '../server/channelAdmission/admissionModels';
+import { DEFAULT_ADMISSION_PRIMARY_MODEL, DEFAULT_ADMISSION_SECONDARY_MODEL } from '../server/channelAdmission/admissionModels';
 import {
   DEFAULT_GROQ_CANDIDATE_MODEL,
   DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
@@ -54,23 +54,28 @@ function main(): number {
     ...compareEnvironment(manifest, process.env),
     checkCodeDefault(
       'ADMISSION_PRIMARY_MODEL',
-      manifest.environment.ADMISSION_PRIMARY_MODEL ?? DEFAULT_ADMISSION_PRIMARY_MODEL,
+      manifest.environment.ADMISSION_PRIMARY_MODEL ?? null,
       DEFAULT_ADMISSION_PRIMARY_MODEL,
     ),
     checkCodeDefault(
       'MULTILINGUAL_CANDIDATE_MODEL',
-      manifest.environment.MULTILINGUAL_CANDIDATE_MODEL ?? DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+      manifest.environment.MULTILINGUAL_CANDIDATE_MODEL ?? null,
       DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
     ),
     checkCodeDefault(
       'MULTILINGUAL_ADJUDICATOR_MODEL',
-      manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL ?? DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+      manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL ?? null,
       DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
     ),
     checkCodeDefault(
       'GROQ_CANDIDATE_MODEL',
-      manifest.environment.GROQ_CANDIDATE_MODEL ?? DEFAULT_GROQ_CANDIDATE_MODEL,
+      manifest.environment.GROQ_CANDIDATE_MODEL ?? null,
       DEFAULT_GROQ_CANDIDATE_MODEL,
+    ),
+    checkCodeDefault(
+      'ADMISSION_SECONDARY_MODEL(default)',
+      'openai/gpt-oss-120b',
+      DEFAULT_ADMISSION_SECONDARY_MODEL,
     ),
   ];
   if (!options.skipSecrets) {

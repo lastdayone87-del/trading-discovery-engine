@@ -37,12 +37,14 @@ npm run config:verify
 `config:verify` runs the compiled `dist/config/verifyProductionConfig.cjs`
 produced by `npm run build`, so it does not depend on the development-only
 `tsx` binary at runtime. For a source checkout before building, use
+`npm run config:verify:local` (rebuilds the bundle first) or
 `npm run config:verify:src`.
 
 The verifier checks:
 
-1. The running environment against `environment`.
-2. The admission model code default against the manifest.
+1. The running environment against the allowlisted `environment` keys.
+2. The admission, classification, and Groq model code defaults against the
+   manifest.
 3. Required secrets and provider-key minimum counts.
 
 It exits non-zero on drift. Useful flags:
@@ -72,7 +74,8 @@ only). It does not update Coolify or any database. Import the values into the
 deployment environment; supply secrets from Coolify or a secret manager.
 
 Like `config:verify`, `config:apply` uses the compiled `dist/config` bundle.
-Use `config:apply:src` for a source checkout before building.
+Use `config:apply:local` to rebuild before running, or `config:apply:src` for
+a source checkout before building.
 
 ## Deployment flow
 
@@ -103,7 +106,8 @@ prints a secret value. Required secret keys are checked by name only.
 Provider-key minimums use the runtime loaders' canonical slot rules:
 
 - 58 YouTube keys (`YOUTUBE_API_KEY`, `YOUTUBE_API_KEY_1..N`; metadata such
-  as `YOUTUBE_API_KEY_1_QUOTA_GROUP` is ignored; duplicate values count once)
+  as `YOUTUBE_API_KEY_1_QUOTA_GROUP` is ignored; `MY_*` placeholders are
+  ignored; duplicate values count once)
 - 5 Gemini keys (`GEMINI_API_KEY`, `GEMINI_API_KEY_2..N`; malformed suffixes
   ignored; duplicate values count once)
 - 7 Groq keys (`GROQ_API_KEY`, `GROQ_API_KEY_2..N`; malformed suffixes

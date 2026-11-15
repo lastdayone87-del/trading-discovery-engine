@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_ADMISSION_PRIMARY_MODEL } from './channelAdmission/admissionModels';
+import { DEFAULT_ADMISSION_PRIMARY_MODEL, DEFAULT_ADMISSION_SECONDARY_MODEL } from './channelAdmission/admissionModels';
 import {
   DEFAULT_GROQ_CANDIDATE_MODEL,
   DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
@@ -29,6 +29,12 @@ test('production manifest owns the measured model defaults and revert baseline',
   assert.equal(manifest.environment.MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_CANDIDATE_MODEL);
   assert.equal(manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL);
   assert.equal(manifest.environment.GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_CANDIDATE_MODEL);
+  // Literal pins guard the measured production values independently of the
+  // constants they are compared against.
+  assert.equal(DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, 'gemini-3.5-flash-lite');
+  assert.equal(DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-3.5-flash-lite');
+  assert.equal(DEFAULT_GROQ_CANDIDATE_MODEL, 'openai/gpt-oss-20b');
+  assert.equal(DEFAULT_ADMISSION_SECONDARY_MODEL, 'openai/gpt-oss-120b');
   assert.equal(manifest.environment.SEMANTIC_PROVIDER, 'gemini');
   assert.equal(manifest.environment.ENRICHMENT_WORKER_CONCURRENCY, '6');
   assert.equal(manifest.environment.ENRICHMENT_SCALE_GATE_ENABLED, 'true');
@@ -45,10 +51,16 @@ test('manifest parsing rejects malformed shapes and secret-like environment keys
   assert.throws(() => parseProductionConfig({ version: 2 }), /version must be 1/);
   assert.throws(() => parseProductionConfig({
     version: 1,
-    environment: { BAD_KEY: 1 },
+    environment: { ADMISSION_PRIMARY_MODEL: 1 },
     secretGroups: [],
     requiredSecrets: [],
-  }), /environment\.BAD_KEY must be string or null/);
+  }), /environment\.ADMISSION_PRIMARY_MODEL must be string or null/);
+  assert.throws(() => parseProductionConfig({
+    version: 1,
+    environment: { BAD_KEY: 'value' },
+    secretGroups: [],
+    requiredSecrets: [],
+  }), /environment\.BAD_KEY is not an allowed non-secret setting/);
   assert.throws(() => parseProductionConfig({
     version: 1,
     environment: {},
@@ -60,13 +72,15 @@ test('manifest parsing rejects malformed shapes and secret-like environment keys
     environment: { DATABASE_URL: 'postgres://secret' },
     secretGroups: [],
     requiredSecrets: [],
-  }), /looks secret/);
-  assert.throws(() => parseProductionConfig({
-    version: 1,
-    environment: { GEMINI_API_KEY: 'secret' },
-    secretGroups: [],
-    requiredSecrets: [],
-  }), /looks secret/);
+  }), /not an allowed non-secret setting/);
+  for (const key of ['GEMINI_API_KEY', 'AWS_ACCESS_KEY_ID', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SIGNING_KEY']) {
+    assert.throws(() => parseProductionConfig({
+      version: 1,
+      environment: { [key]: 'secret' },
+      secretGroups: [],
+      requiredSecrets: [],
+    }), /not an allowed non-secret setting/);
+  }
 });
 
 test('environment comparison distinguishes unset overrides, drift, and redacted values', () => {
@@ -121,15 +135,18 @@ test('secret checks use canonical provider slots and deduplicate values', () => 
     YOUTUBE_API_KEY_1: 'youtube-b',
     YOUTUBE_API_KEY_1_QUOTA_GROUP: 'project-a',
     YOUTUBE_API_KEY_0: 'ignored-malformed',
-    YOUTUBE_API_KEY_2: 'youtube-a',
+    YOUTUBE_API_KEY_2: ' youtube-a ',
     YOUTUBE_API_KEY_1000000_QUOTA_GROUP: 'ignored-metadata',
+    YOUTUBE_API_KEY_3: ' MY_placeholder ',
+    YOUTUBE_API_KEY_9007199254740992: 'ignored-unsafe-slot',
     GEMINI_API_KEY: 'gemini-a',
-    GEMINI_API_KEY_2: 'gemini-a',
+    GEMINI_API_KEY_2: ' gemini-a ',
     GEMINI_API_KEY_EXTRA: 'ignored-malformed',
     GROQ_API_KEY: 'groq-a',
-    GROQ_API_KEY_2: 'groq-b',
+    GROQ_API_KEY_2: ' groq-b ',
     GROQ_API_KEY_EXTRA: 'ignored-malformed',
     GROQ_API_KEY_0: 'ignored-malformed',
+    GROQ_API_KEY_9007199254740992: 'ignored-unsafe-slot',
     DATABASE_URL: 'postgres://example',
   } as NodeJS.ProcessEnv;
   assert.equal(checkSecretGroups(manifest, env).every(check => check.ok), true);
@@ -143,6 +160,7 @@ test('secret checks use canonical provider slots and deduplicate values', () => 
   assert.equal(missing[0]?.ok, false);
   assert.equal(missing[1]?.ok, false);
   assert.equal(missing[2]?.ok, false);
+  assert.equal(checkRequiredSecrets(manifest, {} as NodeJS.ProcessEnv)[0]?.ok, false);
 });
 
 test('production config commands run the compiled bundle, not development tsx', () => {
@@ -153,6 +171,7 @@ test('production config commands run the compiled bundle, not development tsx', 
   assert.match(pkg.scripts['config:apply'] || '', /^node dist\/config\/applyProductionConfig\.cjs$/);
   assert.match(pkg.scripts.build || '', /config:build/);
   assert.match(pkg.scripts['config:build'] || '', /scripts\/verifyProductionConfig\.ts/);
+  assert.match(pkg.scripts['config:build'] || '', /scripts\/applyProductionConfig\.ts/);
 });
 
 test('gemini canonical slots include 10-19 without accepting malformed names', () => {
@@ -177,6 +196,9 @@ test('code default and summary checks fail closed', () => {
   assert.equal(ok.ok, true);
   const drift = checkCodeDefault('ADMISSION_PRIMARY_MODEL', 'gemini-flash-lite-latest', 'gemini-3.6-flash');
   assert.equal(drift.ok, false);
+  const missing = checkCodeDefault('ADMISSION_PRIMARY_MODEL', null, 'gemini-flash-lite-latest');
+  assert.equal(missing.ok, false);
+  assert.equal(missing.expected, '<missing>');
   assert.deepEqual(summarizeChecks([ok]), { ok: true, checks: 1, failures: 0 });
   assert.deepEqual(summarizeChecks([ok, drift]), { ok: false, checks: 2, failures: 1 });
 });

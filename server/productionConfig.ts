@@ -31,6 +31,26 @@ export interface ProductionConfigManifest {
 const SENSITIVE_ENV_KEY = /(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD|DATABASE_URL|PRIVATE_KEY|CREDENTIALS?)(?:_|$)/i;
 const SECRET_GROUP_KINDS = new Set<SecretGroupKind>(['youtube', 'gemini', 'groq']);
 
+/** The manifest is a closed contract: only these non-secret settings may be compared. */
+export const ALLOWED_MANIFEST_ENV_KEYS = new Set([
+  'ADMISSION_PRIMARY_MODEL',
+  'ADMISSION_SECONDARY_MODEL',
+  'MULTILINGUAL_CANDIDATE_MODEL',
+  'MULTILINGUAL_ADJUDICATOR_MODEL',
+  'GROQ_CANDIDATE_MODEL',
+  'SEMANTIC_PROVIDER',
+  'ENRICHMENT_WORKER_CONCURRENCY',
+  'ENRICHMENT_SCALE_GATE_ENABLED',
+  'CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS',
+  'SEARCH_WORKER_CONCURRENCY',
+  'COMMUNITY_RETRY_WORKER_CONCURRENCY',
+  'RENDERED_ADMISSION_GOVERNOR_ENABLED',
+  'RENDERED_ADMISSION_NOMINAL_PER_HOUR',
+  'RENDERED_ADMISSION_EMERGENCY_PER_HOUR',
+  'RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT',
+  'RENDERED_FALLBACK_MAX_WAIT_MS',
+]);
+
 export type ConfigCheckSource = 'environment' | 'code' | 'secret';
 
 export interface ConfigCheck {
@@ -71,6 +91,7 @@ export function parseProductionConfig(raw: unknown): ProductionConfigManifest {
   const environment: Record<string, string | null> = {};
   for (const [key, value] of Object.entries(raw.environment)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key)) invalid(`environment key is not a valid env name: ${key}`);
+    if (!ALLOWED_MANIFEST_ENV_KEYS.has(key)) invalid(`environment.${key} is not an allowed non-secret setting`);
     if (SENSITIVE_ENV_KEY.test(key)) invalid(`environment.${key} looks secret; use requiredSecrets/secretGroups instead`);
     if (value === null) {
       environment[key] = null;
@@ -116,8 +137,8 @@ export function loadProductionConfig(path = 'config/production.json'): Productio
 
 function normalizedEnvValue(value: unknown): string | null {
   if (value === undefined || value === null) return null;
-  const text = String(value);
-  return text.trim() === '' ? null : text;
+  const text = String(value).trim();
+  return text === '' ? null : text;
 }
 
 /** Compare the manifest environment against a process-style env object. */
@@ -143,14 +164,26 @@ export function compareEnvironment(
  * metadata variables such as YOUTUBE_API_KEY_1_QUOTA_GROUP, malformed slots
  * such as GROQ_API_KEY_EXTRA or *_0, and duplicate key values.
  */
-function isCanonicalSecretSlot(kind: SecretGroupKind, name: string): boolean {
+function canonicalSecretSlot(kind: SecretGroupKind, name: string): number | null {
   if (kind === 'youtube') {
-    return name === 'YOUTUBE_API_KEY' || /^YOUTUBE_API_KEY_[1-9][0-9]*$/.test(name);
+    if (name === 'YOUTUBE_API_KEY') return 0;
+    const match = /^YOUTUBE_API_KEY_([1-9][0-9]*)$/.exec(name);
+    if (!match) return null;
+    const slot = Number(match[1]);
+    return Number.isSafeInteger(slot) && slot >= 1 ? slot : null;
   }
   if (kind === 'gemini') {
-    return name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name);
+    if (name === 'GEMINI_API_KEY') return 1;
+    const match = /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.exec(name);
+    if (!match) return null;
+    const slot = Number(match[1]);
+    return Number.isSafeInteger(slot) && slot >= 2 ? slot : null;
   }
-  return name === 'GROQ_API_KEY' || /^GROQ_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name);
+  if (name === 'GROQ_API_KEY') return 1;
+  const match = /^GROQ_API_KEY_([2-9]|[1-9][0-9]+)$/.exec(name);
+  if (!match) return null;
+  const slot = Number(match[1]);
+  return Number.isSafeInteger(slot) && slot >= 2 ? slot : null;
 }
 
 function countCanonicalSecretValues(
@@ -159,7 +192,7 @@ function countCanonicalSecretValues(
 ): number {
   const values = new Set<string>();
   for (const [name, raw] of Object.entries(env)) {
-    if (!isCanonicalSecretSlot(kind, name)) continue;
+    if (canonicalSecretSlot(kind, name) === null) continue;
     const value = normalizedEnvValue(raw);
     if (value === null) continue;
     // The YouTube loader treats MY_* placeholders as unconfigured.
@@ -210,15 +243,15 @@ export function checkRequiredSecrets(
 /** Verify a code-owned default matches the manifest value. */
 export function checkCodeDefault(
   key: string,
-  expected: string,
+  expected: string | null,
   actual: string,
 ): ConfigCheck {
   return {
     source: 'code',
     key,
-    expected,
+    expected: expected ?? '<missing>',
     actual,
-    ok: actual === expected,
+    ok: expected !== null && actual === expected,
   };
 }
 

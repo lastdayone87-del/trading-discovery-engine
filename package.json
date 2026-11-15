@@ -11,6 +11,8 @@
     "config:build": "esbuild scripts/verifyProductionConfig.ts scripts/applyProductionConfig.ts --bundle --platform=node --format=cjs --packages=external --outdir=dist/config --out-extension:.js=.cjs",
     "config:verify": "node dist/config/verifyProductionConfig.cjs",
     "config:apply": "node dist/config/applyProductionConfig.cjs",
+    "config:verify:local": "npm run config:build && node dist/config/verifyProductionConfig.cjs",
+    "config:apply:local": "npm run config:build && node dist/config/applyProductionConfig.cjs",
     "config:verify:src": "tsx scripts/verifyProductionConfig.ts",
     "config:apply:src": "tsx scripts/applyProductionConfig.ts",
     "lint": "tsc --noEmit",

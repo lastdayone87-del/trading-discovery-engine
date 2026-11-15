@@ -14,7 +14,7 @@ import { Innertube } from 'youtubei.js';
 import { evaluateDeterministicAdmission } from '../server/channelAdmission/deterministic';
 import { decideAdmission, normalizeSemanticJudgment } from '../server/channelAdmission/policy';
 import { buildAdmissionPrompt, isSemanticDecisionFailure, needsSecondJudge, type AdmissionJudge } from '../server/channelAdmission/semanticJudge';
-import { DEFAULT_ADMISSION_PRIMARY_MODEL } from '../server/channelAdmission/admissionModels';
+import { resolveAdmissionPrimaryModel, resolveAdmissionSecondaryModel } from '../server/channelAdmission/admissionModels';
 import type { AdmissionEvidence, SemanticJudgment } from '../server/channelAdmission/types';
 import {
   defaultClient as geminiDefaultClient,
@@ -23,10 +23,7 @@ import {
   DEFAULT_GEMINI_FREE_CANDIDATE_MODEL,
   defaultClient as geminiFreeDefaultClient,
 } from '../server/evidenceEngine/providers/GeminiFreeSemanticProvider';
-import {
-  DEFAULT_GROQ_CANDIDATE_MODEL,
-  defaultClient as groqDefaultClient,
-} from '../server/evidenceEngine/providers/GroqSemanticProvider';
+import { defaultClient as groqDefaultClient } from '../server/evidenceEngine/providers/GroqSemanticProvider';
 import type { SemanticModelClient } from '../server/evidenceEngine/providers/GeminiSemanticProvider';
 
 interface PreservedResult {
@@ -295,7 +292,7 @@ function configuredJudge(): CohortJudge | null {
   const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }> = [];
   if (requested === 'auto' || requested === 'gemini') {
     const gemini = geminiDefaultClient();
-    if (gemini) clients.push({ client: gemini, model: process.env.ADMISSION_PRIMARY_MODEL || DEFAULT_ADMISSION_PRIMARY_MODEL, provider: 'gemini_semantic' });
+    if (gemini) clients.push({ client: gemini, model: resolveAdmissionPrimaryModel(), provider: 'gemini_semantic' });
   }
   if (requested === 'auto' || requested === 'gemini-free') {
     const geminiFree = geminiFreeDefaultClient();
@@ -303,7 +300,7 @@ function configuredJudge(): CohortJudge | null {
   }
   if (requested === 'auto' || requested === 'groq') {
     const groq = groqDefaultClient();
-    if (groq) clients.push({ client: groq, model: process.env.ADMISSION_SECONDARY_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL, provider: 'groq_semantic' });
+    if (groq) clients.push({ client: groq, model: resolveAdmissionSecondaryModel(), provider: 'groq_semantic' });
   }
   return clients.length ? new CohortJudge(clients) : null;
 }

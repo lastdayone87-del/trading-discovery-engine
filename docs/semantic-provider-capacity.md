@@ -34,7 +34,7 @@ Applied in Coolify and verified in the running container:
 - Each Gemini key has a distinct quota label (`gemini-project-1` … `-5`).
   Keys from separate Google Cloud projects have independent quotas and must
   never share a label.
-- Worker counts are unchanged: 4 search workers and 3 enrichment workers.
+- Worker counts are unchanged: 2 search workers and 3 enrichment workers.
   Capacity work must be measured before those defaults change.
 
 ## Phase 2 — provider resilience

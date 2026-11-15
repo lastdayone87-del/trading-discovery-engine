@@ -59,7 +59,7 @@ the only writer of classification outcomes.
 
 ## Worker capacity
 
-Worker counts are unchanged: 4 search workers and 3 enrichment workers.
+Worker counts are unchanged: 2 search workers and 3 enrichment workers.
 `ENRICHMENT_WORKER_CONCURRENCY` still wins, but the startup total is capped at
 the historical 20-worker maximum before it is split so two pools cannot exceed
 the old single-pool ceiling.
