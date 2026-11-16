@@ -8,11 +8,19 @@ import { resolveClassificationRouting, resolveClassificationRoutingMode } from '
  */
 export function semanticProviderOutcomeFlags(
   providers: Array<{ provider?: string; outcome?: string }>,
-): { abstained: boolean; failed: boolean } {
+): { abstained: boolean; failed: boolean; served: boolean } {
   const semantic = providers.filter(provider => /semantic/.test(String(provider.provider)));
+  // Suppressed/unavailable routes never ran. A real outage is measured over
+  // attempted routes only, so an unconfigured primary cannot hide a failed
+  // fallback or vice versa.
+  const attempted = semantic.filter(provider => !['SUPPRESSED_BY_POLICY','NOT_APPLICABLE','UNAVAILABLE_CONFIGURATION'].includes(String(provider.outcome)));
+  const outcomes = attempted.map(provider => String(provider.outcome));
   return {
-    abstained: semantic.some(provider => String(provider.outcome).startsWith('ABSTAINED_')),
-    failed: semantic.some(provider => String(provider.outcome).startsWith('FAILED_')),
+    served: outcomes.includes('EXECUTED_WITH_EVIDENCE'),
+    abstained: outcomes.some(outcome => outcome.startsWith('ABSTAINED_')),
+    // A fallback success is not a provider failure. Only an all-attempted
+    // provider outage is a technical failure.
+    failed: outcomes.length > 0 && outcomes.every(outcome => outcome.startsWith('FAILED_')),
   };
 }
 

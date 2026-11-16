@@ -144,16 +144,18 @@ function semanticProviderReports(decision: RoutingInput) {
 
 function semanticSignals(decision: RoutingInput) {
   const providers = semanticProviderReports(decision);
+  const attemptedProviders = providers.filter(provider =>
+    (provider.availability === 'AVAILABLE' || provider.availability === 'FAILED')
+    && provider.outcome !== 'SUPPRESSED_BY_POLICY'
+    && provider.outcome !== 'NOT_APPLICABLE'
+    && provider.outcome !== 'UNAVAILABLE_CONFIGURATION',
+  );
+  const attemptedOutcomes = attemptedProviders.map(provider => String(provider.outcome));
   return {
     used: providers.some(provider => provider.outcome === 'EXECUTED_WITH_EVIDENCE')
       || /^SEMANTIC_/.test(String(decision.classificationMethod || '')),
-    attempted: providers.some(provider =>
-      (provider.availability === 'AVAILABLE' || provider.availability === 'FAILED')
-      && provider.outcome !== 'SUPPRESSED_BY_POLICY'
-      && provider.outcome !== 'NOT_APPLICABLE'
-      && provider.outcome !== 'UNAVAILABLE_CONFIGURATION',
-    ),
-    failed: providers.some(provider => String(provider.outcome).startsWith('FAILED_')),
+    attempted: attemptedProviders.length > 0,
+    failed: attemptedOutcomes.length > 0 && attemptedOutcomes.every(outcome => outcome.startsWith('FAILED_')),
     abstained: providers.some(provider => String(provider.outcome).startsWith('ABSTAINED_')),
   };
 }
@@ -334,6 +336,19 @@ export function resolveClassificationRouting(
     });
   }
 
+  // A technical provider outage is not evidence ambiguity. Defer/retry before
+  // the evidence-sufficiency and provider-degraded branches so a total outage
+  // keeps one stable reason and never becomes human review.
+  if (decision.status === 'UNCERTAIN' && semantic.failed && !semantic.used) {
+    return result({
+      route: 'ENRICH', confidence, evidenceSufficiency: sufficiency,
+      recognitionState, semanticPolicy, semanticUsed: false, semanticAttempted: semantic.attempted,
+      enrich: true,
+      fallbackReason: 'PROVIDER_DEFERRED_RETRY',
+      reasonCodes: ['PROVIDER_DEFERRED_RETRY'],
+    });
+  }
+
   // UNCERTAIN. Enrichment is the only honest action when the evidence bundle
   // is thin or query-only; human review is for sufficient evidence that the
   // semantic layer could not resolve.
@@ -357,19 +372,29 @@ export function resolveClassificationRouting(
     });
   }
 
+  // No semantic capacity is also an incomplete assessment. Keep the channel
+  // pending rather than spending human review on an outage.
+  if (!semantic.used && !semantic.abstained && !semantic.attempted
+    && (semanticPolicy === 'NONE' || semanticPolicy === 'BOUNDED_WAIT')) {
+    return result({
+      route: 'ENRICH', confidence, evidenceSufficiency: sufficiency,
+      recognitionState, semanticPolicy, semanticUsed: false, semanticAttempted: semantic.attempted,
+      enrich: true,
+      fallbackReason: 'SEMANTIC_CAPACITY_REQUIRED',
+      reasonCodes: ['SEMANTIC_CAPACITY_REQUIRED'],
+    });
+  }
+
   // If semantic AI actually served evidence and the decision is still
   // UNCERTAIN, the ambiguity has already survived the AI fallback. Sufficient
   // independent evidence belongs in human review, not another enrichment loop.
-  const semanticUnresolved = semantic.failed || semantic.abstained || semantic.used
-    || (!semantic.used && (semanticPolicy === 'NONE' || semanticPolicy === 'BOUNDED_WAIT'));
+  const semanticUnresolved = semantic.abstained || semantic.used || (semantic.attempted && !semantic.failed);
   if (semanticUnresolved && independent) {
-    const fallbackReason = semantic.failed
-      ? 'SEMANTIC_FAILED_WITH_SUFFICIENT_EVIDENCE'
+    const fallbackReason = semantic.used
+      ? 'SEMANTIC_AMBIGUOUS_WITH_SUFFICIENT_EVIDENCE'
       : semantic.abstained
         ? 'SEMANTIC_ABSTAINED_WITH_SUFFICIENT_EVIDENCE'
-        : semantic.used
-          ? 'SEMANTIC_AMBIGUOUS_WITH_SUFFICIENT_EVIDENCE'
-          : 'NO_SEMANTIC_CAPACITY_WITH_SUFFICIENT_EVIDENCE';
+        : 'SEMANTIC_NO_MATCH_WITH_SUFFICIENT_EVIDENCE';
     return result({
       route: 'HUMAN_REVIEW', confidence, evidenceSufficiency: sufficiency,
       recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
