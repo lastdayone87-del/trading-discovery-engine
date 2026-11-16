@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { fetchYouTubeAutocomplete } from './youtubeAutocomplete';
+import { autocompletePrefixCursorKey, fetchYouTubeAutocomplete } from './youtubeAutocomplete';
 import { generateAutocompleteProposals } from './discoveryProposalGenerators';
 
 test('YouTube autocomplete sends language and region and parses suggestions', async () => {
@@ -53,6 +53,15 @@ test('a negative proposal limit returns no proposals before any provider or DB w
       throw new Error('provider must not run for a negative limit');
     }) as typeof import('./youtubeAutocomplete').generateAutocompleteQueries,
   });
-  assert.deepEqual(result, []);
+  assert.deepEqual(result, { proposals: [], nextSelectionCursor: null });
   assert.equal(providerCalls, 0);
+});
+
+
+test('autocomplete prefix rotation is tracked per language', () => {
+  assert.notEqual(
+    autocompletePrefixCursorKey('Canada', 'en'),
+    autocompletePrefixCursorKey('Canada', 'fr'),
+  );
+  assert.match(autocompletePrefixCursorKey('Canada', 'fr'), /Canada:fr$/);
 });

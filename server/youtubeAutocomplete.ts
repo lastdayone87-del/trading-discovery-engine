@@ -9,6 +9,11 @@ import { normalizeRotationCursor } from './rotationCursor';
 export const YOUTUBE_AUTOCOMPLETE_PROVIDER = 'youtube-autocomplete';
 export const YOUTUBE_AUTOCOMPLETE_TTL_DAYS = 7;
 export const YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES = 20;
+/** Prefix rotation is per country + language, not shared across rotating languages. */
+export function autocompletePrefixCursorKey(country: string, language: string): string {
+  return `youtube_autocomplete_prefix_cursor:${country}:${language}`;
+}
+
 
 export interface AutocompleteSuggestion {
   query: string;
@@ -171,7 +176,7 @@ export async function generateAutocompleteQueries(input: {
   const memory = await getCandidateMemory(country, language.code).catch(() => []);
   const acceptedHistory: CandidateHistoryItem[] = [];
   const allPrefixes = prefixPlan(country, language.code, existing, await localVocabulary(country));
-  const prefixCursorKey = `youtube_autocomplete_prefix_cursor:${country}`;
+  const prefixCursorKey = autocompletePrefixCursorKey(country, language.code);
   const prefixCursor = Math.max(0, Number(await getAppSetting(prefixCursorKey, '0')) || 0);
   const rotated = allPrefixes.length > YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES
     ? [...allPrefixes.slice(prefixCursor % allPrefixes.length), ...allPrefixes.slice(0, prefixCursor % allPrefixes.length)]

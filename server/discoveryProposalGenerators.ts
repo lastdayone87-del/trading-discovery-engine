@@ -966,18 +966,32 @@ export async function generateLlmNativeProposals(country: string, limit = 10): P
 }
 
 // 5c. YOUTUBE AUTOCOMPLETE Generator
+export interface GeneratedAutocompleteProposalBatch {
+  proposals: DiscoveryFrontierProposal[];
+  /** Cursor to persist only after the returned proposals are persisted. */
+  nextSelectionCursor: { key: string; cursor: number } | null;
+}
+
 export async function generateAutocompleteProposals(
   country: string,
   limit = 10,
   deps: { generateAutocomplete?: typeof generateAutocompleteQueries } = {},
-): Promise<DiscoveryFrontierProposal[]> {
+): Promise<GeneratedAutocompleteProposalBatch> {
   const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
-  if (boundedLimit === 0) return [];
+  if (boundedLimit === 0) return { proposals: [], nextSelectionCursor: null };
   try {
     const canonicalC = canonicalCountry(country);
     const generateAutocomplete = deps.generateAutocomplete || generateAutocompleteQueries;
     const result = await generateAutocomplete({ country: canonicalC, limit: Math.max(boundedLimit * 3, 20) });
-    return result.candidates.slice(0, boundedLimit).map(candidate => buildFrontierProposal({
+    const language = result.candidates[0]?.language || 'und';
+    const selectionCursorKey = `youtube_autocomplete_proposal_cursor:${canonicalC}:${language}`;
+    const selectionCursor = normalizeRotationCursor(await getAppSetting(selectionCursorKey, '0'));
+    const rotation = rotateCachedSelection(result.candidates, selectionCursor, boundedLimit);
+    return {
+      nextSelectionCursor: rotation.selected.length > 0
+        ? { key: selectionCursorKey, cursor: rotation.nextCursor }
+        : null,
+      proposals: rotation.selected.map(candidate => buildFrontierProposal({
       proposalFamily: 'COUNTRY_NATIVE',
       country: canonicalC,
       preserveCountryIdentity: true,
@@ -1000,10 +1014,11 @@ export async function generateAutocompleteProposals(
       },
       confidence: Math.min(0.85, Math.max(0.5, candidate.confidence)),
       ttlDays: 14,
-      noveltyRationale: `YouTube Autocomplete observed this local search surface for ${canonicalC} (${candidate.language}) from prefix "${candidate.provenance.prefix || ''}".`,
-    }));
+        noveltyRationale: `YouTube Autocomplete observed this local search surface for ${canonicalC} (${candidate.language}) from prefix "${candidate.provenance.prefix || ''}".`,
+      })),
+    };
   } catch {
-    return [];
+    return { proposals: [], nextSelectionCursor: null };
   }
 }
 
@@ -1026,11 +1041,11 @@ export async function materializeGeneratedQueryProposalsForCountry(country: stri
   }
   generatedQueryCountriesInFlight.add(canonicalC);
   try {
-    const [llmBatch, autocomplete] = await Promise.all([
+    const [llmBatch, autocompleteBatch] = await Promise.all([
       generateLlmNativeProposals(canonicalC, 5).catch(() => ({ proposals: [], nextSelectionCursors: null })),
-      generateAutocompleteProposals(canonicalC, 5).catch(() => []),
+      generateAutocompleteProposals(canonicalC, 5).catch(() => ({ proposals: [], nextSelectionCursor: null })),
     ]);
-    const proposals = [...llmBatch.proposals, ...autocomplete];
+    const proposals = [...llmBatch.proposals, ...autocompleteBatch.proposals];
     if (!proposals.length) return { generated: 0, persisted: 0, proposals: [] };
     const seen = new Set<string>();
     const deduped = proposals.filter(proposal => {
@@ -1042,11 +1057,19 @@ export async function materializeGeneratedQueryProposalsForCountry(country: stri
     // Advance the cached-batch selection cursor only after persistence
     // completed without throwing. A failed write keeps the previous cursor so
     // the next cycle retries the same candidates instead of skipping them.
-    if (deduped.length > 0 && llmBatch.nextSelectionCursors) {
-      await setAppSetting(
-        `native_query_generation_selection_cursor:${canonicalC}`,
-        JSON.stringify(llmBatch.nextSelectionCursors),
-      ).catch(() => undefined);
+    if (deduped.length > 0) {
+      if (llmBatch.nextSelectionCursors) {
+        await setAppSetting(
+          `native_query_generation_selection_cursor:${canonicalC}`,
+          JSON.stringify(llmBatch.nextSelectionCursors),
+        ).catch(() => undefined);
+      }
+      if (autocompleteBatch.nextSelectionCursor) {
+        await setAppSetting(
+          autocompleteBatch.nextSelectionCursor.key,
+          String(autocompleteBatch.nextSelectionCursor.cursor),
+        ).catch(() => undefined);
+      }
     }
     return { generated: deduped.length, persisted, proposals: deduped };
   } finally {

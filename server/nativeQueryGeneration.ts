@@ -139,7 +139,10 @@ function contextDigest(context: NativeQueryGenerationContext): string {
     language: context.language,
     regionCode: context.regionCode || null,
     mode: context.mode,
-    existing: context.existingQueries.map(item => normalizeCandidateText(item.query)).slice(0, 200),
+    // The current query inventory is deliberately not part of the cache key.
+    // It changes whenever one generated candidate is admitted, which would
+    // orphan the rest of a valid cached batch. Current inventory is still
+    // applied as duplicate history when the cached batch is reused.
     gaps: [...context.coverageGaps].sort(),
     autocomplete: [...context.autocompleteSuggestions].sort().slice(0, 100),
     vocabulary: [...context.localVocabulary].sort().slice(0, 120),
@@ -147,15 +150,15 @@ function contextDigest(context: NativeQueryGenerationContext): string {
 }
 
 /**
- * A cache hit is reusable unless memory removed candidates and left the batch
- * underfilled. A provider-short batch (no duplicate loss) stays cached.
+ * A partially consumed cache is still useful: admitted duplicates are filtered
+ * and the remaining pending candidates are returned. Regenerate only when
+ * memory removed every cached candidate, so the batch cannot supply anything.
  */
 export function shouldRegenerateCachedGeneration(input: {
-  requested: number;
   accepted: number;
   lostToMemory: number;
 }): boolean {
-  return input.accepted < input.requested && input.lostToMemory > 0;
+  return input.accepted === 0 && input.lostToMemory > 0;
 }
 
 function candidateMemoryHistory(
@@ -433,7 +436,6 @@ export async function generateNativeQueriesWithLlm(input: {
     // reused to avoid repeating paid provider work. Validation-only empties
     // are written as FAILED and never reach this cache-hit path.
     if (!shouldRegenerateCachedGeneration({
-      requested: count,
       accepted: refreshed.accepted.length,
       lostToMemory: refreshed.rejected.length,
     })) {

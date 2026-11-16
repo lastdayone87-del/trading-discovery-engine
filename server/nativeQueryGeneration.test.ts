@@ -60,10 +60,11 @@ test('selected dormant countries can admit their native standalone surfaces', ()
   assert.equal(decision.eligible, true, decision.reasonCodes.join(','));
 });
 
-test('underfilled cache regenerates only when memory removed candidates', () => {
-  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 4, lostToMemory: 6 }), true);
-  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 4, lostToMemory: 0 }), false);
-  assert.equal(shouldRegenerateCachedGeneration({ requested: 10, accepted: 10, lostToMemory: 0 }), false);
+test('cache regenerates only when memory removed every cached candidate', () => {
+  assert.equal(shouldRegenerateCachedGeneration({ accepted: 0, lostToMemory: 6 }), true);
+  assert.equal(shouldRegenerateCachedGeneration({ accepted: 4, lostToMemory: 6 }), false);
+  assert.equal(shouldRegenerateCachedGeneration({ accepted: 0, lostToMemory: 0 }), false);
+  assert.equal(shouldRegenerateCachedGeneration({ accepted: 10, lostToMemory: 0 }), false);
 });
 
 function inMemoryGenerationStore() {
@@ -286,6 +287,59 @@ test('a replacement pass fills the requested batch past the old 60% threshold', 
   });
   assert.equal(calls, 2);
   assert.equal(result.candidates.length, 5);
+});
+
+test('admitting one cached candidate does not orphan the rest of the batch', async () => {
+  let calls = 0;
+  const memoryStore = inMemoryGenerationStore();
+  const baseContext = {
+    country: 'France',
+    language: 'fr',
+    mode: 'OPEN_WORLD' as const,
+    candidateMemory: [],
+    coverageGaps: [],
+    autocompleteSuggestions: [],
+    localVocabulary: [],
+  };
+  const first = await generateNativeQueriesWithLlm({
+    context: { ...baseContext, existingQueries: [] },
+    count: 3,
+    memoryStore,
+    generateText: async () => {
+      calls += 1;
+      return {
+        text: JSON.stringify({ queries: [
+          { query: 'analyse technique CAC 40', intent: 'market_analysis' },
+          { query: 'bourse direct avis', intent: 'strategy' },
+          { query: 'forex trading', intent: 'forex' },
+        ] }),
+        provider: 'test',
+        model: 'test',
+      };
+    },
+  });
+  assert.equal(first.candidates.length, 3);
+  const admitted = first.candidates[0];
+  const callsAfterFirst = calls;
+
+  const second = await generateNativeQueriesWithLlm({
+    context: {
+      ...baseContext,
+      existingQueries: [{ query: admitted.query, country: 'France', intent: admitted.intent }],
+    },
+    count: 3,
+    memoryStore,
+    generateText: async () => {
+      calls += 1;
+      throw new Error('cached batch should be reused after inventory changes');
+    },
+  });
+  assert.equal(second.cached, true);
+  assert.equal(calls, callsAfterFirst);
+  assert.deepEqual(second.candidates.map(candidate => candidate.query), [
+    first.candidates[1].query,
+    first.candidates[2].query,
+  ]);
 });
 
 test('native replenishment runs below the eligible floor, not only when the pool is empty', () => {
