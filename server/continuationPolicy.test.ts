@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateContinuation, planPersistedPageRecovery, type ContinuationDecisionV2 } from './continuationPolicy';
+import { evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, type ContinuationDecisionV2 } from './continuationPolicy';
 
 const base = { pageNumber:1,maxPages:3,hasNextPage:true,distinctCreators:10,cumulativeDistinctCreators:10,newCreators:8,confirmedCreators:5,qualityConfirmedCreators:3,countryPrecision:.9,communityDiversity:.4,duplicateRatio:.1,consecutiveLowYieldPages:0,maxConsecutiveLowYieldPages:2 };
 test('continues a productive page with explainable utility',()=>{const d=evaluateContinuation(base);assert.equal(d.shouldContinue,true);assert.equal(d.lowYield,false);assert.equal(d.primaryReason,'CONTINUE_PRODUCTIVE');assert.ok(d.marginalUtility>.2);});
@@ -84,4 +84,28 @@ test('persisted-page recovery replays the handoff instead of re-running the page
     },
   });
   assert.deepEqual(terminal, { kind: 'FINALIZE' });
+});
+
+
+test('community discovery never changes creator-search continuation utility or ordering', () => {
+  const v1With = evaluateContinuation({ ...base, communityDiversity: 1 });
+  const v1Without = evaluateContinuation({ ...base, communityDiversity: 0 });
+  assert.equal(v1With.marginalUtility, v1Without.marginalUtility);
+  assert.deepEqual(v1With, v1Without);
+
+  const v2 = {
+    pageNumber: 1, effectiveMaxPages: 10, hasNextPage: true,
+    distinctCreators: 10, cumulativeDistinctCreators: 10,
+    newCreators: 3, pageConfirmedCreators: 2, pageQualityCreators: 1,
+    pageNonTradingCreators: 0, novelCandidateTerms: 0,
+    countryPrecision: 0.9, duplicateRatio: 0.1,
+    priorLowValueStreak: 0, priorDuplicateHeavyStreak: 0,
+    priorWrongCountryStreak: 0, maxLowValuePages: 2,
+    maxDuplicateHeavyPages: 2, maxWrongCountryPages: 2,
+    explorationPagesRemaining: 1,
+  };
+  const v2With = evaluateContinuationV2({ ...v2, communityDiversity: 1 });
+  const v2Without = evaluateContinuationV2({ ...v2, communityDiversity: 0 });
+  assert.equal(v2With.marginalUtility, v2Without.marginalUtility);
+  assert.deepEqual(v2With, v2Without);
 });

@@ -2546,7 +2546,6 @@ export async function processNextSearchJob(
         pageNonTradingCreators: marginal.marginalNonTradingCreators,
         novelCandidateTerms,
         countryPrecision: metrics.countryPrecision,
-        communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
         duplicateRatio,
         priorLowValueStreak: prior.v2Streaks.lowValue,
         priorDuplicateHeavyStreak: prior.v2Streaks.duplicateHeavy,
@@ -2571,7 +2570,6 @@ export async function processNextSearchJob(
         delayedNonTradingCreators: prior.delayedNonTradingCreators,
         delayedQualityCreators: prior.delayedQualityCreators,
         countryPrecision: metrics.countryPrecision,
-        communityDiversity: metrics.tradingConfirmed ? metrics.communitiesDiscovered / metrics.tradingConfirmed : 0,
         duplicateRatio,
         consecutiveLowYieldPages: prior.consecutiveLowYieldPages,
         maxConsecutiveLowYieldPages: maxLow,
@@ -5387,7 +5385,7 @@ async function executeManualSearchPage(sessionId: string, pageNumber: number, pa
     });
     const projectedUnique = new Set([...session.uniqueChannelIds, ...manualMetrics.evaluatedUniqueIds]).size;
     const hasNextVariant = variantIndex + 1 < session.generatedQueryVariants.length;
-    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:manualMetrics.distinctCreators,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:manualMetrics.novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,duplicateRatio:manualMetrics.duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield,deferredOnly:manualMetrics.deferredOnly});
+    const decision = evaluateContinuation({pageNumber,maxPages,hasNextPage:!!page.nextPageToken||hasNextVariant,distinctCreators:manualMetrics.distinctCreators,cumulativeDistinctCreators:projectedUnique,maxDistinctCreators:maxCreators,newCreators:manualMetrics.novelIds.length,confirmedCreators:confirmedIds.length,qualityConfirmedCreators:qualityConfirmedIds.length,countryPrecision:manualMetrics.countryPrecision,duplicateRatio:manualMetrics.duplicateRatio,consecutiveLowYieldPages:session.consecutiveLowYieldPages,maxConsecutiveLowYieldPages:maxLowYield,deferredOnly:manualMetrics.deferredOnly});
     const stopReason = decision.shouldContinue ? null : decision.primaryReason;
     const updated = await recordManualSearchPage(sessionId, { pageNumber, queryVariant, lane: session.retrievalLane, inputPageToken: pageToken, nextPageToken: page.nextPageToken, rawResultCount:page.rawResultCount, rawIds, uniqueIds, evaluatedIds:manualMetrics.evaluatedUniqueIds, knownIds, acceptedIds, confirmedIds, qualityConfirmedIds, averageQualityScore:qualityScores.length?qualityScores.reduce((a,b)=>a+b,0)/qualityScores.length:0, countryPrecision:manualMetrics.countryPrecision,communityDiversity:manualMetrics.communityDiversity,noveltyRatio:manualMetrics.noveltyRatio, duplicateRatio:manualMetrics.duplicateRatio, quotaUnits: 100, quotaEfficiency: qualityConfirmedIds.length / 100, creatorYield: confirmedIds.length, lowYield:decision.lowYield,marginalUtility:decision.marginalUtility,shouldContinue:decision.shouldContinue,primaryReason:decision.primaryReason,reasonCodes:decision.reasonCodes,maxPages, stopReason });
     if (!stopReason) {
