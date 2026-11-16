@@ -35,10 +35,21 @@ export function compositionConfirmsTrading(composition:ContextualCompositionRepo
   // Explicit creator-level trading statement: Tier A plus financial context
   // with no dominant alternative. It does not need a second family.
   if(composition.explicitCreatorTrading) return true;
-  // Otherwise require at least two observed core trading families and majority
-  // trading coverage. `tradingFamilies` is the v1-compatible fallback.
-  const tradingCoreFamilies=composition.tradingCoreFamilies??composition.tradingFamilies;
-  return composition.tradingCoverage>=0.5&&tradingCoreFamilies>=2;
+  // Otherwise require at least two observed trading families (core or
+  // adjacent) and majority trading coverage. The two-family rule is the C5
+  // safeguard; the family label is not a second gate.
+  return composition.tradingCoverage>=0.5&&observedTradingFamilies(composition)>=2;
+}
+
+/**
+ * Core and adjacent are both observed trading families. Older callers may
+ * omit `tradingFamilies`; fall back to the component counts.
+ */
+export function observedTradingFamilies(
+  composition: Pick<ContextualCompositionReport,'tradingFamilies'|'tradingCoreFamilies'|'tradingAdjacentFamilies'>,
+): number {
+  return composition.tradingFamilies
+    ?? ((composition.tradingCoreFamilies ?? 0) + (composition.tradingAdjacentFamilies ?? 0));
 }
 
 const clamp=(n:number)=>Math.max(0,Math.min(100,n));

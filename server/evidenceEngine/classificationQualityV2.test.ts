@@ -21,7 +21,7 @@ function input(overrides: Partial<RawChannelInput>): RawChannelInput {
   return value;
 }
 
-function compose(videos: Array<{ title: string; description?: string }>, description = '', channelName = 'Fixture') {
+function compose(videos: Array<{ title: string; description?: string; published_at?: string }>, description = '', channelName = 'Fixture') {
   const value = input({
     channel_name: channelName,
     description,
@@ -66,6 +66,97 @@ test('C5 v2: one trading family plus nine uninformative families cannot confirm 
   assert.equal(withCreator.explicitCreatorTrading, true);
   assert.equal(withCreator.focus, 'TRADING_DOMINANT');
   assert.equal(compositionConfirmsTrading(withCreator), true);
+});
+
+test('C5 v2: adjacent-only families can confirm when two observed trading families are present', () => {
+  const composition = compose([
+    { title: 'Analyse technique du CAC40' },
+    { title: 'Nasdaq : la claque ! Panique ou opportunité ?' },
+    { title: 'Or sous 4 000 $ : pourquoi j’ai coupé ma position' },
+    { title: 'Trading au sens large' },
+    { title: 'Les bases de Trading' },
+  ]);
+  assert.equal(composition.tradingCoreFamilies, 0);
+  assert.equal(composition.tradingAdjacentFamilies, 5);
+  assert.equal(composition.tradingFamilies, 5);
+  assert.equal(composition.focus, 'TRADING_DOMINANT');
+  assert.equal(compositionConfirmsTrading(composition), true);
+});
+
+test('C5 v2: one core plus ten adjacent families confirms without two core families', () => {
+  const composition = compose([
+    { title: 'Day trading setup' },
+    { title: 'Analyse technique du CAC40' },
+    { title: 'Nasdaq : la claque ! Panique ou opportunité ?' },
+    { title: 'Or sous 4 000 $ : pourquoi j’ai coupé ma position' },
+    { title: 'Trading au sens large' },
+    { title: 'Les bases de Trading' },
+    { title: 'Forex analysis' },
+    { title: 'Gold price analysis' },
+    { title: 'Stock market outlook' },
+    { title: 'Crypto market update' },
+    { title: 'Options market analysis' },
+  ]);
+  assert.equal(composition.tradingCoreFamilies, 1);
+  assert.equal(composition.tradingAdjacentFamilies, 10);
+  assert.equal(composition.tradingFamilies, 11);
+  assert.equal(composition.focus, 'TRADING_DOMINANT');
+  assert.equal(compositionConfirmsTrading(composition), true);
+});
+
+test('C5 v2: two adjacent families meet the two-family safeguard', () => {
+  const composition = compose([
+    { title: 'Analyse technique du CAC40' },
+    { title: 'Nasdaq : la claque ! Panique ou opportunité ?' },
+  ]);
+  assert.equal(composition.tradingCoreFamilies, 0);
+  assert.equal(composition.tradingAdjacentFamilies, 2);
+  assert.equal(composition.tradingFamilies, 2);
+  assert.equal(composition.focus, 'TRADING_DOMINANT');
+  assert.equal(compositionConfirmsTrading(composition), true);
+});
+
+test('C5 v2: a single adjacent family does not confirm', () => {
+  const composition = compose([{ title: 'Analyse technique du CAC40' }]);
+  assert.equal(composition.tradingCoreFamilies, 0);
+  assert.equal(composition.tradingAdjacentFamilies, 1);
+  assert.equal(composition.tradingFamilies, 1);
+  assert.equal(composition.focus, 'INSUFFICIENT_COVERAGE');
+  assert.equal(compositionConfirmsTrading(composition), false);
+});
+
+test('C5 v2: a single core family does not confirm', () => {
+  const composition = compose([{ title: 'Day trading setup' }]);
+  assert.equal(composition.tradingCoreFamilies, 1);
+  assert.equal(composition.tradingAdjacentFamilies, 0);
+  assert.equal(composition.tradingFamilies, 1);
+  assert.equal(composition.focus, 'INSUFFICIENT_COVERAGE');
+  assert.equal(compositionConfirmsTrading(composition), false);
+});
+
+test('C5 v2: an explicit alternative bio is not masked by two adjacent trading families', () => {
+  const composition = compose([
+    { title: 'Analyse technique du CAC40' },
+    { title: 'Nasdaq : la claque ! Panique ou opportunité ?' },
+  ], 'Gaming channel. Minecraft gameplay and Fortnite.');
+  assert.equal(composition.tradingFamilies, 2);
+  assert.equal(composition.explicitCreatorAlternative, true);
+  assert.equal(composition.focus, 'ALTERNATIVE_DOMINANT');
+  assert.equal(compositionConfirmsTrading(composition), false);
+});
+
+test('C5 v2: a recent alternative family is not masked by older adjacent trading families', () => {
+  const composition = compose([
+    { title: 'Analyse technique du CAC40', published_at: '2024-01-01T00:00:00Z' },
+    { title: 'Nasdaq : la claque ! Panique ou opportunité ?', published_at: '2024-01-02T00:00:00Z' },
+    { title: 'Minecraft gameplay', published_at: '2026-11-01T00:00:00Z' },
+  ]);
+  assert.equal(composition.tradingFamilies, 2);
+  assert.equal(composition.alternativeFamilies, 1);
+  assert.equal(composition.recentAlternativeFamilies, 1);
+  assert.equal(composition.recentTradingFamilies, 0);
+  assert.equal(composition.focus, 'MIXED');
+  assert.equal(compositionConfirmsTrading(composition), false);
 });
 
 test('C5 v2: ten trading and ten gaming families remain mixed at 0.5 coverage', () => {

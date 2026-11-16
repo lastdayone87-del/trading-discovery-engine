@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
-import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution } from './decisionPolicy';
+import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution, observedTradingFamilies } from './decisionPolicy';
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
@@ -168,7 +168,7 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     && !composition.explicitCreatorAlternative
     && composition.tradingCoverage >= 0.5
     && composition.nonTitleTierAFamilies >= 1
-    && (composition.tradingCoreFamilies ?? composition.tradingFamilies) >= 2
+    && observedTradingFamilies(composition) >= 2
   );
   // Thin compositions cannot confirm, but they must not erase independent
   // evidence-based corroboration: the lifecycle routing below preserves it at
