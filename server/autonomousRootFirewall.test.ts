@@ -341,3 +341,68 @@ test('reviewed native market rows with retained companion requirements cannot ex
   assert.equal(decision.eligible, false);
   assert.ok(decision.reasonCodes.includes('REVIEWED_NATIVE_REQUIRES_COMPANION'));
 });
+
+function generatedMetadata(term: string, atomTerm = term) {
+  return {
+    queryTemplate: 'LLM_NATIVE_PHRASE',
+    generatedNativePhrase: true,
+    preferredLanguage: 'fr',
+    generationProvenance: {
+      source: 'LLM',
+      mode: 'OPEN_WORLD',
+      provider: 'groq',
+      model: 'test-model',
+      promptVersion: 'native-query-v1',
+      batchId: 'batch-authority',
+      country: 'France',
+      language: 'fr',
+      persona: null,
+      scenario: null,
+      prefix: null,
+      generatedAt: '2026-11-14T00:00:00.000Z',
+    },
+    retrievalSpecificity: {
+      policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+      eligibility: 'STANDALONE',
+    },
+    atoms: [{
+      type: 'TERMINOLOGY',
+      origin: 'COUNTRY_VOCABULARY',
+      term: atomTerm,
+      provenance: 'COUNTRY_VOCABULARY',
+      retrievalPolicy: {
+        policyVersion: RETRIEVAL_SPECIFICITY_POLICY_VERSION,
+        eligibility: 'STANDALONE',
+      },
+    }],
+  };
+}
+
+test('generated authority requires the atom term to match the executed query', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'hello world',
+    country: 'France',
+    generation_metadata: generatedMetadata('hello world', 'analyse technique'),
+  } as any));
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('GENERATED_PROVENANCE_INVALID'));
+});
+
+test('generated authority still requires governed trading semantics', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'hello world',
+    country: 'France',
+    generation_metadata: generatedMetadata('hello world'),
+  } as any));
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasonCodes.includes('CURRENT_RETRIEVAL_SHAPE_FAILED'));
+});
+
+test('a valid generated phrase with matching provenance and atom still authorizes', () => {
+  const decision = evaluateAutonomousQueryAuthority(query({
+    query: 'analyse technique CAC 40',
+    country: 'France',
+    generation_metadata: generatedMetadata('analyse technique CAC 40'),
+  } as any));
+  assert.equal(decision.eligible, true, decision.reasonCodes.join(', '));
+});

@@ -1,7 +1,10 @@
 import type { QueryRecord } from '../src/types';
+import { generatedQueryShape } from './generatedQueryShape';
 import { isBareShortTicker, isForbiddenProseQuery, isRetrievalOrientedQuery, isReviewedNativeStandaloneSurface } from './queryPlanner';
-import { isExtractedStandaloneQuery } from './terminologySearchability';
+import { isExtractedStandaloneQuery, isSearchableTradingTerm } from './terminologySearchability';
 import { RETRIEVAL_SPECIFICITY_POLICY_VERSION } from './retrievalSpecificity';
+import { normalizeLanguageCode } from './languageCodes';
+import { parseQueryGenerationProvenance } from './queryGenerationProvenance';
 import { revalidateQueryRecordAdmission } from './queryQuality/admission';
 
 export const AUTONOMOUS_QUERY_AUTHORITY_POLICY_VERSION = 'autonomous-query-authority-v3';
@@ -192,6 +195,10 @@ export function isScopePromotedRecord(metadata: unknown): boolean {
  * satisfy the current retrieval-shape policy at the moment it is about to spend
  * YouTube quota. This also applies to persistent-research allocations.
  */
+function normalizeAuthorityText(value: unknown): string {
+  return String(value || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('und');
+}
+
 export function evaluateAutonomousQueryAuthority(
   query: QueryRecord,
   options: { scopePromotionActive?: boolean; demandSignalsEnabled?: boolean } = {},
@@ -211,10 +218,49 @@ export function evaluateAutonomousQueryAuthority(
     && metadata.extractedStandalone === true
     && Number.isSafeInteger(extractedCandidateId)
     && extractedCandidateId > 0;
+  const generatedLanguage = typeof metadata.preferredLanguage === 'string'
+    ? metadata.preferredLanguage
+    : typeof metadata.language === 'string' ? metadata.language : undefined;
+  const generatedTemplate = template === 'LLM_NATIVE_PHRASE' || template === 'AUTOCOMPLETE_PHRASE';
+  const generatedCandidate = generatedTemplate || metadata.generatedNativePhrase === true;
+  const generationProvenance = parseQueryGenerationProvenance(metadata.generationProvenance);
+  const provenanceLanguage = normalizeLanguageCode(generationProvenance?.language || '');
+  const requestedLanguage = normalizeLanguageCode(generatedLanguage || '');
+  const generatedProvenanceValid = Boolean(
+    generationProvenance
+    && (generationProvenance.source === 'LLM' || generationProvenance.source === 'AUTOCOMPLETE')
+    && normalizeAuthorityText(generationProvenance.country) === normalizeAuthorityText(query.country)
+    && provenanceLanguage
+    && provenanceLanguage === requestedLanguage,
+  );
+  const generatedAtomMatchesQuery = atoms.length === 1
+    && normalizeAuthorityText(atoms[0]?.term) === normalizeAuthorityText(query.query);
+  const generatedNativeStandalone = generatedCandidate
+    && atoms.length === 1
+    && metadata.generatedNativePhrase === true
+    && generatedProvenanceValid
+    && generatedAtomMatchesQuery;
+  // A generated marker without matching provenance/atom/query is malformed,
+  // not a normal retrieval surface. Fail closed instead of falling through to
+  // the generic shape gate.
+  if (generatedCandidate && !generatedNativeStandalone) {
+    return { eligible: false, reasonCodes: ['GENERATED_PROVENANCE_INVALID'] };
+  }
   const shapeOk = extractedStandalone
     ? !isForbiddenProseQuery(query.query)
       && isExtractedStandaloneQuery({ term: query.query, country: query.country, language: typeof metadata.extractedCandidateLanguage === 'string' ? metadata.extractedCandidateLanguage : undefined })
-    : isRetrievalOrientedQuery(query.country, query.query);
+    : generatedNativeStandalone
+      ? !isForbiddenProseQuery(query.query)
+        && generatedQueryShape(query.query).bounded
+        && isSearchableTradingTerm({
+          term: query.query,
+          termType: 'PHRASE',
+          country: query.country,
+          language: generatedLanguage,
+          maxTokens: 6,
+          requireTradingSemantics: true,
+        }).eligible
+      : isRetrievalOrientedQuery(query.country, query.query);
   if (!shapeOk) return { eligible: false, reasonCodes: ['CURRENT_RETRIEVAL_SHAPE_FAILED'] };
   // A persistent scope promotion is valid only while the operator still has
   // the country selected. Check this for every promoted shape, including
