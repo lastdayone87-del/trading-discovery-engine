@@ -46,7 +46,7 @@ import {
   limitRepeatedPrimaryTerms,
   rotateAwayFromMostRecentIntent,
 } from './queryPlanner';
-import { selectNextQueryForCountry } from './queryIntelligence';
+import { filterPausedExtractedQueryRows, loadExtractedQueryDiscoveryEnabled, selectNextQueryForCountry } from './queryIntelligence';
 import { evaluateAutonomousQueryAuthority } from './autonomousQueryAuthority';
 import { getQueriesByCountry, getAppSetting } from './db';
 import type { QueryRecord } from '../src/types';
@@ -917,7 +917,11 @@ export async function selectExperimentalQueryForCountry(
   // plus the execution-authority gate, deterministic pool order (id ascending)
   // so arm indexes are replay-stable. This population difference is explicit:
   // treatment can only select queries that would actually be allowed to run.
-  const queries = (await getQueriesByCountry(country)).filter(query => reservableFilter(query, now));
+  const extractedQueryDiscoveryEnabled = await loadExtractedQueryDiscoveryEnabled();
+  const queries = filterPausedExtractedQueryRows(
+    await getQueriesByCountry(country),
+    extractedQueryDiscoveryEnabled,
+  ).filter(query => reservableFilter(query, now));
   let eligible = limitRepeatedPrimaryTerms(queriesOutsideCooldown(queries, now, cooldownMinutes), queries, now, cooldownMinutes, maxPrimaryUses);
   // The experiment pool must obey the exact authority gate the scheduler runs
   // immediately before execution, including retrieval provenance and the live
