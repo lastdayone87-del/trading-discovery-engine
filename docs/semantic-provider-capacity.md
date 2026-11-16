@@ -34,7 +34,7 @@ Applied in Coolify and verified in the running container:
 - Each Gemini key has a distinct quota label (`gemini-project-1` … `-5`).
   Keys from separate Google Cloud projects have independent quotas and must
   never share a label.
-- Worker counts are unchanged: 4 search workers and 3 enrichment workers.
+- Worker counts are unchanged: 2 search workers and 3 enrichment workers.
   Capacity work must be measured before those defaults change.
 
 ## Phase 2 — provider resilience
@@ -194,7 +194,7 @@ server/evidenceEngine/providers/GeminiSemanticProvider.test.ts`) cover:
   `contextTruncated=true`; very large evidence sets may classify with less
   descriptive detail instead of failing the whole batch.
 - **Groq free-tier limits still apply.** Seven routes do not create unlimited
-  throughput; pacing and per-org cooldowns remain, and worker counts stay at 4/3
+  throughput; pacing and per-org cooldowns remain, and worker counts stay at 2/3
   until measurements show headroom.
 - **Expected improvement:** no more all-429 loops from shared labels, failover
   across independent Groq/Gemini accounts, daily quota windows respected, and

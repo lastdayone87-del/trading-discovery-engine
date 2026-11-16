@@ -1,4 +1,9 @@
-import { DEFAULT_ADMISSION_PRIMARY_MODEL } from '../server/channelAdmission/admissionModels';
+import { DEFAULT_ADMISSION_PRIMARY_MODEL, DEFAULT_ADMISSION_SECONDARY_MODEL } from '../server/channelAdmission/admissionModels';
+import {
+  DEFAULT_GROQ_CANDIDATE_MODEL,
+  DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+  DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+} from '../server/evidenceEngine/modelDefaults';
 import {
   checkCodeDefault,
   checkRequiredSecrets,
@@ -49,8 +54,28 @@ function main(): number {
     ...compareEnvironment(manifest, process.env),
     checkCodeDefault(
       'ADMISSION_PRIMARY_MODEL',
-      manifest.environment.ADMISSION_PRIMARY_MODEL ?? DEFAULT_ADMISSION_PRIMARY_MODEL,
+      manifest.environment.ADMISSION_PRIMARY_MODEL ?? null,
       DEFAULT_ADMISSION_PRIMARY_MODEL,
+    ),
+    checkCodeDefault(
+      'MULTILINGUAL_CANDIDATE_MODEL',
+      manifest.environment.MULTILINGUAL_CANDIDATE_MODEL ?? null,
+      DEFAULT_MULTILINGUAL_CANDIDATE_MODEL,
+    ),
+    checkCodeDefault(
+      'MULTILINGUAL_ADJUDICATOR_MODEL',
+      manifest.environment.MULTILINGUAL_ADJUDICATOR_MODEL ?? null,
+      DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL,
+    ),
+    checkCodeDefault(
+      'GROQ_CANDIDATE_MODEL',
+      manifest.environment.GROQ_CANDIDATE_MODEL ?? null,
+      DEFAULT_GROQ_CANDIDATE_MODEL,
+    ),
+    checkCodeDefault(
+      'ADMISSION_SECONDARY_MODEL(default)',
+      'openai/gpt-oss-120b',
+      DEFAULT_ADMISSION_SECONDARY_MODEL,
     ),
   ];
   if (!options.skipSecrets) {
@@ -69,8 +94,9 @@ function main(): number {
 }
 
 try {
-  process.exit(main());
+  // Prefer an exit code over process.exit() so piped/JSON output is flushed.
+  process.exitCode = main();
 } catch (error) {
   console.error(`Production config verification failed: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
+  process.exitCode = 1;
 }

@@ -13,8 +13,8 @@ import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultSh
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
-export const DEFAULT_MULTILINGUAL_CANDIDATE_MODEL = 'gemini-3.6-flash';
-export const DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL = 'gemini-3.6-flash';
+import { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from '../modelDefaults';
+export { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL };
 type SemanticLabel = SemanticResultLabel;
 
 export interface SemanticModelResult {
@@ -121,7 +121,7 @@ export function geminiRouteOrg(route: { orgId?: unknown }): string {
 /** Configured key slot numbers (1-based) with a non-empty key. */
 export function geminiConfiguredSlotNumbers(env: NodeJS.ProcessEnv = process.env): number[] {
   return Object.keys(env)
-    .filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name))
+    .filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name))
     .map(name => (name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length))))
     .filter(slot => String(env[slot === 1 ? 'GEMINI_API_KEY' : `GEMINI_API_KEY_${slot}`] || '').trim())
     .sort((a, b) => a - b);
@@ -141,7 +141,7 @@ export function missingGeminiOrgLabels(env: NodeJS.ProcessEnv = process.env): st
 
 /** Return only ordered, non-empty route slots; credentials never leave this process. */
 export function configuredGeminiRoutes(env: NodeJS.ProcessEnv = process.env): GeminiRoute[] {
-  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name));
+  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name));
   names.sort((a, b) => {
     const routeNumber = (name: string) => name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
     return routeNumber(a) - routeNumber(b);

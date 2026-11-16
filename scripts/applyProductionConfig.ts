@@ -71,8 +71,9 @@ function main(): number {
 }
 
 try {
-  process.exit(main());
+  // Prefer an exit code over process.exit() so redirected output is flushed.
+  process.exitCode = main();
 } catch (error) {
   console.error(`Production config apply failed: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
+  process.exitCode = 1;
 }

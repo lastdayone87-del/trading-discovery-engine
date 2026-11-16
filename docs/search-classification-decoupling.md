@@ -6,7 +6,7 @@ Autonomous search pages were spending almost all worker wall time inside the
 per-channel ingestion pipeline. Production measurement from the approved plan:
 a search job averaged ~615s, of which ~606s was channel processing and only
 ~3.8s retrieval. One page of 21 channels recorded 11.34M ms of processing against
-14.3s of retrieval (~540s/channel). Four search workers were therefore
+14.3s of retrieval (~540s/channel). Historically, four search workers were therefore
 head-of-line blocked by semantic provider waits, even though retrieval and
 YouTube quota were not saturated.
 
@@ -59,7 +59,7 @@ the only writer of classification outcomes.
 
 ## Worker capacity
 
-Worker counts are unchanged: 4 search workers and 3 enrichment workers.
+Worker counts are unchanged: 2 search workers and 3 enrichment workers.
 `ENRICHMENT_WORKER_CONCURRENCY` still wins, but the startup total is capped at
 the historical 20-worker maximum before it is split so two pools cannot exceed
 the old single-pool ceiling.

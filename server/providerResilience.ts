@@ -254,7 +254,7 @@ export const DEFAULT_GEMINI_ROUTE_ID = 'gemini-1';
 
 /** Return configured Gemini route IDs from environment (no credentials exposed). */
 export function configuredGeminiRouteIds(env: NodeJS.ProcessEnv = process.env): string[] {
-  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name));
+  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name));
   names.sort((a, b) => {
     const routeNumber = (name: string) => name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
     return routeNumber(a) - routeNumber(b);
@@ -275,7 +275,7 @@ export function configuredGeminiRouteIds(env: NodeJS.ProcessEnv = process.env): 
  * own independent account. Used only to scope ledger reads; never a secret.
  */
 function configuredGeminiOrgIds(env: NodeJS.ProcessEnv = process.env): string[] {
-  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_[2-9][0-9]*$/.test(name));
+  const names = Object.keys(env).filter(name => name === 'GEMINI_API_KEY' || /^GEMINI_API_KEY_([2-9]|[1-9][0-9]+)$/.test(name));
   names.sort((a, b) => {
     const slot = (name: string) => name === 'GEMINI_API_KEY' ? 1 : Number(name.slice('GEMINI_API_KEY_'.length));
     return slot(a) - slot(b);

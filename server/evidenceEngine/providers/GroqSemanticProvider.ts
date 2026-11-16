@@ -27,8 +27,8 @@ import {
   type SemanticObservabilityContext,
 } from './GeminiSemanticProvider';
 
-export const DEFAULT_GROQ_CANDIDATE_MODEL = 'openai/gpt-oss-120b';
-export const DEFAULT_GROQ_ADJUDICATOR_MODEL = 'openai/gpt-oss-120b';
+import { DEFAULT_GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_ADJUDICATOR_MODEL } from '../modelDefaults';
+export { DEFAULT_GROQ_CANDIDATE_MODEL, DEFAULT_GROQ_ADJUDICATOR_MODEL };
 export const GROQ_API_BASE_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 export interface GroqRoute { id: string; key: string; orgId?: string; }

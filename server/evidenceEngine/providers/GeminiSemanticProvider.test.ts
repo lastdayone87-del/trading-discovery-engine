@@ -88,9 +88,9 @@ test('non-404 permanent failures do not invoke fallback model', async () => {
 
 test('configured Gemini routes are ordered, non-empty, and deduplicated without exposing values',async()=>{
   const {configuredGeminiRoutes}=await import('./GeminiSemanticProvider');
-  const routes=configuredGeminiRoutes({GEMINI_API_KEY:'a',GEMINI_API_KEY_2:'b',GEMINI_API_KEY_3:'a',GEMINI_API_KEY_4:'',GEMINI_API_KEY_5:'e',GEMINI_API_KEY_20:'z'});
-  assert.deepEqual(routes.map(route=>route.id),['gemini-1','gemini-2','gemini-5','gemini-20']);
-  assert.deepEqual(routes.map(route=>route.key),['a','b','e','z']);
+  const routes=configuredGeminiRoutes({GEMINI_API_KEY:'a',GEMINI_API_KEY_2:'b',GEMINI_API_KEY_3:'a',GEMINI_API_KEY_4:'',GEMINI_API_KEY_5:'e',GEMINI_API_KEY_10:'h',GEMINI_API_KEY_20:'z'});
+  assert.deepEqual(routes.map(route=>route.id),['gemini-1','gemini-2','gemini-5','gemini-10','gemini-20']);
+  assert.deepEqual(routes.map(route=>route.key),['a','b','e','h','z']);
 });
 
 test('Gemini batch output allowance scales with batch size and stays bounded',()=>{
@@ -247,13 +247,13 @@ test('error-carried account identity skips that account even from another route'
   assert.deepEqual(calls, ['gemini-1']);
 });
 
-test('paid semantic defaults are the proven 3.6-flash models on every route', async () => {
+test('paid semantic defaults are the production 3.5-flash-lite models on every route', async () => {
   const { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } = await import('./GeminiSemanticProvider');
-  assert.equal(DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, 'gemini-3.6-flash');
-  assert.equal(DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-3.6-flash');
+  assert.equal(DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, 'gemini-3.5-flash-lite');
+  assert.equal(DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL, 'gemini-3.5-flash-lite');
 });
 
-test('candidate classification uses the 2.5 default when no model env is set', async () => {
+test('candidate classification uses the 3.5-flash-lite default when no model env is set', async () => {
   const restore = withModelOverrides(undefined, undefined);
   const savedAdjudication = process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
   delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
@@ -262,7 +262,7 @@ test('candidate classification uses the 2.5 default when no model env is set', a
     const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return unrelatedResult; } };
     const provider = new GeminiSemanticProvider(client);
     await provider.collectEvidence(input, {} as any);
-    assert.deepEqual(models, ['gemini-3.6-flash']);
+    assert.deepEqual(models, ['gemini-3.5-flash-lite']);
   } finally {
     restore();
     if (savedAdjudication === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
@@ -292,7 +292,7 @@ test('adjudication second pass uses the configured adjudicator model', async () 
     const client: SemanticModelClient = { classify: async (_prompt, model) => { models.push(model); return low; } };
     const provider = new GeminiSemanticProvider(client);
     await provider.collectEvidence(input, {} as any);
-    assert.deepEqual(models, ['gemini-3.6-flash', 'custom-adjudicator']);
+    assert.deepEqual(models, ['gemini-3.5-flash-lite', 'custom-adjudicator']);
   } finally {
     restore();
     delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
@@ -350,7 +350,7 @@ test('resolveCoolingGeminiOrgs maps persisted windows to a cooling set, failing 
   );
 });
 
-test('production defaults adjudicate low-confidence results with two 3.6-flash calls', async () => {
+test('production defaults adjudicate low-confidence results with two 3.5-flash-lite calls', async () => {
   const restore = withModelOverrides(undefined, undefined);
   process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
   try {
@@ -362,7 +362,7 @@ test('production defaults adjudicate low-confidence results with two 3.6-flash c
     assert.equal(calls.length, 2, 'candidate + adjudication passes must both run on identical defaults');
     assert.ok(calls[0].prompt.includes('"task":"CANDIDATE"'));
     assert.ok(calls[1].prompt.includes('"task":"ADJUDICATION"'));
-    assert.deepEqual(calls.map(call => call.model), ['gemini-3.6-flash', 'gemini-3.6-flash']);
+    assert.deepEqual(calls.map(call => call.model), ['gemini-3.5-flash-lite', 'gemini-3.5-flash-lite']);
   } finally {
     restore();
     delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;

@@ -34,11 +34,22 @@ environment:
 npm run config:verify
 ```
 
+`config:verify` runs the compiled `dist/config/verifyProductionConfig.cjs`
+produced by `npm run build`, so it does not depend on the development-only
+`tsx` binary at runtime. For a source checkout before building, use
+`npm run config:verify:local` (rebuilds the bundle first) or
+`npm run config:verify:src`.
+
 The verifier checks:
 
-1. The running environment against `environment`.
-2. The admission model code default against the manifest.
+1. The running environment against the allowlisted `environment` keys.
+2. The admission, classification, and Groq model code defaults against the
+   manifest.
 3. Required secrets and provider-key minimum counts.
+
+`ADMISSION_SECONDARY_MODEL` is intentionally `null` in the manifest (no
+runtime override). The verifier checks its code fallback
+(`openai/gpt-oss-120b`) as a separate literal check.
 
 It exits non-zero on drift. Useful flags:
 
@@ -66,6 +77,10 @@ This writes `config/production.env.generated` (mode `600`, non-secret values
 only). It does not update Coolify or any database. Import the values into the
 deployment environment; supply secrets from Coolify or a secret manager.
 
+Like `config:verify`, `config:apply` uses the compiled `dist/config` bundle.
+Use `config:apply:local` to rebuild before running, or `config:apply:src` for
+a source checkout before building.
+
 ## Deployment flow
 
 1. Change `config/production.json` and the corresponding code default/test.
@@ -88,11 +103,18 @@ settings above did not silently change.
 
 ## Secrets
 
-Never add secret values to this repository or the manifest. Required secret
-keys are checked by name only. The current provider-key minimums are:
+Never add secret values to this repository or the manifest. Secret-like
+environment keys are rejected by the manifest parser, and the verifier never
+prints a secret value. Required secret keys are checked by name only.
 
-- 58 `YOUTUBE_API_KEY_*`
-- 5 `GEMINI_API_KEY*`
-- 7 `GROQ_API_KEY*`
+Provider-key minimums use the runtime loaders' canonical slot rules:
+
+- 58 YouTube keys (`YOUTUBE_API_KEY`, `YOUTUBE_API_KEY_1..N`; metadata such
+  as `YOUTUBE_API_KEY_1_QUOTA_GROUP` is ignored; `MY_*` placeholders are
+  ignored; duplicate values count once)
+- 5 Gemini keys (`GEMINI_API_KEY`, `GEMINI_API_KEY_2..N`; malformed suffixes
+  ignored; duplicate values count once)
+- 7 Groq keys (`GROQ_API_KEY`, `GROQ_API_KEY_2..N`; malformed suffixes
+  ignored; duplicate values count once)
 
 Plus `DATABASE_URL`, `ADMIN_API_TOKEN`, and `OPERATOR_API_TOKEN`.
