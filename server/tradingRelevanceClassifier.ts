@@ -75,6 +75,9 @@ export async function classifyTradingRelevanceDetailed(
     independentEvidence: corroboration?.disposition === 'PASS',
     videoTexts,
     mode: routingMode,
+    lifecycleAction: decision.stagedClassification?.lifecycleAction,
+    acquisitionEnrich: decision.stagedClassification?.stages
+      .find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('ACQUISITION_ENRICH') ?? false,
   });
   if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 

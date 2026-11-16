@@ -67,6 +67,27 @@ test('default routing is active and LEGACY is an explicit rollback', () => {
   assert.equal(resolveClassificationRoutingMode({ DETERMINISTIC_CLASSIFICATION_ROUTING: 'legacy' } as NodeJS.ProcessEnv), 'LEGACY');
 });
 
+test('evidence-limited lifecycle routes to ENRICH even with independent semantic evidence', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: true, lifecycleAction: 'ENRICH', acquisitionEnrich: true });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.enrich, true);
+  assert.equal(routed.humanReview, false);
+  assert.equal(routed.fallbackReason, 'COMPOSITION_EVIDENCE_REQUIRED');
+});
+
+test('evidence-complete lifecycle ENRICH still goes to human review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: true, lifecycleAction: 'ENRICH', acquisitionEnrich: false });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.humanReview, true);
+  assert.equal(routed.fallbackReason, 'SEMANTIC_AMBIGUOUS_WITH_SUFFICIENT_EVIDENCE');
+});
+
 test('decisive deterministic trading is fast-tracked without semantic', () => {
   const routed = resolveClassificationRouting(decision({
     status: 'TRADING_CONFIRMED',

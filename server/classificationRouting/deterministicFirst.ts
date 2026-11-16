@@ -1,4 +1,4 @@
-import type { EvidenceSufficiency, VerificationDecision } from '../evidenceEngine/types';
+import type { EvidenceSufficiency, LifecycleAction, VerificationDecision } from '../evidenceEngine/types';
 
 export const DETERMINISTIC_FIRST_ROUTING_VERSION = 'deterministic-first-routing-v1';
 
@@ -49,6 +49,10 @@ export interface ClassificationRoutingOptions {
   /** Per-video text documents used only for a precision review guard. */
   videoTexts?: string[];
   mode?: 'ACTIVE' | 'LEGACY';
+  /** Final staged lifecycle; ENRICH is authoritative over review routing. */
+  lifecycleAction?: LifecycleAction;
+  /** True only when ENRICH is an evidence-acquisition state, not ambiguity. */
+  acquisitionEnrich?: boolean;
 }
 
 type RoutingInput = Pick<
@@ -229,6 +233,19 @@ export function resolveClassificationRouting(
       semanticUsed: semantic.used,
       semanticAttempted: semantic.attempted,
       reasonCodes: ['LEGACY_ROUTING'],
+    });
+  }
+
+  // The staged lifecycle already decided that the evidence bundle needs more
+  // acquisition. Do not turn that into human review just because the semantic
+  // layer served evidence.
+  if (decision.status === 'UNCERTAIN' && options.lifecycleAction === 'ENRICH' && options.acquisitionEnrich) {
+    return result({
+      route: 'ENRICH', confidence, evidenceSufficiency: sufficiency,
+      recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
+      enrich: true,
+      fallbackReason: 'COMPOSITION_EVIDENCE_REQUIRED',
+      reasonCodes: ['COMPOSITION_EVIDENCE_REQUIRED'],
     });
   }
 

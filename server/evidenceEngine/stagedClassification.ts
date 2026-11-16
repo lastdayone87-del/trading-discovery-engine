@@ -206,6 +206,7 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
           : ['NO_AFFIRMATIVE_CONTRADICTION'], negative, { negativeWeight, positiveWeight, terminalNegativeWeight, nonTerminalNegativeWeight });
 
   let lifecycleAction: LifecycleAction = 'REVIEW';
+  let acquisitionEnrich = false;
   if (availability.disposition !== 'PASS') lifecycleAction = collection.sufficiency === 'MISSING' || collection.sufficiency === 'INSUFFICIENT' ? 'ENRICH' : 'REVIEW';
   else if (contradiction.disposition === 'FAIL') lifecycleAction = 'REJECT';
   else if (contradiction.disposition === 'ABSTAIN') lifecycleAction = candidate.disposition==='PASS'&&corroboration.disposition==='PASS'?'REVIEW':'ENRICH';
@@ -219,8 +220,18 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     // because coverage is thin. A supported creator-owned terminal negative
     // still rejects under insufficient coverage.
     const affirmativeCandidate = candidate.disposition === 'PASS' && corroboration.disposition === 'PASS';
-    if (composition.focus === 'QUERY_ONLY') lifecycleAction = affirmativeCandidate ? 'REVIEW' : 'ENRICH';
-    else if (composition.focus === 'INSUFFICIENT_COVERAGE') lifecycleAction = lifecycleAction === 'REJECT' ? 'REJECT' : affirmativeCandidate ? 'REVIEW' : 'ENRICH';
+    const activeRouting = resolveClassificationRoutingMode() === 'ACTIVE';
+    // Thin/query-only compositions are evidence-acquisition states, not
+    // unresolved classifications. Keep the affirmative evidence and enrich;
+    // never turn a missing second family into human review. LEGACY preserves
+    // the pre-v2 review behavior as the rollback path.
+    if (composition.focus === 'QUERY_ONLY') {
+      lifecycleAction = activeRouting ? 'ENRICH' : (affirmativeCandidate ? 'REVIEW' : 'ENRICH');
+      acquisitionEnrich = activeRouting;
+    } else if (composition.focus === 'INSUFFICIENT_COVERAGE') {
+      lifecycleAction = lifecycleAction === 'REJECT' ? 'REJECT' : activeRouting ? 'ENRICH' : (affirmativeCandidate ? 'REVIEW' : 'ENRICH');
+      acquisitionEnrich = activeRouting && lifecycleAction === 'ENRICH';
+    }
     else if (composition.focus === 'ALTERNATIVE_DOMINANT') lifecycleAction = contradiction.disposition === 'FAIL' ? 'REJECT' : 'ENRICH';
     else if (composition.focus === 'MIXED' && lifecycleAction === 'CONFIRM') lifecycleAction = 'REVIEW';
     else if (composition.focus === 'TRADING_DOMINANT' && lifecycleAction === 'CONFIRM' && !compositionCorroborates) lifecycleAction = 'REVIEW';
@@ -237,8 +248,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     && substantialCreatorBio
     && creatorBioTierA
     && Boolean(composition && compositionConfirmsTrading(composition));
-  if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input) && !strongCreatorComposition) lifecycleAction = 'REVIEW';
-  const lifecycle = result('LIFECYCLE', 'PASS', [`ROUTE_${lifecycleAction}`], [], { action: lifecycleAction });
+  if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input) && !strongCreatorComposition) {
+    const activeRouting = resolveClassificationRoutingMode() === 'ACTIVE';
+    lifecycleAction = activeRouting ? 'ENRICH' : 'REVIEW';
+    acquisitionEnrich = activeRouting;
+  }
+  const lifecycleReasonCodes = [`ROUTE_${lifecycleAction}`, ...(acquisitionEnrich ? ['ACQUISITION_ENRICH'] : [])];
+  const lifecycle = result('LIFECYCLE', 'PASS', lifecycleReasonCodes, [], { action: lifecycleAction });
   return { pipelineVersion: STAGED_CLASSIFICATION_VERSION, stages: [availability, candidate, corroboration, contradiction, lifecycle], lifecycleAction };
 }
 
