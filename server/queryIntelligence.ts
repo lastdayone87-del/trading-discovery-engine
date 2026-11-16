@@ -2148,6 +2148,8 @@ type CountryNativeAuthorizationInput = {
   targetNeighborhoodDimensions: DiscoveryNeighborhoodDimensions;
   proposalEvidenceSnapshot: Record<string, any>;
   scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
+  /** True when an admitted generated proposal is being made a normal library candidate. */
+  materialized?: boolean;
 };
 
 export type QueryIntelligenceAuthorizationInputResult =
@@ -2254,7 +2256,8 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
         canonicalTermId: evidence.canonicalTermId ?? null,
         evidenceRevision: evidence.evidenceRevision ?? null,
         generationProvenance: evidence.generationProvenance ?? null,
-        sourceProvenanceFamily: evidence.sourceProvenanceFamily ?? null
+        sourceProvenanceFamily: evidence.sourceProvenanceFamily ?? null,
+        materialized: args.materialized === true
       },
       generationSource: String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'YOUTUBE_AUTOCOMPLETE'
         || evidence.generationProvenance?.source === 'AUTOCOMPLETE'

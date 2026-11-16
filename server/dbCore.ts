@@ -4263,7 +4263,11 @@ export async function scheduleAutonomousQueryRuns(
         if (eligibleProvider.rows[0].mode === 'SHADOW') throw new Error('SHADOW_PROVIDER_REQUIRES_EXPLICIT_BRAVE_CANARY');
       }
       const nativeLineage = (candidate.query.generation_metadata?.countryNativeAllocation || {}) as Record<string, unknown>;
-      const allocatedDimensions = candidate.allocationOrigin === 'FRONTIER_CANARY' && nativeLineage.targetNeighborhoodKey
+      // Frontier allocations and generated queries materialized into the normal
+      // library both carry immutable target-neighborhood lineage. Legacy queries
+      // without lineage remain unchanged.
+      const lineageBoundAllocation = candidate.allocationOrigin === 'FRONTIER_CANARY' || nativeLineage.materialized === true;
+      const allocatedDimensions = lineageBoundAllocation && nativeLineage.targetNeighborhoodKey
         ? candidate.targetNeighborhoodDimensions
         : undefined;
       if (nativeLineage.targetNeighborhoodKey && (!allocatedDimensions ||
