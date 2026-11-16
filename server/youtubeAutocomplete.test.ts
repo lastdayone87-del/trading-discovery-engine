@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { autocompletePrefixCursorKey, fetchYouTubeAutocomplete } from './youtubeAutocomplete';
+import { autocompletePrefixCursorKey, autocompletePrefixWindow, fetchYouTubeAutocomplete } from './youtubeAutocomplete';
 import { generateAutocompleteProposals } from './discoveryProposalGenerators';
 
 test('YouTube autocomplete sends language and region and parses suggestions', async () => {
@@ -64,4 +64,23 @@ test('autocomplete prefix rotation is tracked per language', () => {
     autocompletePrefixCursorKey('Canada', 'fr'),
   );
   assert.match(autocompletePrefixCursorKey('Canada', 'fr'), /Canada:fr$/);
+});
+
+
+test('prefix rotation keeps independent offsets per language across turns', () => {
+  const prefixes = Array.from({ length: 40 }, (_, index) => `prefix-${index}`);
+  const cursors = new Map<string, number>();
+  const turn = (language: string) => {
+    const key = autocompletePrefixCursorKey('Canada', language);
+    const cursor = cursors.get(key) ?? 0;
+    const window = autocompletePrefixWindow({ country: 'Canada', language, prefixes, cursor, limit: 20 });
+    cursors.set(window.key, cursor + window.prefixes.length);
+    return window.prefixes;
+  };
+  const englishFirst = turn('en');
+  const frenchFirst = turn('fr');
+  const englishSecond = turn('en');
+  assert.deepEqual(englishFirst, prefixes.slice(0, 20));
+  assert.deepEqual(frenchFirst, prefixes.slice(0, 20));
+  assert.deepEqual(englishSecond, prefixes.slice(20, 40));
 });

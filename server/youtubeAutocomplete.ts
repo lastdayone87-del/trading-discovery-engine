@@ -14,6 +14,29 @@ export function autocompletePrefixCursorKey(country: string, language: string): 
   return `youtube_autocomplete_prefix_cursor:${country}:${language}`;
 }
 
+export interface AutocompletePrefixWindow {
+  key: string;
+  prefixes: string[];
+}
+
+/** Pure prefix window used by the generator and its rotation tests. */
+export function autocompletePrefixWindow(input: {
+  country: string;
+  language: string;
+  prefixes: string[];
+  cursor: number;
+  limit?: number;
+}): AutocompletePrefixWindow {
+  const key = autocompletePrefixCursorKey(input.country, input.language);
+  if (!input.prefixes.length) return { key, prefixes: [] };
+  const limit = Math.max(1, Math.min(input.prefixes.length, Math.trunc(input.limit ?? YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES)));
+  const offset = normalizeRotationCursor(input.cursor) % input.prefixes.length;
+  return {
+    key,
+    prefixes: [...input.prefixes.slice(offset), ...input.prefixes.slice(0, offset)].slice(0, limit),
+  };
+}
+
 
 export interface AutocompleteSuggestion {
   query: string;
@@ -177,11 +200,14 @@ export async function generateAutocompleteQueries(input: {
   const acceptedHistory: CandidateHistoryItem[] = [];
   const allPrefixes = prefixPlan(country, language.code, existing, await localVocabulary(country));
   const prefixCursorKey = autocompletePrefixCursorKey(country, language.code);
-  const prefixCursor = Math.max(0, Number(await getAppSetting(prefixCursorKey, '0')) || 0);
-  const rotated = allPrefixes.length > YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES
-    ? [...allPrefixes.slice(prefixCursor % allPrefixes.length), ...allPrefixes.slice(0, prefixCursor % allPrefixes.length)]
-    : allPrefixes;
-  const prefixes = rotated.slice(0, YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES);
+  const prefixCursor = normalizeRotationCursor(await getAppSetting(prefixCursorKey, '0'));
+  const prefixes = autocompletePrefixWindow({
+    country,
+    language: language.code,
+    prefixes: allPrefixes,
+    cursor: prefixCursor,
+    limit: YOUTUBE_AUTOCOMPLETE_MAX_PREFIXES,
+  }).prefixes;
   const regionCode = countryDiscoveryRegionCode(country);
   const fetchAutocomplete = input.fetchAutocomplete || fetchYouTubeAutocomplete;
   const accepted: NativeQueryCandidate[] = [];
