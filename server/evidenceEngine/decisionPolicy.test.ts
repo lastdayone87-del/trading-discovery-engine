@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { evaluateUnifiedDecisionPolicy, hasIndependentCreatorOwnedPositiveField } from './decisionPolicy';
 import type { EvidenceCollectionReport, EvidenceItem } from './types';
+import type { ContextualCompositionReport } from './contextualComposition';
 
 const collection = (overrides: Partial<EvidenceCollectionReport> = {}): EvidenceCollectionReport => ({
   sufficiency: 'SUFFICIENT',
@@ -108,4 +109,97 @@ test('a channel title is not an independent creator-owned positive field', () =>
   const searchOnly = positive('channel_bio');
   searchOnly.provenance = { ...searchOnly.provenance, fields: [{ field: 'search_match_context', sourceId: 'v1' }] };
   assert.equal(hasIndependentCreatorOwnedPositiveField([searchOnly]), false);
+});
+
+test('only active, trading-education and investing-education categories confirm', () => {
+  const confirm = (contentCategory?: string) => evaluateUnifiedDecisionPolicy({
+    evidence: [positive('channel_bio')],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    contentCategory,
+  });
+  for (const category of ['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION']) {
+    assert.equal(confirm(category).status, 'TRADING_CONFIRMED', category);
+  }
+  for (const category of ['FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'MARKET_INSTITUTION', 'HYPE', 'UNRELATED', 'AMBIGUOUS']) {
+    const decision = confirm(category);
+    assert.equal(decision.status, 'UNCERTAIN', category);
+    assert.ok(decision.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'), category);
+  }
+  // Legacy callers without a category keep the old behavior; a future label
+  // unknown to this policy is not silently treated as non-relevant.
+  assert.equal(confirm(undefined).status, 'TRADING_CONFIRMED');
+  assert.equal(confirm('FUTURE_RELEVANT_CATEGORY').status, 'TRADING_CONFIRMED');
+});
+
+const caliComposition: ContextualCompositionReport = {
+  version: 'contextual-composition-v2',
+  focus: 'TRADING_DOMINANT',
+  observedFamilies: 5,
+  informativeFamilies: 5,
+  duplicateFamiliesCollapsed: 0,
+  tradingFamilies: 5,
+  tradingCoreFamilies: 0,
+  tradingAdjacentFamilies: 5,
+  financeAdjacentFamilies: 0,
+  unrelatedFamilies: 0,
+  uninformativeFamilies: 0,
+  alternativeFamilies: 0,
+  neutralFamilies: 0,
+  recentTradingFamilies: 4,
+  recentAlternativeFamilies: 0,
+  tradingCoverage: 1,
+  alternativeCoverage: 0,
+  financeCoverage: 0,
+  unrelatedCoverage: 0,
+  temporalCoverage: 'KNOWN',
+  nonTitleTierAFamilies: 3,
+  explicitCreatorTrading: false,
+  explicitCreatorAlternative: false,
+  namePriorTrading: true,
+  familyClassifications: [],
+  reasonCodes: ['TRADING_COVERAGE_DOMINANT'],
+};
+
+test('Cali Bourse shape: 0 core + 5 adjacent investing education confirms', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [positive('channel_bio')],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    composition: caliComposition,
+    contentCategory: 'INVESTING_EDUCATION',
+  });
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
+});
+
+test('Cali Bourse shape is blocked when the refined category is a market institution', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [positive('channel_bio')],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    composition: caliComposition,
+    contentCategory: 'MARKET_INSTITUTION',
+  });
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(decision.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'));
+});
+
+test('Cali Bourse shape is blocked when the refined category is hype', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [positive('channel_bio')],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    composition: caliComposition,
+    contentCategory: 'HYPE',
+  });
+  assert.equal(decision.status, 'UNCERTAIN');
+  assert.ok(decision.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'));
 });

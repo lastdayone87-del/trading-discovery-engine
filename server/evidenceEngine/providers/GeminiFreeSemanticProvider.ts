@@ -458,7 +458,9 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
-    const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';
+    const positive = result.label === 'ACTIVE_TRADING'
+      || result.label === 'TRADING_EDUCATION'
+      || result.label === 'INVESTING_EDUCATION';
     const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);

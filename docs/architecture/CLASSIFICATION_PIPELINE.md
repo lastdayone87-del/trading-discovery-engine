@@ -80,8 +80,8 @@ used by discovery.
 The compact multilingual model is the primary generalization provider for
 meaning not represented in static packs. It receives separately identified
 fields rather than flattened text and must return a closed taxonomy:
-`ACTIVE_TRADING`, `INVESTING_EDUCATION`, `FINANCIAL_NEWS`,
-`PERSONAL_FINANCE`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. Its assertion includes
+`ACTIVE_TRADING`, `TRADING_EDUCATION`, `INVESTING_EDUCATION`, `FINANCIAL_NEWS`,
+`PERSONAL_FINANCE`, `MARKET_INSTITUTION`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. `ACTIVE_TRADING`, `TRADING_EDUCATION`, and `INVESTING_EDUCATION` are positive trading-relevance labels; `FINANCIAL_NEWS`, `PERSONAL_FINANCE`, and `MARKET_INSTITUTION` map to non-trading-adjacent evidence; `HYPE` and `UNRELATED` map to negative/alternative evidence. Its assertion includes
 field citations, detected language and script per field, concepts, reason codes,
 and pinned model, prompt, feature, and calibration versions. Unsupported language,
 missing citations, ambiguity, and confidence below policy threshold produce a

@@ -10,7 +10,7 @@ import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchCon
 import { semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
-export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
+export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-2';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
 import { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from '../modelDefaults';
@@ -338,7 +338,10 @@ export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 
       'Infer meaning across languages, scripts, transliteration, loanwords, and code-switching.',
       'Classify creator focus, not isolated keywords. Cite only supplied field references.',
       'Set supportedLanguage=false and label=AMBIGUOUS when meaning cannot be reliably interpreted.',
-      'Distinguish active trading, investing education, financial news, personal finance, hype, and unrelated content.',
+      'Distinguish active trading, trading education, investing education, financial news, personal finance, market institutions, hype, and unrelated content.',
+      'Use TRADING_EDUCATION when the creator teaches trading method, psychology, platform use, or risk management without live execution as the primary product.',
+      'Use MARKET_INSTITUTION for a broker, exchange, bank, data platform, asset manager, fund, or corporate financial brand; do not call it investing education.',
+      'Use PERSONAL_FINANCE for budgeting, banking, taxes, insurance, savings products and consumer finance; use INVESTING_EDUCATION for stock portfolios, market analysis and company analysis.',
       'Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'
     ],
     declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: semanticFieldDocuments(input)
@@ -456,7 +459,9 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
-    const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';
+    const positive = result.label === 'ACTIVE_TRADING'
+      || result.label === 'TRADING_EDUCATION'
+      || result.label === 'INVESTING_EDUCATION';
     const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);

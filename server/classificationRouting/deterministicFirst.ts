@@ -55,6 +55,8 @@ export interface ClassificationRoutingOptions {
   acquisitionEnrich?: boolean;
   /** Specific acquisition cause from the lifecycle stage, when known. */
   acquisitionReason?: string;
+  /** Refined semantic category; relevant categories own the decision. */
+  contentCategory?: string;
 }
 
 type RoutingInput = Pick<
@@ -263,7 +265,10 @@ export function resolveClassificationRouting(
     // the case to human review. This never rejects and never overrides a
     // video sample that actually contains trading analysis.
     const videoTexts = stripRepeatedFooterLines((options.videoTexts || []).map(text => String(text || '').trim()).filter(Boolean));
-    if (videoTexts.length >= 3) {
+    const categoryOwnsDecision = options.contentCategory === 'ACTIVE_TRADING'
+      || options.contentCategory === 'TRADING_EDUCATION'
+      || options.contentCategory === 'INVESTING_EDUCATION';
+    if (!categoryOwnsDecision && videoTexts.length >= 3) {
       const focusByVideo = videoTexts.map(text => nonTradingContentFocus(text));
       const focusedVideos = focusByVideo.filter(focus => focus.total >= 1);
       const strongAnalysisVideos = videoTexts.filter(text => {

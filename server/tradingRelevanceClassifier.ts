@@ -88,6 +88,9 @@ export async function classifyTradingRelevanceDetailed(
     acquisitionEnrich: lifecycleStage?.reasonCodes.includes('ACQUISITION_ENRICH') ?? false,
     acquisitionReason: lifecycleStage?.reasonCodes.find(code =>
       code === 'COMPOSITION_EVIDENCE_REQUIRED' || code === 'THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'),
+    contentCategory: decision.geminiSemanticSummary?.isTrading === 'UNCERTAIN'
+      ? undefined
+      : decision.geminiSemanticSummary?.taxonomyLabel,
   });
   if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 
@@ -158,6 +161,8 @@ export async function classifyTradingRelevanceDetailed(
     // which returns a calibrated probability regardless of semantic serving.
     confidence_basis: noEvidence ? 'NEUTRAL_PRIOR' : 'CALIBRATED',
     ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
+    content_category: decision.geminiSemanticSummary?.taxonomyLabel,
+    content_category_confidence: decision.geminiSemanticSummary?.calibratedConfidence,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,
     ...(legacyReporting ? {} : {

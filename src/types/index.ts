@@ -109,6 +109,9 @@ export interface TradingRelevanceBreakdown {
   ai_prompt_payload?: string;
   ai_raw_response?: string;
   ai_model?: string;
+  /** Semantic taxonomy category for downstream relevance/category routing. */
+  content_category?: 'ACTIVE_TRADING' | 'TRADING_EDUCATION' | 'INVESTING_EDUCATION' | 'FINANCIAL_NEWS' | 'PERSONAL_FINANCE' | 'MARKET_INSTITUTION' | 'HYPE' | 'UNRELATED' | 'AMBIGUOUS';
+  content_category_confidence?: number;
   /** Integrated deterministic-first routing metadata. */
   classification_route?: string;
   deterministic_fast_track?: boolean;

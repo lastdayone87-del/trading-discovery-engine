@@ -280,6 +280,35 @@ test('a confirmed channel whose video sample contradicts its bio is sent to huma
   assert.equal(routed.fallbackReason, 'NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW');
 });
 
+test('a relevant refined category owns the decision over the video-focus heuristic', () => {
+  for (const contentCategory of ['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION']) {
+    const routed = resolveClassificationRouting(decision({
+      status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+      providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+    }), {
+      independentEvidence: true,
+      contentCategory,
+      videoTexts: ['forex trading live analysis', 'dance choreography trending music song vlog', 'music cover song', 'weekend vlog'],
+    });
+    assert.equal(routed.route, 'SEMANTIC_TRADING', contentCategory);
+  }
+});
+
+test('non-relevant refined categories still use the video-focus guard', () => {
+  for (const category of ['MARKET_INSTITUTION', 'HYPE', 'UNRELATED', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE']) {
+    const routed = resolveClassificationRouting(decision({
+      status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
+      providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+    }), {
+      independentEvidence: true,
+      contentCategory: category,
+      videoTexts: ['forex trading live analysis', 'dance choreography trending music song vlog', 'music cover song', 'weekend vlog'],
+    });
+    assert.equal(routed.route, 'HUMAN_REVIEW', category);
+    assert.equal(routed.fallbackReason, 'NON_TRADING_CONTENT_FOCUS_REQUIRES_REVIEW', category);
+  }
+});
+
 test('a confirmed channel with real trading analysis in its videos is not sent to review', () => {
   const routed = resolveClassificationRouting(decision({
     status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',

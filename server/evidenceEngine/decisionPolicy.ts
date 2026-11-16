@@ -9,7 +9,7 @@ import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeE
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
 export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=SEMANTIC_TOP_CALIBRATED_CONFIDENCE;
 
-export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:EvidenceCollectionReport;lifecycleAction:LifecycleAction;minimumPositiveWeight:number;minimumTradingScore:number;composition?:ContextualCompositionReport;recognition?:RecognitionAssessment}
+export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:EvidenceCollectionReport;lifecycleAction:LifecycleAction;minimumPositiveWeight:number;minimumTradingScore:number;composition?:ContextualCompositionReport;recognition?:RecognitionAssessment;contentCategory?:string}
 export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';confidenceScore:number;tradingProbability:number;nonTradingProbability:number;coverageConfidence:number;reasonCodes:string[]}
 
 /** C2: a channel title is a name prior, never independent confirmation. */
@@ -50,6 +50,15 @@ export function observedTradingFamilies(
 ): number {
   return composition.tradingFamilies
     ?? ((composition.tradingCoreFamilies ?? 0) + (composition.tradingAdjacentFamilies ?? 0));
+}
+
+/** Explicit non-relevant categories. Unknown/future labels keep legacy behavior. */
+const NON_RELEVANT_CONTENT_CATEGORIES = new Set([
+  'FINANCIAL_NEWS','PERSONAL_FINANCE','MARKET_INSTITUTION','HYPE','UNRELATED','AMBIGUOUS',
+]);
+
+export function isTradingRelevantCategory(category?:string):boolean{
+  return category===undefined || !NON_RELEVANT_CONTENT_CATEGORIES.has(category);
 }
 
 const clamp=(n:number)=>Math.max(0,Math.min(100,n));
@@ -162,16 +171,18 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const independentCreatorField=hasIndependentCreatorOwnedPositiveField(positive);
   const compositionOk=input.composition?compositionConfirmsTrading(input.composition):true;
   const recognitionAllowsConfirmation=!input.recognition||input.recognition.state==='DECISIVE_TRADING';
+  const contentCategoryAllowsConfirmation=isTradingRelevantCategory(input.contentCategory);
   const positiveBoundary=boundary.satisfied;
   const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(input.evidence,input.collection);
   const dominantAttributedContradiction=qualifiesDominantAttributedContradiction(input.evidence,input.collection);
   const terminalNegative=terminalNegativeItems(negative, input.collection.terminalNegativeSufficiency
     ? { terminalEligible: input.collection.terminalNegativeSufficiency.status === 'SUFFICIENT' }
     : {});
-  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY');if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
+  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY');if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
     status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {
+    if(input.lifecycleAction==='CONFIRM'&&!contentCategoryAllowsConfirmation)reasons.push('CONTENT_CATEGORY_NOT_TRADING_RELEVANT');
     if(input.lifecycleAction==='CONFIRM'&&!independentCreatorField)reasons.push('INDEPENDENT_CREATOR_OWNED_FIELD_REQUIRED');
     if(input.lifecycleAction==='CONFIRM'&&!compositionOk)reasons.push('CONTEXTUAL_COMPOSITION_CONFIRMATION_REQUIRED');
     if(input.lifecycleAction==='CONFIRM'&&!recognitionAllowsConfirmation)reasons.push('RECOGNITION_STATE_NOT_DECISIVE_TRADING');
