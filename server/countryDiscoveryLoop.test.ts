@@ -1347,7 +1347,7 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
       if (text.includes('WITH first_sighting AS')) {
         return {
           rows: [{
-            page_distinct: 2, marginal_new: 0, marginal_confirmed: 1, marginal_quality: 1,
+            page_distinct: 2, marginal_new: 0, marginal_confirmed: 1, marginal_quality: 1, marginal_fresh_confirmed: 0, marginal_fresh_quality: 0,
             marginal_non_trading: 0, cross_page_repeat: 1, cumulative_unique: 3,
             cumulative_confirmed: 2, cumulative_quality: 1, cumulative_non_trading: 0,
           }],
@@ -1360,6 +1360,9 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
   const metrics = await getAutonomousPageMarginalMetrics('run-1', 2, runner as never);
   assert.equal(metrics.pageDistinctCreators, 2);
   assert.equal(metrics.marginalNewCreators, 0);
+  assert.equal(metrics.marginalConfirmedCreators, 1, 'health counters still include known creators');
+  assert.equal(metrics.marginalFreshConfirmedCreators, 0, 'known confirmed creators are not fresh continuation yield');
+  assert.equal(metrics.marginalFreshQualityCreators, 0);
   assert.equal(metrics.crossPageRepeatCreators, 1);
   assert.equal(metrics.cumulativeUniqueCreators, 3, 'not the sum of per-page distinct counts');
   assert.equal(metrics.cumulativeConfirmedCreators, 2);
@@ -1373,6 +1376,9 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
   // retroactively credit an earlier page).
   assert.match(sql, /\(array_agg\(s\.persisted AND NOT s\.was_known ORDER BY s\.page_number, s\.id\)\)\[1\] AS first_was_new/);
   assert.match(sql, /AND fs\.first_was_new\)::int AS marginal_new/);
+  assert.match(sql, /fs\.first_was_new AND c\.trading_status='TRADING_CONFIRMED'\)::int AS marginal_fresh_confirmed/);
+  assert.match(sql, /fs\.first_was_new AND c\.trading_status='TRADING_CONFIRMED' AND COALESCE\(c\.quality_score,0\)>=55\)::int AS marginal_fresh_quality/);
+  assert.match(sql, /c\.trading_status='TRADING_CONFIRMED'\)::int AS marginal_confirmed/);
   const { getAutonomousContinuationState } = await import('./autonomousPageStore');
   await getAutonomousContinuationState('run-1', 3, runner as never);
   const streakCall = runner.calls.find(call => call.text.includes('page_number < $2'));
