@@ -475,8 +475,9 @@ export const AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY = 5;
  */
 export async function listPendingAutonomousRuns(
   perCountryLimit = AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY,
+  dbOverride?: { query: (sql: string, params?: unknown[]) => Promise<{ rows: any[] }> },
 ): Promise<PendingAutonomousRun[]> {
-  const db = await getDb();
+  const db = dbOverride || await getDb();
   const perCountry = Math.max(1, Math.min(20, Math.trunc(perCountryLimit) || AUTONOMOUS_CONTINUATION_CANDIDATES_PER_COUNTRY));
   const result = await db.query(
     // Rank within each country, then retain a small fallback list per country.
@@ -494,12 +495,12 @@ export async function listPendingAutonomousRuns(
               -- must not determine the ordering of pending runs.
               COALESCE((
                 SELECT GREATEST(0, LEAST(1,
-                  0.30 * (p.marginal_quality_creators::float / NULLIF(p.distinct_creator_count,0))
-                  + 0.25 * (p.marginal_confirmed_creators::float / NULLIF(p.distinct_creator_count,0))
-                  + 0.20 * (p.marginal_new_creators::float / NULLIF(p.distinct_creator_count,0))
+                  0.30 * COALESCE(p.marginal_quality_creators::float / NULLIF(p.distinct_creator_count,0),0)
+                  + 0.25 * COALESCE(p.marginal_confirmed_creators::float / NULLIF(p.distinct_creator_count,0),0)
+                  + 0.20 * COALESCE(p.marginal_new_creators::float / NULLIF(p.distinct_creator_count,0),0)
                   + 0.15 * COALESCE(p.country_precision,0)
                   - 0.20 * COALESCE(p.duplicate_ratio,0)
-                  - 0.20 * (p.marginal_non_trading_creators::float / NULLIF(p.distinct_creator_count,0))
+                  - 0.20 * COALESCE(p.marginal_non_trading_creators::float / NULLIF(p.distinct_creator_count,0),0)
                 ))
                 FROM autonomous_query_page_observations p
                 WHERE p.query_run_id=qr.id
