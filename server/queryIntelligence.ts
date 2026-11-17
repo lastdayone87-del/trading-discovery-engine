@@ -66,6 +66,7 @@ import {
 import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb } from './queryQuality/selector';
 import { isQuerySelectable } from './queryQuality/lifecycle';
 import { preservedCollisionAction } from './frontierLineage';
+import { shouldSkipTargetFallback } from './discoveryFallbackPolicy';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
 import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
@@ -1529,17 +1530,24 @@ export async function selectNextQueryForCountry(
       };
       return createNeighborhoodKey(dimensions) === targetKey;
     });
+    let targetedFailureCodes: string[] | null = null;
     if (matches.length > 0) {
       const targeted = selectHierarchicalUcb(matches, pool.context);
       const selected = targeted.queryId ? pool.queriesById.get(targeted.queryId) : null;
       if (selected) {
         return buildSelectionResult(selected, pool, 'NEIGHBORHOOD_TARGETED', `Frontier neighborhood canonical selection for target key "${targetKey}": ${targeted.reason}`, targeted);
       }
+      targetedFailureCodes = targeted.reasonCodes;
       // Matches can exist while every candidate is cooling down, admission-
       // blocked or otherwise unselectable. Do not fall through to a generic
       // legacy query; try the governed generated/planned target fallback below.
     }
-    {
+    // Generating another immature candidate cannot help if the selector is
+    // already fail-closed on exhausted portfolio capacity with no free provider.
+    if (shouldSkipTargetFallback(targetedFailureCodes)) {
+      return null;
+    }
+    try {
       const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
       const matchingGenerated = generated.find(query => {
         const dimensions: DiscoveryNeighborhoodDimensions = {
@@ -1566,6 +1574,12 @@ export async function selectNextQueryForCountry(
       }
       const plannedTarget = planFrontierTargetedQuery({ country, target });
       if (plannedTarget) {
+        const existingPlanned = allQueries.find(query => normalizeQuery(query.query) === normalizeQuery(plannedTarget.query));
+        if (existingPlanned) {
+          // Never resurrect a rejected/proven row or rewrite an existing
+          // candidate's metadata merely to satisfy a targeted fallback.
+          return null;
+        }
         const selected = await upsertQueryRecord({
           query: plannedTarget.query,
           country,
@@ -1587,6 +1601,12 @@ export async function selectNextQueryForCountry(
           }
         }
       }
+    } catch (error) {
+      // Generation/planning failures must not suppress otherwise usable generic
+      // candidates; fall through to the normal selector below.
+      console.warn('[query-intelligence] targeted fallback failed', {
+        country, error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

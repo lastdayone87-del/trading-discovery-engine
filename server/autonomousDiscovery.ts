@@ -29,6 +29,7 @@ import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchActi
 import { sweepRelationshipCanarySeeds } from './relationshipCanarySeeds';
 import { materializeGeneratedQueryProposalsForCountry } from './discoveryProposalGenerators';
 import { materializeAdmittedGeneratedQueriesForCountry, materializedGeneratedTargetDimensions } from './generatedQueryMaterialization';
+import { discoveryDiversityKeys } from './discoveryDiversity';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -847,9 +848,11 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       // Diversity is a within-country guarantee. The same intent/term in a
       // different country is a different discovery surface and must not be
       // discarded by the global batch guard.
-      const diversityCountry = String(selected.queryRecord.country || country).normalize('NFKC').trim().toLocaleLowerCase('en');
-      const intentKey = `${diversityCountry}::${intent}`;
-      const primaryTermKey = `${diversityCountry}::${primaryTerm}`;
+      const { intentKey, primaryTermKey } = discoveryDiversityKeys(
+        String(selected.queryRecord.country || country),
+        intent,
+        primaryTerm,
+      );
       if ((usedIntents.has(intentKey) || usedPrimaryTerms.has(primaryTermKey)) && attempts < countries.length * 2) {
         if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
           await releaseAllocationDecision(frontierAllocationInfo.decision.decisionId, 'Batch diversity guard skipped reserved allocation');

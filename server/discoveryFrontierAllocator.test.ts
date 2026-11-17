@@ -594,7 +594,7 @@ test('free InnerTube frontier allocation is not blocked by official quota spend'
       }
       if (sql.includes('frontier_allocation_daily_assignment_cap')) return { rows: [{ setting_value: '10' }] };
       if (sql.includes('frontier_allocation_daily_quota_cap')) return { rows: [{ setting_value: '1000' }] };
-      if (sql.includes('daily_assignments')) return { rows: [{ daily_assignments: 0, daily_quota_used: 5000, daily_official_quota_used: 0 }] };
+      if (sql.includes('daily_assignments')) return { rows: [{ daily_assignments: 0, daily_quota_used: 9000, daily_official_quota_used: 5000 }] };
       if (sql.includes('discovery_neighborhoods')) {
         return { rows: [{
           neighborhood_key: 'US|en|GENERAL|trading|KEYWORD_SEARCH|RELEVANCE|none|automated_query',

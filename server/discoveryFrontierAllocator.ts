@@ -802,10 +802,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
       `SELECT
          COUNT(*)::int AS daily_assignments,
          COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used,
-         -- Provider amounts are the authoritative official-unit accounting.
-         -- Date-ordering retargets can consume official units while retaining
-         -- InnerTube lineage columns; quota_reserved/quota_consumed alone do not
-         -- distinguish free capacity from official spend.
+         -- Provider amounts are the authoritative official-unit accounting:
+         -- free InnerTube stays zero, while official/date-retarget consumption
+         -- carries the same official units as quota_reserved/quota_consumed.
          COALESCE(SUM(GREATEST(provider_reserved_amount, provider_consumed_amount)), 0)::int AS daily_official_quota_used
        FROM frontier_allocation_decisions
        WHERE quota_day = $1
@@ -823,7 +822,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
       ?? 0
     );
 
-    if (dailyAssignments >= assignmentCap || dailyOfficialQuotaUsed + providerQuotaUnits > quotaCap) {
+    const assignmentCapExceeded = dailyAssignments >= assignmentCap;
+    const officialQuotaCapExceeded = providerQuotaUnits > 0
+      && dailyOfficialQuotaUsed + providerQuotaUnits > quotaCap;
+    if (assignmentCapExceeded || officialQuotaCapExceeded) {
       if (client) await runner.query('COMMIT');
       return {
         authorized: false,
