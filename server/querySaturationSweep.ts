@@ -18,6 +18,8 @@ interface SweepRow {
   distinct_results: number;
   pending_classifications: number;
   known_channels: number;
+  /** Null when the run has no sighting evidence at all. */
+  known_classified: number | null;
   duplicate_results: number;
   evaluated_raw_results: number;
   official_quota_units: number;
@@ -105,7 +107,11 @@ export async function runQuerySaturationSweep(options: {
                  AND cs.funnel_outcome='TRADING_CONFIRMED'
                  AND cs.country_outcome IN ('CONFIRMED','LIKELY')
                  AND c.quality_score >= 55
-             )::int AS fresh_quality
+             )::int AS fresh_quality,
+             COUNT(DISTINCT cs.channel_id) FILTER (
+               WHERE cs.was_known
+                 AND cs.funnel_outcome <> 'CLASSIFICATION_PENDING'
+             )::int AS known_classified
       FROM mature m
       JOIN channel_sightings cs ON cs.query_run_id=m.id
       LEFT JOIN channels c ON c.channel_id=cs.channel_id
@@ -120,7 +126,8 @@ export async function runQuerySaturationSweep(options: {
              SUM(m.evaluated_raw_results)::int AS evaluated_raw_results,
              SUM(m.quota_used)::int AS official_quota_units,
              COALESCE(f.fresh_relevant, 0)::int AS fresh_relevant,
-             COALESCE(f.fresh_quality, 0)::int AS fresh_quality
+             COALESCE(f.fresh_quality, 0)::int AS fresh_quality,
+             MAX(f.known_classified) AS known_classified
       FROM mature m
       LEFT JOIN pending p ON p.query_run_id=m.id
       LEFT JOIN fresh f ON f.query_id=m.query_id AND f.country=m.country
@@ -199,6 +206,9 @@ export async function runQuerySaturationSweep(options: {
       freshRelevantCreators: row.fresh_relevant,
       freshQualityCreators: row.fresh_quality,
       knownChannels: row.known_channels,
+      knownClassifiedCreators: row.known_classified === null || row.known_classified === undefined
+        ? undefined
+        : Number(row.known_classified),
       duplicateResults: row.duplicate_results,
       evaluatedRawResults: row.evaluated_raw_results,
       officialQuotaUnits: row.official_quota_units,

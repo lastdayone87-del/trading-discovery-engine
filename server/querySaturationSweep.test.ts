@@ -9,6 +9,7 @@ const row = {
   distinct_results: 100,
   pending_classifications: 0,
   known_channels: 90,
+  known_classified: 90,
   duplicate_results: 50,
   evaluated_raw_results: 150,
   official_quota_units: 1000,
@@ -165,4 +166,20 @@ test('baselines and the bounded decision batch use separate SQL queries', async 
   assert.match(batch!.sql, /LIMIT \$3/);
   assert.equal(batch!.params[2], 26);
   assert.doesNotMatch(baseline!.sql, /LIMIT \$3/);
+});
+
+
+test('sweep passes classified-only known share to the evaluator', async () => {
+  const { db, updates } = makeDb([{
+    ...row,
+    pending_classifications: 10,
+    known_channels: 90,
+    known_classified: 60,
+  }]);
+  const result = await runQuerySaturationSweep({
+    db, readSetting, now: new Date('2026-11-16T00:00:00.000Z'),
+  });
+  assert.equal(result.active, 1);
+  assert.equal(result.dormant, 0);
+  assert.equal(updates.length, 0);
 });
