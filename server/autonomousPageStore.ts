@@ -235,6 +235,18 @@ export async function getAutonomousRunMetrics(runId: string, clientOverride?: Pa
   const classificationPending = Math.min(distinct, Number(sightings.rows[0]?.classification_pending || 0));
   const countryEvaluated = Math.max(0, distinct - classificationPending);
   const evaluatedRawResults = Number(metrics.evaluatedRawResults ?? Math.max(0, metrics.rawResults - metrics.deferredResults));
+  const noveltyRatio = distinct ? metrics.newChannels / distinct : metrics.noveltyRatio;
+  const countryPrecision = countryEvaluated ? (countryEvaluated - rejected) / countryEvaluated : 1;
+  const evaluatedCreators = metrics.nonTrading + metrics.uncertain + metrics.needsReview + metrics.tradingConfirmed;
+  // The aggregate page score was computed before run-wide country corrections.
+  // Recompute it from the same components so promotion/demotion never acts on
+  // a stale country precision.
+  const creatorDiscoveryScore = creatorDiscoveryScoreFromComponents({
+    tradingPrecision: metrics.tradingPrecision,
+    noveltyRatio,
+    qualityYield: evaluatedCreators ? metrics.qualityChannels / evaluatedCreators : 0,
+    countryPrecision,
+  });
   return {
     ...metrics,
     distinctResults: distinct,
@@ -246,8 +258,9 @@ export async function getAutonomousRunMetrics(runId: string, clientOverride?: Pa
     // completeQueryRun recomputes precision from these two fields.
     countryRejected: rejected,
     classificationPending,
-    noveltyRatio: distinct ? metrics.newChannels / distinct : metrics.noveltyRatio,
-    countryPrecision: countryEvaluated ? (countryEvaluated - rejected) / countryEvaluated : 1,
+    noveltyRatio,
+    countryPrecision,
+    creatorDiscoveryScore,
   };
 }
 

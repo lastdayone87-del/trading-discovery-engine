@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateQueryFunnel, countDeferredRawResults, isCollectionChangeEligible, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
+import { calculateQueryFunnel, countDeferredRawResults, creatorDiscoveryScoreFromComponents, isCollectionChangeEligible, isSeverelyContaminatedQuery, manualSearchContinuationMetrics, selectQueryCollection, type QueryObservation } from './queryPerformance';
 import { countTrailingLowYieldPages, evaluateContinuation } from './continuationPolicy';
-import { aggregatePageMetrics } from './autonomousPageStore';
+import { aggregatePageMetrics, getAutonomousRunMetrics } from './autonomousPageStore';
 
 test('zero-quota runs cannot demote a query while quota runs keep the existing threshold', () => {
   const metrics = {
@@ -405,4 +405,31 @@ test('creator-only score controls rejection as well as promotion', () => {
   assert.equal(selectQueryCollection('EXPERIMENTAL', 1, metrics, undefined, { collectionChangeEligible: true }), 'EXPERIMENTAL');
   const lowCreator = { ...metrics, creatorDiscoveryScore: 24, performanceScore: 30 };
   assert.equal(selectQueryCollection('EXPERIMENTAL', 1, lowCreator, undefined, { collectionChangeEligible: true }), 'REJECTED');
+});
+
+
+test('run-wide country corrections recompute the creator-only score', async () => {
+  const page = {
+    rawResults: 20, deferredResults: 0, evaluatedRawResults: 20, distinctResults: 10,
+    duplicateResults: 0, knownChannels: 2, newChannels: 5, countryRejected: 0,
+    nonTrading: 2, uncertain: 2, needsReview: 0, tradingConfirmed: 6,
+    classificationPending: 0, qualityChannels: 3, communitiesDiscovered: 0,
+    averageQualityScore: 60, noveltyRatio: 0.5, countryPrecision: 1,
+    tradingPrecision: 0.6, performanceScore: 50,
+  };
+  const db = {
+    query: async (sql: string) => sql.includes('page_metrics')
+      ? { rows: [{ page_metrics: page, cumulative_unique_creators: 10 }] }
+      : { rows: [{ sightings: 10, distinct_creators: 10, country_rejected: 5, classification_pending: 0 }] },
+  };
+  const uncorrected = aggregatePageMetrics([page]);
+  const corrected = await getAutonomousRunMetrics('run-county-correction', db as any);
+  assert.equal(corrected.countryPrecision, 0.5);
+  assert.ok(corrected.creatorDiscoveryScore! < uncorrected.creatorDiscoveryScore!);
+  assert.equal(corrected.creatorDiscoveryScore, creatorDiscoveryScoreFromComponents({
+    tradingPrecision: corrected.tradingPrecision,
+    noveltyRatio: corrected.noveltyRatio,
+    qualityYield: 3 / 10,
+    countryPrecision: 0.5,
+  }));
 });
