@@ -81,7 +81,8 @@ test('run-wide metrics keep the rejected count on the same distinct set as the d
   // Pending sightings have no country verdict and stay out of both sides:
   // the denominator is the run-wide distinct set minus still-pending creators.
   assert.match(source,/classification_pending/);
-  assert.match(source,/countryPrecision:\s*countryEvaluated\s*\?\s*\(countryEvaluated\s*-\s*rejected\)\s*\/\s*countryEvaluated\s*:\s*1/);
+  assert.match(source,/countryPrecision\s*=\s*countryEvaluated\s*\?\s*\(countryEvaluated\s*-\s*rejected\)\s*\/\s*countryEvaluated\s*:\s*1/);
+  assert.match(source,/creatorDiscoveryScore\s*=\s*creatorDiscoveryScoreFromComponents\(/);
 });
 test('run-wide sightings recompute duplicate metrics even when the distinct total matches', async () => {
   const page = (overrides: Record<string, unknown>) => ({

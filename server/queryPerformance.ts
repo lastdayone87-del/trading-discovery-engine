@@ -105,6 +105,13 @@ export interface QueryFunnelMetrics {
   countryPrecision: number;
   tradingPrecision: number;
   performanceScore: number;
+  /**
+   * Creator-search success score. Same components as performanceScore with
+   * community yield removed and the remaining weights renormalized. Community
+   * discovery remains an enrichment metric and never determines query
+   * collection/promotion.
+   */
+  creatorDiscoveryScore?: number;
 }
 
 const ratio = (numerator: number, denominator: number): number => denominator > 0 ? numerator / denominator : 0;
@@ -118,6 +125,22 @@ const ratio = (numerator: number, denominator: number): number => denominator > 
 export function countDeferredRawResults(rawIds: string[], deferredIds: Iterable<string>): number {
   const deferred = deferredIds instanceof Set ? deferredIds : new Set(deferredIds);
   return rawIds.reduce((count, id) => count + (deferred.has(id) ? 1 : 0), 0);
+}
+
+/** Creator-search score from normalized components; community is intentionally absent. */
+export function creatorDiscoveryScoreFromComponents(input: {
+  tradingPrecision: number;
+  noveltyRatio: number;
+  qualityYield: number;
+  countryPrecision: number;
+}): number {
+  const clamp01 = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+  return Math.round(100 * (
+    0.30 * clamp01(input.tradingPrecision) +
+    0.25 * clamp01(input.noveltyRatio) +
+    0.20 * clamp01(input.qualityYield) +
+    0.15 * clamp01(input.countryPrecision)
+  ) / 0.90);
 }
 
 export function calculateQueryFunnel(
@@ -186,6 +209,15 @@ export function calculateQueryFunnel(
     0.15 * countryPrecision +
     0.10 * communityYield
   ));
+  // Creator-search success uses only trading relevance, novelty, quality and
+  // country precision. The old community weight is removed and the remaining
+  // 0.90 weight is renormalized so the score stays on the familiar 0-100 scale.
+  const creatorDiscoveryScore = creatorDiscoveryScoreFromComponents({
+    tradingPrecision,
+    noveltyRatio,
+    qualityYield,
+    countryPrecision,
+  });
 
   return {
     rawResults,
@@ -209,7 +241,8 @@ export function calculateQueryFunnel(
     noveltyRatio,
     countryPrecision,
     tradingPrecision,
-    performanceScore
+    performanceScore,
+    creatorDiscoveryScore
   };
 }
 
@@ -324,7 +357,8 @@ export function selectQueryCollection(
   // stable for these arms; severe contamination above still quarantines on
   // safety.
   if (options.collectionChangeEligible === false) return current === 'REJECTED' ? 'REJECTED' : current;
-  if (metrics.performanceScore >= 60) {
+  const creatorScore = metrics.creatorDiscoveryScore ?? metrics.performanceScore;
+  if (creatorScore >= 60) {
     // A zero-confirm run can never establish PROVEN, even when the legacy
     // blended score is high (novelty/community alone are not yield).
     if (metrics.tradingConfirmed <= 0) return 'EXPERIMENTAL';
@@ -344,6 +378,6 @@ export function selectQueryCollection(
     }
     return 'PROVEN';
   }
-  if (metrics.performanceScore < 25 && totalRuns >= 2) return 'REJECTED';
+  if (creatorScore < 25 && totalRuns >= 2) return 'REJECTED';
   return current === 'REJECTED' ? 'REJECTED' : 'EXPERIMENTAL';
 }
