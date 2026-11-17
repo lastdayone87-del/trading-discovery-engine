@@ -20,6 +20,12 @@ export interface QuerySaturationEvidence {
   freshQualityCreators: number;
   /** Known creators observed in those mature runs. */
   knownChannels: number;
+  /**
+   * Known creators whose classification is no longer pending. When present,
+   * the known-creator share uses classified results as its denominator so
+   * queued classifications do not dilute the share.
+   */
+  knownClassifiedCreators?: number;
   /** Provider duplicate results across the mature runs. */
   duplicateResults: number;
   /** Evaluated raw results across the mature runs (distinct + duplicates). */
@@ -112,7 +118,12 @@ export function evaluateQuerySaturation(
   const assessed = Math.max(0, input.distinctResults);
   const pendingShare = ratio(Math.max(0, input.pendingClassifications), assessed);
   const freshPerRun = ratio(input.freshRelevantCreators, matureRuns);
-  const knownCreatorShare = ratio(input.knownChannels, assessed);
+  const classifiedResults = Math.max(0, assessed - Math.max(0, input.pendingClassifications));
+  const knownShareDenominator = input.knownClassifiedCreators === undefined ? assessed : classifiedResults;
+  const knownShareNumerator = input.knownClassifiedCreators === undefined
+    ? input.knownChannels
+    : Math.min(Math.max(0, input.knownClassifiedCreators), knownShareDenominator);
+  const knownCreatorShare = ratio(knownShareNumerator, knownShareDenominator);
   const duplicateRate = ratio(input.duplicateResults, Math.max(input.evaluatedRawResults, input.distinctResults));
   const metrics: QuerySaturationMetrics = {
     matureRuns,

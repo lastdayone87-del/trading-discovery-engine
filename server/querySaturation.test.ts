@@ -107,3 +107,37 @@ test('returned policy is a copy and cannot mutate module defaults', () => {
   assert.notEqual(second.policy.minimumMatureRuns, 999);
   assert.equal(second.state, 'ACTIVE');
 });
+
+
+test('known share excludes pending classifications from its cohort', () => {
+  const decision = evaluateQuerySaturation({
+    ...base,
+    freshRelevantCreators: 0,
+    freshQualityCreators: 0,
+    distinctResults: 100,
+    pendingClassifications: 16,
+    knownChannels: 84,
+    knownClassifiedCreators: 84,
+    duplicateResults: 50,
+    evaluatedRawResults: 150,
+  });
+  assert.equal(decision.metrics.pendingShare, 0.16);
+  assert.equal(decision.metrics.knownCreatorShare, 1);
+  assert.equal(decision.state, 'DORMANT');
+});
+
+test('pending known creators do not inflate the classified known share', () => {
+  const decision = evaluateQuerySaturation({
+    ...base,
+    freshRelevantCreators: 0,
+    freshQualityCreators: 0,
+    distinctResults: 100,
+    pendingClassifications: 16,
+    knownChannels: 100,
+    knownClassifiedCreators: 68,
+    duplicateResults: 50,
+    evaluatedRawResults: 150,
+  });
+  assert.equal(decision.metrics.knownCreatorShare, 68 / 84);
+  assert.equal(decision.state, 'ACTIVE');
+});
