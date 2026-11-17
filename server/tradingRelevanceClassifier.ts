@@ -70,7 +70,12 @@ export async function classifyTradingRelevanceDetailed(
   // the cache key covers documents the ledger's checksum omits.
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
-  const precision = await applyCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel);
+  const semantic = semanticProviderOutcomeFlags(decision.evidenceCollection.providers);
+  // A precision downgrade is only meaningful on a relevant result produced by
+  // a semantic provider. A provider outage must defer, never be relabelled.
+  const precision = decision.status !== 'NON_TRADING' && semantic.served
+    ? await applyCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel)
+    : null;
   if (precision) {
     // A precision guard may only downgrade a first-pass relevant category.
     // It never upgrades, and the evidence safeguards are untouched.
