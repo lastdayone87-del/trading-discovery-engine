@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 import { runQuerySaturationSweep } from './querySaturationSweep';
 
-const databaseUrl = process.env.QUERY_SATURATION_TEST_DATABASE_URL;
+const databaseUrl = process.env.QUERY_SATURATION_TEST_DATABASE_URL || process.env.DATABASE_URL;
 const maybe = databaseUrl ? test : test.skip;
 
 /**

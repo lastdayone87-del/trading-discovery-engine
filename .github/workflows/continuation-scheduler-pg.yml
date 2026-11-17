@@ -15,6 +15,8 @@ on:
       - 'server/continuationResumeUtility.postgres.test.ts'
       - 'server/autonomousPageStore.ts'
       - 'server/continuationPolicy.ts'
+      - 'server/querySaturationSweep.postgres.test.ts'
+      - 'server/querySaturationSweep.ts'
       - 'server/activeQueryRunIds.postgres.test.ts'
       - 'scripts/runMigrations.ts'
       - 'package.json'
@@ -48,6 +50,7 @@ jobs:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/continuation_scheduler
       PHASE4_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/continuation_scheduler
       CONTINUATION_RESUME_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/continuation_scheduler
+      QUERY_SATURATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/continuation_scheduler
       PGSSL: disable
       NODE_ENV: test
     steps:
@@ -66,4 +69,5 @@ jobs:
           server/queryRunLifecycle.postgres.test.ts
           server/continuationSegment.postgres.test.ts
           server/continuationResumeUtility.postgres.test.ts
+          server/querySaturationSweep.postgres.test.ts
           server/activeQueryRunIds.postgres.test.ts

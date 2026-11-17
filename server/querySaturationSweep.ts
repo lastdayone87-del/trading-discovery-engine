@@ -67,99 +67,127 @@ export async function runQuerySaturationSweep(options: {
     minimumKnownCreatorShare: await boundedNumber(readSetting, 'query_saturation_known_share', 0.85, 0, 1),
   };
 
-  // Bound the sweep to the recent mature window and to a batch. Provider-
-  // degraded runs are excluded exactly as query-quality evidence does, and
-  // pending counts are read from current sightings rather than the stale
-  // completion-time snapshot.
-  const rows = (await db.query(
-    `WITH mature AS (
-       SELECT qr.id, qr.query_id, qr.country, qr.distinct_results, qr.known_channels,
-              qr.duplicate_results, qr.quota_used,
-              COALESCE((qr.performance_details->>'evaluatedRawResults')::int, qr.raw_results, 0) AS evaluated_raw_results,
-              COALESCE((qr.performance_details->>'classificationPending')::int, 0) AS stored_pending
-       FROM query_runs qr
-       WHERE qr.status='COMPLETED'
-         AND qr.query_id IS NOT NULL
-         AND qr.completed_at > now()-interval '30 days'
-         AND qr.completed_at < now()-interval '48 hours'
-         AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int, 0)=0
-         AND COALESCE((qr.performance_details->>'providerRateLimited')::int, 0)=0
-         AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = ''
-              OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%')
-     ), pending AS (
-       SELECT cs.query_run_id,
-              COUNT(DISTINCT cs.channel_id) FILTER (
-                WHERE cs.funnel_outcome='CLASSIFICATION_PENDING'
-              )::int AS pending_current
-       FROM channel_sightings cs
-       JOIN mature m ON m.id=cs.query_run_id
-       GROUP BY cs.query_run_id
-     ), fresh AS (
-       SELECT m.query_id, m.country,
-              COUNT(DISTINCT cs.channel_id) FILTER (
-                WHERE cs.persisted AND NOT cs.was_known
-                  AND cs.funnel_outcome='TRADING_CONFIRMED'
-                  AND cs.country_outcome IN ('CONFIRMED','LIKELY')
-              )::int AS fresh_relevant,
-              COUNT(DISTINCT cs.channel_id) FILTER (
-                WHERE cs.persisted AND NOT cs.was_known
-                  AND cs.funnel_outcome='TRADING_CONFIRMED'
-                  AND cs.country_outcome IN ('CONFIRMED','LIKELY')
-                  AND c.quality_score >= 55
-              )::int AS fresh_quality
-       FROM mature m
-       JOIN channel_sightings cs ON cs.query_run_id=m.id
-       LEFT JOIN channels c ON c.channel_id=cs.channel_id
-       GROUP BY m.query_id, m.country
-     ), grouped AS (
-       SELECT m.query_id, m.country,
-              COUNT(*)::int AS mature_runs,
-              SUM(m.distinct_results)::int AS distinct_results,
-              SUM(COALESCE(p.pending_current, m.stored_pending))::int AS pending_classifications,
-              SUM(m.known_channels)::int AS known_channels,
-              SUM(m.duplicate_results)::int AS duplicate_results,
-              SUM(m.evaluated_raw_results)::int AS evaluated_raw_results,
-              SUM(m.quota_used)::int AS official_quota_units,
-              COALESCE(f.fresh_relevant, 0)::int AS fresh_relevant,
-              COALESCE(f.fresh_quality, 0)::int AS fresh_quality
-       FROM mature m
-       LEFT JOIN pending p ON p.query_run_id=m.id
-       LEFT JOIN fresh f ON f.query_id=m.query_id AND f.country=m.country
-       GROUP BY m.query_id, m.country, f.fresh_relevant, f.fresh_quality
-       ORDER BY m.query_id
-     )
-     SELECT * FROM grouped`,
-    [],
-  )).rows as SweepRow[];
+  // The baseline must cover the full mature cohort, but the decision batch
+  // stays bounded in the database rather than materializing every group in
+  // Node. A keyset cursor rotates the batch across sweeps.
+  const cohortCtes = `
+    WITH mature AS (
+      SELECT qr.id, qr.query_id, qr.country, qr.distinct_results, qr.known_channels,
+             qr.duplicate_results, qr.quota_used,
+             COALESCE((qr.performance_details->>'evaluatedRawResults')::int, qr.raw_results, 0) AS evaluated_raw_results,
+             COALESCE((qr.performance_details->>'classificationPending')::int, 0) AS stored_pending
+      FROM query_runs qr
+      WHERE qr.status='COMPLETED'
+        AND qr.query_id IS NOT NULL
+        AND qr.completed_at > now()-interval '30 days'
+        AND qr.completed_at < now()-interval '48 hours'
+        AND COALESCE((qr.performance_details->>'providerRequestsFailed')::int, 0)=0
+        AND COALESCE((qr.performance_details->>'providerRateLimited')::int, 0)=0
+        AND (COALESCE(qr.performance_details->>'providerRunOutcome','') = ''
+             OR qr.performance_details->>'providerRunOutcome' LIKE 'SUCCESS%')
+    ), pending AS (
+      SELECT cs.query_run_id,
+             COUNT(DISTINCT cs.channel_id) FILTER (
+               WHERE cs.funnel_outcome='CLASSIFICATION_PENDING'
+             )::int AS pending_current
+      FROM channel_sightings cs
+      JOIN mature m ON m.id=cs.query_run_id
+      GROUP BY cs.query_run_id
+    ), fresh AS (
+      SELECT m.query_id, m.country,
+             COUNT(DISTINCT cs.channel_id) FILTER (
+               WHERE cs.persisted AND NOT cs.was_known
+                 AND cs.funnel_outcome='TRADING_CONFIRMED'
+                 AND cs.country_outcome IN ('CONFIRMED','LIKELY')
+             )::int AS fresh_relevant,
+             COUNT(DISTINCT cs.channel_id) FILTER (
+               WHERE cs.persisted AND NOT cs.was_known
+                 AND cs.funnel_outcome='TRADING_CONFIRMED'
+                 AND cs.country_outcome IN ('CONFIRMED','LIKELY')
+                 AND c.quality_score >= 55
+             )::int AS fresh_quality
+      FROM mature m
+      JOIN channel_sightings cs ON cs.query_run_id=m.id
+      LEFT JOIN channels c ON c.channel_id=cs.channel_id
+      GROUP BY m.query_id, m.country
+    ), grouped AS (
+      SELECT m.query_id, m.country,
+             COUNT(*)::int AS mature_runs,
+             SUM(m.distinct_results)::int AS distinct_results,
+             SUM(COALESCE(p.pending_current, m.stored_pending))::int AS pending_classifications,
+             SUM(m.known_channels)::int AS known_channels,
+             SUM(m.duplicate_results)::int AS duplicate_results,
+             SUM(m.evaluated_raw_results)::int AS evaluated_raw_results,
+             SUM(m.quota_used)::int AS official_quota_units,
+             COALESCE(f.fresh_relevant, 0)::int AS fresh_relevant,
+             COALESCE(f.fresh_quality, 0)::int AS fresh_quality
+      FROM mature m
+      LEFT JOIN pending p ON p.query_run_id=m.id
+      LEFT JOIN fresh f ON f.query_id=m.query_id AND f.country=m.country
+      GROUP BY m.query_id, m.country, f.fresh_relevant, f.fresh_quality
+    )`;
+
+  const baselineRows = (await db.query(
+    `${cohortCtes}
+     SELECT country,
+            SUM(fresh_relevant)::int AS fresh,
+            SUM(mature_runs)::int AS runs
+     FROM grouped
+     WHERE mature_runs >= $1
+       AND pending_classifications <= distinct_results * $2::numeric
+     GROUP BY country`,
+    [policy.minimumMatureRuns, policy.maximumPendingShare],
+  )).rows as Array<{ country: string; fresh: number; runs: number }>;
 
   const countryBaseline = new Map<string, { fresh: number; runs: number }>();
   const global = { fresh: 0, runs: 0 };
-  for (const row of rows) {
-    if (row.pending_classifications > row.distinct_results * policy.maximumPendingShare) continue;
-    if (row.mature_runs < policy.minimumMatureRuns) continue;
-    const current = countryBaseline.get(row.country) || { fresh: 0, runs: 0 };
-    current.fresh += Number(row.fresh_relevant || 0);
-    current.runs += Number(row.mature_runs || 0);
-    countryBaseline.set(row.country, current);
-    global.fresh += Number(row.fresh_relevant || 0);
-    global.runs += Number(row.mature_runs || 0);
+  for (const row of baselineRows) {
+    countryBaseline.set(row.country, {
+      fresh: Number(row.fresh || 0),
+      runs: Number(row.runs || 0),
+    });
+    global.fresh += Number(row.fresh || 0);
+    global.runs += Number(row.runs || 0);
+  }
+
+  const parseCursor = (raw: string): { queryId: number; country: string } | null => {
+    const match = /^(-?\d+)\|(.+)$/.exec(raw);
+    if (!match) return null;
+    const queryId = Number(match[1]);
+    return Number.isSafeInteger(queryId) ? { queryId, country: match[2] } : null;
+  };
+  const cursor = parseCursor(String(await readSetting('query_saturation_cursor', '') || ''));
+  const fetchBatch = async (after: { queryId: number; country: string } | null): Promise<SweepRow[]> => (
+    (await db.query(
+      `${cohortCtes}
+       SELECT * FROM grouped
+       WHERE ($1::int IS NULL OR (query_id, country) > ($1::int, $2::text))
+       ORDER BY query_id, country
+       LIMIT $3`,
+      [after?.queryId ?? null, after?.country ?? null, limit + 1],
+    )).rows as SweepRow[]
+  );
+
+  let fetched = await fetchBatch(cursor);
+  if (fetched.length === 0 && cursor) {
+    // The cursor was at the end of the cohort; wrap to the beginning in the
+    // same sweep instead of waiting for another interval.
+    fetched = await fetchBatch(null);
+  }
+  const hasMore = fetched.length > limit;
+  const batch = fetched.slice(0, limit);
+  if (setSetting) {
+    const last = batch[batch.length - 1];
+    await setSetting(
+      'query_saturation_cursor',
+      hasMore && last ? `${last.query_id}|${last.country}` : '',
+    ).catch(() => undefined);
   }
 
   const result: QuerySaturationSweepResult = {
     evaluated: 0, dormant: 0, active: 0, insufficient: 0,
     skippedExistingDormancy: 0, policy, dormancyDays,
   };
-  const rawCursor = Number(await readSetting('query_saturation_cursor', '0'));
-  const cursor = Number.isFinite(rawCursor) && rawCursor >= 0 ? Math.trunc(rawCursor) : 0;
-  const start = rows.length > 0 ? cursor % rows.length : 0;
-  // Rotate the bounded update batch so groups beyond the first page are not
-  // permanently invisible. Baselines above are computed over the full cohort,
-  // not this batch.
-  const batch = rows.slice(start, start + limit);
-  if (setSetting) {
-    const nextCursor = start + batch.length >= rows.length ? 0 : start + batch.length;
-    await setSetting('query_saturation_cursor', String(nextCursor)).catch(() => undefined);
-  }
   const now = options.now || new Date();
   for (const row of batch) {
     const baseline = countryBaseline.get(row.country) || global;

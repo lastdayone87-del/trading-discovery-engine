@@ -22,7 +22,32 @@ function makeDb(rows: any[], options: { rowCount?: number } = {}) {
     updates,
     db: {
       query: async (sql: string, params: unknown[]) => {
-        if (sql.includes('WITH mature AS')) return { rows };
+        if (sql.includes('SUM(fresh_relevant)')) {
+          const minimum = Number(params[0]);
+          const maximumPending = Number(params[1]);
+          const baseline = new Map<string, { fresh: number; runs: number }>();
+          for (const candidate of rows) {
+            if (candidate.mature_runs < minimum) continue;
+            if (candidate.pending_classifications > candidate.distinct_results * maximumPending) continue;
+            const current = baseline.get(candidate.country) || { fresh: 0, runs: 0 };
+            current.fresh += candidate.fresh_relevant;
+            current.runs += candidate.mature_runs;
+            baseline.set(candidate.country, current);
+          }
+          return { rows: [...baseline].map(([country, value]) => ({ country, ...value })) };
+        }
+        if (sql.includes('SELECT * FROM grouped')) {
+          const afterId = params[0] as number | null;
+          const afterCountry = params[1] as string | null;
+          const limited = rows
+            .slice()
+            .sort((a, b) => a.query_id - b.query_id || a.country.localeCompare(b.country))
+            .filter(candidate => afterId === null
+              || candidate.query_id > afterId
+              || (candidate.query_id === afterId && candidate.country > String(afterCountry)))
+            .slice(0, Number(params[2]));
+          return { rows: limited };
+        }
         updates.push({ sql, params });
         return { rowCount: options.rowCount ?? 1, rows: [] };
       },
@@ -113,10 +138,31 @@ test('bounded sweep rotates through later query groups instead of pinning the fi
     db,
     limit: 1,
     now: new Date('2026-11-16T00:00:00.000Z'),
-    readSetting: async (key, fallback) => key === 'query_saturation_cursor' ? '1' : fallback,
+    readSetting: async (key, fallback) => key === 'query_saturation_cursor' ? '1|Canada' : fallback,
     setSetting: async (key, value) => { if (key === 'query_saturation_cursor') persisted = value; },
   });
   assert.equal(result.dormant, 1);
   assert.equal(updates[0].params[0], 2);
-  assert.equal(persisted, '2');
+  assert.equal(persisted, '2|Canada');
+});
+
+
+test('baselines and the bounded decision batch use separate SQL queries', async () => {
+  const seen: Array<{ sql: string; params: unknown[] }> = [];
+  const db = {
+    query: async (sql: string, params: unknown[]) => {
+      seen.push({ sql, params });
+      if (sql.includes('SUM(fresh_relevant)')) return { rows: [{ country: 'Canada', fresh: 0, runs: 10 }] };
+      if (sql.includes('SELECT * FROM grouped')) return { rows: [{ ...row }] };
+      return { rowCount: 1, rows: [] };
+    },
+  };
+  await runQuerySaturationSweep({ db, readSetting, limit: 25, now: new Date('2026-11-16T00:00:00.000Z') });
+  const baseline = seen.find(entry => entry.sql.includes('SUM(fresh_relevant)'));
+  const batch = seen.find(entry => entry.sql.includes('SELECT * FROM grouped'));
+  assert.ok(baseline);
+  assert.ok(batch);
+  assert.match(batch!.sql, /LIMIT \$3/);
+  assert.equal(batch!.params[2], 26);
+  assert.doesNotMatch(baseline!.sql, /LIMIT \$3/);
 });
