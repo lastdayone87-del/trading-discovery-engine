@@ -40,3 +40,22 @@ export function preservedRowBlocksNormalScheduling(
   if (!lineage || typeof lineage !== 'object' || Array.isArray(lineage)) return false;
   return Boolean(lineage.targetNeighborhoodKey) && lineage.materialized !== true;
 }
+
+
+export type PreservedCollisionAction = 'NONE' | 'PROTECTED' | 'DEFER';
+
+/**
+ * Decides what to do when materialization collides with a preserved row.
+ * Terminal rows remain protected; runnable rows are reused; frontier-only
+ * lineage is deferred because the normal scheduler cannot execute it.
+ */
+export function preservedCollisionAction(input: {
+  preservedExistingRow: boolean;
+  collection: string;
+  storedGenerationMetadata?: Record<string, any> | null;
+}): PreservedCollisionAction {
+  if (!input.preservedExistingRow) return 'NONE';
+  if (input.collection === 'REJECTED' || input.collection === 'PROVEN') return 'PROTECTED';
+  if (preservedRowBlocksNormalScheduling(input.storedGenerationMetadata)) return 'DEFER';
+  return 'NONE';
+}

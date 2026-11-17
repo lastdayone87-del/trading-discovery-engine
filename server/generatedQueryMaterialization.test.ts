@@ -121,8 +121,10 @@ test('system errors defer the proposal without consuming it', async () => {
   });
   assert.equal(result.deferred, 1);
   assert.equal(result.materialized, 0);
+  assert.equal(result.rejected, 0);
   assert.ok(updates.some(update => update.sql.includes('materializationDeferredAt')));
   assert.equal(updates.some(update => update.sql.includes("trial_status='TRIED'")), false);
+  assert.equal(updates.some(update => update.sql.includes("trial_status='DISABLED'")), false);
 });
 
 test('a concurrent claim prevents duplicate authorization', async () => {

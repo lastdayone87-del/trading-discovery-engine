@@ -65,7 +65,7 @@ import {
 } from './queryQuality/posterior';
 import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb } from './queryQuality/selector';
 import { isQuerySelectable } from './queryQuality/lifecycle';
-import { preservedRowBlocksNormalScheduling } from './frontierLineage';
+import { preservedCollisionAction } from './frontierLineage';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
 import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
@@ -2335,8 +2335,18 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
         primaryTerm: planned.primaryTerm,
         generationMetadata: planned.metadata
       }, { preserveExistingRow: args.preserveExistingLibraryRow === true, db: client });
-      if (queryRecord.preservedExistingRow
-        && preservedRowBlocksNormalScheduling(queryRecord.storedGenerationMetadata)) {
+      const collisionAction = preservedCollisionAction({
+        preservedExistingRow: queryRecord.preservedExistingRow === true,
+        collection: queryRecord.collection,
+        storedGenerationMetadata: queryRecord.storedGenerationMetadata,
+      });
+      if (collisionAction === 'PROTECTED') {
+        // Terminal protected rows stay terminal; do not let an unrunnable
+        // lineage deferral keep a proposal pending forever.
+        await client.query('ROLLBACK');
+        return { status: 'REJECTED', code: 'EXISTING_QUERY_PROTECTED', queryRecord: null };
+      }
+      if (collisionAction === 'DEFER') {
         // The preserved row still carries frontier-only lineage, which the
         // normal scheduler rejects. Defer instead of marking a proposal TRIED
         // on metadata that was never persisted to that row.
@@ -2349,10 +2359,6 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
       throw error;
     } finally {
       client.release();
-    }
-    if (args.preserveExistingLibraryRow
-      && (queryRecord.collection === 'REJECTED' || queryRecord.collection === 'PROVEN')) {
-      return { status: 'REJECTED', code: 'EXISTING_QUERY_PROTECTED', queryRecord: null };
     }
     // Persistence is not authorization. A native/LLM/autocomplete surface that
     // admission marked duplicate, speculative or otherwise ineligible must not

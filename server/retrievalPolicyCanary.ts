@@ -98,11 +98,6 @@ export function evaluateRetrievalPolicyEligibility(input: {
 }
 
 /**
- * Evaluates and reserves Phase 9 canary treatment authority under a transaction advisory lock.
- * Concurrency-safe: tracks reserved + committed treatment capacity in the active Pacific quota day.
- * State-aware: COMMITTED reservations cannot be reused to authorize a second query run.
- */
-/**
  * Retrieval learning may not change the retrieval lane or search ordering of a
  * lineage-bound (frontier/materialized) query, because the run must match its
  * immutable neighborhood key. Return the reason to schedule the control
@@ -117,6 +112,11 @@ export function canaryTreatmentSkipReason(input: {
   return null;
 }
 
+/**
+ * Evaluates and reserves Phase 9 canary treatment authority under a transaction advisory lock.
+ * Concurrency-safe: tracks reserved + committed treatment capacity in the active Pacific quota day.
+ * State-aware: COMMITTED reservations cannot be reused to authorize a second query run.
+ */
 export async function reserveRetrievalCanaryTreatment(input: {
   opportunityKey: string;
   neighborhoodKey: string;

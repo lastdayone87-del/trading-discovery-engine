@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { upsertQueryRecord } from './dbCore';
-import { preservedRowBlocksNormalScheduling } from './frontierLineage';
+import { preservedCollisionAction, preservedRowBlocksNormalScheduling } from './frontierLineage';
 
 test('preserveExistingRow canonicalizes country and carries fresh admission metadata', async () => {
   const calls: Array<{ sql: string; params: unknown[] }> = [];
@@ -58,4 +58,24 @@ test('preserved frontier-only lineage blocks normal scheduling', () => {
   }), false);
   assert.equal(preservedRowBlocksNormalScheduling({}), false);
   assert.equal(preservedRowBlocksNormalScheduling({ countryNativeAllocation: { materialized: false } }), false);
+});
+
+
+test('terminal protected collisions are not deferred', () => {
+  const lineage = { countryNativeAllocation: { targetNeighborhoodKey: 'key', materialized: false } };
+  assert.equal(preservedCollisionAction({
+    preservedExistingRow: true, collection: 'REJECTED', storedGenerationMetadata: lineage,
+  }), 'PROTECTED');
+  assert.equal(preservedCollisionAction({
+    preservedExistingRow: true, collection: 'PROVEN', storedGenerationMetadata: lineage,
+  }), 'PROTECTED');
+  assert.equal(preservedCollisionAction({
+    preservedExistingRow: true, collection: 'EXPERIMENTAL', storedGenerationMetadata: lineage,
+  }), 'DEFER');
+  assert.equal(preservedCollisionAction({
+    preservedExistingRow: true, collection: 'EXPERIMENTAL', storedGenerationMetadata: {},
+  }), 'NONE');
+  assert.equal(preservedCollisionAction({
+    preservedExistingRow: false, collection: 'REJECTED', storedGenerationMetadata: lineage,
+  }), 'NONE');
 });
