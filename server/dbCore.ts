@@ -38,7 +38,7 @@ import { lineageBoundDimensions } from './frontierLineage';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
-import { reserveRetrievalCanaryTreatment, commitRetrievalCanaryReservation, releaseRetrievalCanaryReservation } from './retrievalPolicyCanary';
+import { reserveRetrievalCanaryTreatment, commitRetrievalCanaryReservation, releaseRetrievalCanaryReservation, canaryTreatmentSkipReason } from './retrievalPolicyCanary';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { calculateObservedMarginalValue, calculateExpectedMarginalValue } from './neighborhoodValueModel';
 import { calculateSegmentHealthFromHistory, classifyCreatorSizeBand, type SegmentType } from './segmentedDiscoveryHealth';
@@ -2684,7 +2684,13 @@ export async function reservePortfolioContinuationPage(input: {
 export async function getQueryQualityDashboardRows(country?:string,limit=200):Promise<QueryQualityDashboardRunInput[]>{const db=await getDb();const res=await db.query(`SELECT qr.id::text AS run_id,qr.query_id,COALESCE(ql.query,'') AS query,qr.country,qr.status,qr.selection_strategy,qr.selection_reason,qr.quota_used,qr.completed_at,qr.performance_details,COALESCE(a.metrics,'{}'::jsonb) AS metrics,COALESCE(qr.metadata,'{}'::jsonb) AS run_metadata,(SELECT apo.stopping_reason FROM autonomous_query_page_observations apo WHERE apo.query_run_id=qr.id ORDER BY apo.page_number DESC LIMIT 1) AS stop_reason FROM query_runs qr LEFT JOIN query_library ql ON ql.id=qr.query_id LEFT JOIN query_run_accounting_attributions a ON a.query_run_id=qr.id WHERE ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.scheduled_at DESC LIMIT $2`,[country||null,Math.max(1,Math.min(500,Math.floor(limit)))]);return res.rows.map((r:any)=>{const metrics=parseJson<Record<string,any>>(r.metrics,{});const metadata=parseGenerationMetadata(r.run_metadata);const admission=metadata.queryAdmission||null;return {runId:String(r.run_id||''),queryId:Number(r.query_id||0),query:String(r.query||''),country:String(r.country||''),status:String(r.status||''),selectionStrategy:String(r.selection_strategy||'UNKNOWN'),selectionReason:String(r.selection_reason||''),stopReason:r.stop_reason?String(r.stop_reason):null,quotaUsed:Number(r.quota_used||0),completedAt:iso(r.completed_at),performanceScore:Number(r.performance_details?.performanceScore||metrics.performanceScore||0),qualityVector:metrics.qualityVector||null,admission:admission?{tier:admission.tier,compositionFamily:admission.compositionFamily,reasonCodes:Array.isArray(admission.reasonCodes)?admission.reasonCodes:[],source:admission.source,eligible:admission.eligible}:null};});}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
 export interface QueryDuplicateHistoryItem {query:string;country:string;aliasOf?:string;}
-export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;},options:{/** Still-current same-country rows, preloaded by a batch producer. */history?:QueryDuplicateHistoryItem[];/** Never mutate an existing (country, normalized_query) row. */preserveExistingRow?:boolean;/** Optional caller transaction, used when scope validation and the write must be atomic. */db?:{query:(text:string,params?:unknown[])=>Promise<{rows:any[];rowCount?:number|null}>}}={}):Promise<QueryRecord>{
+export type UpsertQueryRecordResult = QueryRecord & {
+  /** The insert collided with a preserved row instead of creating a new one. */
+  preservedExistingRow?: boolean;
+  /** Generation metadata as persisted on the preserved row, before fresh admission. */
+  storedGenerationMetadata?: Record<string, unknown>;
+};
+export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;},options:{/** Still-current same-country rows, preloaded by a batch producer. */history?:QueryDuplicateHistoryItem[];/** Never mutate an existing (country, normalized_query) row. */preserveExistingRow?:boolean;/** Optional caller transaction, used when scope validation and the write must be atomic. */db?:{query:(text:string,params?:unknown[])=>Promise<{rows:any[];rowCount?:number|null}>}}={}):Promise<UpsertQueryRecordResult>{
   const db=options.db||await getDb();
   const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' ');
   const normalized=normalizeQueryText(query);
@@ -2714,7 +2720,14 @@ export async function upsertQueryRecord(record:{query:string;country:string;coll
     if (existing.rowCount) {
       // The persisted row is preserved, but authorization must evaluate the
       // fresh admission decision for this proposal, not stale row metadata.
-      return { ...rowToQuery(existing.rows[0]), country, generation_metadata: generationMetadata };
+      const stored = rowToQuery(existing.rows[0]);
+      return {
+        ...stored,
+        country,
+        generation_metadata: generationMetadata,
+        preservedExistingRow: true,
+        storedGenerationMetadata: stored.generation_metadata,
+      };
     }
   }
   const res=options.preserveExistingRow
@@ -2722,7 +2735,14 @@ export async function upsertQueryRecord(record:{query:string;country:string;coll
     : await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=CASE WHEN COALESCE(query_library.generation_metadata,'{}'::jsonb) ? 'queryHold' THEN 'REJECTED' ELSE excluded.collection END,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=CASE WHEN COALESCE(query_library.generation_metadata,'{}'::jsonb) ? 'queryHold' THEN query_library.generation_metadata ELSE excluded.generation_metadata END RETURNING *`,values);
   if (options.preserveExistingRow && !res.rowCount) {
     const existing=await db.query('SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query=$2 LIMIT 1',[country,normalized]);
-    return { ...rowToQuery(existing.rows[0]), country, generation_metadata: generationMetadata };
+    const stored = rowToQuery(existing.rows[0]);
+    return {
+      ...stored,
+      country,
+      generation_metadata: generationMetadata,
+      preservedExistingRow: true,
+      storedGenerationMetadata: stored.generation_metadata,
+    };
   }
   return rowToQuery(res.rows[0]);
 }
@@ -4402,8 +4422,12 @@ export async function scheduleAutonomousQueryRuns(
       // A quota-free run cannot accept a DATE treatment config: the free
       // provider has no date ordering and there is no official budget left to
       // retarget. Keep these exceptional runs on RELEVANCE.
-      const canaryTreatment = candidate.quotaFreeRequired
-        ? { authorized: false, reason: 'QUOTA_FREE_EXPLORATION_RELEVANCE_ONLY' }
+      const canarySkipReason = canaryTreatmentSkipReason({
+        lineageBound: Boolean(allocatedDimensions),
+        quotaFreeRequired: candidate.quotaFreeRequired === true,
+      });
+      const canaryTreatment = canarySkipReason
+        ? { authorized: false, reason: canarySkipReason }
         : await reserveRetrievalCanaryTreatment({
           opportunityKey: oppKey,
           neighborhoodKey: neighborhood.neighborhoodKey,

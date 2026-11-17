@@ -65,6 +65,7 @@ import {
 } from './queryQuality/posterior';
 import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb } from './queryQuality/selector';
 import { isQuerySelectable } from './queryQuality/lifecycle';
+import { preservedRowBlocksNormalScheduling } from './frontierLineage';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
 import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
@@ -2136,11 +2137,13 @@ export type QueryIntelligenceAuthorizationCode =
   | 'QUERY_ADMISSION_REJECTED'
   | 'QUERY_HOLD_ACTIVE'
   | 'EXISTING_QUERY_PROTECTED'
-  | 'SCOPE_PROMOTION_STALE';
+  | 'SCOPE_PROMOTION_STALE'
+  | 'EXISTING_QUERY_LINEAGE_UNRUNNABLE';
 
 export type QueryIntelligenceAuthorizationOutcome =
   | { status: 'AUTHORIZED'; code: 'AUTHORIZED'; queryRecord: QueryRecord }
   | { status: 'REJECTED'; code: QueryIntelligenceAuthorizationCode; queryRecord: null }
+  | { status: 'DEFERRED'; code: 'EXISTING_QUERY_LINEAGE_UNRUNNABLE'; queryRecord: null }
   | { status: 'SYSTEM_ERROR'; code: 'AUTHORIZATION_SYSTEM_ERROR'; errorClass: string; queryRecord: null };
 
 type CountryNativeAuthorizationInput = {
@@ -2309,7 +2312,10 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
 
     const pool = await getDb();
     const client = await pool.connect();
-    let queryRecord: QueryRecord;
+    let queryRecord: QueryRecord & {
+      preservedExistingRow?: boolean;
+      storedGenerationMetadata?: Record<string, unknown>;
+    };
     try {
       await client.query('BEGIN');
       if (args.scopePromotionBasis === 'PERSISTENT_SCOPE_SELECTION'
@@ -2329,6 +2335,14 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
         primaryTerm: planned.primaryTerm,
         generationMetadata: planned.metadata
       }, { preserveExistingRow: args.preserveExistingLibraryRow === true, db: client });
+      if (queryRecord.preservedExistingRow
+        && preservedRowBlocksNormalScheduling(queryRecord.storedGenerationMetadata)) {
+        // The preserved row still carries frontier-only lineage, which the
+        // normal scheduler rejects. Defer instead of marking a proposal TRIED
+        // on metadata that was never persisted to that row.
+        await client.query('ROLLBACK');
+        return { status: 'DEFERRED', code: 'EXISTING_QUERY_LINEAGE_UNRUNNABLE', queryRecord: null };
+      }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);

@@ -292,3 +292,22 @@ test('a stale persistent-scope result is deferred, not permanently disabled', as
   assert.ok(updates.some(update => update.sql.includes('materializationDeferredAt')));
   assert.equal(updates.some(update => update.sql.includes("trial_status='DISABLED'")), false);
 });
+
+
+test('an unrunnable preserved lineage outcome is deferred, not consumed', async () => {
+  const { db, updates } = makeDb([{ ...proposal }]);
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    readSetting: async () => 'true',
+    authorize: (async () => ({
+      status: 'DEFERRED',
+      code: 'EXISTING_QUERY_LINEAGE_UNRUNNABLE',
+      queryRecord: null,
+    })) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(result.materialized, 0);
+  assert.ok(updates.some(update => update.sql.includes('materializationDeferredAt')));
+  assert.equal(updates.some(update => update.sql.includes("trial_status='TRIED'")), false);
+});

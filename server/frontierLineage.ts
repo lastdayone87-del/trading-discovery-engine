@@ -24,3 +24,19 @@ export function lineageBoundDimensions(
   if (!nativeLineage?.targetNeighborhoodKey) return undefined;
   return targetDimensions;
 }
+
+
+/**
+ * A preserved library row that carries frontier-only neighborhood lineage
+ * cannot be scheduled through the normal selector: normal runs have LEGACY
+ * allocation origin, so lineageBoundDimensions() would return undefined and
+ * scheduling would reject FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH.
+ * Materialization must defer rather than consume the proposal in that case.
+ */
+export function preservedRowBlocksNormalScheduling(
+  generationMetadata: Record<string, any> | null | undefined,
+): boolean {
+  const lineage = generationMetadata?.countryNativeAllocation;
+  if (!lineage || typeof lineage !== 'object' || Array.isArray(lineage)) return false;
+  return Boolean(lineage.targetNeighborhoodKey) && lineage.materialized !== true;
+}

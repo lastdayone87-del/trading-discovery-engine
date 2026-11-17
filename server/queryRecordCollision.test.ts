@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { upsertQueryRecord } from './dbCore';
+import { preservedRowBlocksNormalScheduling } from './frontierLineage';
 
 test('preserveExistingRow canonicalizes country and carries fresh admission metadata', async () => {
   const calls: Array<{ sql: string; params: unknown[] }> = [];
@@ -39,6 +40,22 @@ test('preserveExistingRow canonicalizes country and carries fresh admission meta
   assert.equal((record.generation_metadata as any).staleMarker, undefined);
   assert.equal((record.generation_metadata as any).countryNativeAllocation.materialized, true);
   assert.ok((record.generation_metadata as any).queryAdmission);
+  assert.equal(record.preservedExistingRow, true);
+  assert.equal((record.storedGenerationMetadata as any).staleMarker, true);
   assert.equal(calls.some(call => call.sql.includes('INSERT INTO query_library')), false);
   assert.equal(calls.find(call => call.sql.includes('LOWER(country)=LOWER($1)'))?.params[0], 'Canada');
+});
+
+test('preserved frontier-only lineage blocks normal scheduling', () => {
+  assert.equal(preservedRowBlocksNormalScheduling({
+    countryNativeAllocation: { targetNeighborhoodKey: 'canada|en|strategy|market structure|video|relevance|none|automated_query' },
+  }), true);
+  assert.equal(preservedRowBlocksNormalScheduling({
+    countryNativeAllocation: { targetNeighborhoodKey: 'canada|en|strategy|market structure|video|relevance|none|automated_query', materialized: false },
+  }), true);
+  assert.equal(preservedRowBlocksNormalScheduling({
+    countryNativeAllocation: { targetNeighborhoodKey: 'canada|en|strategy|market structure|video|relevance|none|automated_query', materialized: true },
+  }), false);
+  assert.equal(preservedRowBlocksNormalScheduling({}), false);
+  assert.equal(preservedRowBlocksNormalScheduling({ countryNativeAllocation: { materialized: false } }), false);
 });
