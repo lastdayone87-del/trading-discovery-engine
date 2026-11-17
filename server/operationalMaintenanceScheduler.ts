@@ -1,6 +1,7 @@
 import {
   getChannelById,
   getDb,
+  setAppSetting,
   reconcileStaleClassificationSightings,
   recoverStaleChannelLocks,
   upsertChannel,
@@ -360,7 +361,7 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
     reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200),
     sweepQuerySaturation: async () => {
-      const result = await runQuerySaturationSweep({ db: await getDb() });
+      const result = await runQuerySaturationSweep({ db: await getDb(), setSetting: setAppSetting });
       if (result.dormant > 0) {
         console.info(`[Operational Maintenance] query saturation evaluated=${result.evaluated} dormant=${result.dormant} active=${result.active} insufficient=${result.insufficient}.`);
       }

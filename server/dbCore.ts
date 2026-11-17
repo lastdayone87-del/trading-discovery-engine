@@ -689,6 +689,32 @@ async function ensureClassificationSightingIndex(client: { query: (text: string,
 }
 
 /**
+ * Migration 185 indexes the mature saturation sweep. Build both indexes
+ * concurrently before the transactional migration loop; migration 185 only
+ * adopts a valid index or verifies an empty table.
+ */
+async function ensureQuerySaturationIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const ensure = async (name: string, table: string, createSql: string): Promise<void> => {
+    const index = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${name}')
+    `);
+    const existing = index.rows[0];
+    if (existing?.indisvalid && existing?.indisready) return;
+    if (existing?.oid) await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+    const target = await client.query(`SELECT to_regclass('public.${table}') AS oid`);
+    if (!target.rows[0]?.oid) return;
+    const populated = await client.query(`SELECT EXISTS(SELECT 1 FROM public.${table} LIMIT 1) AS populated`);
+    if (!populated.rows[0]?.populated) return;
+    await client.query(createSql);
+  };
+  await ensure('idx_query_runs_saturation_mature','query_runs',`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_query_runs_saturation_mature ON public.query_runs(status, completed_at, query_id) WHERE query_id IS NOT NULL`);
+  await ensure('idx_channel_sightings_query_run_funnel','channel_sightings',`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_channel_sightings_query_run_funnel ON public.channel_sightings(query_run_id, funnel_outcome)`);
+}
+
+/**
  * Migration 170 indexes the enrichment throughput window and the semantic
  * cache retention sweep. `jobs` is a hot queue table: a transactional build
  * would block inserts, claims, heartbeats, and completions for the duration.
@@ -767,6 +793,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // transactional loop; the migration itself only adopts or verifies.
     const migration170 = await client.query('SELECT 1 FROM schema_migrations WHERE version=170');
     if (!migration170.rowCount) await ensurePhase4ScaleIndexes(client);
+    const migration185 = await client.query('SELECT 1 FROM schema_migrations WHERE version=185');
+    if (!migration185.rowCount) await ensureQuerySaturationIndexes(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}

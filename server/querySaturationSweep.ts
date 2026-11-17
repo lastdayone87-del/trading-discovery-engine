@@ -1,4 +1,4 @@
-import { getAppSetting } from './db';
+import { getAppSetting, setAppSetting } from './db';
 import { evaluateQuerySaturation, type QuerySaturationPolicy } from './querySaturation';
 
 export interface QuerySaturationSweepResult {
@@ -51,9 +51,11 @@ export async function runQuerySaturationSweep(options: {
   dormancyDays?: number;
   limit?: number;
   readSetting?: (key: string, fallback: string) => Promise<string>;
+  setSetting?: (key: string, value: string) => Promise<unknown>;
 }): Promise<QuerySaturationSweepResult> {
   const db = options.db;
   const readSetting = options.readSetting || getAppSetting;
+  const setSetting = options.setSetting;
   const dormancyDays = Math.max(1, Math.min(90, Math.trunc(
     options.dormancyDays ?? await boundedNumber(readSetting, 'query_saturation_dormancy_days', 14, 1, 90),
   )));
@@ -125,10 +127,9 @@ export async function runQuerySaturationSweep(options: {
        LEFT JOIN fresh f ON f.query_id=m.query_id AND f.country=m.country
        GROUP BY m.query_id, m.country, f.fresh_relevant, f.fresh_quality
        ORDER BY m.query_id
-       LIMIT $1
      )
      SELECT * FROM grouped`,
-    [limit],
+    [],
   )).rows as SweepRow[];
 
   const countryBaseline = new Map<string, { fresh: number; runs: number }>();
@@ -148,8 +149,19 @@ export async function runQuerySaturationSweep(options: {
     evaluated: 0, dormant: 0, active: 0, insufficient: 0,
     skippedExistingDormancy: 0, policy, dormancyDays,
   };
+  const rawCursor = Number(await readSetting('query_saturation_cursor', '0'));
+  const cursor = Number.isFinite(rawCursor) && rawCursor >= 0 ? Math.trunc(rawCursor) : 0;
+  const start = rows.length > 0 ? cursor % rows.length : 0;
+  // Rotate the bounded update batch so groups beyond the first page are not
+  // permanently invisible. Baselines above are computed over the full cohort,
+  // not this batch.
+  const batch = rows.slice(start, start + limit);
+  if (setSetting) {
+    const nextCursor = start + batch.length >= rows.length ? 0 : start + batch.length;
+    await setSetting('query_saturation_cursor', String(nextCursor)).catch(() => undefined);
+  }
   const now = options.now || new Date();
-  for (const row of rows) {
+  for (const row of batch) {
     const baseline = countryBaseline.get(row.country) || global;
     const baselineFreshPerRun = baseline.runs > 0 ? baseline.fresh / baseline.runs : 0;
     const decision = evaluateQuerySaturation({

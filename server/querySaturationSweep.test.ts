@@ -101,20 +101,22 @@ test('zero-valued known-share setting is honored, not replaced by the default', 
 });
 
 
-test('sweep SQL uses current pending sightings, excludes degraded runs, and is bounded', async () => {
-  let sqlSeen = '';
-  let paramsSeen: unknown[] = [];
-  const db = {
-    query: async (sql: string, params: unknown[]) => {
-      if (sql.includes('WITH mature AS')) { sqlSeen = sql; paramsSeen = params; return { rows: [] }; }
-      return { rowCount: 1, rows: [] };
-    },
-  };
-  await runQuerySaturationSweep({ db, readSetting, limit: 42, now: new Date('2026-11-16T00:00:00.000Z') });
-  assert.match(sqlSeen, /providerRequestsFailed/);
-  assert.match(sqlSeen, /providerRateLimited/);
-  assert.match(sqlSeen, /providerRunOutcome/);
-  assert.match(sqlSeen, /CLASSIFICATION_PENDING/);
-  assert.match(sqlSeen, /LIMIT \$1/);
-  assert.deepEqual(paramsSeen, [42]);
+
+test('bounded sweep rotates through later query groups instead of pinning the first page', async () => {
+  const { db, updates } = makeDb([
+    { ...row, query_id: 1 },
+    { ...row, query_id: 2 },
+    { ...row, query_id: 3 },
+  ]);
+  let persisted = '';
+  const result = await runQuerySaturationSweep({
+    db,
+    limit: 1,
+    now: new Date('2026-11-16T00:00:00.000Z'),
+    readSetting: async (key, fallback) => key === 'query_saturation_cursor' ? '1' : fallback,
+    setSetting: async (key, value) => { if (key === 'query_saturation_cursor') persisted = value; },
+  });
+  assert.equal(result.dormant, 1);
+  assert.equal(updates[0].params[0], 2);
+  assert.equal(persisted, '2');
 });
