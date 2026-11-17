@@ -72,19 +72,19 @@ test('hybrid guard catches every false positive and keeps every genuine educator
   }
 });
 
-test('a signal-first brand is HYPE even with an educational disclaimer', () => {
-  const signal = deterministicCategoryGuard({
+test('explicit signal products are HYPE; a signal name alone is not', () => {
+  const explicit = deterministicCategoryGuard({
     channel_name: 'Signal Room',
-    description: 'Market analysis and trade breakdowns. This content is for educational purposes only.',
+    description: 'Join our VIP signals group for daily entries. This content is for educational purposes only.',
     video_titles: ['Gold setup', 'BTC entry'],
   });
-  assert.equal(signal?.category, 'HYPE');
-  const academy = deterministicCategoryGuard({
-    channel_name: 'Signal Academy',
-    description: 'Market analysis and trade breakdowns. This content is for educational purposes only.',
-    video_titles: ['Gold setup', 'BTC entry'],
+  assert.equal(explicit?.category, 'HYPE');
+  const nameOnly = deterministicCategoryGuard({
+    channel_name: 'Shinobi Signals',
+    description: 'Live day trading NQ and order flow. Free Discord community.',
+    video_titles: ['Live NQ trading', 'How to read footprint charts'],
   });
-  assert.equal(academy, null);
+  assert.equal(nameOnly, null);
 });
 
 test('analysis intended to inform trading is not downgraded as news', () => {

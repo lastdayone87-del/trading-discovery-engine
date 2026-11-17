@@ -43,6 +43,14 @@ const EDUCATION_TERMS = /\b(?:course|learn|learning|education|educational|academ
 // Explicit teaching/branding terms only. "Strategy" or "analysis" appear in
 // almost every signal-seller bio and must not exempt a signal-first channel.
 const EXPLICIT_EDUCATION_TERMS = /\b(?:course|learn|learning|education|educational|academy|training|tutorial|guide|lesson|mentor|coaching)\b/iu;
+// Commercial self-identification. A trader who mentions a prop firm or uses a
+// platform is not the institution; only explicit vendor/venue language may
+// trigger a deterministic institution downgrade.
+const VENDOR_SELF = /\b(?:official (?:youtube )?channel|we are|we're|our (?:company|platform|software|broker|prop firm|fund)|sign up|open an account|free trial|pricing|subscription|book a demo)\b/iu;
+const FIRST_PERSON_TRADER = /\b(?:i am|i'm|my (?:journey|trades|trading|account|strategy|portfolio)|educator|coach|mentor)\b/iu;
+const SIGNAL_RECAP = /\b(?:recap|review|education|lesson|course|academy|tutorial|read charts|not chase signals)\b/iu;
+const NEGATED_SIGNALS = /\b(?:no|not|never)\s+(?:paid|vip|free)?\s*signals?\b/iu;
+const PRODUCT_SELF = /\b(?:automated trading software|autotrader|trading software)\b/iu;
 
 function decodeEntities(value: unknown): string {
   return String(value || '')
@@ -75,13 +83,17 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
 
   // HYPE: explicit signals/VIP/promo products. Require a real signal offer:
   // "stress-free" or a free community is not a signal product.
-  const signalOffer = /\b(?:free|vip)\s+(?:trading\s+)?signals?\b/iu.test(nameAndBio)
-    || (/\b(?:vip|free)\s+(?:telegram|whatsapp|discord)\b/iu.test(nameAndBio) && /\bsignals?\b/iu.test(nameAndBio))
-    || /\bsignals?\s+(?:group|channel|service|vip)\b/iu.test(nameAndBio);
+  const signalOffer = (/\b(?:vip|paid|premium)\s+(?:signals?|signal group|telegram|discord|channel)\b/iu.test(nameAndBio)
+    || /\b(?:free signals?|signals? (?:group|service|channel))\b/iu.test(nameAndBio))
+    && !SIGNAL_RECAP.test(nameAndBio)
+    && !NEGATED_SIGNALS.test(nameAndBio)
+    && /\b(?:join|vip|paid|premium|telegram|discord|whatsapp|group|channel|service)\b/iu.test(nameAndBio);
   if (signalOffer) {
     return { category: 'HYPE', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_HYPE_VIP_SIGNALS'] };
   }
-  if (/\b(?:live trading signals|real[- ]time signals|price action signals|accurate signals)\b/iu.test(all)) {
+  if (/\b(?:live trading signals|real[- ]time signals|price action signals)\b/iu.test(all)
+    && !SIGNAL_RECAP.test(nameAndBio)
+    && !EXPLICIT_EDUCATION_TERMS.test(nameAndBio)) {
     return { category: 'HYPE', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_HYPE_SIGNALS'] };
   }
   if (/\b(?:100x|presale|pre-sale|memecoin)\b/iu.test(nameAndBio)
@@ -90,12 +102,6 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
   }
   if (/\b(?:official agency|promo agency|cryptopromo)\b/iu.test(nameAndBio)) {
     return { category: 'HYPE', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_HYPE_PROMO_AGENCY'] };
-  }
-  // A signal-first brand is HYPE unless the brand itself is explicitly an
-  // academy/course. Bios almost always contain an "educational purposes"
-  // disclaimer, so only the name is safe to inspect here.
-  if (/\bsignals?\b/iu.test(name) && !EXPLICIT_EDUCATION_TERMS.test(name)) {
-    return { category: 'HYPE', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_HYPE_SIGNAL_CHANNEL'] };
   }
   if (/\btradingreels?\b/iu.test(all)
     && /\b(?:motivation|reels?)\b/iu.test(all)
@@ -108,7 +114,9 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_STOCK_PICK_SERVICE'] };
   }
   if (/\b(?:prop firm|prop trading|proprietary trading firm)\b/iu.test(nameAndBio)
-    && !/\b(?:teach|teacher|education|educational|mentor|mentorship|course|learn|lesson|strategy|strategies)\b/iu.test(nameAndBio)) {
+    && /\b(?:official|we are|we're|our (?:prop firm|funded))\b/iu.test(nameAndBio)
+    && /\b(?:sign up|apply|join|challenge|coupon|discount|payout|funded account)\b/iu.test(nameAndBio)
+    && !FIRST_PERSON_TRADER.test(nameAndBio)) {
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_PROP_FIRM'] };
   }
   if (/\bcuentas? (?:son )?simuladas?\b/iu.test(nameAndBio)
@@ -116,11 +124,14 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_SIMULATED_PROGRAMS'] };
   }
   if (/\b(?:automated trading software|autotrader|trading software|trading platform)\b/iu.test(nameAndBio)
-    && /\b(?:software|platform|system|service|vendor)\b/iu.test(nameAndBio)) {
+    && (VENDOR_SELF.test(nameAndBio) || PRODUCT_SELF.test(nameAndBio))
+    && /\b(?:software|platform|system|service|vendor)\b/iu.test(nameAndBio)
+    && !FIRST_PERSON_TRADER.test(nameAndBio)) {
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_TRADING_SOFTWARE'] };
   }
-  if (/\b(?:investor events|masterclasses?|conferences?|congress?|beleggersfair)\b/iu.test(nameAndBio)
-    && /\b(?:platform|events?|masterclasses?|congress?|fair)\b/iu.test(nameAndBio)) {
+  if (/\b(?:events?|masterclasses?|conferences?|congres|beleggersfair|tickets?|register now)\b/iu.test(nameAndBio)
+    && /\b(?:congres|conference|fair|tickets?|register|platform|masterclasses?)\b/iu.test(nameAndBio)
+    && (/\b(?:live en online events|online events|investor events|event platform)\b/iu.test(nameAndBio) || VENDOR_SELF.test(nameAndBio))) {
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_EVENTS_PLATFORM'] };
   }
   if (/\b(?:ai narrates|panel completo|quantiva\.live)\b/iu.test(nameAndBio)) {
@@ -145,9 +156,6 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
     const liveTitles = videoTitles.filter(title => /\b(?:live|trade recap|setup|entry|exit|signal)\b/iu.test(title)).length;
     if (financeTitles <= 1 && nonFinanceBio >= 2) {
       return { category: 'UNRELATED', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_UNRELATED_PRIMARY_FOCUS'] };
-    }
-    if (financeTitles <= 1 && newsTitles >= 3 && liveTitles === 0) {
-      return { category: 'FINANCIAL_NEWS', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_NEWS_PRIMARY_FOCUS'] };
     }
   }
 
