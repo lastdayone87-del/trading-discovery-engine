@@ -105,6 +105,13 @@ export interface QueryFunnelMetrics {
   countryPrecision: number;
   tradingPrecision: number;
   performanceScore: number;
+  /**
+   * Creator-search success score. Same components as performanceScore with
+   * community yield removed and the remaining weights renormalized. Community
+   * discovery remains an enrichment metric and never determines query
+   * collection/promotion.
+   */
+  creatorDiscoveryScore?: number;
 }
 
 const ratio = (numerator: number, denominator: number): number => denominator > 0 ? numerator / denominator : 0;
@@ -186,6 +193,15 @@ export function calculateQueryFunnel(
     0.15 * countryPrecision +
     0.10 * communityYield
   ));
+  // Creator-search success uses only trading relevance, novelty, quality and
+  // country precision. The old community weight is removed and the remaining
+  // 0.90 weight is renormalized so the score stays on the familiar 0-100 scale.
+  const creatorDiscoveryScore = Math.round(100 * (
+    0.30 * tradingPrecision +
+    0.25 * noveltyRatio +
+    0.20 * qualityYield +
+    0.15 * countryPrecision
+  ) / 0.90);
 
   return {
     rawResults,
@@ -209,7 +225,8 @@ export function calculateQueryFunnel(
     noveltyRatio,
     countryPrecision,
     tradingPrecision,
-    performanceScore
+    performanceScore,
+    creatorDiscoveryScore
   };
 }
 
@@ -324,7 +341,7 @@ export function selectQueryCollection(
   // stable for these arms; severe contamination above still quarantines on
   // safety.
   if (options.collectionChangeEligible === false) return current === 'REJECTED' ? 'REJECTED' : current;
-  if (metrics.performanceScore >= 60) {
+  if ((metrics.creatorDiscoveryScore ?? metrics.performanceScore) >= 60) {
     // A zero-confirm run can never establish PROVEN, even when the legacy
     // blended score is high (novelty/community alone are not yield).
     if (metrics.tradingConfirmed <= 0) return 'EXPERIMENTAL';

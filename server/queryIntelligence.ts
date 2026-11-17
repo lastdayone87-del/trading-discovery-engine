@@ -2460,6 +2460,7 @@ export async function evaluateQueryPerformance(
   } = {}
 ): Promise<{ performanceScore: number; newCollection: QueryCollection; summary: string }> {
   const performanceScore = metrics.performanceScore;
+  const creatorDiscoveryScore = metrics.creatorDiscoveryScore ?? performanceScore;
   // Q4c promotion guard: PROVEN is a lower-confidence-bound decision over
   // result-level, globally-new confirmed creators per quota, not a high
   // blended performance score. The current run is not yet committed when the
@@ -2474,7 +2475,7 @@ export async function evaluateQueryPerformance(
     await getAppSetting('query_proven_min_completed_runs', ''),
   );
   const collectionChangeEligible = isCollectionChangeEligible(attribution);
-  if (performanceScore >= 60 && collectionChangeEligible) {
+  if (creatorDiscoveryScore >= 60 && collectionChangeEligible) {
     // One aggregated read per country (a row per query id, not per run). The
     // query's own prior is kept separate from every other arm so the promotion
     // confidence bound is shrunk toward a genuinely peer-derived rate instead

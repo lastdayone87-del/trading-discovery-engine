@@ -369,3 +369,15 @@ test('promotion guard uses evaluated raw results for duplicate saturation', () =
     invalidQueryRate: 0,
   }), 'EXPERIMENTAL');
 });
+
+
+test('creator discovery score ignores community presence and uses creator-search components only', () => {
+  const creator = (channelId: string, hasCommunity: boolean): QueryObservation => ({
+    channelId, wasKnown: false, persisted: true, funnelOutcome: 'TRADING_CONFIRMED',
+    qualityScore: 80, hasCommunity,
+  });
+  const withoutCommunity = calculateQueryFunnel(2, [creator('a', false), creator('b', false)]);
+  const withCommunity = calculateQueryFunnel(2, [creator('a', true), creator('b', true)]);
+  assert.equal(withoutCommunity.creatorDiscoveryScore, withCommunity.creatorDiscoveryScore);
+  assert.ok((withCommunity.performanceScore || 0) > (withoutCommunity.performanceScore || 0));
+});
