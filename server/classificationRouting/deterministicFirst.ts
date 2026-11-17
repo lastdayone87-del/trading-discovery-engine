@@ -163,10 +163,16 @@ function semanticSignals(decision: RoutingInput) {
 }
 
 function hasTerminalNegativeEvidence(decision: RoutingInput): boolean {
+  const reasons = decision.decisionPolicy?.reasonCodes || [];
+  // A high-precision category guard is a terminal non-trading decision. It
+  // does not need the unrelated-domain evidence threshold because it never
+  // rejects on weak keywords; it only confirms a commercial/promo/news/
+  // unrelated category after the first-pass relevant result.
+  if (reasons.includes('CONTENT_CATEGORY_PRECISION_GUARD')) return true;
   if (decision.evidenceCollection.terminalNegativeSufficiency?.status !== 'SUFFICIENT') return false;
   // The policy layer only terminalizes creator-level unrelated-domain
   // evidence. The status cannot be terminalized by isolated keywords.
-  return (decision.decisionPolicy?.reasonCodes || []).some(code =>
+  return reasons.some(code =>
     code === 'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'
     || code === 'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION',
   );

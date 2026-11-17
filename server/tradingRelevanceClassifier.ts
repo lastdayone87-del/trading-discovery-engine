@@ -1,6 +1,7 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
 import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
 import { resolveClassificationRouting, resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
+import { applyCategoryPrecisionGuard } from './evidenceEngine/categoryPrecisionGuard';
 
 /**
  * Semantic provider outcomes only. A deterministic provider failure must not
@@ -69,6 +70,27 @@ export async function classifyTradingRelevanceDetailed(
   // the cache key covers documents the ledger's checksum omits.
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
+  const precision = await applyCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel);
+  if (precision) {
+    // A precision guard may only downgrade a first-pass relevant category.
+    // It never upgrades, and the evidence safeguards are untouched.
+    decision.status = 'NON_TRADING';
+    decision.confidenceScore = Math.min(22, decision.confidenceScore);
+    decision.geminiSemanticSummary = {
+      ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),
+      isTrading: 'NO',
+      taxonomyLabel: precision.category,
+      reason: `[${precision.category}] Precision guard: ${precision.reasonCodes.join(', ')}`,
+    };
+    decision.decisionPolicy = {
+      ...(decision.decisionPolicy || { version: 'precision-guard-v1', tradingProbability: 0, nonTradingProbability: 0, coverageConfidence: 0, reasonCodes: [] }),
+      reasonCodes: [
+        ...(decision.decisionPolicy?.reasonCodes || []),
+        'CONTENT_CATEGORY_PRECISION_GUARD',
+        ...precision.reasonCodes,
+      ],
+    };
+  }
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
   const lifecycleStage = decision.stagedClassification?.stages.find(stage => stage.stage === 'LIFECYCLE');
   const routingMode = resolveClassificationRoutingMode();

@@ -548,6 +548,16 @@ test('LEGACY routing returns the legacy route vocabulary', () => {
   assert.equal(nonTrading.route, 'SEMANTIC_NON_TRADING');
 });
 
+test('a category precision guard is terminal non-trading, not review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'NON_TRADING',
+    confidenceScore: 15,
+    policyReasons: ['CONTENT_CATEGORY_PRECISION_GUARD', 'PRECISION_CATEGORY_HYPE'],
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'SEMANTIC_NON_TRADING');
+  assert.equal(routed.humanReview, false);
+});
+
 test('a serving semantic NO assessment sends a confirmed decision to review', () => {
   const routed = resolveClassificationRouting(decision({
     status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'DECISIVE_TRADING', semanticPolicy: 'BOUNDED_WAIT',
