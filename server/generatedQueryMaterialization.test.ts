@@ -205,3 +205,25 @@ test('materialized lineage and existing-row protection are wired into scheduler 
   assert.match(queryIntelligence, /preserveExistingRow: args\.preserveExistingLibraryRow === true/);
   assert.match(queryIntelligence, /EXISTING_QUERY_PROTECTED/);
 });
+
+
+test('persistent-selection materialization rechecks live scope before authorizing', async () => {
+  const { db } = makeDb([{ ...proposal }]);
+  let authorized = false;
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    readSetting: async (key, fallback) => {
+      if (key === 'query_intelligence_discovery_scope') return 'SELECTED_COUNTRIES';
+      if (key === 'query_intelligence_selected_countries') return '["France"]';
+      return fallback;
+    },
+    authorize: (async () => {
+      authorized = true;
+      return { status: 'AUTHORIZED', code: 'AUTHORIZED', queryRecord: { id: 42 } };
+    }) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(authorized, false);
+});

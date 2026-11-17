@@ -11,6 +11,24 @@ export interface GeneratedQueryMaterializationResult {
   queryIds: number[];
 }
 
+async function isStillInPersistentSelection(
+  country: string,
+  readSetting: (key: string, fallback: string) => Promise<string>,
+): Promise<boolean> {
+  const scope = String(await readSetting('query_intelligence_discovery_scope', 'GLOBAL')).toUpperCase();
+  if (scope !== 'SELECTED_COUNTRIES') return true;
+  const raw = await readSetting('query_intelligence_selected_countries', '[]');
+  try {
+    const selected = JSON.parse(raw);
+    if (!Array.isArray(selected)) return false;
+    const target = country.normalize('NFKC').trim().toLocaleLowerCase('en');
+    return selected.some(value => typeof value === 'string'
+      && value.normalize('NFKC').trim().toLocaleLowerCase('en') === target);
+  } catch {
+    return false;
+  }
+}
+
 const parseJson = (value: unknown): Record<string, any> => {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, any>;
   if (typeof value !== 'string') return {};
@@ -90,6 +108,13 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
 
   for (const row of rows.rows as any[]) {
     result.attempted++;
+    // A detached materialization may outlive a scope change. Re-check the live
+    // persistent selection before creating a promoted dormant-country row.
+    if (options.scopePromotionBasis === 'PERSISTENT_SCOPE_SELECTION'
+      && !await isStillInPersistentSelection(country, readSetting)) {
+      result.deferred++;
+      continue;
+    }
     const dimensions = parseJson(row.target_dimensions) as unknown as DiscoveryNeighborhoodDimensions;
     const evidence = parseJson(row.supporting_evidence);
     const snapshot = {
