@@ -531,7 +531,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         void materializeGeneratedQueryProposalsForCountry(generatedCountry)
           .then(async result => {
             if (result.persisted > 0) log(`Generated-query materialization: ${result.persisted} proposal(s) for ${generatedCountry}.`);
-            const supply = await materializeAdmittedGeneratedQueriesForCountry(generatedCountry);
+            const supply = await materializeAdmittedGeneratedQueriesForCountry(generatedCountry, {
+              scopePromotionBasis: resolveScopePromotionForScope(scope, generatedCountry, targetCountry),
+            });
             if (supply.materialized > 0) {
               log(`Generated-query supply: ${supply.materialized} admitted proposal(s) entered the normal query library for ${generatedCountry}.`);
             }

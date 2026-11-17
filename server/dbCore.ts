@@ -34,6 +34,7 @@ import { acquisitionJobClockV2Enabled, claimOrderByClause, isCommunityRetryOnlyC
 import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { lineageBoundDimensions } from './frontierLineage';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
@@ -4266,10 +4267,11 @@ export async function scheduleAutonomousQueryRuns(
       // Frontier allocations and generated queries materialized into the normal
       // library both carry immutable target-neighborhood lineage. Legacy queries
       // without lineage remain unchanged.
-      const lineageBoundAllocation = candidate.allocationOrigin === 'FRONTIER_CANARY' || nativeLineage.materialized === true;
-      const allocatedDimensions = lineageBoundAllocation && nativeLineage.targetNeighborhoodKey
-        ? candidate.targetNeighborhoodDimensions
-        : undefined;
+      const allocatedDimensions = lineageBoundDimensions(
+        candidate.allocationOrigin,
+        nativeLineage,
+        candidate.targetNeighborhoodDimensions,
+      );
       if (nativeLineage.targetNeighborhoodKey && (!allocatedDimensions ||
           createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey)) {
         throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');

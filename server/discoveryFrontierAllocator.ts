@@ -304,6 +304,10 @@ export async function getNeighborhoodCandidates(
       FROM frontier_discovery_proposals
       WHERE target_neighborhood_key = n.neighborhood_key
         AND trial_status = 'PENDING'
+        AND (supporting_evidence->>'materializingAt' IS NULL
+             OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
+        AND (supporting_evidence->>'materializationDeferredAt' IS NULL
+             OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
         AND (expires_at IS NULL OR expires_at > $1)
         AND (proposal_family <> 'EXTERNAL_OSINT'
           OR COALESCE((supporting_evidence->>'expiresAt')::timestamptz, '-infinity'::timestamptz) > $1)
@@ -885,6 +889,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
         `SELECT proposal_family,source_provenance,supporting_evidence,confidence,target_neighborhood_key,target_dimensions
          FROM frontier_discovery_proposals
          WHERE proposal_id=$1 AND trial_status='PENDING' AND (expires_at IS NULL OR expires_at>$2)
+           AND (supporting_evidence->>'materializingAt' IS NULL
+                OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
+           AND (supporting_evidence->>'materializationDeferredAt' IS NULL
+                OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
          FOR UPDATE`,
         [topCandidate.proposalId, now.toISOString()]
       );

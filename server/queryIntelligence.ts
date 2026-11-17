@@ -2134,7 +2134,8 @@ export type QueryIntelligenceAuthorizationCode =
   | 'RETRIEVAL_ANCHOR_UNAVAILABLE'
   | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM'
   | 'QUERY_ADMISSION_REJECTED'
-  | 'QUERY_HOLD_ACTIVE';
+  | 'QUERY_HOLD_ACTIVE'
+  | 'EXISTING_QUERY_PROTECTED';
 
 export type QueryIntelligenceAuthorizationOutcome =
   | { status: 'AUTHORIZED'; code: 'AUTHORIZED'; queryRecord: QueryRecord }
@@ -2150,6 +2151,8 @@ type CountryNativeAuthorizationInput = {
   scopePromotionBasis?: 'PERSISTENT_SCOPE_SELECTION' | 'DIRECT_TARGET';
   /** True when an admitted generated proposal is being made a normal library candidate. */
   materialized?: boolean;
+  /** Materialization must never overwrite an existing library row. */
+  preserveExistingLibraryRow?: boolean;
 };
 
 export type QueryIntelligenceAuthorizationInputResult =
@@ -2272,6 +2275,21 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
     if (!planned) return { status: 'REJECTED', code: 'RETRIEVAL_ANCHOR_UNAVAILABLE', queryRecord: null };
     if (!planned.query.normalize('NFKC').toLocaleLowerCase('en').includes(nativeTerm.normalize('NFKC').toLocaleLowerCase('en'))) {
       return { status: 'REJECTED', code: 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM', queryRecord: null };
+    }
+
+    // A generated proposal must never resurrect/rewrite an existing library
+    // row. The check is before upsert; the materializer treats this rejection
+    // as "leave the existing candidate alone", not as a reason to overwrite it.
+    if (args.preserveExistingLibraryRow) {
+      const existing = await (await getDb()).query(
+        `SELECT id, collection FROM query_library
+         WHERE LOWER(country)=LOWER($1) AND LOWER(query)=LOWER($2)
+         LIMIT 1`,
+        [args.country, planned.query],
+      );
+      if (existing.rowCount) {
+        return { status: 'REJECTED', code: 'EXISTING_QUERY_PROTECTED', queryRecord: null };
+      }
     }
 
     const queryRecord = await upsertQueryRecord({
