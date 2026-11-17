@@ -164,3 +164,44 @@ test('materialized generated queries use lineage-bound dimensions only when mate
   );
   assert.equal(lineageBoundDimensions('LEGACY', { materialized: true }, dimensions), undefined);
 });
+
+
+test('a final TRIED update race is reported as deferred, not materialized', async () => {
+  const { db } = makeDb([{ ...proposal }], { finalRowCount: 0 });
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    readSetting: async () => 'true',
+    authorize: (async () => ({ status: 'AUTHORIZED', code: 'AUTHORIZED', queryRecord: { id: 42 } })) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(result.materialized, 0);
+  assert.deepEqual(result.queryIds, []);
+});
+
+test('authorization exceptions after a claim are deferred and remain retryable', async () => {
+  const { db, updates } = makeDb([{ ...proposal }]);
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    readSetting: async () => 'true',
+    authorize: (async () => { throw new Error('transient'); }) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(result.materialized, 0);
+  assert.ok(updates.some(update => update.sql.includes('materializationDeferredAt')));
+  assert.equal(updates.some(update => update.sql.includes("trial_status='TRIED'")), false);
+});
+
+test('materialized lineage and existing-row protection are wired into scheduler and authorizer', async () => {
+  const { readFileSync } = await import('node:fs');
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const autonomous = readFileSync(new URL('./autonomousDiscovery.ts', import.meta.url), 'utf8');
+  const queryIntelligence = readFileSync(new URL('./queryIntelligence.ts', import.meta.url), 'utf8');
+  assert.match(dbCore, /lineageBoundDimensions\(/);
+  assert.match(dbCore, /nativeLineage/);
+  assert.match(autonomous, /materializedGeneratedTargetDimensions\(selected\.queryRecord\.generation_metadata\)/);
+  assert.match(autonomous, /scopePromotionBasis: promotionBasis === 'DIRECT_TARGET' \? undefined : promotionBasis/);
+  assert.match(queryIntelligence, /preserveExistingRow: args\.preserveExistingLibraryRow === true/);
+  assert.match(queryIntelligence, /EXISTING_QUERY_PROTECTED/);
+});

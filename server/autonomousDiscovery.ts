@@ -531,8 +531,12 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         void materializeGeneratedQueryProposalsForCountry(generatedCountry)
           .then(async result => {
             if (result.persisted > 0) log(`Generated-query materialization: ${result.persisted} proposal(s) for ${generatedCountry}.`);
+            const promotionBasis = resolveScopePromotionForScope(scope, generatedCountry, targetCountry);
             const supply = await materializeAdmittedGeneratedQueriesForCountry(generatedCountry, {
-              scopePromotionBasis: resolveScopePromotionForScope(scope, generatedCountry, targetCountry),
+              // A one-shot direct-target basis applies only to the explicitly
+              // requested allocation, never to every pending proposal in the
+              // background bulk materialization batch.
+              scopePromotionBasis: promotionBasis === 'DIRECT_TARGET' ? undefined : promotionBasis,
             });
             if (supply.materialized > 0) {
               log(`Generated-query supply: ${supply.materialized} admitted proposal(s) entered the normal query library for ${generatedCountry}.`);

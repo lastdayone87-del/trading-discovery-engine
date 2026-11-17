@@ -890,9 +890,9 @@ export async function evaluateFrontierCanaryAllocation(input: {
          FROM frontier_discovery_proposals
          WHERE proposal_id=$1 AND trial_status='PENDING' AND (expires_at IS NULL OR expires_at>$2)
            AND (supporting_evidence->>'materializingAt' IS NULL
-                OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
+                OR (supporting_evidence->>'materializingAt')::timestamptz < $2::timestamptz - interval '15 minutes')
            AND (supporting_evidence->>'materializationDeferredAt' IS NULL
-                OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
+                OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < $2::timestamptz - interval '15 minutes')
          FOR UPDATE`,
         [topCandidate.proposalId, now.toISOString()]
       );

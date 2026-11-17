@@ -108,6 +108,13 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
        WHERE proposal_id=$1 AND trial_status='PENDING'
          AND (supporting_evidence->>'materializingAt' IS NULL
               OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
+         AND (supporting_evidence->>'materializationDeferredAt' IS NULL
+              OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
+         AND NOT EXISTS (
+           SELECT 1 FROM frontier_allocation_decisions d
+           WHERE d.proposal_id=$1
+             AND d.decision_status IN ('RESERVED','COMMITTED')
+         )
        RETURNING proposal_id`,
       [row.proposal_id],
     );

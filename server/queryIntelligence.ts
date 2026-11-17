@@ -2277,21 +2277,6 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
       return { status: 'REJECTED', code: 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM', queryRecord: null };
     }
 
-    // A generated proposal must never resurrect/rewrite an existing library
-    // row. The check is before upsert; the materializer treats this rejection
-    // as "leave the existing candidate alone", not as a reason to overwrite it.
-    if (args.preserveExistingLibraryRow) {
-      const existing = await (await getDb()).query(
-        `SELECT id, collection FROM query_library
-         WHERE LOWER(country)=LOWER($1) AND LOWER(query)=LOWER($2)
-         LIMIT 1`,
-        [args.country, planned.query],
-      );
-      if (existing.rowCount) {
-        return { status: 'REJECTED', code: 'EXISTING_QUERY_PROTECTED', queryRecord: null };
-      }
-    }
-
     const queryRecord = await upsertQueryRecord({
       query: planned.query,
       country: args.country,
@@ -2303,7 +2288,11 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
       discoveryObjective: planned.discoveryObjective,
       primaryTerm: planned.primaryTerm,
       generationMetadata: planned.metadata
-    });
+    }, { preserveExistingRow: args.preserveExistingLibraryRow === true });
+    if (args.preserveExistingLibraryRow
+      && (queryRecord.collection === 'REJECTED' || queryRecord.collection === 'PROVEN')) {
+      return { status: 'REJECTED', code: 'EXISTING_QUERY_PROTECTED', queryRecord: null };
+    }
     // Persistence is not authorization. A native/LLM/autocomplete surface that
     // admission marked duplicate, speculative or otherwise ineligible must not
     // reach the scheduler merely because the proposal row was materialized.
