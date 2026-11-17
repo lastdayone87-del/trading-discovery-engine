@@ -14,6 +14,7 @@ import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecove
 import { reconcileClassificationResolutionGaps } from './classificationResolutionRecovery';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
+import { runQuerySaturationSweep } from './querySaturationSweep';
 
 /**
  * Non-claim-critical maintenance cadence. Worker pools still tick every second
@@ -22,6 +23,7 @@ import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJ
  */
 export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
 export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
+export const QUERY_SATURATION_SWEEP_INTERVAL_MS = 15 * 60_000;
 
 /**
  * The resolution sweep mutates channel/job state. It stays read-only unless an
@@ -44,6 +46,8 @@ export interface OperationalMaintenanceDependencies {
   resumeOrphanedAutonomousPages(): Promise<unknown>;
   /** Delayed repair of pending classification sightings; runs at minute scale. */
   reconcileStaleClassificationSightings(): Promise<unknown>;
+  /** Mature creator-only saturation evidence; applies reversible next_eligible_at dormancy. */
+  sweepQuerySaturation?(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -74,6 +78,8 @@ export interface OperationalMaintenanceSchedulerOptions {
   classificationSightingSweepIntervalMs?: number;
   /** Interval for the classification-resolution sweep. */
   classificationResolutionSweepIntervalMs?: number;
+  /** Interval for mature creator-only query saturation evaluation. */
+  querySaturationSweepIntervalMs?: number;
   /** Warn when a single sweep remains in flight longer than this. */
   watchdogMs?: number;
   setWatchdog?: (callback: () => void, delayMs: number) => unknown;
@@ -90,6 +96,7 @@ export function createOperationalMaintenanceScheduler(
 ): OperationalMaintenanceScheduler {
   const intervalMs = options.intervalMs ?? OPERATIONAL_MAINTENANCE_INTERVAL_MS;
   const classificationResolutionSweepIntervalMs = options.classificationResolutionSweepIntervalMs ?? CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS;
+  const querySaturationSweepIntervalMs = options.querySaturationSweepIntervalMs ?? QUERY_SATURATION_SWEEP_INTERVAL_MS;
   const classificationSightingSweepIntervalMs = options.classificationSightingSweepIntervalMs ?? 60_000;
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback: () => void, delayMs: number) => {
@@ -114,6 +121,7 @@ export function createOperationalMaintenanceScheduler(
   let lastStaleChannelLockRecoveryMs: number | null = null;
   let lastClassificationSightingSweepMs: number | null = null;
   let lastClassificationResolutionSweepMs: number | null = null;
+  let lastQuerySaturationSweepMs: number | null = null;
   let ticks = 0;
   let failures = 0;
   let lastTickAt: string | null = null;
@@ -208,6 +216,12 @@ export function createOperationalMaintenanceScheduler(
           console.info('[Operational Maintenance] classification resolution recovery', result);
         }
       });
+    }
+    if (dependencies.sweepQuerySaturation
+      && (lastQuerySaturationSweepMs === null
+        || nowMs - lastQuerySaturationSweepMs >= querySaturationSweepIntervalMs)) {
+      lastQuerySaturationSweepMs = nowMs;
+      await isolate('query_saturation_sweep', () => dependencies.sweepQuerySaturation!());
     }
     await isolate('phase_b_observation_reconciliation', () => dependencies.triggerPhaseBObservationReconciliation());
     // The reconciler defaults its enqueue limit to the configured queue
@@ -344,7 +358,14 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
     },
     triggerPhaseBObservationReconciliation: () => triggerPhaseBObservationReconciliation(),
     resumeOrphanedAutonomousPages: () => resumeOrphanedAutonomousPages(),
-    reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200)
+    reconcileStaleClassificationSightings: () => reconcileStaleClassificationSightings(200),
+    sweepQuerySaturation: async () => {
+      const result = await runQuerySaturationSweep({ db: await getDb() });
+      if (result.dormant > 0) {
+        console.info(`[Operational Maintenance] query saturation evaluated=${result.evaluated} dormant=${result.dormant} active=${result.active} insufficient=${result.insufficient}.`);
+      }
+      return result;
+    }
   };
 }
 
