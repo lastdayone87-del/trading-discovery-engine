@@ -9,7 +9,7 @@ import {
   type ContinuationDecisionV2,
   type ContinuationStreaks,
 } from './continuationPolicy';
-import type { QueryFunnelMetrics } from './queryPerformance';
+import { creatorDiscoveryScoreFromComponents, type QueryFunnelMetrics } from './queryPerformance';
 
 export type AutonomousPageDecision = ContinuationDecision | ContinuationDecisionV2;
 
@@ -651,5 +651,11 @@ export function aggregatePageMetrics(pages: QueryFunnelMetrics[]): QueryFunnelMe
     countryPrecision: countryEvaluated ? (countryEvaluated - countryRejected) / countryEvaluated : 1,
     tradingPrecision: evaluated ? sum('tradingConfirmed') / evaluated : 0,
     performanceScore: Math.round(weighted('performanceScore')),
+    creatorDiscoveryScore: creatorDiscoveryScoreFromComponents({
+      tradingPrecision: evaluated ? sum('tradingConfirmed') / evaluated : 0,
+      noveltyRatio: distinct ? sum('newChannels') / distinct : 0,
+      qualityYield: evaluated ? sum('qualityChannels') / evaluated : 0,
+      countryPrecision: countryEvaluated ? (countryEvaluated - countryRejected) / countryEvaluated : 1,
+    }),
   };
 }

@@ -381,3 +381,28 @@ test('creator discovery score ignores community presence and uses creator-search
   assert.equal(withoutCommunity.creatorDiscoveryScore, withCommunity.creatorDiscoveryScore);
   assert.ok((withCommunity.performanceScore || 0) > (withoutCommunity.performanceScore || 0));
 });
+
+
+test('multi-page aggregation preserves the creator-only score independent of community yield', () => {
+  const page = (hasCommunity: boolean) => calculateQueryFunnel(1, [{
+    channelId: hasCommunity ? 'community' : 'plain', wasKnown: false, persisted: true,
+    funnelOutcome: 'TRADING_CONFIRMED', qualityScore: 80, hasCommunity,
+  }]);
+  const low = aggregatePageMetrics([page(false), page(false)]);
+  const high = aggregatePageMetrics([page(true), page(true)]);
+  assert.equal(low.creatorDiscoveryScore, high.creatorDiscoveryScore);
+  assert.notEqual(low.performanceScore, high.performanceScore);
+});
+
+test('creator-only score controls rejection as well as promotion', () => {
+  const metrics = {
+    rawResults: 40, distinctResults: 30, duplicateResults: 2, knownChannels: 20, newChannels: 10,
+    countryRejected: 1, nonTrading: 2, uncertain: 1, needsReview: 0, tradingConfirmed: 27,
+    classificationPending: 0, uniqueChannels: 30, qualityChannels: 12, communitiesDiscovered: 3,
+    quotaUsed: 100, noveltyRatio: 0.3, countryPrecision: 0.96, tradingPrecision: 0.9,
+    averageQualityScore: 40, performanceScore: 23, creatorDiscoveryScore: 25,
+  };
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 1, metrics, undefined, { collectionChangeEligible: true }), 'EXPERIMENTAL');
+  const lowCreator = { ...metrics, creatorDiscoveryScore: 24, performanceScore: 30 };
+  assert.equal(selectQueryCollection('EXPERIMENTAL', 1, lowCreator, undefined, { collectionChangeEligible: true }), 'REJECTED');
+});
