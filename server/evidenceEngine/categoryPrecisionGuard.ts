@@ -35,6 +35,10 @@ const EDUCATION = /\b(?:course|learn|learning|education|educational|academy|trai
 const FINANCE = /\b(?:trading|trade|trader|forex|fx|stock|stocks|equity|equities|crypto|bitcoin|btc|eth|ethereum|xauusd|market|markets|finance|financial|broker|exchange|portfolio|etf|gold|silver|nasdaq|futures?|options?|fund|wealth|invest|investing|investment|bourse|aktien|acciones|ações|bolsa|investir|investieren|inversión|investimento)\b/iu;
 const NON_FINANCE = /\b(?:art|candle|candles|car|cars|comedy|drama|religion|church|god|sports?|football|cricket|fitness|gym|health|software|tutorial|travel|beauty|makeup|music|song|game|gaming|food|recipe|wedding|jewelry|jewellery|design|agency|sales|business|marketing|shop|artist)\b/giu;
 const NEWS = /\b(?:news|headlines?|updates?|commentary|interviews?|market recap|daily briefing)\b/iu;
+// Analysis intended to inform trading/investing decisions is trading content,
+// not news. These terms prevent the news rule from downgrading analysis-only
+// channels that happen to mention news or updates in their bio.
+const TRADING_ANALYSIS_TERMS = /\b(?:technical analysis|market analysis|analisi tecnica|analyse technique|análisis técnico|analysis|charts?|price action|market structure|support|resistance|trends?|scenarios?|setups?|entries|key levels|levels|trade ideas?|forecast|forecasts|分析|分析技術)\b/iu;
 const EDUCATION_TERMS = /\b(?:course|learn|learning|education|educational|academy|training|tutorial|guide|lesson|mentor|coaching|explained|how to)\b/iu;
 // Explicit teaching/branding terms only. "Strategy" or "analysis" appear in
 // almost every signal-seller bio and must not exempt a signal-first channel.
@@ -126,7 +130,8 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
   // FINANCIAL_NEWS: explicit news product, not an educator that publishes updates.
   if (/\bnews\b/iu.test(nameAndBio)
     && /\b(?:daily|updates?|financial market|headlines?)\b/iu.test(nameAndBio)
-    && !EDUCATION_TERMS.test(nameAndBio)) {
+    && !EDUCATION_TERMS.test(nameAndBio)
+    && !TRADING_ANALYSIS_TERMS.test(nameAndBio)) {
     return { category: 'FINANCIAL_NEWS', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_NEWS_PRODUCT'] };
   }
 
@@ -175,20 +180,27 @@ const ADJUDICATOR_EXAMPLES: Array<[string, string]> = [
   ['Vanski Trades — art, candles, shop relaunch; one day-trading video', 'UNRELATED'],
   ['Emilio Gallardo — sales career training; one trading strategy video', 'UNRELATED'],
   ['BasedClips — crypto news clips and commentary', 'FINANCIAL_NEWS'],
-  ['JezzaBTC — daily crypto technical analysis, news and financial market updates', 'FINANCIAL_NEWS'],
+  ['JezzaBTC — daily crypto technical analysis, news and financial market updates', 'KEEP_RELEVANT'],
   ['madDogzz — recurring XAUUSD live trading sessions plus comedy and motivation shorts', 'KEEP_RELEVANT'],
   ['forex_sumit_27 — daily live XAUUSD execution and market analysis, no signal product', 'KEEP_RELEVANT'],
   ['A channel named for signals that distributes entries and setups with light analysis', 'HYPE'],
   ['A design-career vlog whose trading uploads are a minority of the channel', 'UNRELATED'],
   ['A UI/UX design and coding vlog that occasionally posts forex trade recaps', 'UNRELATED'],
   ['A teacher who sells a watchlist or alerts but whose videos are structured lessons', 'KEEP_RELEVANT'],
-  ['Weekly gold forecast plus a VIP analysis service', 'FINANCIAL_NEWS'],
-  ['Daily crypto price-prediction channel', 'FINANCIAL_NEWS'],
+  ['Weekly gold forecast plus a VIP analysis service', 'KEEP_RELEVANT'],
+  ['Daily crypto price-prediction channel', 'KEEP_RELEVANT'],
   ['Broker comparison, fee and regulation reviews', 'FINANCIAL_NEWS'],
   ['Independent trader with an affiliate link to a charting tool', 'KEEP_RELEVANT'],
   ['Active trader offering account management alongside trade recaps', 'KEEP_RELEVANT'],
   ['Coach or mentor publishing weekly forex analysis and lessons', 'KEEP_RELEVANT'],
   ['Teacher sharing free lessons plus a free signals group', 'KEEP_RELEVANT'],
+  ['Oxford Chart / Ermes Group — technical analysis of NASDAQ, Dow, S&P, gold and EUR/USD with levels and scenarios', 'KEEP_RELEVANT'],
+  ['Alpha Market TV — crypto technical analysis with charts, key levels, trends, support/resistance and price scenarios', 'KEEP_RELEVANT'],
+  ['Stock & Commodity Hub — stock price targets, technical/fundamental analysis, IPO updates and investment insights', 'KEEP_RELEVANT'],
+  ['Forex-Sun — forex market analysis and trading ideas from two traders', 'KEEP_RELEVANT'],
+  ['TiaBTC — Bitcoin technical analysis with support levels and trade scenarios', 'KEEP_RELEVANT'],
+  ['A channel that republishes crypto news clips and headlines with no original analysis', 'FINANCIAL_NEWS'],
+  ['Market event reporting: CPI/FOMC headlines and company announcements without trade analysis', 'FINANCIAL_NEWS'],
 ];
 
 export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabel: string): string {
@@ -205,9 +217,9 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
     'Downgrade only when the PRIMARY product is clearly one of:',
     '- MARKET_INSTITUTION: broker, exchange, bank, prop firm, fund, asset manager, data/software platform, trading-robot vendor, stock-pick service, or events/conference platform.',
     '- HYPE: VIP/free signals, guaranteed returns, 100x/memecoin/presale promotion, affiliate-first promotion, or trading motivation/reels without structured education.',
-    '- FINANCIAL_NEWS: news, market updates, commentary, interviews, research media, or crypto news clips as the primary product.',
+    '- FINANCIAL_NEWS: reporting market events, company announcements, economic developments, or financial headlines as the primary product, without original trading/investment analysis or actionable trade ideas. News clips and broker-comparison media also qualify.',
     '- UNRELATED: primary content is non-financial (art, cars, comedy, drama, religion, sports, fitness, tech tutorials, travel, beauty, etc.).',
-    'Keep relevant when the creator teaches trading method, psychology, platform use, risk management, stock portfolios, ETFs, dividends, valuation, company analysis, or long-term investing, even if the videos use charts, discuss brokers, review software, or sell a course, watchlist, alerts, or a paid community.',
+    'Keep relevant when the creator teaches or produces trading method, market or technical analysis, psychology, platform use, risk management, stock portfolios, ETFs, dividends, valuation, company analysis, or long-term investing. Analysis-only and forecast-style trading channels qualify even without step-by-step lessons. This holds even if the videos discuss brokers, review software, or sell a course, watchlist, alerts, or a paid community.',
     'Teaching algorithmic trading, backtesting, or how to use a trading platform is trading education; only a vendor selling the software/platform is MARKET_INSTITUTION.',
     'Free educational content is not HYPE. HYPE requires VIP/free signals, guaranteed returns, 100x/memecoin/presale promotion, or affiliate-first promotion.',
     'Recurring live trading sessions, trade recaps, or a public trading journey are active trading, not HYPE or UNRELATED, even when the channel also posts motivation or comedy shorts.',
@@ -215,8 +227,8 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
     'If the bio identifies a non-financial primary profession (software, design, fitness, sales, art, etc.) and trading is only a minority of uploads, return UNRELATED; the channel identity matters more than a minority block of trading recaps.',
     'A channel named for signals, or one that primarily distributes entries and setups, is HYPE even if it also provides analysis. Education teaches method; signals distribute trades.',
     'A channel that teaches trading and also offers a free study or signals group is still education when its videos are lessons.',
-    'A channel whose primary uploads are weekly or daily forecasts, price predictions, market updates, or "what happens next" analysis is FINANCIAL_NEWS, even when it explains chart reasoning.',
-    'A coach or mentor who publishes weekly market analysis as part of teaching method, psychology, or risk is TRADING_EDUCATION; pure analysis without teaching is FINANCIAL_NEWS.',
+    'Market or technical analysis intended to inform trading decisions is trading content, even when it is analysis-only, forecast-style, or does not provide step-by-step lessons: charts, price action, market structure, support/resistance, trends, scenarios, setups, and trade ideas all qualify.',
+    'FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading decisions.',
     'A broker comparison, review, or research site is FINANCIAL_NEWS, not education.',
     'An independent trader who uses affiliate links or promotes a tool, or who offers account management or mentorship, remains active trading or education when the videos are trade recaps, backtests, or lessons. Only the official institution channel, or a channel whose primary product is the tool or managed account, is MARKET_INSTITUTION.',
     'A free Telegram or Discord community is not HYPE by itself; HYPE requires a signals or promotional-returns product to be the primary offer.',

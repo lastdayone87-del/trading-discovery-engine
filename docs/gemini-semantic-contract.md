@@ -21,6 +21,9 @@ Request: JSON `{task: CANDIDATE|ADJUDICATION, promptVersion: 'priority2-multilin
 
 `SemanticModelResult` fields/types (`GeminiSemanticProvider.ts:15-23`, normalized by `parse()`, `:131-141`):
 - `label`: one of `ACTIVE_TRADING, TRADING_EDUCATION, INVESTING_EDUCATION, FINANCIAL_NEWS, PERSONAL_FINANCE, MARKET_INSTITUTION, HYPE, UNRELATED, AMBIGUOUS`, else forced `AMBIGUOUS`
+- `TRADING_EDUCATION` includes analysis-only and forecast-style trading channels that produce charts, price action, market structure, support/resistance, trends, scenarios, setups, or trade ideas intended to inform trading decisions; step-by-step lessons are not required.
+- `INVESTING_EDUCATION` includes investment analysis, stock/ETF/portfolio/valuation/company analysis, price targets, and long-term investing ideas without step-by-step lessons.
+- `FINANCIAL_NEWS` is reserved for reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading/investment analysis or actionable trade ideas.
 - `confidence`: number clamped 0..100
 - `supportedLanguage`: strict `=== true`
 - `reasonCodes`: string[], max 8

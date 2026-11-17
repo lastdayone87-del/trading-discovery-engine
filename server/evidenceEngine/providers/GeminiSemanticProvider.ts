@@ -10,7 +10,7 @@ import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchCon
 import { semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
-export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-2';
+export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-3';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
 import { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from '../modelDefaults';
@@ -339,9 +339,11 @@ export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 
       'Classify creator focus, not isolated keywords. Cite only supplied field references.',
       'Set supportedLanguage=false and label=AMBIGUOUS when meaning cannot be reliably interpreted.',
       'Distinguish active trading, trading education, investing education, financial news, personal finance, market institutions, hype, and unrelated content.',
-      'Use TRADING_EDUCATION when the creator teaches trading method, psychology, platform use, or risk management without live execution as the primary product.',
+      'Use TRADING_EDUCATION when the creator teaches trading method, psychology, platform use, or risk management, or primarily produces market or technical analysis intended to inform trading decisions: charts, price action, market structure, support and resistance, trends, scenarios, setups, or trade ideas. Analysis-only and forecast-style trading channels qualify; step-by-step lessons are not required.',
+      'Use INVESTING_EDUCATION when the creator primarily produces investment analysis, stock, ETF, portfolio, valuation or company analysis, price targets, or long-term investing ideas, even without step-by-step lessons.',
+      'Use FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading or investing decisions.',
       'Use MARKET_INSTITUTION for a broker, exchange, bank, data platform, asset manager, fund, or corporate financial brand; do not call it investing education.',
-      'Use PERSONAL_FINANCE for budgeting, banking, taxes, insurance, savings products and consumer finance; use INVESTING_EDUCATION for stock portfolios, market analysis and company analysis.',
+      'Use PERSONAL_FINANCE for budgeting, banking, taxes, insurance, savings products and consumer finance.',
       'Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'
     ],
     declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: semanticFieldDocuments(input)

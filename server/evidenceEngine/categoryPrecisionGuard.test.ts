@@ -34,7 +34,7 @@ test('deterministic guard catches the high-confidence false-positive cases', () 
     }
   }
   // The remaining four are deliberately left to the conservative adjudicator.
-  assert.equal(caught, 13);
+  assert.equal(caught, 12);
 });
 
 test('deterministic guard never downgrades a genuine education channel', () => {
@@ -46,7 +46,6 @@ test('deterministic guard never downgrades a genuine education channel', () => {
 test('hybrid guard catches every false positive and keeps every genuine educator', async () => {
   const fallback: Record<string, PrecisionGuardResult['category']> = {
     BasedClips: 'FINANCIAL_NEWS',
-    JezzaBTC: 'FINANCIAL_NEWS',
     'Fx Crack Robo House': 'MARKET_INSTITUTION',
     shashwat01: 'HYPE',
   };
@@ -86,6 +85,14 @@ test('a signal-first brand is HYPE even with an educational disclaimer', () => {
     video_titles: ['Gold setup', 'BTC entry'],
   });
   assert.equal(academy, null);
+});
+
+test('analysis intended to inform trading is not downgraded as news', () => {
+  assert.equal(deterministicCategoryGuard({
+    channel_name: 'Forex-Sun',
+    description: 'Forex Trading, market analysis and trading knowledge. Technical analysis, news and daily updates with support, resistance and price scenarios.',
+    video_titles: ['EUR/USD key levels', 'Gold support and resistance', 'USD/JPY breakout or reversal'],
+  }), null);
 });
 
 test('weak words do not create a signal-product downgrade', () => {
@@ -179,4 +186,6 @@ test('adjudicator prompt explicitly forbids relevant-to-relevant relabeling', ()
   assert.match(prompt, /confidence \(0-100\)/);
   assert.match(prompt, /watchlist, alerts, or a paid community/);
   assert.match(prompt, /signal-first brand|named for signals/);
+  assert.match(prompt, /analysis-only, forecast-style/);
+  assert.match(prompt, /FINANCIAL_NEWS only when the primary product is reporting market events/);
 });
