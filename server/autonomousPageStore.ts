@@ -489,8 +489,18 @@ export async function listPendingAutonomousRuns(
               qr.search_ordering, qr.retrieval_config_key, qr.retrieval_treatment_origin,
               qr.requested_page_depth, qr.metadata, qr.provider_allocation_snapshot,
               COALESCE(qr.last_page_at, qr.started_at, qr.scheduled_at) AS resume_at,
+              -- Recompute creator-only utility for resume ranking. Persisted
+              -- marginal_utility_v2 from before the community-removal change
+              -- must not determine the ordering of pending runs.
               COALESCE((
-                SELECT p.marginal_utility_v2
+                SELECT GREATEST(0, LEAST(1,
+                  0.30 * (p.marginal_quality_creators::float / NULLIF(p.distinct_creator_count,0))
+                  + 0.25 * (p.marginal_confirmed_creators::float / NULLIF(p.distinct_creator_count,0))
+                  + 0.20 * (p.marginal_new_creators::float / NULLIF(p.distinct_creator_count,0))
+                  + 0.15 * COALESCE(p.country_precision,0)
+                  - 0.20 * COALESCE(p.duplicate_ratio,0)
+                  - 0.20 * (p.marginal_non_trading_creators::float / NULLIF(p.distinct_creator_count,0))
+                ))
                 FROM autonomous_query_page_observations p
                 WHERE p.query_run_id=qr.id
                 ORDER BY p.page_number DESC LIMIT 1

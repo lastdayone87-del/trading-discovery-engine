@@ -109,3 +109,10 @@ test('community discovery never changes creator-search continuation utility or o
   assert.equal(v2With.marginalUtility, v2Without.marginalUtility);
   assert.deepEqual(v2With, v2Without);
 });
+
+
+test('v1 duplicate ratio reduces marginal utility', () => {
+  const clean = evaluateContinuation({ ...base, duplicateRatio: 0 });
+  const duplicateHeavy = evaluateContinuation({ ...base, duplicateRatio: 0.7 });
+  assert.ok(duplicateHeavy.marginalUtility < clean.marginalUtility);
+});

@@ -77,11 +77,11 @@ test('high duplicate rate alone does not retire a productive query', () => {
     ...base,
     freshRelevantCreators: 6,
     knownChannels: 50,
-    duplicateResults: 80,
+    duplicateResults: 100,
     evaluatedRawResults: 180,
   });
   assert.equal(decision.state, 'ACTIVE');
-  assert.ok(decision.reasons.length === 0 || decision.reasons.includes('DUPLICATE_RATE_HIGH'));
+  assert.ok(decision.reasons.includes('DUPLICATE_RATE_HIGH'));
 });
 
 test('baseline is evaluated per run, not absolute creator volume', () => {
@@ -89,4 +89,21 @@ test('baseline is evaluated per run, not absolute creator volume', () => {
   const high = evaluateQuerySaturation({ ...base, freshRelevantCreators: 2, knownChannels: 95, baselineFreshPerRun: 0.1 });
   assert.equal(low.state, 'DORMANT');
   assert.equal(high.state, 'ACTIVE');
+});
+
+
+test('duplicate-heavy page is a penalty, not a positive contribution', () => {
+  const clean = evaluateQuerySaturation({ ...base, duplicateResults: 0, freshRelevantCreators: 1 });
+  const duplicateHeavy = evaluateQuerySaturation({ ...base, duplicateResults: 50, evaluatedRawResults: 150, freshRelevantCreators: 1 });
+  assert.ok(duplicateHeavy.metrics.duplicateRate > clean.metrics.duplicateRate);
+  assert.ok(duplicateHeavy.metrics.freshPerRunLcb <= clean.metrics.freshPerRunLcb);
+});
+
+
+test('returned policy is a copy and cannot mutate module defaults', () => {
+  const first = evaluateQuerySaturation(base);
+  (first.policy as any).minimumMatureRuns = 999;
+  const second = evaluateQuerySaturation({ ...base, matureRuns: 8 });
+  assert.notEqual(second.policy.minimumMatureRuns, 999);
+  assert.equal(second.state, 'ACTIVE');
 });

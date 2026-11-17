@@ -90,8 +90,11 @@ const ratio = (numerator: number, denominator: number): number => denominator > 
  * only after real exposure.
  */
 function freshPerRunLowerBound(input: QuerySaturationEvidence): number {
-  const priorExposure = 3;
-  const priorFresh = Math.max(0, safe(input.baselineFreshPerRun)) * priorExposure;
+  const baseline = Math.max(0, safe(input.baselineFreshPerRun));
+  // No baseline means a neutral Gamma(1,1) prior, exactly as documented. A
+  // baseline contributes three pseudo-exposure runs centered on its rate.
+  const priorExposure = baseline > 0 ? 3 : 0;
+  const priorFresh = baseline * priorExposure;
   const shape = 1 + priorFresh + safe(input.freshRelevantCreators);
   const rate = 1 + priorExposure + Math.max(0, input.matureRuns);
   return gammaQuantile(shape, rate, 0.05);
@@ -101,6 +104,10 @@ export function evaluateQuerySaturation(
   input: QuerySaturationEvidence,
   policy: QuerySaturationPolicy = DEFAULT_QUERY_SATURATION_POLICY,
 ): QuerySaturationDecision {
+  // Never expose the module-level default object by reference: callers may
+  // carry the policy in diagnostics and mutate it without intending to change
+  // every later evaluation.
+  const effectivePolicy: QuerySaturationPolicy = { ...policy };
   const matureRuns = Math.max(0, Math.floor(input.matureRuns));
   const assessed = Math.max(0, input.distinctResults);
   const pendingShare = ratio(Math.max(0, input.pendingClassifications), assessed);
@@ -122,27 +129,27 @@ export function evaluateQuerySaturation(
   };
 
   const reasons: string[] = [];
-  if (matureRuns < policy.minimumMatureRuns) reasons.push('INSUFFICIENT_MATURE_RUNS');
-  if (pendingShare > policy.maximumPendingShare) reasons.push('CLASSIFICATION_PENDING_EXCEEDS_POLICY');
+  if (matureRuns < effectivePolicy.minimumMatureRuns) reasons.push('INSUFFICIENT_MATURE_RUNS');
+  if (pendingShare > effectivePolicy.maximumPendingShare) reasons.push('CLASSIFICATION_PENDING_EXCEEDS_POLICY');
   if (reasons.length > 0) {
-    return { state: 'INSUFFICIENT_EVIDENCE', reasons, policy, metrics };
+    return { state: 'INSUFFICIENT_EVIDENCE', reasons, policy: { ...effectivePolicy }, metrics };
   }
 
   const baseline = metrics.baselineFreshPerRun;
   const lcbThreshold = baseline > 0
-    ? baseline * policy.maximumLcbToBaselineRatio
-    : policy.maximumLcbToBaselineRatio;
+    ? baseline * effectivePolicy.maximumLcbToBaselineRatio
+    : effectivePolicy.maximumLcbToBaselineRatio;
   // Require both the point estimate and its lower confidence bound to be
   // below the comparable baseline. This prevents a small country or niche from
   // becoming dormant merely because its absolute sample is small: a market
   // producing at its own baseline rate remains active even with fewer runs.
   const lowPointEstimate = baseline > 0
     ? metrics.freshPerRun <= lcbThreshold
-    : metrics.freshPerRun <= policy.maximumLcbToBaselineRatio;
+    : metrics.freshPerRun <= effectivePolicy.maximumLcbToBaselineRatio;
   const lowFreshLcb = lowPointEstimate && (baseline > 0
     ? metrics.freshPerRunLcb <= lcbThreshold
-    : metrics.freshPerRunLcb <= policy.maximumLcbToBaselineRatio);
-  const highKnownShare = metrics.knownCreatorShare >= policy.minimumKnownCreatorShare;
+    : metrics.freshPerRunLcb <= effectivePolicy.maximumLcbToBaselineRatio);
+  const highKnownShare = metrics.knownCreatorShare >= effectivePolicy.minimumKnownCreatorShare;
   if (lowFreshLcb) reasons.push('FRESH_CREATOR_YIELD_LCB_BELOW_BASELINE');
   if (highKnownShare) reasons.push('KNOWN_CREATOR_SHARE_HIGH');
   // Duplicate rate is diagnostic and contributes only alongside credible
@@ -153,7 +160,7 @@ export function evaluateQuerySaturation(
   return {
     state: dormant ? 'DORMANT' : 'ACTIVE',
     reasons: dormant ? reasons : reasons.filter(reason => reason === 'DUPLICATE_RATE_HIGH'),
-    policy,
+    policy: { ...effectivePolicy },
     metrics,
   };
 }

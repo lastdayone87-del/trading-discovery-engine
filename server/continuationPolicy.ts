@@ -68,7 +68,7 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
 
   const marginalUtility = Number(clamp(
     0.30 * qualityYield + 0.25 * confirmedYield + 0.20 * novelty +
-    0.15 * (hasCountryVerdicts ? clamp(input.countryPrecision) : 0.5) +
+    0.15 * (hasCountryVerdicts ? clamp(input.countryPrecision) : 0.5) -
     0.20 * clamp(input.duplicateRatio) - 0.20 * nonTradingPenalty
   ).toFixed(5));
 
