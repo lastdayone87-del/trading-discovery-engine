@@ -29,6 +29,7 @@ import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchActi
 import { sweepRelationshipCanarySeeds } from './relationshipCanarySeeds';
 import { materializeGeneratedQueryProposalsForCountry } from './discoveryProposalGenerators';
 import { materializeAdmittedGeneratedQueriesForCountry, materializedGeneratedTargetDimensions } from './generatedQueryMaterialization';
+import { discoveryDiversityKeys } from './discoveryDiversity';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -844,7 +845,15 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
 
       const intent = selected.queryRecord.intent;
       const primaryTerm = selected.queryRecord.primary_term || selected.queryRecord.query;
-      if ((usedIntents.has(intent) || usedPrimaryTerms.has(primaryTerm)) && attempts < countries.length * 2) {
+      // Diversity is a within-country guarantee. The same intent/term in a
+      // different country is a different discovery surface and must not be
+      // discarded by the global batch guard.
+      const { intentKey, primaryTermKey } = discoveryDiversityKeys(
+        String(selected.queryRecord.country || country),
+        intent,
+        primaryTerm,
+      );
+      if ((usedIntents.has(intentKey) || usedPrimaryTerms.has(primaryTermKey)) && attempts < countries.length * 2) {
         if (frontierAllocationInfo?.authorized && frontierAllocationInfo.decision?.decisionId) {
           await releaseAllocationDecision(frontierAllocationInfo.decision.decisionId, 'Batch diversity guard skipped reserved allocation');
           frontierAllocationInfo.authorized = false;
@@ -902,8 +911,8 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         if (creatorAllocation?.assignmentId) await bindCreatorCanaryQueryRun({ assignmentId: creatorAllocation.assignmentId, assignmentKey: creatorAllocation.assignmentKey, queryRunId: created[0].runId, queryId: created[0].query.id, selectionStrategy: selected.selectionStrategy, boundAt: now.toISOString() })
           .catch(error => console.warn('[CreatorIntelligence] Assignment binding failed without affecting scheduled query:', error instanceof Error ? error.message : error));
         if (research) await markResearchActionQueued(research.actionId, created[0].runId);
-        usedIntents.add(intent);
-        usedPrimaryTerms.add(primaryTerm);
+        usedIntents.add(intentKey);
+        usedPrimaryTerms.add(primaryTermKey);
       } else if (!candidateDiagnosticRecorded) {
         candidateDiagnostic = { ...candidateDiagnostic, disposition: 'SKIPPED', reasonCode: 'RESERVATION_PRECONDITION_ZERO_ROWS', schedulingOutcome: 'NOT_REACHED' };
         recordCandidateDiagnostic(candidateDiagnostic);

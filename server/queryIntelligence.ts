@@ -66,6 +66,7 @@ import {
 import { coverageCellFor, portfolioBudget, buildHierarchy, selectHierarchicalUcb } from './queryQuality/selector';
 import { isQuerySelectable } from './queryQuality/lifecycle';
 import { preservedCollisionAction } from './frontierLineage';
+import { shouldSkipTargetedGeneration } from './discoveryFallbackPolicy';
 import { getCountryMarketProfile } from './queryQuality/profiles';
 import type { DecayedArmCounts, SelectorCandidate, SelectorContext, SelectorDecision } from './queryQuality/types';
 import { selectQueryCollection, isCollectionChangeEligible, isSeverelyContaminatedQuery, type QueryFunnelMetrics, type QueryPromotionGuard } from './queryPerformance';
@@ -1529,59 +1530,83 @@ export async function selectNextQueryForCountry(
       };
       return createNeighborhoodKey(dimensions) === targetKey;
     });
+    let targetedFailureCodes: string[] | null = null;
     if (matches.length > 0) {
       const targeted = selectHierarchicalUcb(matches, pool.context);
       const selected = targeted.queryId ? pool.queriesById.get(targeted.queryId) : null;
       if (selected) {
         return buildSelectionResult(selected, pool, 'NEIGHBORHOOD_TARGETED', `Frontier neighborhood canonical selection for target key "${targetKey}": ${targeted.reason}`, targeted);
       }
-    } else {
-      const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
-      const matchingGenerated = generated.find(query => {
-        const dimensions: DiscoveryNeighborhoodDimensions = {
-          country: target.country || country,
-          language: target.language,
-          queryIntent: query.intent || target.queryIntent,
-          primaryTermFamily: query.primary_term || query.query,
-          retrievalLane: target.retrievalLane,
-          searchOrdering: target.searchOrdering,
-          instrumentOrTheme: target.instrumentOrTheme,
-          sourceFamily: target.sourceFamily,
-        };
-        return createNeighborhoodKey(dimensions) === targetKey;
-      });
-      if (matchingGenerated) {
-        const refreshed = await loadPool(await loadQueries());
-        const candidate = refreshed.candidates.find(item => item.queryId === matchingGenerated.id);
-        if (candidate) {
-          const decision = selectHierarchicalUcb([candidate], refreshed.context);
-          if (decision.queryId) {
-            return buildSelectionResult(matchingGenerated, refreshed, 'NEIGHBORHOOD_TARGETED', `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${matchingGenerated.query}.`, decision);
-          }
-        }
-      }
-      const plannedTarget = planFrontierTargetedQuery({ country, target });
-      if (plannedTarget) {
-        const selected = await upsertQueryRecord({
-          query: plannedTarget.query,
-          country,
-          collection: 'EXPERIMENTAL',
-          intent: plannedTarget.intent,
-          knowledgeTiers: plannedTarget.knowledgeTiers,
-          generationMode: plannedTarget.generationMode,
-          generationReason: plannedTarget.generationReason,
-          discoveryObjective: plannedTarget.discoveryObjective,
-          primaryTerm: plannedTarget.primaryTerm,
-          generationMetadata: plannedTarget.metadata,
+      targetedFailureCodes = targeted.reasonCodes;
+      // Matches can exist while every candidate is cooling down, admission-
+      // blocked or otherwise unselectable. Do not fall through to a generic
+      // legacy query; try the governed generated/planned target fallback below.
+    }
+    // Generating another immature candidate cannot help if the targeted
+    // subset is already fail-closed on exhausted portfolio capacity with no
+    // free provider. Skip targeted generation, but do not return: a mature
+    // candidate outside the targeted subset may still be selectable.
+    if (!shouldSkipTargetedGeneration(targetedFailureCodes)) {
+      try {
+        const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
+        const matchingGenerated = generated.find(query => {
+          const dimensions: DiscoveryNeighborhoodDimensions = {
+            country: target.country || country,
+            language: target.language,
+            queryIntent: query.intent || target.queryIntent,
+            primaryTermFamily: query.primary_term || query.query,
+            retrievalLane: target.retrievalLane,
+            searchOrdering: target.searchOrdering,
+            instrumentOrTheme: target.instrumentOrTheme,
+            sourceFamily: target.sourceFamily,
+          };
+          return createNeighborhoodKey(dimensions) === targetKey;
         });
-        const refreshed = await loadPool(await loadQueries());
-        const candidate = refreshed.candidates.find(item => item.queryId === selected.id);
-        if (candidate) {
-          const decision = selectHierarchicalUcb([candidate], refreshed.context);
-          if (decision.queryId) {
-            return buildSelectionResult(selected, refreshed, 'NEIGHBORHOOD_TARGETED', `Constructed governed fallback for targeted frontier neighborhood key "${targetKey}".`, decision);
+        if (matchingGenerated) {
+          const refreshed = await loadPool(await loadQueries());
+          const candidate = refreshed.candidates.find(item => item.queryId === matchingGenerated.id);
+          if (candidate) {
+            const decision = selectHierarchicalUcb([candidate], refreshed.context);
+            if (decision.queryId) {
+              return buildSelectionResult(matchingGenerated, refreshed, 'NEIGHBORHOOD_TARGETED', `Generated candidate matching targeted frontier neighborhood key "${targetKey}": ${matchingGenerated.query}.`, decision);
+            }
           }
         }
+        const plannedTarget = planFrontierTargetedQuery({ country, target });
+        if (plannedTarget) {
+          const existingPlanned = allQueries.find(query => normalizeQuery(query.query) === normalizeQuery(plannedTarget.query));
+          if (existingPlanned) {
+            // Never resurrect a rejected/proven row or rewrite an existing
+            // candidate's metadata merely to satisfy a targeted fallback.
+            return null;
+          }
+          const selected = await upsertQueryRecord({
+            query: plannedTarget.query,
+            country,
+            collection: 'EXPERIMENTAL',
+            intent: plannedTarget.intent,
+            knowledgeTiers: plannedTarget.knowledgeTiers,
+            generationMode: plannedTarget.generationMode,
+            generationReason: plannedTarget.generationReason,
+            discoveryObjective: plannedTarget.discoveryObjective,
+            primaryTerm: plannedTarget.primaryTerm,
+            generationMetadata: plannedTarget.metadata,
+          });
+          const refreshed = await loadPool(await loadQueries());
+          const candidate = refreshed.candidates.find(item => item.queryId === selected.id);
+          if (candidate) {
+            const decision = selectHierarchicalUcb([candidate], refreshed.context);
+            if (decision.queryId) {
+              return buildSelectionResult(selected, refreshed, 'NEIGHBORHOOD_TARGETED', `Constructed governed fallback for targeted frontier neighborhood key "${targetKey}".`, decision);
+            }
+          }
+        }
+      } catch (error) {
+        // Generation/planning failures must not suppress otherwise usable generic
+        // candidates; fall through to the normal selector below.
+        console.warn('[query-intelligence] targeted fallback failed', {
+          country, error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
   }

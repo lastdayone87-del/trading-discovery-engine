@@ -801,7 +801,11 @@ export async function evaluateFrontierCanaryAllocation(input: {
     const usageRes = await runner.query(
       `SELECT
          COUNT(*)::int AS daily_assignments,
-         COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
+         COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used,
+         -- Provider amounts are the authoritative official-unit accounting:
+         -- free InnerTube stays zero, while official/date-retarget consumption
+         -- carries the same official units as quota_reserved/quota_consumed.
+         COALESCE(SUM(GREATEST(provider_reserved_amount, provider_consumed_amount)), 0)::int AS daily_official_quota_used
        FROM frontier_allocation_decisions
        WHERE quota_day = $1
          AND allocation_origin = 'FRONTIER_CANARY'
@@ -810,15 +814,24 @@ export async function evaluateFrontierCanaryAllocation(input: {
     );
 
     const dailyAssignments = Number(usageRes.rows[0]?.daily_assignments || 0);
-    const dailyQuotaUsed = Number(usageRes.rows[0]?.daily_quota_used || 0);
+    // Fall back to the legacy total only for old test fixtures / pre-migration
+    // rows. Production decisions always carry provider amounts.
+    const dailyOfficialQuotaUsed = Number(
+      usageRes.rows[0]?.daily_official_quota_used
+      ?? usageRes.rows[0]?.daily_quota_used
+      ?? 0
+    );
 
-    if (dailyAssignments >= assignmentCap || dailyQuotaUsed + providerQuotaUnits > quotaCap) {
+    const assignmentCapExceeded = dailyAssignments >= assignmentCap;
+    const officialQuotaCapExceeded = providerQuotaUnits > 0
+      && dailyOfficialQuotaUsed + providerQuotaUnits > quotaCap;
+    if (assignmentCapExceeded || officialQuotaCapExceeded) {
       if (client) await runner.query('COMMIT');
       return {
         authorized: false,
         allocationOrigin: 'LEGACY',
         country: input.legacyCountry,
-        reason: `FRONTIER_CANARY_DAILY_CAP_EXCEEDED (assignments: ${dailyAssignments}/${assignmentCap}, quota: ${dailyQuotaUsed + providerQuotaUnits}/${quotaCap})`
+        reason: `FRONTIER_CANARY_DAILY_CAP_EXCEEDED (assignments: ${dailyAssignments}/${assignmentCap}, officialQuota: ${dailyOfficialQuotaUsed + providerQuotaUnits}/${quotaCap})`
       };
     }
 
