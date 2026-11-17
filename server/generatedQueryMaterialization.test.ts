@@ -273,3 +273,22 @@ test('persistent promotion fails closed on a malformed selected-country array', 
   assert.equal(result.deferred, 1);
   assert.equal(authorized, false);
 });
+
+
+test('a stale persistent-scope result is deferred, not permanently disabled', async () => {
+  const { db, updates } = makeDb([{ ...proposal }]);
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    readSetting: async () => 'true',
+    authorize: (async () => ({
+      status: 'REJECTED',
+      code: 'SCOPE_PROMOTION_STALE',
+      queryRecord: null,
+    })) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(result.rejected, 0);
+  assert.ok(updates.some(update => update.sql.includes('materializationDeferredAt')));
+  assert.equal(updates.some(update => update.sql.includes("trial_status='DISABLED'")), false);
+});

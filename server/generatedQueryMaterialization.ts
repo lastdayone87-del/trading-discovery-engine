@@ -201,7 +201,7 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
       continue;
     }
 
-    if (outcome.status === 'REJECTED') {
+    if (outcome.status === 'REJECTED' && outcome.code !== 'SCOPE_PROMOTION_STALE') {
       await db.query(
         `UPDATE frontier_discovery_proposals
          SET trial_status='DISABLED',
