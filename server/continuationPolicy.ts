@@ -9,7 +9,9 @@ export interface ContinuationPolicyInput {
   distinctCreators: number; cumulativeDistinctCreators: number; maxDistinctCreators?: number;
   newCreators: number; confirmedCreators: number; qualityConfirmedCreators: number;
   delayedConfirmedCreators?: number; delayedNonTradingCreators?: number; delayedQualityCreators?: number;
-  countryPrecision: number; communityDiversity: number; duplicateRatio: number;
+  countryPrecision: number; duplicateRatio: number;
+  /** @deprecated Retained only for payload compatibility; creator-search continuation never scores community discovery. */
+  communityDiversity?: number;
   consecutiveLowYieldPages: number; maxConsecutiveLowYieldPages: number;
   /**
    * Observations on this page whose classification is still queued. They have
@@ -66,8 +68,7 @@ export function evaluateContinuation(input: ContinuationPolicyInput): Continuati
 
   const marginalUtility = Number(clamp(
     0.30 * qualityYield + 0.25 * confirmedYield + 0.20 * novelty +
-    0.15 * (hasCountryVerdicts ? clamp(input.countryPrecision) : 0.5) +
-    0.10 * clamp(input.communityDiversity) -
+    0.15 * (hasCountryVerdicts ? clamp(input.countryPrecision) : 0.5) -
     0.20 * clamp(input.duplicateRatio) - 0.20 * nonTradingPenalty
   ).toFixed(5));
 
@@ -138,8 +139,9 @@ export interface ContinuationV2Input {
   /** Literal candidate terms on this page not already in country vocabulary. */
   novelCandidateTerms: number;
   countryPrecision: number;
-  communityDiversity: number;
   duplicateRatio: number;
+  /** @deprecated Retained only for payload compatibility; creator-search continuation never scores community discovery. */
+  communityDiversity?: number;
   priorLowValueStreak: number;
   priorDuplicateHeavyStreak: number;
   priorWrongCountryStreak: number;
@@ -224,7 +226,6 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
     + 0.25 * confirmedYield
     + 0.20 * novelty
     + 0.15 * clamp(input.countryPrecision)
-    + 0.10 * clamp(input.communityDiversity)
     - 0.20 * clamp(input.duplicateRatio)
     - 0.20 * nonTradingPenalty
   ).toFixed(5));
