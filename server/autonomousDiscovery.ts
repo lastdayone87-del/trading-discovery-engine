@@ -28,6 +28,7 @@ import { calculateDiscoveryCapacity } from './discoverySchedulerPolicy';
 import { getAllocatedResearchQuery, markResearchActionQueued, rejectResearchAction } from './persistentResearch';
 import { sweepRelationshipCanarySeeds } from './relationshipCanarySeeds';
 import { materializeGeneratedQueryProposalsForCountry } from './discoveryProposalGenerators';
+import { materializeAdmittedGeneratedQueriesForCountry, materializedGeneratedTargetDimensions } from './generatedQueryMaterialization';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -528,8 +529,18 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
       const generatedCountry = countries[generatedCursor % countries.length];
       if (generatedCountry) {
         void materializeGeneratedQueryProposalsForCountry(generatedCountry)
-          .then(result => {
+          .then(async result => {
             if (result.persisted > 0) log(`Generated-query materialization: ${result.persisted} proposal(s) for ${generatedCountry}.`);
+            const promotionBasis = resolveScopePromotionForScope(scope, generatedCountry, targetCountry);
+            const supply = await materializeAdmittedGeneratedQueriesForCountry(generatedCountry, {
+              // A one-shot direct-target basis applies only to the explicitly
+              // requested allocation, never to every pending proposal in the
+              // background bulk materialization batch.
+              scopePromotionBasis: promotionBasis === 'DIRECT_TARGET' ? undefined : promotionBasis,
+            });
+            if (supply.materialized > 0) {
+              log(`Generated-query supply: ${supply.materialized} admitted proposal(s) entered the normal query library for ${generatedCountry}.`);
+            }
           })
           .catch(error => console.warn('[FrontierProposals] Generated-query materialization warning:', error));
         await setAppSetting('generated_query_country_cursor', String(generatedCursor + 1)).catch(() => undefined);
@@ -849,7 +860,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         quotaFreeRequired: selected.quotaFreeRequired === true,
         allocationOrigin: frontierAllocationInfo?.authorized ? 'FRONTIER_CANARY' : 'LEGACY',
         frontierDecisionId: frontierAllocationInfo?.authorized ? frontierAllocationInfo.decision?.decisionId : undefined,
-        targetNeighborhoodDimensions: frontierAllocationInfo?.authorized ? frontierAllocationInfo.targetNeighborhoodDimensions : undefined,
+        targetNeighborhoodDimensions: frontierAllocationInfo?.authorized
+          ? frontierAllocationInfo.targetNeighborhoodDimensions
+          : materializedGeneratedTargetDimensions(selected.queryRecord.generation_metadata),
         allowShadowProvider: providerTarget?.allowShadowProvider,
         allocationProvenance: creatorAllocation ? {
           assignmentId: creatorAllocation.assignmentId,

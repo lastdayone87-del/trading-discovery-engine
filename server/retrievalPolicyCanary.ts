@@ -98,6 +98,21 @@ export function evaluateRetrievalPolicyEligibility(input: {
 }
 
 /**
+ * Retrieval learning may not change the retrieval lane or search ordering of a
+ * lineage-bound (frontier/materialized) query, because the run must match its
+ * immutable neighborhood key. Return the reason to schedule the control
+ * configuration instead of reserving a canary treatment.
+ */
+export function canaryTreatmentSkipReason(input: {
+  lineageBound: boolean;
+  quotaFreeRequired: boolean;
+}): string | null {
+  if (input.lineageBound) return 'LINEAGE_BOUND_RETRIEVAL_CONFIGURATION';
+  if (input.quotaFreeRequired) return 'QUOTA_FREE_EXPLORATION_RELEVANCE_ONLY';
+  return null;
+}
+
+/**
  * Evaluates and reserves Phase 9 canary treatment authority under a transaction advisory lock.
  * Concurrency-safe: tracks reserved + committed treatment capacity in the active Pacific quota day.
  * State-aware: COMMITTED reservations cannot be reused to authorize a second query run.

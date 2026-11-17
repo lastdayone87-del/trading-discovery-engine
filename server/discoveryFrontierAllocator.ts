@@ -304,6 +304,10 @@ export async function getNeighborhoodCandidates(
       FROM frontier_discovery_proposals
       WHERE target_neighborhood_key = n.neighborhood_key
         AND trial_status = 'PENDING'
+        AND (supporting_evidence->>'materializingAt' IS NULL
+             OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
+        AND (supporting_evidence->>'materializationDeferredAt' IS NULL
+             OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
         AND (expires_at IS NULL OR expires_at > $1)
         AND (proposal_family <> 'EXTERNAL_OSINT'
           OR COALESCE((supporting_evidence->>'expiresAt')::timestamptz, '-infinity'::timestamptz) > $1)
@@ -328,7 +332,19 @@ export async function getNeighborhoodCandidates(
         AND allocation_origin = 'FRONTIER_CANARY'
         AND decision_status IN ('RESERVED', 'COMMITTED')
     ) recent ON true
-    ${targetCountry ? 'WHERE LOWER(n.country) = LOWER($4)' : ''}
+    WHERE NOT EXISTS (
+      -- A proposal being materialized into the normal library cannot also be
+      -- selected as a proposal-less frontier neighborhood: that would bypass
+      -- the locked-proposal check and race the materializer's authorization.
+      SELECT 1 FROM frontier_discovery_proposals mp
+      WHERE mp.target_neighborhood_key = n.neighborhood_key
+        AND mp.trial_status = 'PENDING'
+        AND (
+          (mp.supporting_evidence->>'materializingAt')::timestamptz >= $1::timestamptz - interval '15 minutes'
+          OR (mp.supporting_evidence->>'materializationDeferredAt')::timestamptz >= $1::timestamptz - interval '15 minutes'
+        )
+    )
+    ${targetCountry ? 'AND LOWER(n.country) = LOWER($4)' : ''}
     ORDER BY n.last_observed_at DESC
     LIMIT 50
   `;
@@ -857,6 +873,21 @@ export async function evaluateFrontierCanaryAllocation(input: {
 
     const topCandidate = eligibleCandidates[0].candidate;
     const topScore = eligibleCandidates[0].score;
+    // Recheck under a row lock immediately before reserving: a claim may have
+    // started after candidate loading, including on a neighborhood whose
+    // proposal was hidden from the LATERAL join.
+    const activeMaterialization = await runner.query(
+      `SELECT 1 FROM frontier_discovery_proposals
+        WHERE target_neighborhood_key=$1 AND trial_status='PENDING'
+          AND ((supporting_evidence->>'materializingAt')::timestamptz >= $2::timestamptz - interval '15 minutes'
+            OR (supporting_evidence->>'materializationDeferredAt')::timestamptz >= $2::timestamptz - interval '15 minutes')
+        FOR SHARE`,
+      [topCandidate.neighborhoodKey, now.toISOString()],
+    );
+    if (activeMaterialization.rowCount) {
+      if (client) await runner.query('COMMIT');
+      return { authorized: false, allocationOrigin: 'LEGACY', country: input.legacyCountry, reason: 'MATERIALIZATION_IN_PROGRESS' };
+    }
     let lockedProposalSnapshot = topCandidate.proposalEvidenceSnapshot || null;
     if (topCandidate.proposalId) {
       const selectedEvidence = (topCandidate.proposalEvidenceSnapshot?.supportingEvidence || {}) as Record<string, unknown>;
@@ -885,6 +916,10 @@ export async function evaluateFrontierCanaryAllocation(input: {
         `SELECT proposal_family,source_provenance,supporting_evidence,confidence,target_neighborhood_key,target_dimensions
          FROM frontier_discovery_proposals
          WHERE proposal_id=$1 AND trial_status='PENDING' AND (expires_at IS NULL OR expires_at>$2)
+           AND (supporting_evidence->>'materializingAt' IS NULL
+                OR (supporting_evidence->>'materializingAt')::timestamptz < $2::timestamptz - interval '15 minutes')
+           AND (supporting_evidence->>'materializationDeferredAt' IS NULL
+                OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < $2::timestamptz - interval '15 minutes')
          FOR UPDATE`,
         [topCandidate.proposalId, now.toISOString()]
       );

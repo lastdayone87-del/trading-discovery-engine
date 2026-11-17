@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   evaluateRetrievalPolicyEligibility,
+  canaryTreatmentSkipReason,
   deterministicExplorationValue,
   selectLearnedRetrievalConfiguration,
   reserveRetrievalCanaryTreatment,
@@ -127,4 +128,12 @@ test('releaseIncrementalTreatmentPageReservation preserves the official 100-unit
   assert.ok(parentUpdate, 'parent reservation must be reconciled');
   // Official behavior unchanged: floor 100, subtract exactly the persisted 100.
   assert.deepEqual(parentUpdate.params.slice(-2), [100, 100]);
+});
+
+
+test('lineage-bound and quota-free queries skip incompatible canary treatments', () => {
+  assert.equal(canaryTreatmentSkipReason({ lineageBound: true, quotaFreeRequired: false }), 'LINEAGE_BOUND_RETRIEVAL_CONFIGURATION');
+  assert.equal(canaryTreatmentSkipReason({ lineageBound: true, quotaFreeRequired: true }), 'LINEAGE_BOUND_RETRIEVAL_CONFIGURATION');
+  assert.equal(canaryTreatmentSkipReason({ lineageBound: false, quotaFreeRequired: true }), 'QUOTA_FREE_EXPLORATION_RELEVANCE_ONLY');
+  assert.equal(canaryTreatmentSkipReason({ lineageBound: false, quotaFreeRequired: false }), null);
 });
