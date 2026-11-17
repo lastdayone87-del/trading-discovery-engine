@@ -7,6 +7,18 @@ import { applyCategoryPrecisionGuard } from './evidenceEngine/categoryPrecisionG
  * Semantic provider outcomes only. A deterministic provider failure must not
  * relabel a semantic attempt as degraded or abstained.
  */
+/**
+ * Only a semantic verdict that actually served may own the content category.
+ * An abstention can retain a relevant label (no citations, low confidence, or
+ * unsupported language) but must not disable the video-focus review guard.
+ */
+export function routingContentCategory(
+  summary?: { isTrading?: string; taxonomyLabel?: string },
+): string | undefined {
+  if (!summary || summary.isTrading === 'UNCERTAIN') return undefined;
+  return summary.taxonomyLabel;
+}
+
 export function semanticProviderOutcomeFlags(
   providers: Array<{ provider?: string; outcome?: string }>,
 ): { abstained: boolean; failed: boolean; served: boolean } {
@@ -115,9 +127,7 @@ export async function classifyTradingRelevanceDetailed(
     acquisitionEnrich: lifecycleStage?.reasonCodes.includes('ACQUISITION_ENRICH') ?? false,
     acquisitionReason: lifecycleStage?.reasonCodes.find(code =>
       code === 'COMPOSITION_EVIDENCE_REQUIRED' || code === 'THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'),
-    contentCategory: decision.geminiSemanticSummary?.isTrading === 'UNCERTAIN'
-      ? undefined
-      : decision.geminiSemanticSummary?.taxonomyLabel,
+    contentCategory: routingContentCategory(decision.geminiSemanticSummary),
   });
   if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 
