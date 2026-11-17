@@ -16,7 +16,7 @@ const row = {
   fresh_quality: 0,
 };
 
-function makeDb(rows: any[]) {
+function makeDb(rows: any[], options: { rowCount?: number } = {}) {
   const updates: Array<{ sql: string; params: unknown[] }> = [];
   return {
     updates,
@@ -24,7 +24,7 @@ function makeDb(rows: any[]) {
       query: async (sql: string, params: unknown[]) => {
         if (sql.includes('WITH mature AS')) return { rows };
         updates.push({ sql, params });
-        return { rowCount: 1, rows: [] };
+        return { rowCount: options.rowCount ?? 1, rows: [] };
       },
     },
   };
@@ -32,7 +32,7 @@ function makeDb(rows: any[]) {
 
 const readSetting = async (_key: string, fallback: string) => fallback;
 
-test('mature exhausted query receives reversible next_eligible_at dormancy', async () => {
+test('mature exhausted query receives one reversible dormancy deadline with evidence', async () => {
   const { db, updates } = makeDb([{ ...row }]);
   const result = await runQuerySaturationSweep({
     db, readSetting, now: new Date('2026-11-16T00:00:00.000Z'), dormancyDays: 14,
@@ -41,9 +41,21 @@ test('mature exhausted query receives reversible next_eligible_at dormancy', asy
   assert.equal(result.dormant, 1);
   assert.equal(updates.length, 1);
   assert.match(updates[0].sql, /next_eligible_at/);
-  assert.match(updates[0].sql, /collection IN \('EXPERIMENTAL','PROVEN'\)/);
+  assert.match(updates[0].sql, /next_eligible_at <= now\(\)/);
+  assert.match(updates[0].sql, /NOT EXISTS/);
   assert.doesNotMatch(updates[0].sql, /REJECTED/);
   assert.equal(updates[0].params[0], 101);
+  assert.equal(updates[0].params[1], '2026-11-30T00:00:00.000Z');
+  const evidence = JSON.parse(String(updates[0].params[2]));
+  assert.equal(evidence.state, 'DORMANT');
+  assert.equal(evidence.dormancyDays, 14);
+});
+
+test('an existing future dormancy is preserved, not renewed', async () => {
+  const { db, updates } = makeDb([{ ...row }], { rowCount: 0 });
+  const result = await runQuerySaturationSweep({ db, readSetting, now: new Date('2026-11-16T00:00:00.000Z') });
+  assert.equal(result.skippedExistingDormancy, 1);
+  assert.equal(updates.length, 1);
 });
 
 test('productive mature query stays active and is not written', async () => {
@@ -63,10 +75,46 @@ test('pending classification is insufficient evidence and is not written', async
 
 test('low-volume markets are evaluated against their own per-run baseline', async () => {
   const { db } = makeDb([
-    { ...row, query_id: 1, country: 'Ireland', mature_runs: 8, fresh_relevant: 2, known_channels: 60 },
-    { ...row, query_id: 2, country: 'Ireland', mature_runs: 8, fresh_relevant: 2, known_channels: 60 },
+    { ...row, query_id: 1, country: 'Ireland', mature_runs: 8, fresh_relevant: 1, known_channels: 95 },
+    { ...row, query_id: 2, country: 'Ireland', mature_runs: 8, fresh_relevant: 1, known_channels: 95 },
+    { ...row, query_id: 3, country: 'Canada', mature_runs: 8, fresh_relevant: 10, known_channels: 20 },
   ]);
   const result = await runQuerySaturationSweep({ db, readSetting, now: new Date('2026-11-16T00:00:00.000Z') });
-  assert.equal(result.active, 2);
+  assert.equal(result.active, 3);
   assert.equal(result.dormant, 0);
+});
+
+test('zero-valued known-share setting is honored, not replaced by the default', async () => {
+  const settings = new Map([
+    ['query_saturation_known_share', '0'],
+    ['query_saturation_min_mature_runs', '7'],
+    ['query_saturation_max_pending_share', '0.2'],
+    ['query_saturation_max_lcb_baseline_ratio', '0.5'],
+  ]);
+  const { db } = makeDb([{ ...row, known_channels: 99 }]);
+  const result = await runQuerySaturationSweep({
+    db,
+    readSetting: async (key, fallback) => settings.get(key) ?? fallback,
+    now: new Date('2026-11-16T00:00:00.000Z'),
+  });
+  assert.equal(result.policy.minimumKnownCreatorShare, 0);
+});
+
+
+test('sweep SQL uses current pending sightings, excludes degraded runs, and is bounded', async () => {
+  let sqlSeen = '';
+  let paramsSeen: unknown[] = [];
+  const db = {
+    query: async (sql: string, params: unknown[]) => {
+      if (sql.includes('WITH mature AS')) { sqlSeen = sql; paramsSeen = params; return { rows: [] }; }
+      return { rowCount: 1, rows: [] };
+    },
+  };
+  await runQuerySaturationSweep({ db, readSetting, limit: 42, now: new Date('2026-11-16T00:00:00.000Z') });
+  assert.match(sqlSeen, /providerRequestsFailed/);
+  assert.match(sqlSeen, /providerRateLimited/);
+  assert.match(sqlSeen, /providerRunOutcome/);
+  assert.match(sqlSeen, /CLASSIFICATION_PENDING/);
+  assert.match(sqlSeen, /LIMIT \$1/);
+  assert.deepEqual(paramsSeen, [42]);
 });
