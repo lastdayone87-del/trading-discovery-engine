@@ -46,6 +46,8 @@ export interface AutonomousPageObservation {
   marginalNewCreators?: number;
   marginalConfirmedCreators?: number;
   marginalQualityCreators?: number;
+  marginalFreshConfirmedCreators?: number;
+  marginalFreshQualityCreators?: number;
   marginalNonTradingCreators?: number;
   novelCandidateTerms?: number;
   crossPageRepeatCreators?: number;
@@ -80,10 +82,12 @@ export async function recordAutonomousPage(p: AutonomousPageObservation): Promis
          marginal_confirmed_creators,marginal_quality_creators,marginal_non_trading_creators,
          novel_candidate_terms,cross_page_repeat_creators,cumulative_unique_creators,
          provider_page_cost_units,provider_page_cost_usd,relevance,marginal_utility_v2,
-         continuation_decision_v2,resume_mode,deferred_reason
+         continuation_decision_v2,resume_mode,deferred_reason,
+         marginal_fresh_confirmed_creators,marginal_fresh_quality_creators
        ) VALUES(
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
-         $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43
+         $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,
+         $44,$45
        ) ON CONFLICT(query_run_id,page_number) DO NOTHING RETURNING id`,
       [
         p.queryRunId, p.pageNumber, p.inputPageToken, p.nextPageToken, p.retrievalLane, p.searchOrdering,
@@ -100,6 +104,8 @@ export async function recordAutonomousPage(p: AutonomousPageObservation): Promis
         Math.max(0, Math.trunc(p.providerPageCostUnits || 0)), Math.max(0, Number(p.providerPageCostUsd || 0)),
         JSON.stringify(p.relevance || {}), Number(p.marginalUtilityV2 ?? p.decision.marginalUtility ?? 0),
         JSON.stringify(decisionV2 || {}), p.resumeMode || 'NONE', p.deferredReason || null,
+        p.marginalFreshConfirmedCreators === undefined ? null : Math.max(0, Math.trunc(p.marginalFreshConfirmedCreators)),
+        p.marginalFreshQualityCreators === undefined ? null : Math.max(0, Math.trunc(p.marginalFreshQualityCreators)),
       ],
     );
     if (r.rowCount) {
@@ -269,6 +275,10 @@ export interface AutonomousPageMarginalMetrics {
   marginalNewCreators: number;
   marginalConfirmedCreators: number;
   marginalQualityCreators: number;
+  /** Fresh (first-seen) confirmed creators; used only for continuation yield. */
+  marginalFreshConfirmedCreators: number;
+  /** Fresh (first-seen) quality-confirmed creators; used only for continuation yield. */
+  marginalFreshQualityCreators: number;
   marginalNonTradingCreators: number;
   crossPageRepeatCreators: number;
   cumulativeUniqueCreators: number;
@@ -314,6 +324,10 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND fs.first_was_new)::int AS marginal_new,
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status='TRADING_CONFIRMED')::int AS marginal_confirmed,
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status='TRADING_CONFIRMED' AND COALESCE(c.quality_score,0)>=55)::int AS marginal_quality,
+       -- Continuation yield is fresh-only. These columns are separate from the
+       -- health counters above, which intentionally include known creators.
+       COUNT(*) FILTER (WHERE fs.first_page=$2 AND fs.first_was_new AND c.trading_status='TRADING_CONFIRMED')::int AS marginal_fresh_confirmed,
+       COUNT(*) FILTER (WHERE fs.first_page=$2 AND fs.first_was_new AND c.trading_status='TRADING_CONFIRMED' AND COALESCE(c.quality_score,0)>=55)::int AS marginal_fresh_quality,
        COUNT(*) FILTER (WHERE fs.first_page=$2 AND c.trading_status IN ('NON_TRADING','HUMAN_REJECTED'))::int AS marginal_non_trading,
        COUNT(*) FILTER (WHERE fs.first_page < $2 AND ps.channel_id IS NOT NULL)::int AS cross_page_repeat,
        COUNT(*) FILTER (WHERE fs.first_page <= $2)::int AS cumulative_unique,
@@ -332,6 +346,8 @@ export async function getAutonomousPageMarginalMetrics(runId: string, pageNumber
     marginalNewCreators: Number(row.marginal_new || 0),
     marginalConfirmedCreators: Number(row.marginal_confirmed || 0),
     marginalQualityCreators: Number(row.marginal_quality || 0),
+    marginalFreshConfirmedCreators: Number(row.marginal_fresh_confirmed || 0),
+    marginalFreshQualityCreators: Number(row.marginal_fresh_quality || 0),
     marginalNonTradingCreators: Number(row.marginal_non_trading || 0),
     crossPageRepeatCreators: Number(row.cross_page_repeat || 0),
     cumulativeUniqueCreators: Number(row.cumulative_unique || 0),
@@ -508,8 +524,8 @@ export async function listPendingAutonomousRuns(
               -- must not determine the ordering of pending runs.
               COALESCE((
                 SELECT GREATEST(0, LEAST(1,
-                  0.30 * COALESCE(p.marginal_quality_creators::float / NULLIF(p.distinct_creator_count,0),0)
-                  + 0.25 * COALESCE(p.marginal_confirmed_creators::float / NULLIF(p.distinct_creator_count,0),0)
+                  0.30 * COALESCE(COALESCE(p.marginal_fresh_quality_creators,p.marginal_quality_creators)::float / NULLIF(p.distinct_creator_count,0),0)
+                  + 0.25 * COALESCE(COALESCE(p.marginal_fresh_confirmed_creators,p.marginal_confirmed_creators)::float / NULLIF(p.distinct_creator_count,0),0)
                   + 0.20 * COALESCE(p.marginal_new_creators::float / NULLIF(p.distinct_creator_count,0),0)
                   + 0.15 * COALESCE(p.country_precision,0)
                   - 0.20 * COALESCE(p.duplicate_ratio,0)

@@ -33,11 +33,12 @@ maybe('resume ranking orders creator utility from controlled pending rows', asyn
       query_run_id int, page_number int, marginal_quality_creators int,
       marginal_confirmed_creators int, marginal_new_creators int,
       marginal_non_trading_creators int, distinct_creator_count int,
-      country_precision numeric, duplicate_ratio numeric, marginal_utility_v2 numeric
+      country_precision numeric, duplicate_ratio numeric, marginal_utility_v2 numeric,
+      marginal_fresh_confirmed_creators int, marginal_fresh_quality_creators int
     );
     CREATE TEMP TABLE jobs (id int, status text, idempotency_key text);
   `);
-  await client.query(`INSERT INTO query_library(id, query) VALUES (1,'one'),(2,'two')`);
+  await client.query(`INSERT INTO query_library(id, query) VALUES (1,'one'),(2,'two'),(3,'three'),(4,'four')`);
   const insertRun = `INSERT INTO query_runs(
     id, query_id, country, source, pages_completed, continuation_status, scheduled_at, status
   ) VALUES ($1,$2,'Canada','automated_query',0,'RUNNING',now(),'RUNNING')`;
@@ -67,4 +68,23 @@ maybe('resume ranking orders creator utility from controlled pending rows', asyn
   assert.deepEqual(ranked.map(run => run.runId), ['12', '11']);
   assert.ok(ranked[0].marginalUtility > ranked[1].marginalUtility);
   assert.equal(ranked[1].marginalUtility, 0);
+
+  // Fresh-only columns must override legacy confirmed/quality counts.
+  await client.query(insertRun, [13, 3]);
+  await client.query(insertRun, [14, 4]);
+  await client.query(
+    `INSERT INTO autonomous_query_page_observations(
+       query_run_id,page_number,marginal_quality_creators,marginal_confirmed_creators,
+       marginal_new_creators,marginal_non_trading_creators,distinct_creator_count,
+       country_precision,duplicate_ratio,marginal_utility_v2,
+       marginal_fresh_confirmed_creators,marginal_fresh_quality_creators
+     ) VALUES
+       (13,1,8,8,0,0,10,1,0,1,0,0),
+       (14,1,0,0,0,0,10,1,0,0,8,8)`,
+  );
+  const freshRanked = await listPendingAutonomousRuns(5, client);
+  const freshIndex = freshRanked.findIndex(run => run.runId === '14');
+  const legacyIndex = freshRanked.findIndex(run => run.runId === '13');
+  assert.ok(freshIndex >= 0 && legacyIndex >= 0);
+  assert.ok(freshIndex < legacyIndex, 'fresh yield outranks legacy known-creator counts');
 });
