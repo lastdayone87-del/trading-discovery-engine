@@ -526,3 +526,54 @@ test('getFrontierAllocationDiagnostics and getFrontierAllocationControlCompariso
   assert.equal(typeof comp.legacyControl, 'object');
   assert.equal(typeof comp.frontierCanary, 'object');
 });
+
+test('candidate loading excludes neighborhoods with an active materialization claim', async () => {
+  let sqlSeen = '';
+  await getNeighborhoodCandidates('Canada', new Date(), {
+    query: async (sql: string) => { sqlSeen = sql; return { rows: [] }; },
+  });
+  assert.match(sqlSeen, /NOT EXISTS \([\s\S]*materializingAt[\s\S]*materializationDeferredAt/);
+});
+
+test('a materialization claim started after candidate loading blocks the frontier reservation', async () => {
+  let decisionInserted = false;
+  const mockClient = {
+    query: async (sql: string) => {
+      if (sql.includes('frontier_allocation_enabled')) return { rows: [{ setting_value: 'true' }] };
+      if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+      if (sql.includes('discovery_provider_registry')) {
+        return { rows: [{
+          provider_key: 'youtube-search', provider_family: 'youtube',
+          capabilities: ['SEARCH_YOUTUBE'], quota_domain: 'YOUTUBE_DATA_API', mode: 'ACTIVE',
+          daily_cost_cap: 0, configuration_version: 1, updated_at: '2026-08-20T00:00:00Z',
+        }] };
+      }
+      if (sql.includes('frontier_allocation_daily_assignment_cap')) return { rows: [{ setting_value: '10' }] };
+      if (sql.includes('frontier_allocation_daily_quota_cap')) return { rows: [{ setting_value: '1000' }] };
+      if (sql.includes('daily_assignments')) return { rows: [{ daily_assignments: 0, daily_quota_used: 0 }] };
+      if (sql.includes('discovery_neighborhoods')) {
+        return { rows: [{
+          neighborhood_key: 'CA|en|GENERAL|trading|KEYWORD_SEARCH|RELEVANCE|none|automated_query',
+          country: 'Canada',
+          dimensions: JSON.stringify({ country: 'Canada', language: 'en', queryIntent: 'GENERAL', primaryTermFamily: 'trading', retrievalLane: 'KEYWORD_SEARCH', searchOrdering: 'RELEVANCE', sourceFamily: 'automated_query' }),
+          frontier_state: 'UNEXPLORED', expected_marginal_value: 80, uncertainty: 0.9,
+          coverage_gain: 0.8, known_creator_ratio: 0, result_set_overlap: 0,
+          is_saturating: false, proposal_id: null, last_allocated_at: null, recent_allocation_count: 0,
+        }] };
+      }
+      if (sql.includes('FOR SHARE') && sql.includes('materializingAt')) return { rows: [{ ok: 1 }], rowCount: 1 };
+      if (sql.includes('app_settings')) return { rows: [] };
+      if (sql.includes('INSERT INTO frontier_allocation_decisions')) { decisionInserted = true; return { rows: [] }; }
+      return { rows: [] };
+    },
+  };
+
+  const result = await evaluateFrontierCanaryAllocation({
+    opportunityKey: `opp_active_claim_${Date.now()}`,
+    legacyCountry: 'Canada',
+    client: mockClient,
+  });
+  assert.equal(result.authorized, false);
+  assert.equal(result.reason, 'MATERIALIZATION_IN_PROGRESS');
+  assert.equal(decisionInserted, false);
+});

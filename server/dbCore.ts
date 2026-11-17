@@ -2684,10 +2684,13 @@ export async function reservePortfolioContinuationPage(input: {
 export async function getQueryQualityDashboardRows(country?:string,limit=200):Promise<QueryQualityDashboardRunInput[]>{const db=await getDb();const res=await db.query(`SELECT qr.id::text AS run_id,qr.query_id,COALESCE(ql.query,'') AS query,qr.country,qr.status,qr.selection_strategy,qr.selection_reason,qr.quota_used,qr.completed_at,qr.performance_details,COALESCE(a.metrics,'{}'::jsonb) AS metrics,COALESCE(qr.metadata,'{}'::jsonb) AS run_metadata,(SELECT apo.stopping_reason FROM autonomous_query_page_observations apo WHERE apo.query_run_id=qr.id ORDER BY apo.page_number DESC LIMIT 1) AS stop_reason FROM query_runs qr LEFT JOIN query_library ql ON ql.id=qr.query_id LEFT JOIN query_run_accounting_attributions a ON a.query_run_id=qr.id WHERE ($1::text IS NULL OR LOWER(qr.country)=LOWER($1)) ORDER BY qr.scheduled_at DESC LIMIT $2`,[country||null,Math.max(1,Math.min(500,Math.floor(limit)))]);return res.rows.map((r:any)=>{const metrics=parseJson<Record<string,any>>(r.metrics,{});const metadata=parseGenerationMetadata(r.run_metadata);const admission=metadata.queryAdmission||null;return {runId:String(r.run_id||''),queryId:Number(r.query_id||0),query:String(r.query||''),country:String(r.country||''),status:String(r.status||''),selectionStrategy:String(r.selection_strategy||'UNKNOWN'),selectionReason:String(r.selection_reason||''),stopReason:r.stop_reason?String(r.stop_reason):null,quotaUsed:Number(r.quota_used||0),completedAt:iso(r.completed_at),performanceScore:Number(r.performance_details?.performanceScore||metrics.performanceScore||0),qualityVector:metrics.qualityVector||null,admission:admission?{tier:admission.tier,compositionFamily:admission.compositionFamily,reasonCodes:Array.isArray(admission.reasonCodes)?admission.reasonCodes:[],source:admission.source,eligible:admission.eligible}:null};});}
 export async function getQueryByText(queryText:string):Promise<QueryRecord|null>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library WHERE LOWER(query)=LOWER($1)',[queryText.trim()]); return res.rows[0]?rowToQuery(res.rows[0]):null;}
 export interface QueryDuplicateHistoryItem {query:string;country:string;aliasOf?:string;}
-export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;},options:{/** Still-current same-country rows, preloaded by a batch producer. */history?:QueryDuplicateHistoryItem[];/** Never mutate an existing (country, normalized_query) row. */preserveExistingRow?:boolean}={}):Promise<QueryRecord>{
-  const db=await getDb();
+export async function upsertQueryRecord(record:{query:string;country:string;collection:'PROVEN'|'EXPERIMENTAL'|'REJECTED';intent:string;knowledgeTiers?:number[];generationMode?:string;generationReason?:string;discoveryObjective?:string;primaryTerm?:string;generationMetadata?:Record<string,unknown>;},options:{/** Still-current same-country rows, preloaded by a batch producer. */history?:QueryDuplicateHistoryItem[];/** Never mutate an existing (country, normalized_query) row. */preserveExistingRow?:boolean;/** Optional caller transaction, used when scope validation and the write must be atomic. */db?:{query:(text:string,params?:unknown[])=>Promise<{rows:any[];rowCount?:number|null}>}}={}):Promise<QueryRecord>{
+  const db=options.db||await getDb();
   const query=record.query.normalize('NFKC').trim().replace(/\s+/g,' ');
   const normalized=normalizeQueryText(query);
+  // Canonical country identity keeps the case-sensitive (country, normalized_query)
+  // uniqueness constraint from creating a second row for an alias/casing variant.
+  const country=canonicalCountry(record.country);
   const admissionMetadata=parseGenerationMetadata(record.generationMetadata as Record<string,unknown>||{});
   // Country-scoped duplicate suppression compares against every other row,
   // including cooling/rejected rows. The current row is excluded so an
@@ -2695,21 +2698,31 @@ export async function upsertQueryRecord(record:{query:string;country:string;coll
   // once instead of rescanning the whole country per candidate.
   const history=(options.history
     ? options.history
-    : (await db.query(`SELECT query,country,generation_metadata FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query<>$2`,[record.country,normalized])).rows.map((row:any)=>{
+    : (await db.query(`SELECT query,country,generation_metadata FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query<>$2`,[country,normalized])).rows.map((row:any)=>{
         const metadata=parseGenerationMetadata(row.generation_metadata);
         const aliasOf=typeof metadata.aliasOf==='string'?metadata.aliasOf:undefined;
         return {query:String(row.query||''),country:String(row.country||''),...(aliasOf?{aliasOf}:{})};
       })
   ).filter((item:QueryDuplicateHistoryItem)=>item.query&&normalizeQueryText(item.query)!==normalized);
-  const admission=admitQueryRecord({query,country:record.country,primary_term:record.primaryTerm,generation_metadata:admissionMetadata},{history,now:new Date().toISOString()});
+  const admission=admitQueryRecord({query,country,primary_term:record.primaryTerm,generation_metadata:admissionMetadata},{history,now:new Date().toISOString()});
   const generationMetadata=withQueryAdmission(admissionMetadata,admission.admission);
-  const values=[query,normalized,record.country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)];
+  const values=[query,normalized,country,record.collection,record.intent,record.knowledgeTiers||[1],record.generationMode||'LEGACY',record.generationReason||'Legacy query',record.discoveryObjective||'Discover relevant trading creators.',record.primaryTerm||null,JSON.stringify(generationMetadata)];
+  if (options.preserveExistingRow) {
+    // Compare country case-insensitively as well as through the canonical
+    // value, so legacy rows written before canonicalization still protect.
+    const existing=await db.query(`SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query=$2 LIMIT 1`,[country,normalized]);
+    if (existing.rowCount) {
+      // The persisted row is preserved, but authorization must evaluate the
+      // fresh admission decision for this proposal, not stale row metadata.
+      return { ...rowToQuery(existing.rows[0]), country, generation_metadata: generationMetadata };
+    }
+  }
   const res=options.preserveExistingRow
     ? await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO NOTHING RETURNING *`,values)
     : await db.query(`INSERT INTO query_library(query,normalized_query,country,collection,intent,knowledge_tiers,generation_mode,generation_reason,discovery_objective,primary_term,generation_metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now()) ON CONFLICT(country,normalized_query) DO UPDATE SET query=excluded.query,collection=CASE WHEN COALESCE(query_library.generation_metadata,'{}'::jsonb) ? 'queryHold' THEN 'REJECTED' ELSE excluded.collection END,intent=excluded.intent,knowledge_tiers=excluded.knowledge_tiers,generation_mode=excluded.generation_mode,generation_reason=excluded.generation_reason,discovery_objective=excluded.discovery_objective,primary_term=excluded.primary_term,generation_metadata=CASE WHEN COALESCE(query_library.generation_metadata,'{}'::jsonb) ? 'queryHold' THEN query_library.generation_metadata ELSE excluded.generation_metadata END RETURNING *`,values);
   if (options.preserveExistingRow && !res.rowCount) {
-    const existing=await db.query('SELECT * FROM query_library WHERE country=$1 AND normalized_query=$2',[record.country,normalized]);
-    return rowToQuery(existing.rows[0]);
+    const existing=await db.query('SELECT * FROM query_library WHERE LOWER(country)=LOWER($1) AND normalized_query=$2 LIMIT 1',[country,normalized]);
+    return { ...rowToQuery(existing.rows[0]), country, generation_metadata: generationMetadata };
   }
   return rowToQuery(res.rows[0]);
 }

@@ -2135,7 +2135,8 @@ export type QueryIntelligenceAuthorizationCode =
   | 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM'
   | 'QUERY_ADMISSION_REJECTED'
   | 'QUERY_HOLD_ACTIVE'
-  | 'EXISTING_QUERY_PROTECTED';
+  | 'EXISTING_QUERY_PROTECTED'
+  | 'SCOPE_PROMOTION_STALE';
 
 export type QueryIntelligenceAuthorizationOutcome =
   | { status: 'AUTHORIZED'; code: 'AUTHORIZED'; queryRecord: QueryRecord }
@@ -2222,11 +2223,40 @@ export function classifyCountryNativeAuthorizationInput(args: CountryNativeAutho
   return { status: 'VALID', nativeTerm, evidence, targetKey };
 }
 
+/**
+ * Last-responsible-moment check for persistent country promotion. Reads the
+ * settings with row locks inside the same transaction as the library write, so
+ * clearing the operator selection cannot race the authorization upsert.
+ */
+async function persistentSelectionStillActive(
+  client: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+  country: string,
+): Promise<boolean> {
+  const res = await client.query(
+    `SELECT setting_key, setting_value FROM app_settings
+      WHERE setting_key IN ('query_intelligence_discovery_scope','query_intelligence_selected_countries')
+      FOR SHARE`,
+  );
+  const values = new Map(res.rows.map(row => [String(row.setting_key), String(row.setting_value)]));
+  if (String(values.get('query_intelligence_discovery_scope') || 'GLOBAL').toUpperCase() !== 'SELECTED_COUNTRIES') {
+    return false;
+  }
+  try {
+    const selected = JSON.parse(values.get('query_intelligence_selected_countries') || '[]');
+    if (!Array.isArray(selected) || selected.some(value => typeof value !== 'string')) return false;
+    const target = country.normalize('NFKC').trim().toLocaleLowerCase('en');
+    return selected.some(value => value.normalize('NFKC').trim().toLocaleLowerCase('en') === target);
+  } catch {
+    return false;
+  }
+}
+
 /** Governed Query Intelligence boundary for immutable Phase 8 concept allocations. */
 export async function authorizeCountryNativeAllocationQuery(args: CountryNativeAuthorizationInput): Promise<QueryIntelligenceAuthorizationOutcome> {
   try {
+    const country = canonicalCountry(args.country);
     try {
-      await assertCountryAllowed(args.country, 'query_generation');
+      await assertCountryAllowed(country, 'query_generation');
     } catch (error: any) {
       if (error?.code === 'COUNTRY_EXCLUDED') {
         return { status: 'REJECTED', code: 'COUNTRY_EXCLUDED', queryRecord: null };
@@ -2239,9 +2269,9 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
     const { nativeTerm, evidence, targetKey } = inputResult;
 
     const vocabs = await getCountryVocabularies();
-    const countryVocabulary = vocabs.find(v => v.country.toLowerCase() === args.country.toLowerCase());
+    const countryVocabulary = vocabs.find(v => v.country.toLowerCase() === country.toLowerCase());
     const planned = planCountryNativeProposalQuery({
-      country: args.country,
+      country,
       nativeTerm,
       countryVocabulary,
       targetIntent: args.targetNeighborhoodDimensions.queryIntent,
@@ -2277,18 +2307,35 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
       return { status: 'REJECTED', code: 'CONSTRUCTED_QUERY_MISSING_NATIVE_TERM', queryRecord: null };
     }
 
-    const queryRecord = await upsertQueryRecord({
-      query: planned.query,
-      country: args.country,
-      collection: 'EXPERIMENTAL',
-      intent: planned.intent,
-      knowledgeTiers: planned.knowledgeTiers,
-      generationMode: planned.generationMode,
-      generationReason: planned.generationReason,
-      discoveryObjective: planned.discoveryObjective,
-      primaryTerm: planned.primaryTerm,
-      generationMetadata: planned.metadata
-    }, { preserveExistingRow: args.preserveExistingLibraryRow === true });
+    const pool = await getDb();
+    const client = await pool.connect();
+    let queryRecord: QueryRecord;
+    try {
+      await client.query('BEGIN');
+      if (args.scopePromotionBasis === 'PERSISTENT_SCOPE_SELECTION'
+        && !await persistentSelectionStillActive(client, country)) {
+        await client.query('ROLLBACK');
+        return { status: 'REJECTED', code: 'SCOPE_PROMOTION_STALE', queryRecord: null };
+      }
+      queryRecord = await upsertQueryRecord({
+        query: planned.query,
+        country,
+        collection: 'EXPERIMENTAL',
+        intent: planned.intent,
+        knowledgeTiers: planned.knowledgeTiers,
+        generationMode: planned.generationMode,
+        generationReason: planned.generationReason,
+        discoveryObjective: planned.discoveryObjective,
+        primaryTerm: planned.primaryTerm,
+        generationMetadata: planned.metadata
+      }, { preserveExistingRow: args.preserveExistingLibraryRow === true, db: client });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
     if (args.preserveExistingLibraryRow
       && (queryRecord.collection === 'REJECTED' || queryRecord.collection === 'PROVEN')) {
       return { status: 'REJECTED', code: 'EXISTING_QUERY_PROTECTED', queryRecord: null };

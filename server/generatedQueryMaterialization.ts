@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getDb, getAppSetting } from './db';
 import { authorizeCountryNativeAllocationQuery } from './queryIntelligence';
 import type { DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
@@ -16,11 +17,13 @@ async function isStillInPersistentSelection(
   readSetting: (key: string, fallback: string) => Promise<string>,
 ): Promise<boolean> {
   const scope = String(await readSetting('query_intelligence_discovery_scope', 'GLOBAL')).toUpperCase();
-  if (scope !== 'SELECTED_COUNTRIES') return true;
+  // A persistent promotion is valid only while the live mode still selects
+  // countries. GLOBAL or malformed scope means the old promotion is stale.
+  if (scope !== 'SELECTED_COUNTRIES') return false;
   const raw = await readSetting('query_intelligence_selected_countries', '[]');
   try {
     const selected = JSON.parse(raw);
-    if (!Array.isArray(selected)) return false;
+    if (!Array.isArray(selected) || selected.some(value => typeof value !== 'string')) return false;
     const target = country.normalize('NFKC').trim().toLocaleLowerCase('en');
     return selected.some(value => typeof value === 'string'
       && value.normalize('NFKC').trim().toLocaleLowerCase('en') === target);
@@ -127,10 +130,15 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
     // Claim before the slow authorization path. Frontier allocation also
     // locks the proposal row and refuses a claimed proposal; this prevents the
     // background materializer from consuming a reservation mid-scheduling.
+    const claimToken = randomUUID();
     const claim = await db.query(
       `UPDATE frontier_discovery_proposals
-       SET supporting_evidence = supporting_evidence || jsonb_build_object('materializingAt', now())
+       SET supporting_evidence = supporting_evidence || jsonb_build_object(
+         'materializingAt', now(),
+         'materializingClaim', $2::text
+       )
        WHERE proposal_id=$1 AND trial_status='PENDING'
+         AND (expires_at IS NULL OR expires_at > now())
          AND (supporting_evidence->>'materializingAt' IS NULL
               OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
          AND (supporting_evidence->>'materializationDeferredAt' IS NULL
@@ -141,7 +149,7 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
              AND d.decision_status IN ('RESERVED','COMMITTED')
          )
        RETURNING proposal_id`,
-      [row.proposal_id],
+      [row.proposal_id, claimToken],
     );
     if (!claim.rowCount) { result.deferred++; continue; }
 
@@ -160,10 +168,11 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
     } catch (error: any) {
       await db.query(
         `UPDATE frontier_discovery_proposals
-         SET supporting_evidence = (supporting_evidence - 'materializingAt')
+         SET supporting_evidence = (supporting_evidence - 'materializingAt' - 'materializingClaim')
            || jsonb_build_object('materializationDeferredAt', now())
-         WHERE proposal_id=$1 AND trial_status='PENDING'`,
-        [row.proposal_id],
+         WHERE proposal_id=$1 AND trial_status='PENDING'
+           AND supporting_evidence->>'materializingClaim'=$2`,
+        [row.proposal_id, claimToken],
       );
       result.deferred++;
       console.warn('[GeneratedSupply] Materialization deferred:', {
@@ -177,10 +186,11 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
       const saved = await db.query(
         `UPDATE frontier_discovery_proposals
          SET trial_status='TRIED',
-             supporting_evidence = (supporting_evidence - 'materializingAt')
-               || jsonb_build_object('materializedQueryId', $2::int, 'materializedAt', now())
-         WHERE proposal_id=$1 AND trial_status='PENDING'`,
-        [row.proposal_id, outcome.queryRecord.id],
+             supporting_evidence = (supporting_evidence - 'materializingAt' - 'materializingClaim')
+               || jsonb_build_object('materializedQueryId', $3::int, 'materializedAt', now())
+         WHERE proposal_id=$1 AND trial_status='PENDING'
+           AND supporting_evidence->>'materializingClaim'=$2`,
+        [row.proposal_id, claimToken, outcome.queryRecord.id],
       );
       if (saved.rowCount) {
         result.materialized++;
@@ -195,19 +205,21 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
       await db.query(
         `UPDATE frontier_discovery_proposals
          SET trial_status='DISABLED',
-             supporting_evidence = (supporting_evidence - 'materializingAt')
-               || jsonb_build_object('materializationRejectedCode', $2::text, 'materializationRejectedAt', now())
-         WHERE proposal_id=$1 AND trial_status='PENDING'`,
-        [row.proposal_id, outcome.code],
+             supporting_evidence = (supporting_evidence - 'materializingAt' - 'materializingClaim')
+               || jsonb_build_object('materializationRejectedCode', $3::text, 'materializationRejectedAt', now())
+         WHERE proposal_id=$1 AND trial_status='PENDING'
+           AND supporting_evidence->>'materializingClaim'=$2`,
+        [row.proposal_id, claimToken, outcome.code],
       );
       result.rejected++;
     } else {
       await db.query(
         `UPDATE frontier_discovery_proposals
-         SET supporting_evidence = (supporting_evidence - 'materializingAt')
+         SET supporting_evidence = (supporting_evidence - 'materializingAt' - 'materializingClaim')
            || jsonb_build_object('materializationDeferredAt', now())
-         WHERE proposal_id=$1 AND trial_status='PENDING'`,
-        [row.proposal_id],
+         WHERE proposal_id=$1 AND trial_status='PENDING'
+           AND supporting_evidence->>'materializingClaim'=$2`,
+        [row.proposal_id, claimToken],
       );
       result.deferred++;
     }

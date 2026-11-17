@@ -80,7 +80,10 @@ test('materializes an authorized generated proposal as a normal candidate and fo
   assert.equal(authorizeArgs.proposalEvidenceSnapshot.supportingEvidence.nativeTerm, 'market structure');
   const final = updates.find(update => update.sql.includes("trial_status='TRIED'"));
   assert.ok(final);
-  assert.deepEqual(final.params, ['p-1', 42]);
+  assert.equal(final.params[0], 'p-1');
+  assert.equal(typeof final.params[1], 'string');
+  assert.equal(String(final.params[1]).length, 36);
+  assert.equal(final.params[2], 42);
 });
 
 test('rejected admission disables the proposal instead of blindly admitting it', async () => {
@@ -99,7 +102,9 @@ test('rejected admission disables the proposal instead of blindly admitting it',
   assert.equal(result.materialized, 0);
   const final = updates.find(update => update.sql.includes("trial_status='DISABLED'"));
   assert.ok(final);
-  assert.deepEqual(final.params, ['p-1', 'QUERY_ADMISSION_REJECTED']);
+  assert.equal(final.params[0], 'p-1');
+  assert.equal(typeof final.params[1], 'string');
+  assert.equal(final.params[2], 'QUERY_ADMISSION_REJECTED');
 });
 
 test('system errors defer the proposal without consuming it', async () => {
@@ -217,6 +222,47 @@ test('persistent-selection materialization rechecks live scope before authorizin
     readSetting: async (key, fallback) => {
       if (key === 'query_intelligence_discovery_scope') return 'SELECTED_COUNTRIES';
       if (key === 'query_intelligence_selected_countries') return '["France"]';
+      return fallback;
+    },
+    authorize: (async () => {
+      authorized = true;
+      return { status: 'AUTHORIZED', code: 'AUTHORIZED', queryRecord: { id: 42 } };
+    }) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(authorized, false);
+});
+
+test('persistent promotion is stale when the live scope is GLOBAL', async () => {
+  const { db } = makeDb([{ ...proposal }]);
+  let authorized = false;
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    readSetting: async (key, fallback) => {
+      if (key === 'query_intelligence_discovery_scope') return 'GLOBAL';
+      return fallback;
+    },
+    authorize: (async () => {
+      authorized = true;
+      return { status: 'AUTHORIZED', code: 'AUTHORIZED', queryRecord: { id: 42 } };
+    }) as any,
+  });
+  assert.equal(result.deferred, 1);
+  assert.equal(authorized, false);
+});
+
+test('persistent promotion fails closed on a malformed selected-country array', async () => {
+  const { db } = makeDb([{ ...proposal }]);
+  let authorized = false;
+  const result = await materializeAdmittedGeneratedQueriesForCountry('Canada', {
+    db,
+    limit: 5,
+    scopePromotionBasis: 'PERSISTENT_SCOPE_SELECTION',
+    readSetting: async (key, fallback) => {
+      if (key === 'query_intelligence_discovery_scope') return 'SELECTED_COUNTRIES';
+      if (key === 'query_intelligence_selected_countries') return '["Canada", 7]';
       return fallback;
     },
     authorize: (async () => {
