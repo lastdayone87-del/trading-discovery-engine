@@ -279,7 +279,7 @@ export async function applyCategoryPrecisionGuard(
 ): Promise<PrecisionGuardResult | null> {
   if (!firstLabel) return null;
   if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION'].includes(firstLabel)) return null;
-  const enabled = options.enabled ?? process.env.CONTENT_CATEGORY_PRECISION_GUARD_ENABLED === 'true';
+  const enabled = options.enabled ?? process.env.CONTENT_CATEGORY_PRECISION_GUARD_ENABLED !== 'false';
   if (!enabled) return null;
   const deterministic = deterministicCategoryGuard(input);
   if (deterministic) return deterministic;

@@ -122,6 +122,18 @@ test('a sparse or empty video sample cannot support an unrelated downgrade', () 
   }), null);
 });
 
+test('the guard is on by default and can be disabled explicitly', async () => {
+  const c = FALSE_POSITIVE_CASES.find(value => value.name === 'CryptoDexWorld')!;
+  const guarded = await applyCategoryPrecisionGuard(input(c), 'INVESTING_EDUCATION', {
+    adjudicator: async () => result('HYPE'),
+  });
+  assert.equal(guarded?.category, 'HYPE');
+  assert.equal(await applyCategoryPrecisionGuard(input(c), 'INVESTING_EDUCATION', {
+    enabled: false,
+    adjudicator: async () => result('HYPE'),
+  }), null);
+});
+
 test('guard is disabled by flag and only runs for a relevant first-pass label', async () => {
   const c = FALSE_POSITIVE_CASES.find(value => value.name === 'CryptoDexWorld')!;
   assert.equal(await applyCategoryPrecisionGuard(input(c), 'INVESTING_EDUCATION', { enabled: false }), null);
