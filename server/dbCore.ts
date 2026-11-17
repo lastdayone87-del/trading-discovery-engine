@@ -4534,14 +4534,14 @@ export async function scheduleAutonomousQueryRuns(
           const [frontierCapRes, frontierUseRes] = await Promise.all([
             client.query(`SELECT setting_value FROM app_settings WHERE setting_key = 'frontier_allocation_daily_quota_cap'`),
             client.query(
-              `SELECT COALESCE(SUM(GREATEST(quota_reserved, quota_consumed)), 0)::int AS daily_quota_used
+              `SELECT COALESCE(SUM(GREATEST(provider_reserved_amount, provider_consumed_amount)), 0)::int AS daily_official_quota_used
                FROM frontier_allocation_decisions
                WHERE quota_day = $1 AND allocation_origin = 'FRONTIER_CANARY' AND decision_status IN ('RESERVED', 'COMMITTED')`,
               [getYouTubeQuotaDay(new Date())]
             ),
           ]);
           const frontierQuotaCap = Number(frontierCapRes.rows[0]?.setting_value ?? 1000);
-          if (Number(frontierUseRes.rows[0]?.daily_quota_used || 0) + 100 > frontierQuotaCap) {
+          if (Number(frontierUseRes.rows[0]?.daily_official_quota_used || 0) + 100 > frontierQuotaCap) {
             await failStep('provider_guard_quota', new Error(`FRONTIER_CANARY_DAILY_CAP_EXCEEDED (date-ordering retarget needs official units)`));
           }
           await client.query(

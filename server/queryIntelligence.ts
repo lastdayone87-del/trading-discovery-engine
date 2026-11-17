@@ -1535,7 +1535,11 @@ export async function selectNextQueryForCountry(
       if (selected) {
         return buildSelectionResult(selected, pool, 'NEIGHBORHOOD_TARGETED', `Frontier neighborhood canonical selection for target key "${targetKey}": ${targeted.reason}`, targeted);
       }
-    } else {
+      // Matches can exist while every candidate is cooling down, admission-
+      // blocked or otherwise unselectable. Do not fall through to a generic
+      // legacy query; try the governed generated/planned target fallback below.
+    }
+    {
       const generated = await generateCandidateQueriesForCountry(country, 1, 'EXPLORATION', { scopePromotionBasis: options.scopePromotionBasis });
       const matchingGenerated = generated.find(query => {
         const dimensions: DiscoveryNeighborhoodDimensions = {
