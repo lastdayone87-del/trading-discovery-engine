@@ -12,23 +12,8 @@ ALTER TABLE jobs
   ADD COLUMN IF NOT EXISTS parked_reason TEXT,
   ADD COLUMN IF NOT EXISTS parked_at TIMESTAMPTZ;
 
--- The dedicated community-retry consumer orders by updated_at so a saturated
--- cohort yields its turn to never-claimed/new work. Match that order exactly.
-CREATE INDEX IF NOT EXISTS idx_jobs_retry_fair_claim
-  ON jobs (priority DESC, updated_at ASC, id ASC)
-  WHERE status='PENDING' AND type='RETRY_COMMUNITY_ACQUISITION';
 
--- Channel job lookups are frequent in reconciliation/reporting. Restrict the
--- index to active retry rows so it stays small and selective.
-CREATE INDEX IF NOT EXISTS idx_jobs_retry_channel_active
-  ON jobs ((payload->>'channelId'))
-  WHERE type='RETRY_COMMUNITY_ACQUISITION'
-    AND status IN ('PENDING','PROCESSING');
 
--- Bounded URL claim path: per-channel due order.
-CREATE INDEX IF NOT EXISTS idx_community_url_state_claim
-  ON community_acquisition_url_state (channel_id, next_eligible_at, first_observed_at)
-  WHERE state='PENDING';
 
 COMMENT ON COLUMN jobs.capacity_deferrals IS
   'Number of attempt-free capacity/browser-gate deferrals for observability and bounded parking.';

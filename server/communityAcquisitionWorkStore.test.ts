@@ -59,6 +59,7 @@ test('materialize preserves required work and optional multi-invite recall rows'
   assert.equal(required.recall, false);
   assert.equal(required.priority, 100);
   assert.equal(required.state, 'PENDING');
+  assert.ok(required.attempts >= 1, 'processed evidence must seed a valid attempt count');
   assert.equal(recall.required, false);
   assert.equal(recall.recall, true);
   assert.equal(recall.priority, 10);

@@ -736,6 +736,15 @@ async function ensureQuerySaturationIndexes(client: { query: (text: string, valu
  * Build every index concurrently before the loop's BEGIN; migration 170 then
  * only adopts a valid index or verifies an empty table.
  */
+async function ensureAcquisitionReliabilityIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  await ensureConcurrentIndex(client, 'idx_jobs_retry_fair_claim', 'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_retry_fair_claim ON public.jobs (priority DESC, updated_at ASC, id ASC) WHERE status='PENDING' AND type='RETRY_COMMUNITY_ACQUISITION'`);
+  await ensureConcurrentIndex(client, 'idx_jobs_retry_channel_active', 'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_retry_channel_active ON public.jobs ((payload->>'channelId')) WHERE type='RETRY_COMMUNITY_ACQUISITION' AND status IN ('PENDING','PROCESSING')`);
+  await ensureConcurrentIndex(client, 'idx_community_url_state_claim_v2', 'community_acquisition_url_state',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_community_url_state_claim_v2 ON public.community_acquisition_url_state (channel_id, priority DESC, never_executed DESC, first_observed_at ASC, work_key) WHERE state='PENDING'`);
+}
+
 async function ensurePhase4ScaleIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
   await ensureConcurrentIndex(client,
     'idx_jobs_enrich_created_at',
@@ -810,6 +819,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // idempotent and also repairs a build that failed on a previous boot.
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
+    const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');
+    if (acquisitionReliabilityMigration.rowCount) await ensureAcquisitionReliabilityIndexes(client);
     // Phase 0 queue/capacity indexes and the partial backfill index require
     // migration 162's columns. Build them concurrently first, then run the
     // idempotent historical clock backfill in bounded batches. The partial
@@ -3715,14 +3726,64 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
   const traceId=String(claimed?.payload?.traceId||'');
   if(traceId){try{await db.query(`INSERT INTO discovery_execution_trace(trace_id,stage,outcome,detail) VALUES($1,'WORKER_POLLING','REACHED',$2),($1,'QUEUE_CLAIM','REACHED',$3)`,[traceId,JSON.stringify({workerId,claimableTypes:types||null}),JSON.stringify({workerId,jobId:claimed!.id,type:claimed!.type})]);}catch(error){console.warn('[Execution Trace] Claim trace unavailable; discovery claim remains committed.',error instanceof Error?error.message:error);}}
   return claimed;}
-export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
+export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,capacity_deferrals=0,capacity_wait_started_at=NULL,parked_reason=NULL,parked_at=NULL,last_progress_at=now(),updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 /**
  * Return a batch-owner job to PENDING after a completed URL-ledger slice. The
  * per-URL ledger owns the real attempt budget, so the channel-level claim is
  * refunded; otherwise a channel with more than five URL slices would exhaust
  * before its URL work could be processed.
  */
-export async function rescheduleJob(jobId:string,runAfter:string,note:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,note.slice(0,2000),runAfter]); await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,note.slice(0,2000)]);}
+export async function rescheduleJob(
+  jobId:string,
+  runAfter:string,
+  note:string,
+  claim?:{workerId?:string|null;attemptNumber?:number;generation?:number},
+):Promise<boolean>{
+  const db=await getDb();
+  const client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    const message=note.slice(0,2000);
+    const updated=await client.query(
+      `UPDATE jobs
+          SET status='PENDING',
+              attempts=GREATEST(0,attempts-1),
+              last_error=$2,
+              locked_by=NULL,
+              locked_at=NULL,
+              run_after=$3,
+              capacity_deferrals=0,
+              capacity_wait_started_at=NULL,
+              parked_reason=NULL,
+              parked_at=NULL,
+              last_progress_at=now(),
+              updated_at=now()
+        WHERE id=$1
+          AND status='PROCESSING'
+          AND ($4::text IS NULL OR locked_by=$4)
+          AND ($5::int IS NULL OR attempts=$5)
+      RETURNING id`,
+      [jobId,message,runAfter,claim?.workerId??null,claim?.attemptNumber??null],
+    );
+    if(!updated.rowCount){await client.query('ROLLBACK');return false;}
+    await client.query(
+      `UPDATE job_attempts
+          SET status='COMPLETED',finished_at=now(),error=$2
+        WHERE job_id=$1
+          AND ($3::int IS NULL OR attempt_number=$3)
+          AND ($4::int IS NULL OR generation=$4)
+          AND finished_at IS NULL`,
+      [jobId,message,claim?.attemptNumber??null,claim?.generation??null],
+    );
+    await client.query('COMMIT');
+    return true;
+  }catch(error){
+    await client.query('ROLLBACK').catch(()=>undefined);
+    throw error;
+  }finally{
+    client.release();
+  }
+}
 
 /**
  * Durable affirmative proof that community inspection genuinely began for one
@@ -4004,7 +4065,8 @@ export async function failJob(jobId:string,error:any):Promise<JobFailureDisposit
     }else if(decision.disposition==='FAILED'){
       await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);
     }else{
-      await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);
+      const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
+      await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,capacity_deferrals=0,capacity_wait_started_at=NULL,parked_reason=NULL,parked_at=NULL,last_progress_at=now(),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
     }
     await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const stuck=await client.query(`SELECT id,type,locked_by,locked_at,attempts FROM jobs WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval FOR UPDATE`,[String(staleAfterMinutes)]); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); await client.query('COMMIT'); const summary=summarizeRecoveredStaleJobs(stuck.rows,Date.now()); if(summary.recovered>0)console.warn(JSON.stringify({event:'stale_jobs_recovered',...summary,staleAfterMinutes,timestamp:new Date().toISOString()})); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}

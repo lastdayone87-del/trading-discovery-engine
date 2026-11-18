@@ -21,6 +21,7 @@ import {
   communityAcquisitionWorkKey,
   hasBrowserExecution,
   hasDirectProcessedAcquisitionEvidence,
+  countsTowardAttemptBudget,
   hasProcessedAcquisitionEvidence,
   isCommunityLedgerWorkObservation,
   isInfrastructureFailureClass,
@@ -45,6 +46,7 @@ export interface CommunityWorkRow {
   normalizedUrl: string;
   surface: string;
   state: CommunityWorkState;
+  leaseToken: string | null;
   required: boolean;
   recall: boolean;
   priority: number;
@@ -181,31 +183,35 @@ export async function materializeCommunityWorkForChannel(
 
   const requiredRows = projection.rows.map(row => {
     const classified = initialLedgerState(row);
+    const attempts = Math.min(5, Math.max(row.neverExecuted ? 0 : 1, row.attempts));
+    const state = classified.state === 'PENDING' && attempts >= 5 ? 'EXHAUSTED' : classified.state;
     return {
       work_key: row.workKey,
       channel_id: row.channelId,
       url: row.url,
       normalized_url: row.normalizedUrl,
       surface: row.surface,
-      state: classified.state,
-      required: true,
+      state,
+      required: row.required,
       recall: false,
       priority: 100,
       never_executed: row.neverExecuted,
-      attempts: 0,
+      attempts,
       max_attempts: 5,
-      retryable: classified.state === 'PENDING' || classified.state === 'PARKED_INFRA',
+      retryable: state === 'PENDING' || state === 'PARKED_INFRA',
       browser_executed: !row.neverBrowserExecuted,
       first_observed_at: row.firstObservedAt,
-      last_attempt_at: null,
-      next_eligible_at: classified.state === 'PARKED_INFRA'
+      last_attempt_at: row.lastAttemptAt,
+      last_observed_at: row.lastObservedAt,
+      next_eligible_at: state === 'PARKED_INFRA'
         ? new Date(Date.now() + CAPACITY_BACKOFF_SECONDS * 1000).toISOString()
         : new Date().toISOString(),
       last_failure_class: row.lastFailureClass,
       last_outcome: row.lastOutcome,
-      terminal_reason: classified.reason,
+      terminal_reason: state === 'EXHAUSTED' ? 'MAX_ATTEMPTS' : classified.reason,
       terminal_evidence: {
         materializedFrom: 'external_acquisition_observations',
+        latestObservedAt: row.lastObservedAt,
         latestOutcome: row.lastOutcome,
         latestFailureClass: row.lastFailureClass,
         retryOwned: row.retryOwned,
@@ -247,11 +253,16 @@ export async function materializeCommunityWorkForChannel(
     const directProcessed = hasDirectProcessedAcquisitionEvidence(latest);
     const browserExecuted = hasBrowserExecution(latest);
     const infra = isInfrastructureFailureClass(latest.failureClass);
+    const historicalAttempts = group.observations.reduce((count, observation) => count + (countsTowardAttemptBudget(observation) ? 1 : 0), 0);
+    const attempts = Math.min(5, Math.max(directProcessed ? 1 : 0, historicalAttempts));
     const state: CommunityWorkState = terminal.terminal
       ? 'RESOLVED'
       : infra
         ? 'PARKED_INFRA'
-        : 'PENDING';
+        : attempts >= 5
+          ? 'EXHAUSTED'
+          : 'PENDING';
+    const lastObservedAt = group.observations.reduce((latestAt, observation) => Date.parse(observation.observedAt) > Date.parse(latestAt) ? observation.observedAt : latestAt, group.observations[0].observedAt);
     return {
       work_key: workKey,
       channel_id: channelId,
@@ -263,23 +274,23 @@ export async function materializeCommunityWorkForChannel(
       recall: true,
       priority: 10,
       never_executed: !group.observations.some(hasDirectProcessedAcquisitionEvidence),
-      attempts: 0,
+      attempts,
       max_attempts: 5,
       retryable: state === 'PENDING' || state === 'PARKED_INFRA',
       browser_executed: group.observations.some(hasBrowserExecution),
       first_observed_at: group.observations.reduce((min, obs) => obs.observedAt < min ? obs.observedAt : min, group.observations[0].observedAt),
-      last_attempt_at: null,
-      next_eligible_at: state === 'PENDING'
+      last_attempt_at: latest ? latest.observedAt : null,
+      last_observed_at: lastObservedAt,
+      next_eligible_at: state === 'PENDING' || state === 'RESOLVED'
         ? new Date().toISOString()
-        : state === 'PARKED_INFRA'
-          ? new Date(Date.now() + CAPACITY_BACKOFF_SECONDS * 1000).toISOString()
-          : new Date().toISOString(),
+        : new Date(Date.now() + CAPACITY_BACKOFF_SECONDS * 1000).toISOString(),
       last_failure_class: latest.failureClass || null,
       last_outcome: latest.outcome,
-      terminal_reason: terminal.terminal ? terminal.reason : state === 'PARKED_INFRA' ? String(latest.failureClass || 'CAPACITY') : null,
+      terminal_reason: terminal.terminal ? terminal.reason : state === 'EXHAUSTED' ? 'MAX_ATTEMPTS' : state === 'PARKED_INFRA' ? String(latest.failureClass || 'CAPACITY') : null,
       terminal_evidence: {
         materializedFrom: 'external_acquisition_observations',
         recall: true,
+        latestObservedAt: lastObservedAt,
         latestOutcome: latest.outcome,
         latestFailureClass: latest.failureClass || null,
         observations: group.observations.length,
@@ -308,7 +319,26 @@ export async function materializeCommunityWorkForChannel(
          last_failure_class text, last_outcome text, terminal_reason text,
          terminal_evidence jsonb
        )
-     ON CONFLICT (work_key) DO NOTHING`,
+     ON CONFLICT (work_key) DO UPDATE SET
+       state=EXCLUDED.state,
+       required=EXCLUDED.required,
+       recall=EXCLUDED.recall,
+       priority=EXCLUDED.priority,
+       never_executed=EXCLUDED.never_executed,
+       attempts=EXCLUDED.attempts,
+       retryable=EXCLUDED.retryable,
+       browser_executed=EXCLUDED.browser_executed,
+       last_attempt_at=EXCLUDED.last_attempt_at,
+       next_eligible_at=EXCLUDED.next_eligible_at,
+       last_failure_class=EXCLUDED.last_failure_class,
+       last_outcome=EXCLUDED.last_outcome,
+       terminal_reason=EXCLUDED.terminal_reason,
+       terminal_evidence=EXCLUDED.terminal_evidence,
+       updated_at=now()
+     WHERE community_acquisition_url_state.state='RESOLVED'
+       AND EXCLUDED.state IN ('PENDING','PARKED_INFRA')
+       AND COALESCE(community_acquisition_url_state.terminal_evidence->>'latestObservedAt','')
+           < COALESCE(EXCLUDED.terminal_evidence->>'latestObservedAt','')`,
     [JSON.stringify(rows)],
   );
   return { inserted: result.rowCount || 0, projected: rows.length };
@@ -357,7 +387,7 @@ export async function resetStaleCommunityWork(
   const databaseClient = await database(db);
   const result = await databaseClient.query(
     `UPDATE community_acquisition_url_state
-        SET state='PENDING', next_eligible_at=now(), updated_at=now()
+        SET state='PENDING', lease_token=NULL, next_eligible_at=now(), updated_at=now()
       WHERE state='RUNNING'
         AND last_attempt_at < now() - ($1::text || ' minutes')::interval`,
     [String(Math.max(1, Math.floor(staleMinutes)))],
@@ -388,13 +418,14 @@ export async function claimCommunityWorkSlice(
      )
      UPDATE community_acquisition_url_state s
         SET state='RUNNING',
+            lease_token=gen_random_uuid(),
             last_attempt_at=now(),
             next_eligible_at=now() + ($3::text || ' minutes')::interval,
             updated_at=now()
        FROM due
       WHERE s.work_key=due.work_key
       RETURNING s.work_key,s.channel_id,s.url,s.normalized_url,s.surface,s.state,
-                s.required,s.recall,s.priority,s.never_executed,s.browser_executed,
+                s.lease_token,s.required,s.recall,s.priority,s.never_executed,s.browser_executed,
                 s.attempts,s.max_attempts,s.first_observed_at,s.last_attempt_at,
                 s.next_eligible_at,s.last_failure_class,s.last_outcome,
                 s.terminal_reason,s.terminal_evidence`,
@@ -411,6 +442,7 @@ function rowToCommunityWorkRow(row: any): CommunityWorkRow {
     normalizedUrl: String(row.normalized_url),
     surface: String(row.surface),
     state: String(row.state) as CommunityWorkState,
+    leaseToken: row.lease_token ? String(row.lease_token) : null,
     required: row.required !== false,
     recall: row.recall === true,
     priority: Number(row.priority ?? 100),
@@ -490,22 +522,34 @@ export async function completeCommunityWorkSlice(
 
   for (const row of claimed) {
     const group = grouped.get(row.workKey) || [];
-    const latest = selectEffectiveInspectionObservation(latestInspectionObservations(group));
+    // Only observations created after this claim may decide this slice. A
+    // claimed URL that never reached the inspector must not re-charge an old
+    // failure from the 90-day history.
+    const claimBoundaryMs = row.lastAttemptAt ? Date.parse(row.lastAttemptAt) - 5 * 60_000 : 0;
+    const freshGroup = group.filter(observation => {
+      const at = Date.parse(observation.observedAt);
+      return Number.isFinite(at) && at >= claimBoundaryMs;
+    });
+    const latest = selectEffectiveInspectionObservation(latestInspectionObservations(freshGroup));
     if (!latest) {
       // The URL was not present in this slice's collected links. Do not charge
       // an attempt; keep it available for a future inspection but back off so a
       // stale ledger row cannot spin.
-      await db.query(
+      const released = await db.query(
         `UPDATE community_acquisition_url_state
             SET state='PENDING',
                 next_eligible_at=now() + interval '5 minutes',
                 updated_at=now(),
                 terminal_evidence=terminal_evidence || $2::jsonb
-          WHERE work_key=$1`,
-        [row.workKey, JSON.stringify({ lastSliceObserved: false })],
+          WHERE work_key=$1
+            AND state='RUNNING'
+            AND lease_token=$3::uuid`,
+        [row.workKey, JSON.stringify({ lastSliceObserved: false }), row.leaseToken],
       );
-      pending++;
-      updated++;
+      if ((released.rowCount || 0) > 0) {
+        pending++;
+        updated++;
+      }
       continue;
     }
 
@@ -514,7 +558,9 @@ export async function completeCommunityWorkSlice(
     const browserExecuted = hasBrowserExecution(latest);
     const infra = isInfrastructureFailureClass(latest.failureClass);
     const terminal = terminalFor(latest);
-    const attemptDelta = (processed || (latest.outcome === 'ACQUISITION_FAILED' && !infra)) ? 1 : 0;
+    // Borrowed/static evidence can resolve the URL but only direct processed
+    // work or a genuine site failure consumes a billable attempt.
+    const attemptDelta = (directProcessed || (latest.outcome === 'ACQUISITION_FAILED' && !infra)) ? 1 : 0;
     const attempts = row.attempts + attemptDelta;
 
     let state: CommunityWorkState;
@@ -523,25 +569,21 @@ export async function completeCommunityWorkSlice(
     if (terminal.terminal) {
       state = 'RESOLVED';
       reason = terminal.reason;
-      resolved++;
     } else if (infra) {
       state = 'PARKED_INFRA';
       reason = String(latest.failureClass || 'CAPACITY');
       nextEligibleAt = new Date(Date.now() + backoffSeconds(row.attempts, true) * 1000).toISOString();
-      parked++;
     } else if (attempts >= row.maxAttempts) {
       state = 'EXHAUSTED';
       reason = 'MAX_ATTEMPTS';
-      exhausted++;
     } else {
       state = 'PENDING';
       nextEligibleAt = new Date(Date.now() + backoffSeconds(attempts, false) * 1000).toISOString();
-      pending++;
     }
 
     const neverExecuted = row.neverExecuted && !directProcessed;
     const browserExecutedResult = row.neverBrowserExecuted ? browserExecuted : true;
-    await db.query(
+    const result = await db.query(
       `UPDATE community_acquisition_url_state
           SET state=$2,
               never_executed=$3,
@@ -555,7 +597,9 @@ export async function completeCommunityWorkSlice(
               terminal_evidence=$11::jsonb,
               retryable=$12,
               updated_at=now()
-        WHERE work_key=$1`,
+        WHERE work_key=$1
+          AND state='RUNNING'
+          AND lease_token=$13::uuid`,
       [
         row.workKey,
         state,
@@ -570,6 +614,7 @@ export async function completeCommunityWorkSlice(
         JSON.stringify({
           observationId: latest.id || null,
           observedAt: latest.observedAt,
+          latestObservedAt: latest.observedAt,
           outcome: latest.outcome,
           failureClass: latest.failureClass || null,
           processed,
@@ -579,9 +624,16 @@ export async function completeCommunityWorkSlice(
           retryOwned: observationOwnsRetry(latest),
         }),
         state === 'PENDING' || state === 'PARKED_INFRA',
+        row.leaseToken,
       ],
     );
-    updated++;
+    if ((result.rowCount || 0) > 0) {
+      updated++;
+      if (state === 'RESOLVED') resolved++;
+      else if (state === 'PARKED_INFRA') parked++;
+      else if (state === 'EXHAUSTED') exhausted++;
+      else if (state === 'PENDING') pending++;
+    }
   }
 
   return { updated, resolved, parked, exhausted, pending };
@@ -597,7 +649,7 @@ export async function releaseCommunityWorkSlice(
   const databaseClient = await database(db);
   const result = await databaseClient.query(
     `UPDATE community_acquisition_url_state
-        SET state='PENDING', next_eligible_at=$2, updated_at=now()
+        SET state='PENDING', lease_token=NULL, next_eligible_at=$2, updated_at=now()
       WHERE work_key = ANY($1::text[])
         AND state='RUNNING'`,
     [[...workKeys], nextEligibleAt],

@@ -1515,6 +1515,10 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
 
   if (slice.length === 0) {
     const summary = await communityWorkSummary(channel.channel_id, db);
+    // A prior slice can leave a Discord validation check pending after all URL
+    // work resolved. Do not close the batch without giving the legacy
+    // validation path its bounded retry.
+    if (job.payload?.ledgerValidationPending) return false;
     if (summary.total > 0 && summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0) {
       await completeJob(job.id);
       return true;
@@ -1523,8 +1527,10 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
   }
 
   const allowedUrls = new Set(slice.map(row => row.normalizedUrl));
+  const seedUrls = slice.map(row => ({ url: row.url, surface: row.surface }));
+  let inspectionResult: Awaited<ReturnType<typeof inspectAndValidateChannel>>;
   try {
-    await inspectAndValidateChannel(
+    inspectionResult = await inspectAndValidateChannel(
       channel,
       undefined,
       false,
@@ -1543,16 +1549,35 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
         jobId: job.id,
         slicePass: Math.max(1, job.attempts || 1),
       },
-      { allowedUrls, slicePass: Math.max(1, job.attempts || 1) },
+      { allowedUrls, seedUrls, slicePass: Math.max(1, job.attempts || 1) },
     );
   } catch (error) {
     await releaseCommunityWorkSlice(slice.map(row => row.workKey), db, new Date(Date.now() + 60_000).toISOString());
     throw error;
   }
 
-  await completeCommunityWorkSlice(channel.channel_id, slice, { db });
+  try {
+    await completeCommunityWorkSlice(channel.channel_id, slice, { db });
+  } catch (error) {
+    // Completion can fail after some rows were updated. Release only rows that
+    // are still RUNNING; the stale sweep remains the final backstop.
+    await releaseCommunityWorkSlice(slice.map(row => row.workKey), db, new Date(Date.now() + 60_000).toISOString());
+    throw error;
+  }
   const summary = await communityWorkSummary(channel.channel_id, db);
   if (summary.total > 0 && summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0) {
+    const refreshed = await getChannelById(channel.channel_id);
+    if ((inspectionResult && typeof inspectionResult === 'object' && inspectionResult.retryDirective)
+      || refreshed?.discord_validation_status === 'RETRY_PENDING'
+      || refreshed?.scan_status === 'FAILED') {
+      // Hand the unvalidated invite back to the legacy bounded validation
+      // path; it must not be silently closed as a clean URL-ledger completion.
+      await db.query(
+        `UPDATE jobs SET payload=jsonb_set(payload,'{ledgerValidationPending}','true'::jsonb),updated_at=now() WHERE id=$1`,
+        [job.id],
+      );
+      return false;
+    }
     await completeJob(job.id);
     return true;
   }
@@ -1560,11 +1585,19 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
     // More URL work is pending. Reschedule the batch owner without consuming
     // its channel-level attempt; the per-URL ledger already charged only the
     // URLs that actually processed work.
-    await rescheduleJob(
+    const rescheduled = await rescheduleJob(
       job.id,
       summary.minNextEligibleAt || new Date(Date.now() + 1_000).toISOString(),
       'Community acquisition ledger slice complete; rescheduled for remaining URL work',
+      {
+        workerId: job.locked_by || null,
+        attemptNumber: job.attempts,
+        generation: job.reopen_generation,
+      },
     );
+    if (!rescheduled) {
+      console.warn('[CommunityAcquisition] ledger slice reschedule lost its claim; leaving recovery to the stale-claim sweep');
+    }
     return true;
   }
   throw deferred(summary);
@@ -1750,7 +1783,8 @@ export async function processNextSearchJob(
       // work through the generic unresolved-failure path below.
       // Browser-capacity attempt-free deferral throws above and is untouched.
       if(shouldCompleteSuppressedRetryJob(inspectionResult,refreshed?.scan_status)){await completeJob(job.id);return true;}
-      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'){
+      const outstandingRetryDirective=inspectionResult&&typeof inspectionResult==='object'&&Boolean(inspectionResult.retryDirective);
+      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'||outstandingRetryDirective){
         throw Object.assign(
           new Error('Retryable community acquisition remains unresolved'),
           inspectionAcquisitionEvidence?{acquisitionEvidence:inspectionAcquisitionEvidence}:{},
@@ -3903,7 +3937,7 @@ export async function inspectAndValidateChannel(
   scheduleRetry: boolean = true,
   executionMarker?: { jobId: string; attemptNumber: number; generation?: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> },
   attribution?: ChannelInspectionAttributionInput,
-  inspectionScope?: { allowedUrls?: ReadonlySet<string>; slicePass?: number },
+  inspectionScope?: { allowedUrls?: ReadonlySet<string>; seedUrls?: Array<{url:string;surface:string}>; slicePass?: number },
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   // Phase 0 lane attribution: explicit caller lane > execution marker > the
   // inspection shape. The attribution is observational only and never changes
@@ -4109,7 +4143,8 @@ export async function inspectAndValidateChannel(
             const normalized = normalizeCommunityWorkUrl(url);
             return Boolean(normalized && inspectionScope.allowedUrls!.has(normalized));
           }
-        : undefined
+        : undefined,
+      ledgerSeedUrls: inspectionScope?.seedUrls
     });
     // Carry only controls this run actually examined into any retry directive.
     // A pre-click failure leaves the previous per-seed offsets unchanged, so

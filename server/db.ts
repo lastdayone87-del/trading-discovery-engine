@@ -221,7 +221,8 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
     if(capacityLease){
       // Renew only capacity bookkeeping. first_transient_failure_at and
       // created_at are deliberately absent from this statement.
-      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,terminal_failure_class=NULL,${capacityLeaseRefreshSetSql('$4')} WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),String(CAPACITY_LEASE_DURATION_MS)]);
+      const capacityParked = '(capacity_deferrals+1>=10 OR (capacity_wait_started_at IS NOT NULL AND capacity_wait_started_at<now()-interval \'24 hours\'))';
+      await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=CASE WHEN ${capacityParked} THEN now()+interval '6 hours' ELSE $3 END,terminal_failure_class=NULL,capacity_deferrals=capacity_deferrals+1,capacity_wait_started_at=COALESCE(capacity_wait_started_at,now()),parked_reason=CASE WHEN ${capacityParked} THEN 'CAPACITY_WAIT' ELSE parked_reason END,parked_at=CASE WHEN ${capacityParked} THEN now() ELSE parked_at END,${capacityLeaseRefreshSetSql('$4')} WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),String(CAPACITY_LEASE_DURATION_MS)]);
     }else{
       await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,terminal_failure_class=NULL,first_transient_failure_at=COALESCE(first_transient_failure_at,$4::timestamptz),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),transientAnchor]);
     }
@@ -229,7 +230,7 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
     await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,terminal_failure_class=$5,first_transient_failure_at=CASE WHEN $3::boolean THEN COALESCE(first_transient_failure_at,$4::timestamptz) ELSE first_transient_failure_at END,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,retryableInfrastructure,transientAnchor,terminalFailureClass]);
   }else{
     const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
-    await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,terminal_failure_class=NULL,first_transient_failure_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
+    await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,terminal_failure_class=NULL,first_transient_failure_at=NULL,capacity_deferrals=0,capacity_wait_started_at=NULL,parked_reason=NULL,parked_at=NULL,last_progress_at=now(),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
   }
   // The job-row transition above is the disposition: count it here so a
   // failure in the secondary attempts bookkeeping below cannot omit it.

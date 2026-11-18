@@ -2,9 +2,10 @@
  * Revalidate the retry backlog against the URL work ledger.
  *
  * This is deliberately not the old blanket quarantine script. For each job:
+ *   * lock the pending batch owner before examining it;
  *   * materialize missing URL work from durable observations;
  *   * if every URL is RESOLVED/EXHAUSTED (no active or parked work), close the
- *     batch owner with evidence;
+ *     batch owner with append-only closure evidence;
  *   * if any URL is still relevant, leave the job PENDING and let the normal
  *     fair scheduler process it;
  *   * never create a 30-day quarantine merely because a job is old.
@@ -50,7 +51,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const db = await getDb();
   const triageJoin = args.triageOnly
-    ? `JOIN retry_backlog_triage t ON t.job_id=j.id AND t.bucket='QUARANTINE'`
+    ? `JOIN retry_backlog_triage t ON t.job_id=j.id AND t.bucket='QUARANTINE' AND t.undone_at IS NULL`
     : '';
   const jobs = await db.query(
     `SELECT j.id,j.payload->>'channelId' AS channel_id,j.attempts,j.first_enqueued_at,
@@ -59,6 +60,7 @@ async function main() {
        ${triageJoin}
       WHERE j.type='RETRY_COMMUNITY_ACQUISITION'
         AND j.status='PENDING'
+        AND j.closed_at IS NULL
       ORDER BY j.first_enqueued_at ASC, j.id ASC
       LIMIT $1`,
     [args.limit],
@@ -69,6 +71,7 @@ async function main() {
     closedResolved: 0,
     leftActive: 0,
     leftParked: 0,
+    skippedClaimed: 0,
     noLedgerRows: 0,
     dryRun: !args.apply,
   };
@@ -100,6 +103,22 @@ async function main() {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
+      // Serialize ledger materialization/closure with any worker materializing
+      // or completing a URL for this channel, then lock the batch owner. If a
+      // worker claimed it after the initial scan, skip it entirely.
+      await client.query('LOCK TABLE community_acquisition_url_state IN SHARE ROW EXCLUSIVE MODE');
+      const locked = await client.query(
+        `SELECT 1 FROM jobs
+          WHERE id=$1 AND status='PENDING' AND closed_at IS NULL
+          FOR UPDATE SKIP LOCKED`,
+        [jobId],
+      );
+      if (!locked.rowCount) {
+        await client.query('ROLLBACK');
+        summary.skippedClaimed++;
+        continue;
+      }
+
       await materializeCommunityWorkForChannel(channelId, { db: client });
       const work = await communityWorkSummary(channelId, client);
       if (work.total === 0) {
@@ -108,13 +127,38 @@ async function main() {
         continue;
       }
       if (work.active === 0 && work.parkedInfra + work.parkedExternal === 0) {
-        await client.query(
+        const closed = await client.query(
           `UPDATE jobs
               SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,
-                  terminal_failure_class=NULL,last_error=$2,updated_at=now()
-            WHERE id=$1 AND status='PENDING'`,
-          [jobId, 'Revalidated: all URL work resolved or exhausted'],
+                  terminal_failure_class=NULL,last_error=$2,updated_at=now(),
+                  closed_reason='LEDGER_ALL_TERMINAL',
+                  closed_by='revalidateCommunityRetryBacklog',
+                  closed_at=now(),
+                  closed_evidence=$3::jsonb
+            WHERE id=$1 AND status='PENDING' AND closed_at IS NULL
+            RETURNING id`,
+          [
+            jobId,
+            'Revalidated: all URL work resolved or exhausted',
+            JSON.stringify({
+              source: 'revalidateCommunityRetryBacklog',
+              ledger: {
+                total: work.total,
+                pending: work.pending,
+                running: work.running,
+                parkedInfra: work.parkedInfra,
+                parkedExternal: work.parkedExternal,
+                resolved: work.resolved,
+                exhausted: work.exhausted,
+              },
+            }),
+          ],
         );
+        if (!closed.rowCount) {
+          await client.query('ROLLBACK');
+          summary.skippedClaimed++;
+          continue;
+        }
         await client.query(
           `UPDATE job_attempts SET status='COMPLETED',finished_at=now()
             WHERE job_id=$1 AND finished_at IS NULL`,
@@ -123,6 +167,20 @@ async function main() {
         await client.query('COMMIT');
         summary.closedResolved++;
       } else {
+        // Revalidation found real work. Do not leave it behind the old
+        // 30-day quarantine: both new and old work must keep progressing.
+        if (work.active > 0 || work.parkedInfra + work.parkedExternal > 0) {
+          await client.query(
+            `UPDATE jobs SET run_after=now(),updated_at=now()
+              WHERE id=$1 AND status='PENDING'`,
+            [jobId],
+          );
+          await client.query(
+            `UPDATE retry_backlog_triage SET undone_at=now()
+              WHERE job_id=$1 AND undone_at IS NULL`,
+            [jobId],
+          );
+        }
         await client.query('COMMIT');
         if (work.active > 0) summary.leftActive++;
         else summary.leftParked++;
@@ -136,6 +194,7 @@ async function main() {
   }
 
   console.log(JSON.stringify(summary, null, 2));
+  if (typeof (db as any).end === 'function') await (db as any).end();
 }
 
 main().catch(error => {

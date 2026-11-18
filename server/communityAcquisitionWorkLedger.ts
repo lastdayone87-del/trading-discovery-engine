@@ -124,12 +124,14 @@ export interface CommunityWorkProjectionRow {
   attempts: number;
   maxAttempts: number;
   firstObservedAt: string;
+  lastObservedAt: string;
   lastAttemptAt: string | null;
   lastFailureClass: string | null;
   lastOutcome: string;
   terminalReason: string | null;
   terminalEvidence: Record<string, unknown>;
   retryOwned: boolean;
+  required: boolean;
   observations: number;
 }
 
@@ -636,6 +638,7 @@ export function projectCommunityAcquisitionWork(
       attempts,
       maxAttempts,
       firstObservedAt: earliestAt,
+      lastObservedAt: group.observations.reduce((latest, observation) => Date.parse(observation.observedAt) > Date.parse(latest) ? observation.observedAt : latest, group.observations[0].observedAt),
       lastAttemptAt,
       lastFailureClass: latest.failureClass ? String(latest.failureClass) : null,
       lastOutcome: latest.outcome,
@@ -651,6 +654,7 @@ export function projectCommunityAcquisitionWork(
         retryOwned,
       },
       retryOwned,
+      required: isRequiredCommunityWorkObservation(latest),
       observations: group.observations.length,
     });
   }

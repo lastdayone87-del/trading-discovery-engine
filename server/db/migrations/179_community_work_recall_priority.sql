@@ -7,9 +7,6 @@ ALTER TABLE community_acquisition_url_state
   ADD COLUMN IF NOT EXISTS recall BOOLEAN NOT NULL DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100;
 
-CREATE INDEX IF NOT EXISTS idx_community_url_state_priority_claim
-  ON community_acquisition_url_state (channel_id, priority DESC, next_eligible_at, first_observed_at)
-  WHERE state='PENDING';
 
 COMMENT ON COLUMN community_acquisition_url_state.required IS
   'TRUE for required community work; FALSE for optional multi-invite recall.';

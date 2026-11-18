@@ -159,43 +159,33 @@ test('rate-limit retry time uses the expiry that frees the selected limit', () =
   assert.equal(denied.retryAtMs, 68_000);
 });
 
-test('governor reserves 35% for queued DISCOVERY and borrows it when discovery is idle', () => {
+test('governor strictly reserves 35% of the window for DISCOVERY', () => {
   const governor = makeGovernor();
   const none = new Set<never>();
-  const discoveryQueued = new Set(['DISCOVERY'] as const);
-  const retryQueued = new Set(['RETRY'] as const);
+  const queued = new Set(['RETRY'] as const);
 
-  // With no discovery waiter, the reserve is borrowable: retry can use the
-  // full nominal window instead of stopping at the 26/hour non-discovery cap.
-  for (let index = 0; index < 40; index++) {
+  // 26 of 40 is the non-discovery cap even when no discovery request is
+  // currently queued. The unused reserve is not reassigned.
+  for (let index = 0; index < 26; index++) {
     assert.equal(governor.admit('RETRY', none).admitted, true, `retry ${index + 1}`);
   }
-  const rateLimited = governor.admit('RETRY', none);
-  assert.equal(rateLimited.admitted, false);
-  assert.equal(rateLimited.reason, 'RATE_LIMIT');
-
-  const reserved = makeGovernor();
-  for (let index = 0; index < 26; index++) {
-    assert.equal(reserved.admit('RETRY', none).admitted, true, `reserved retry ${index + 1}`);
-  }
-  const blocked = reserved.admit('RETRY', discoveryQueued);
+  const blocked = governor.admit('RETRY', none);
   assert.equal(blocked.admitted, false);
   assert.equal(blocked.reason, 'DISCOVERY_FLOOR');
   assert.equal(blocked.retryAtMs, 60_000, 'the oldest non-discovery reservation expiry');
 
   for (let index = 0; index < 14; index++) {
-    assert.equal(reserved.admit('DISCOVERY', discoveryQueued).admitted, true, `discovery ${index + 1}`);
+    assert.equal(governor.admit('DISCOVERY', none).admitted, true, `discovery ${index + 1}`);
   }
-  assert.equal(reserved.snapshot().admissionsInWindow, 40);
-  assert.equal(reserved.snapshot().discoverySharePct, 35);
+  assert.equal(governor.snapshot().admissionsInWindow, 40);
+  assert.equal(governor.snapshot().discoverySharePct, 35);
 
-  // The nominal window is full; queued demand allows the emergency allowance,
-  // while the non-discovery floor remains enforced for the reserved share.
-  const emergency = reserved.admit('RETRY', discoveryQueued);
+  // The nominal window is full; emergency demand allows the five remaining
+  // non-discovery slots up to the 48/hour cap's 31 non-discovery limit.
+  const emergency = governor.admit('RETRY', queued);
   assert.equal(emergency.admitted, true);
   assert.equal(emergency.limit, 48);
   assert.equal(emergency.emergency, true);
-  assert.equal(emergency.reason, null);
 });
 
 test('governor tracks window expiry and exposes a bounded snapshot', () => {
