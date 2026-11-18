@@ -4158,6 +4158,23 @@ export async function inspectAndValidateChannel(
       });
     }
     if(inspection.acquisitionOutcomes?.length){
+      // A claimed ledger row carries the surface that owns its work key. The
+      // inspector may classify the same URL through a different surface path
+      // (for example a Discord widget discovered inside a website); restore the
+      // claimed surface on the durable observation so completion updates the
+      // row it actually claimed instead of creating a duplicate surface row.
+      if(inspectionScope?.seedUrls?.length){
+        const claimedSurfaceByUrl=new Map<string,string>();
+        for(const seed of inspectionScope.seedUrls){
+          const normalized=normalizeCommunityWorkUrl(seed.url);
+          if(normalized)claimedSurfaceByUrl.set(normalized,seed.surface);
+        }
+        for(const outcome of inspection.acquisitionOutcomes){
+          const normalized=normalizeCommunityWorkUrl(outcome.requestedUrl);
+          const surface=normalized?claimedSurfaceByUrl.get(normalized):undefined;
+          if(surface)outcome.surface=surface as typeof outcome.surface;
+        }
+      }
       // WorkRemaining is a per-pass snapshot, not a caller-supplied guess.
       // Compute it from the same classifier the lane event uses so persisted
       // observation telemetry and the event baseline cannot disagree.

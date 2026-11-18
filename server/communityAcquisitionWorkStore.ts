@@ -507,6 +507,7 @@ export async function completeCommunityWorkSlice(
     windowDays: options.windowDays,
   });
   const grouped = new Map<string, CommunityWorkObservation[]>();
+  const groupedByUrl = new Map<string, CommunityWorkObservation[]>();
   for (const observation of observations) {
     const normalized = normalizeCommunityWorkUrl(observation.requestedUrl);
     if (!normalized) continue;
@@ -515,6 +516,9 @@ export async function completeCommunityWorkSlice(
     const group = grouped.get(key);
     if (group) group.push(observation);
     else grouped.set(key, [observation]);
+    const urlGroup = groupedByUrl.get(normalized);
+    if (urlGroup) urlGroup.push(observation);
+    else groupedByUrl.set(normalized, [observation]);
   }
 
   let updated = 0;
@@ -524,7 +528,7 @@ export async function completeCommunityWorkSlice(
   let pending = 0;
 
   for (const row of claimed) {
-    const group = grouped.get(row.workKey) || [];
+    const group = grouped.get(row.workKey) || groupedByUrl.get(row.normalizedUrl) || [];
     // Only observations created after this claim may decide this slice. A
     // claimed URL that never reached the inspector must not re-charge an old
     // failure from the 90-day history.
@@ -562,11 +566,14 @@ export async function completeCommunityWorkSlice(
                 updated_at=now()
           WHERE work_key=$1
             AND state='RUNNING'
-            AND lease_token=$3::uuid`,
+            AND lease_token=$3::uuid
+          RETURNING state`,
         [row.workKey, JSON.stringify({ lastSliceObserved: false }), row.leaseToken],
       );
       if ((released.rowCount || 0) > 0) {
-        pending++;
+        const nextState = String(released.rows[0]?.state || 'PENDING');
+        if (nextState === 'EXHAUSTED') exhausted++;
+        else pending++;
         updated++;
       }
       continue;
