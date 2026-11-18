@@ -53,7 +53,7 @@ test('work keys are stable and scoped to channel, surface, and normalized URL', 
   );
 });
 
-test('the direct-invite predicate matches every host the candidate parser accepts', () => {
+test('the direct-invite predicate covers Discord invite hosts recognized by the candidate parser', () => {
   for (const url of [
     'https://discord.gg/code',
     'https://discord.com/invite/code',
@@ -66,6 +66,8 @@ test('the direct-invite predicate matches every host the candidate parser accept
     assert.equal(isDirectDiscordInviteUrl(url), true, url);
   }
   assert.equal(isDirectDiscordInviteUrl('https://discord.com/channels/1/2'), false);
+  assert.equal(isDirectDiscordInviteUrl('https://disboard.org/server/code'), false,
+    'directory pages are candidates, not direct invite URLs');
 });
 
 test('legacy alias filters still admit canonical observation surfaces', () => {

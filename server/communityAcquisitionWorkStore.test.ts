@@ -42,12 +42,17 @@ function observation(input: {
   };
 }
 
-function materializeDb(fixtures: ReturnType<typeof observation>[]) {
+function materializeDb(
+  fixtures: ReturnType<typeof observation>[],
+  seed: Array<Record<string, any>> = [],
+) {
   const inserts: any[] = [];
   const queries: Array<{ sql: string; params?: unknown[] }> = [];
+  const ledger = new Map<string, Record<string, any>>(seed.map(row => [String(row.work_key), { ...row }]));
   return {
     inserts,
     queries,
+    ledger,
     async query(sql: string, params?: unknown[]) {
       queries.push({ sql, params });
       if (sql.includes('FROM external_acquisition_observations')) {
@@ -59,8 +64,26 @@ function materializeDb(fixtures: ReturnType<typeof observation>[]) {
         return { rows: fixtures.filter(row => row.channel_id === params?.[0]) };
       }
       if (sql.includes('INSERT INTO community_acquisition_url_state')) {
-        inserts.push(JSON.parse(String(params?.[0] || '[]')));
-        return { rows: [], rowCount: 2 };
+        const rows = JSON.parse(String(params?.[0] || '[]'));
+        inserts.push(rows);
+        // Model the production ON CONFLICT contract just enough to exercise
+        // recovery: RESOLVED and budget-neutral UNREACHED_SLICE rows can be
+        // replaced by newer PENDING/PARKED evidence; MAX_ATTEMPTS cannot.
+        for (const row of rows) {
+          const existing = ledger.get(String(row.work_key));
+          if (!existing) {
+            ledger.set(String(row.work_key), row);
+            continue;
+          }
+          const recoverable = existing.state === 'RESOLVED'
+            || (existing.state === 'EXHAUSTED' && existing.terminal_reason === 'UNREACHED_SLICE');
+          const newer = String(existing.terminal_evidence?.latestObservedAt || '')
+            < String(row.terminal_evidence?.latestObservedAt || '');
+          if (recoverable && ['PENDING','PARKED_INFRA'].includes(String(row.state)) && newer) {
+            ledger.set(String(row.work_key), row);
+          }
+        }
+        return { rows: [], rowCount: rows.length };
       }
       throw new Error(`unexpected SQL: ${sql.slice(0, 80)}`);
     },
@@ -109,18 +132,41 @@ test('materialize preserves required work and optional multi-invite recall rows'
   assert.equal(recall.state, 'PENDING');
 });
 
-test('materialization can recover an exhausted row once newer evidence lowers its attempt count', async () => {
-  const db = materializeDb([
-    observation({
-      id: 'fresh',
-      url: 'https://recover.example/community',
-      observedAt: '2026-11-02T00:00:00.000Z',
-    }),
-  ]);
+test('MAX_ATTEMPTS exhaustion keeps its saved budget after old observations age out', async () => {
+  const url = 'https://budget.example/community';
+  const workKey = communityAcquisitionWorkKey('UC-ledger', url, 'CREATOR_WEBSITES');
+  const db = materializeDb(
+    [observation({ id: 'fresh', url, observedAt: '2026-11-02T00:00:00.000Z' })],
+    [{
+      work_key: workKey,
+      state: 'EXHAUSTED',
+      terminal_reason: 'MAX_ATTEMPTS',
+      terminal_evidence: { latestObservedAt: '2026-11-01T00:00:00.000Z' },
+    }],
+  );
   await materializeCommunityWorkForChannel('UC-ledger', { db });
+  assert.equal(db.ledger.get(workKey)?.state, 'EXHAUSTED',
+    'a capped URL must not regain attempts merely because old rows left the window');
   const insertSql = db.queries.find(query => query.sql.includes('INSERT INTO community_acquisition_url_state'))?.sql || '';
-  assert.match(insertSql, /WHERE community_acquisition_url_state\.state IN \('RESOLVED','EXHAUSTED'\)/);
-  assert.match(insertSql, /EXCLUDED\.state IN \('PENDING','PARKED_INFRA'\)/);
+  assert.match(insertSql, /terminal_reason='UNREACHED_SLICE'/);
+});
+
+test('budget-neutral UNREACHED_SLICE exhaustion recovers on newer evidence', async () => {
+  const url = 'https://unreached.example/community';
+  const workKey = communityAcquisitionWorkKey('UC-ledger', url, 'CREATOR_WEBSITES');
+  const db = materializeDb(
+    [observation({ id: 'fresh', url, observedAt: '2026-11-02T00:00:00.000Z' })],
+    [{
+      work_key: workKey,
+      state: 'EXHAUSTED',
+      terminal_reason: 'UNREACHED_SLICE',
+      terminal_evidence: { latestObservedAt: '2026-11-01T00:00:00.000Z', noObservationCount: 5 },
+    }],
+  );
+  await materializeCommunityWorkForChannel('UC-ledger', { db });
+  const recovered = db.ledger.get(workKey);
+  assert.equal(recovered?.state, 'PENDING');
+  assert.equal(recovered?.retryable, true);
 });
 
 test('a found direct invite stays claimable until its validation pass completes', async () => {
@@ -204,8 +250,17 @@ test('terminal-channel retirement resolves every active ledger state', async () 
   };
   const retired = await retireTerminalChannelCommunityWork('UC-ledger', db);
   assert.equal(retired, 4);
-  assert.match(updates[0].sql, /state IN \('PENDING','RUNNING','PARKED_INFRA','PARKED_EXTERNAL'\)/);
-  assert.match(updates[0].sql, /terminal_reason='CHANNEL_TERMINAL'/);
+  const sql = updates[0].sql;
+  assert.match(sql, /SET state='RESOLVED'/);
+  assert.match(sql, /terminal_reason='CHANNEL_TERMINAL'/);
+  assert.match(sql, /retryable=FALSE/);
+  assert.match(sql, /lease_token=NULL/);
+  assert.match(sql, /next_eligible_at=now\(\)/);
+  assert.match(sql, /state IN \('PENDING','RUNNING','PARKED_INFRA','PARKED_EXTERNAL'\)/);
+  assert.match(sql, /EXISTS \(\s*SELECT 1 FROM channels c/);
+  assert.match(sql, /c\.country_status='REJECTED'/);
+  assert.match(sql, /c\.trading_status IN \('NON_TRADING','HUMAN_REJECTED'\)/);
+  assert.match(sql, /c\.scan_status IN \('SKIPPED_EXCLUDED','SKIPPED_NON_TRADING'\)/);
   assert.equal(updates[0].params?.[0], 'UC-ledger');
 });
 

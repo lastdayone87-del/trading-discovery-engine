@@ -97,7 +97,7 @@ async function main() {
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
         const locator = String(row?.discord_candidate_locator || '').trim();
         const validationStatus = String(row?.discord_validation_status || '').toUpperCase();
-        const validationUnfinished = validationStatus !== 'COMPLETED' && validationStatus !== 'SUCCEEDED';
+        const validationUnfinished = !['COMPLETED','SUCCEEDED','FAILED_OPERATIONAL'].includes(validationStatus);
         const validationPending = (payload?.ledgerValidationPending === true && validationUnfinished)
           || (row?.scan_status === 'FAILED' && validationUnfinished)
           || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'));
@@ -147,7 +147,7 @@ async function main() {
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
         const locator = String(row?.discord_candidate_locator || '').trim();
         const validationStatus = String(row?.discord_validation_status || '').toUpperCase();
-        const validationUnfinished = validationStatus !== 'COMPLETED' && validationStatus !== 'SUCCEEDED';
+        const validationUnfinished = !['COMPLETED','SUCCEEDED','FAILED_OPERATIONAL'].includes(validationStatus);
         if ((payload?.ledgerValidationPending === true && validationUnfinished)
           || (row?.scan_status === 'FAILED' && validationUnfinished)
           || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'))) {

@@ -357,7 +357,13 @@ export async function materializeCommunityWorkForChannel(
        terminal_reason=EXCLUDED.terminal_reason,
        terminal_evidence=EXCLUDED.terminal_evidence,
        updated_at=now()
-     WHERE community_acquisition_url_state.state IN ('RESOLVED','EXHAUSTED')
+     WHERE (
+             community_acquisition_url_state.state='RESOLVED'
+             OR (
+               community_acquisition_url_state.state='EXHAUSTED'
+               AND community_acquisition_url_state.terminal_reason='UNREACHED_SLICE'
+             )
+           )
        AND EXCLUDED.state IN ('PENDING','PARKED_INFRA')
        AND COALESCE(community_acquisition_url_state.terminal_evidence->>'latestObservedAt','')
            < COALESCE(EXCLUDED.terminal_evidence->>'latestObservedAt','')`,
@@ -797,7 +803,16 @@ export async function retireTerminalChannelCommunityWork(
             next_eligible_at=now(),
             updated_at=now()
       WHERE channel_id=$1
-        AND state IN ('PENDING','RUNNING','PARKED_INFRA','PARKED_EXTERNAL')`,
+        AND state IN ('PENDING','RUNNING','PARKED_INFRA','PARKED_EXTERNAL')
+        AND EXISTS (
+          SELECT 1 FROM channels c
+           WHERE c.channel_id=$1
+             AND (
+               c.country_status='REJECTED'
+               OR c.trading_status IN ('NON_TRADING','HUMAN_REJECTED')
+               OR c.scan_status IN ('SKIPPED_EXCLUDED','SKIPPED_NON_TRADING')
+             )
+        )`,
     [channelId, JSON.stringify({ reason: 'channel_terminal', retiredBy: 'retireTerminalChannelCommunityWork' })],
   );
   return result.rowCount || 0;
