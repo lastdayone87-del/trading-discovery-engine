@@ -778,6 +778,32 @@ export async function communityWorkSummary(channelId: string, db?: CommunityWork
 }
 
 /**
+ * Retire every active ledger row for a channel that has become terminally
+ * rejected/non-trading. The batch owner is being closed, so leaving PENDING,
+ * RUNNING, or PARKED rows behind would orphan visible work with no consumer.
+ */
+export async function retireTerminalChannelCommunityWork(
+  channelId: string,
+  db?: CommunityWorkDb,
+): Promise<number> {
+  const databaseClient = await database(db);
+  const result = await databaseClient.query(
+    `UPDATE community_acquisition_url_state
+        SET state='RESOLVED',
+            terminal_reason='CHANNEL_TERMINAL',
+            terminal_evidence=terminal_evidence || $2::jsonb,
+            retryable=FALSE,
+            lease_token=NULL,
+            next_eligible_at=now(),
+            updated_at=now()
+      WHERE channel_id=$1
+        AND state IN ('PENDING','RUNNING','PARKED_INFRA','PARKED_EXTERNAL')`,
+    [channelId, JSON.stringify({ reason: 'channel_terminal', retiredBy: 'retireTerminalChannelCommunityWork' })],
+  );
+  return result.rowCount || 0;
+}
+
+/**
  * Mark PENDING rows that cannot possibly produce useful community evidence as
  * resolved. This is deliberately conservative: malformed/non-HTTP URLs and
  * asset/JS/CSS/PDF-style destinations only. Affiliate and redirect URLs stay.

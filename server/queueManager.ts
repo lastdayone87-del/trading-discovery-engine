@@ -193,6 +193,7 @@ import {
   promoteDueCommunityWork,
   releaseCommunityWorkSlice,
   resetStaleCommunityWork,
+  retireTerminalChannelCommunityWork,
   retireUnusableCommunityWork,
 } from './communityAcquisitionWorkStore';
 
@@ -1514,11 +1515,11 @@ function communityValidationStillPending(channel: ChannelRecord, job: DurableJob
  */
 async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: DurableJob): Promise<boolean> {
   const db = await getDb();
-  // A terminal channel cannot acquire anything. Close its batch owner instead
-  // of cycling URL slices through the inspector's early terminal return.
-  if (channel.country_status === 'REJECTED'
-    || channel.trading_status === 'NON_TRADING'
-    || channel.trading_status === 'HUMAN_REJECTED') {
+  // A terminal channel cannot acquire anything. Retire its active ledger work
+  // before closing the batch owner so no PENDING/PARKED rows are left orphaned
+  // with no consumer, then close through the shared terminal predicate.
+  if (isTerminalState(channel)) {
+    await retireTerminalChannelCommunityWork(channel.channel_id, db);
     await completeJob(job.id);
     return true;
   }
@@ -1546,8 +1547,12 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
     // work resolved. Do not close the batch without giving the legacy
     // validation path its bounded retry.
     const refreshed = await getChannelById(channel.channel_id);
-    if (refreshed && communityValidationStillPending(refreshed, job)) return false;
-    if (summary.total > 0 && summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0) {
+    const urlWorkTerminal = summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0;
+    // Validation may run only after URL work is terminal. A parked URL must keep
+    // its backoff; handing the channel to the unrestricted legacy crawler here
+    // would bypass the ledger's capacity parking.
+    if (refreshed && urlWorkTerminal && communityValidationStillPending(refreshed, job)) return false;
+    if (summary.total > 0 && urlWorkTerminal) {
       await completeJob(job.id);
       return true;
     }

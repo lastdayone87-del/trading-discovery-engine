@@ -85,7 +85,7 @@ export const COMMUNITY_ACQUISITION_WORK_SURFACES: ReadonlySet<string> = new Set(
  */
 export function isDirectDiscordInviteUrl(raw: string): boolean {
   const value = String(raw || '').trim();
-  return /^https?:\/\/(www\.)?(discord\.gg|discord\.com\/invite|discordapp\.com\/invite)\//i.test(value);
+  return /^https?:\/\/(www\.)?(discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite|dsc\.gg|discord\.me|discord\.io)\//i.test(value);
 }
 
 export function canonicalCommunityWorkSurface(surface: string): string {
@@ -608,7 +608,12 @@ export function projectCommunityAcquisitionWork(
   options: ProjectCommunityWorkOptions = {},
 ): { rows: CommunityWorkProjectionRow[]; stats: CommunityWorkProjectionStats } {
   const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
-  const surfaces = options.surfaces ?? COMMUNITY_ACQUISITION_WORK_SURFACES;
+  // Callers may pass legacy aliases (LINKED_WEBSITES, SOCIAL_BIO, ...). Collapse
+  // both the filter set and the observation surface so membership cannot fail
+  // solely because one side still uses the old name.
+  const surfaces = new Set(
+    [...(options.surfaces ?? COMMUNITY_ACQUISITION_WORK_SURFACES)].map(canonicalCommunityWorkSurface),
+  );
   const grouped = new Map<string, {
     channelId: string;
     normalizedUrl: string;

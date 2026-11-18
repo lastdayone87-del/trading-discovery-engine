@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   billableInspectionAttempts,
   communityAcquisitionWorkKey,
+  isDirectDiscordInviteUrl,
   normalizeCommunityWorkUrl,
   percentDelta,
   projectCommunityAcquisitionWork,
@@ -50,6 +51,30 @@ test('work keys are stable and scoped to channel, surface, and normalized URL', 
     communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_BIO'),
     communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_PROFILES'),
   );
+});
+
+test('the direct-invite predicate matches every host the candidate parser accepts', () => {
+  for (const url of [
+    'https://discord.gg/code',
+    'https://discord.com/invite/code',
+    'https://discordapp.com/invite/code',
+    'https://discord.app/invite/code',
+    'https://dsc.gg/code',
+    'https://discord.me/code',
+    'https://discord.io/code',
+  ]) {
+    assert.equal(isDirectDiscordInviteUrl(url), true, url);
+  }
+  assert.equal(isDirectDiscordInviteUrl('https://discord.com/channels/1/2'), false);
+});
+
+test('legacy alias filters still admit canonical observation surfaces', () => {
+  const { rows } = projectCommunityAcquisitionWork(
+    [observation()],
+    { surfaces: new Set(['LINKED_WEBSITES']) },
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].surface, 'CREATOR_WEBSITES');
 });
 
 test('URL normalization ignores host case, fragments, default ports, and trailing path slashes', () => {

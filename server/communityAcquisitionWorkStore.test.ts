@@ -4,6 +4,7 @@ import {
   claimCommunityWorkSlice,
   materializeCommunityWorkForChannel,
   completeCommunityWorkSlice,
+  retireTerminalChannelCommunityWork,
   type CommunityWorkRow,
 } from './communityAcquisitionWorkStore';
 import { communityAcquisitionWorkKey } from './communityAcquisitionWorkLedger';
@@ -30,7 +31,7 @@ function observation(input: {
     requested_url: input.url,
     outcome: input.outcome || 'ACQUISITION_FAILED',
     retryable: input.retryable ?? true,
-    failure_class: input.failureClass ?? 'NETWORK_FAILURE',
+    failure_class: input.failureClass === undefined ? 'NETWORK_FAILURE' : input.failureClass,
     observed_at: input.observedAt,
     provenance: {
       surface: input.surface || 'CREATOR_WEBSITES',
@@ -177,6 +178,21 @@ test('one inspection does not consume two attempts when static and rendered rows
   const leasedResult = await materializeCommunityWorkForChannel('UC-ledger', { db: leased });
   assert.equal(leasedResult.projected, 1);
   assert.equal(leased.inserts[0][0].attempts, 2, 'two distinct claims are two attempts');
+});
+
+test('terminal-channel retirement resolves every active ledger state', async () => {
+  const updates: Array<{ sql: string; params?: unknown[] }> = [];
+  const db = {
+    async query(sql: string, params?: unknown[]) {
+      updates.push({ sql, params });
+      return { rows: [], rowCount: 4 };
+    },
+  };
+  const retired = await retireTerminalChannelCommunityWork('UC-ledger', db);
+  assert.equal(retired, 4);
+  assert.match(updates[0].sql, /state IN \('PENDING','RUNNING','PARKED_INFRA','PARKED_EXTERNAL'\)/);
+  assert.match(updates[0].sql, /terminal_reason='CHANNEL_TERMINAL'/);
+  assert.equal(updates[0].params?.[0], 'UC-ledger');
 });
 
 test('a slice never claims two surfaces for the same normalized URL', async () => {
