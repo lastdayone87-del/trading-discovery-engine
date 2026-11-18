@@ -17,7 +17,7 @@
 
 ## 2. Structured output contract (call site 1)
 
-Request: JSON `{task: CANDIDATE|ADJUDICATION, promptVersion: 'priority2-multilingual-structured-2', closedTaxonomy (9 labels), instructions[7], declaredCountry, declaredLanguageHints, documents[{ref,text}]}` with `responseMimeType: application/json`, `temperature: 0`. Documents: ≤40 corpus docs (or title+bio+≤12 videos+≤6 playlists+≤4 transcripts), each text sliced to 1200 chars; country/language/activity surfaces excluded.
+Request: JSON `{task: CANDIDATE|ADJUDICATION, promptVersion: 'priority2-multilingual-structured-4', closedTaxonomy (9 labels), structured focus reason codes, declaredCountry, declaredLanguageHints, documents[{ref,text}]}` with `responseMimeType: application/json`, `temperature: 0`. Documents: ≤40 corpus docs (or title+bio+≤12 videos+≤6 playlists+≤4 transcripts), each text sliced to 1200 chars; country/language/activity surfaces excluded.
 
 `SemanticModelResult` fields/types (`GeminiSemanticProvider.ts:15-23`, normalized by `parse()`, `:131-141`):
 - `label`: one of `ACTIVE_TRADING, TRADING_EDUCATION, INVESTING_EDUCATION, FINANCIAL_NEWS, PERSONAL_FINANCE, MARKET_INSTITUTION, HYPE, UNRELATED, AMBIGUOUS`, else forced `AMBIGUOUS`
