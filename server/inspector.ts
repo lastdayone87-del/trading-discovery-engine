@@ -1885,8 +1885,9 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
           }
         }
       }
-      if(sitemapSeeds.length){const allowedSitemapSeeds=channelData.allowedCommunityUrl?sitemapSeeds.filter(item=>channelData.allowedCommunityUrl!(item.url)):sitemapSeeds;if(allowedSitemapSeeds.length)websiteUrls=rankCommunitySurfaces([...websiteUrls,...allowedSitemapSeeds]);}
-      ladderSeedAdmission={admitted:sitemapSeeds.length,considered:ladderSeedsConsidered};
+      let admittedSitemapSeeds=0;
+      if(sitemapSeeds.length){const allowedSitemapSeeds=channelData.allowedCommunityUrl?sitemapSeeds.filter(item=>channelData.allowedCommunityUrl!(item.url)):sitemapSeeds;admittedSitemapSeeds=allowedSitemapSeeds.length;if(allowedSitemapSeeds.length)websiteUrls=rankCommunitySurfaces([...websiteUrls,...allowedSitemapSeeds]);}
+      ladderSeedAdmission={admitted:admittedSitemapSeeds,considered:ladderSeedsConsidered};
     }catch{/* sitemap seeding never breaks seed selection */}
   }
   // Repeat-failure skip set: URLs with 5+ consecutive identical deterministic
