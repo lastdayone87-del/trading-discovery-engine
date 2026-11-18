@@ -357,20 +357,44 @@ export function billableInspectionAttempts(observations: readonly CommunityWorkO
       .map(observation => observation.workLeaseToken)
       .filter((value): value is string => Boolean(value)),
   );
-  const untokenedTimes = billable
-    .filter(observation => !observation.workLeaseToken)
-    .map(observation => Date.parse(observation.observedAt))
-    .filter(value => Number.isFinite(value))
-    .sort((a, b) => a - b);
-  let historicalClaims = 0;
-  let clusterStart = Number.NaN;
-  for (const at of untokenedTimes) {
-    if (!Number.isFinite(clusterStart) || at - clusterStart > COMMUNITY_INSPECTION_WINDOW_MS) {
-      historicalClaims++;
-      clusterStart = at;
-    }
+  // Rendered telemetry records the inspection's start time. Use those anchors
+  // to fold a static row into the rendered run it belongs to even when the
+  // crawl took minutes. Anchors come from every observation, including FOUND,
+  // because a successful rendered row still identifies the same inspection.
+  const inspectionAnchors = new Set<number>();
+  for (const observation of observations) {
+    const provenance = asRecord(observation.provenance) || {};
+    const telemetry = asRecord(provenance.crawlerTelemetry) || {};
+    const startedAt = Date.parse(String(telemetry.crawlStartedAt || ''));
+    if (Number.isFinite(startedAt)) inspectionAnchors.add(startedAt);
   }
-  return Math.min(5, leaseClaims.size + historicalClaims);
+  const anchors = [...inspectionAnchors].sort((a, b) => a - b);
+  const claimedAnchors = new Set<number>();
+  const claimedStaticClusters = new Set<number>();
+  for (const observation of billable) {
+    if (observation.workLeaseToken) continue;
+    const at = Date.parse(observation.observedAt);
+    if (!Number.isFinite(at)) continue;
+    const provenance = asRecord(observation.provenance) || {};
+    const telemetry = asRecord(provenance.crawlerTelemetry) || {};
+    const ownAnchor = Date.parse(String(telemetry.crawlStartedAt || ''));
+    const anchor = Number.isFinite(ownAnchor)
+      ? ownAnchor
+      : anchors.find(candidate => at >= candidate && at - candidate <= COMMUNITY_INSPECTION_WINDOW_MS);
+    if (anchor !== undefined) {
+      claimedAnchors.add(anchor);
+      continue;
+    }
+    // Static-only legacy scans have no rendered anchor. The static budget is
+    // 60s; two minutes keeps one run together without merging the queue's
+    // minimum 30s backoff retries as aggressively as a five-minute window.
+    const cluster = [...claimedStaticClusters]
+      .sort((a, b) => a - b)
+      .find(candidate => at >= candidate && at - candidate <= 2 * 60_000);
+    if (cluster !== undefined) continue;
+    claimedStaticClusters.add(at);
+  }
+  return Math.min(5, leaseClaims.size + claimedAnchors.size + claimedStaticClusters.size);
 }
 
 /**

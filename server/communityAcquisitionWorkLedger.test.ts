@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  billableInspectionAttempts,
   communityAcquisitionWorkKey,
   normalizeCommunityWorkUrl,
   percentDelta,
@@ -72,6 +73,30 @@ test('URL normalization ignores host case, fragments, default ports, and trailin
     'https://example.com/x?keep=1',
     'tracking parameters are not durable work identity',
   );
+});
+
+test('rendered inspection anchors fold static rows without merging separate retries', () => {
+  const base = observation();
+  const at = (time: string, telemetry: Record<string, unknown>) => ({
+    ...base,
+    observedAt: time,
+    provenance: { surface: 'CREATOR_WEBSITES', required: true, crawlerTelemetry: telemetry },
+  });
+  const observations = [
+    at('2026-11-01T00:00:01.000Z', { mode: 'STATIC', pagesInspected: 2 }),
+    at('2026-11-01T00:00:30.000Z', { mode: 'RENDERED', pagesInspected: 4, crawlStartedAt: '2026-11-01T00:00:00.000Z' }),
+    at('2026-11-01T00:01:30.000Z', { mode: 'STATIC', pagesInspected: 2 }),
+    at('2026-11-01T00:03:00.000Z', { mode: 'RENDERED', pagesInspected: 4, crawlStartedAt: '2026-11-01T00:02:50.000Z' }),
+  ];
+  assert.equal(billableInspectionAttempts(observations), 2,
+    'two rendered anchors are two claims; their static rows are not extra attempts');
+
+  const combined = [
+    ...observations,
+    { ...base, observedAt: '2026-11-01T00:02:50.000Z', workLeaseToken: '11111111-1111-4111-8111-111111111111' },
+  ];
+  assert.equal(billableInspectionAttempts(combined), 3,
+    'exact lease claims must not erase historical attempts');
 });
 
 test('a started request never clears never_executed', () => {
