@@ -54,7 +54,7 @@ async function main() {
     ? `JOIN retry_backlog_triage t ON t.job_id=j.id AND t.bucket='QUARANTINE' AND t.undone_at IS NULL`
     : '';
   const jobs = await db.query(
-    `SELECT j.id,j.payload->>'channelId' AS channel_id,j.attempts,j.first_enqueued_at,
+    `SELECT j.id,j.payload,j.payload->>'channelId' AS channel_id,j.attempts,j.first_enqueued_at,
             j.last_error
        FROM jobs j
        ${triageJoin}
@@ -126,6 +126,28 @@ async function main() {
         continue;
       }
       if (work.active === 0 && work.parkedInfra + work.parkedExternal === 0) {
+        const channelState = await client.query(
+          `SELECT discord_validation_status,scan_status FROM channels WHERE channel_id=$1`,
+          [channelId],
+        );
+        const row = channelState.rows[0];
+        const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
+        if (payload?.ledgerValidationPending === true
+          || row?.discord_validation_status === 'RETRY_PENDING') {
+          await client.query(
+            `UPDATE jobs SET run_after=now(),updated_at=now() WHERE id=$1 AND status='PENDING'`,
+            [jobId],
+          );
+          await client.query(
+            `UPDATE retry_backlog_triage
+                SET undone_at=now(),undone_by='revalidateCommunityRetryBacklog'
+              WHERE job_id=$1 AND bucket='QUARANTINE' AND undone_at IS NULL`,
+            [jobId],
+          );
+          await client.query('COMMIT');
+          summary.leftActive++;
+          continue;
+        }
         const closed = await client.query(
           `UPDATE jobs
               SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,
