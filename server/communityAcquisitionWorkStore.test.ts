@@ -109,6 +109,20 @@ test('materialize preserves required work and optional multi-invite recall rows'
   assert.equal(recall.state, 'PENDING');
 });
 
+test('materialization can recover an exhausted row once newer evidence lowers its attempt count', async () => {
+  const db = materializeDb([
+    observation({
+      id: 'fresh',
+      url: 'https://recover.example/community',
+      observedAt: '2026-11-02T00:00:00.000Z',
+    }),
+  ]);
+  await materializeCommunityWorkForChannel('UC-ledger', { db });
+  const insertSql = db.queries.find(query => query.sql.includes('INSERT INTO community_acquisition_url_state'))?.sql || '';
+  assert.match(insertSql, /WHERE community_acquisition_url_state\.state IN \('RESOLVED','EXHAUSTED'\)/);
+  assert.match(insertSql, /EXCLUDED\.state IN \('PENDING','PARKED_INFRA'\)/);
+});
+
 test('a found direct invite stays claimable until its validation pass completes', async () => {
   const db = materializeDb([
     observation({
@@ -133,13 +147,13 @@ test('one inspection does not consume two attempts when static and rendered rows
     observation({
       id: 's1',
       url: 'https://scan.example/community',
-      observedAt: '2026-11-01T00:00:01.000Z',
+      observedAt: '2026-11-01T00:00:42.000Z',
       telemetry: { mode: 'STATIC', pagesInspected: 2 },
     }),
     observation({
       id: 'r1',
       url: 'https://scan.example/community',
-      observedAt: '2026-11-01T00:00:42.000Z',
+      observedAt: '2026-11-01T00:00:01.000Z',
       telemetry: { mode: 'RENDERED', pagesInspected: 4 },
     }),
     observation({

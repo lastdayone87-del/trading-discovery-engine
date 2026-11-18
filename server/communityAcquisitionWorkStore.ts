@@ -357,7 +357,7 @@ export async function materializeCommunityWorkForChannel(
        terminal_reason=EXCLUDED.terminal_reason,
        terminal_evidence=EXCLUDED.terminal_evidence,
        updated_at=now()
-     WHERE community_acquisition_url_state.state='RESOLVED'
+     WHERE community_acquisition_url_state.state IN ('RESOLVED','EXHAUSTED')
        AND EXCLUDED.state IN ('PENDING','PARKED_INFRA')
        AND COALESCE(community_acquisition_url_state.terminal_evidence->>'latestObservedAt','')
            < COALESCE(EXCLUDED.terminal_evidence->>'latestObservedAt','')`,

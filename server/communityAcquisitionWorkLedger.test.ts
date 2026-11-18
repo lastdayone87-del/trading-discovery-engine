@@ -122,6 +122,21 @@ test('rendered inspection anchors fold static rows without merging separate retr
   ];
   assert.equal(billableInspectionAttempts(combined), 3,
     'exact lease claims must not erase historical attempts');
+
+  const staticThenRendered = [
+    at('2026-11-01T00:00:40.000Z', { mode: 'STATIC', pagesInspected: 1 }),
+    at('2026-11-01T00:00:00.000Z', { mode: 'RENDERED', pagesInspected: 2 }),
+  ];
+  assert.equal(billableInspectionAttempts(staticThenRendered), 1,
+    'a static row that finishes after the rendered anchor belongs to that run');
+
+  const renderedThenStaticRetry = [
+    at('2026-11-01T00:00:00.000Z', { mode: 'RENDERED', pagesInspected: 2 }),
+    at('2026-11-01T00:01:00.000Z', { mode: 'STATIC', pagesInspected: 1 }),
+    at('2026-11-01T00:03:00.000Z', { mode: 'RENDERED', pagesInspected: 2 }),
+  ];
+  assert.equal(billableInspectionAttempts(renderedThenStaticRetry), 2,
+    'a static row before the next rendered anchor is a separate historical attempt');
 });
 
 test('a started request never clears never_executed', () => {

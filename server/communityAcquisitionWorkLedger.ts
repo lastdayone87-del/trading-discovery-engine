@@ -357,57 +357,51 @@ export function billableInspectionAttempts(observations: readonly CommunityWorkO
       .map(observation => observation.workLeaseToken)
       .filter((value): value is string => Boolean(value)),
   );
-  // Rendered telemetry records the inspection's start time. Use those anchors
-  // to fold a static row into the rendered run it belongs to even when the
-  // crawl took minutes. Anchors come from every observation, including FOUND,
-  // because a successful rendered row still identifies the same inspection.
+  // A rendered observation is stamped at the inspection's start. Those timestamps
+  // are exact anchors: static rows from the same run finish later and fold into
+  // the anchor, while a later rendered run creates its own anchor even when the
+  // two runs are minutes apart. This is what prevents one scan from consuming
+  // two attempts without merging genuine retries.
   const inspectionAnchors = new Set<number>();
   for (const observation of observations) {
     const provenance = asRecord(observation.provenance) || {};
     const telemetry = asRecord(provenance.crawlerTelemetry) || {};
     const startedAt = Date.parse(String(telemetry.crawlStartedAt || ''));
     if (Number.isFinite(startedAt)) inspectionAnchors.add(startedAt);
+    if (String(telemetry.mode || '').toUpperCase() === 'RENDERED') {
+      const observedAt = Date.parse(observation.observedAt);
+      if (Number.isFinite(observedAt)) inspectionAnchors.add(observedAt);
+    }
   }
   const anchors = [...inspectionAnchors].sort((a, b) => a - b);
   const claimedAnchors = new Set<number>();
-  const claimedStaticClusters = new Set<number>();
+  const staticClusters: number[] = [];
   for (const observation of billable) {
     if (observation.workLeaseToken) continue;
     const at = Date.parse(observation.observedAt);
     if (!Number.isFinite(at)) continue;
     const provenance = asRecord(observation.provenance) || {};
     const telemetry = asRecord(provenance.crawlerTelemetry) || {};
+    const rendered = String(telemetry.mode || '').toUpperCase() === 'RENDERED';
     const ownAnchor = Date.parse(String(telemetry.crawlStartedAt || ''));
     const anchor = Number.isFinite(ownAnchor)
       ? ownAnchor
-      : anchors.find(candidate => at >= candidate && at - candidate <= COMMUNITY_INSPECTION_WINDOW_MS);
+      : rendered
+        ? at
+        : anchors.find(candidate => at >= candidate - 5_000 && at - candidate <= COMMUNITY_INSPECTION_WINDOW_MS);
     if (anchor !== undefined) {
       claimedAnchors.add(anchor);
       continue;
     }
-    // Static-only legacy scans have no rendered anchor. The static budget is
-    // 60s; two minutes keeps one run together without merging the queue's
-    // minimum 30s backoff retries as aggressively as a five-minute window.
-    const cluster = [...claimedStaticClusters]
-      .sort((a, b) => a - b)
-      .find(candidate => at >= candidate && at - candidate <= 2 * 60_000);
-    if (cluster !== undefined) continue;
-    claimedStaticClusters.add(at);
+    // Static-only legacy scans have no rendered anchor. One static run emits
+    // one row per seed, so only same-inspection clock skew should collapse.
+    if (!staticClusters.some(candidate => Math.abs(at - candidate) <= 5_000)) {
+      staticClusters.push(at);
+    }
   }
-  return Math.min(5, leaseClaims.size + claimedAnchors.size + claimedStaticClusters.size);
+  return Math.min(5, leaseClaims.size + claimedAnchors.size + staticClusters.length);
 }
 
-/**
- * Effective retry ownership. Delegate to the production predicate so the
- * ledger cannot drift from the worker:
- *
- *   * required retryable `ACQUISITION_FAILED` / `PARTIALLY_INSPECTED`;
- *   * required `FOUND` rows with an outstanding bounded gap class;
- *   * eligible `PARTIALLY_INSPECTED` `STATIC_BUDGET_GAP` rows even when
- *     `required=false`;
- *   * no deterministic permanent failure, BLOCK/DEMOTE tier, auxiliary URL,
- *     or borrowed shared evidence.
- */
 export function observationOwnsRetry(observation: CommunityWorkObservation): boolean {
   if (sharedEvidenceSource(observation)) return false;
   if (!isCommunityLedgerWorkObservation(observation)) return false;
