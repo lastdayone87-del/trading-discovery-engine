@@ -122,26 +122,29 @@ function billableInspectionAttempts(observations: readonly CommunityWorkObservat
   // New observations carry the exact claim lease. One lease is one attempt,
   // even when the inspection emitted static and rendered rows.
   const leaseClaims = new Set(
-    billable.map(observation => observation.workLeaseToken).filter((value): value is string => Boolean(value)),
+    billable
+      .map(observation => observation.workLeaseToken)
+      .filter((value): value is string => Boolean(value)),
   );
-  if (leaseClaims.size > 0) return Math.min(5, leaseClaims.size);
-  // Historical rows predate the lease token. One inspector run shares a single
-  // `observedAt` (or a sub-second timestamp skew); genuine retries are spaced
-  // by the queue's at-least-30-second backoff, so a one-second window cannot
-  // merge separate retries.
-  const times = billable
+  // Historical rows predate the lease token. One inspector run shares a
+  // single `observedAt` or a sub-second timestamp skew; genuine retries are
+  // spaced by the queue's at-least-30-second backoff. Keep the historical
+  // fallback separate from exact lease claims so a URL with both does not
+  // lose its historical attempts.
+  const untokenedTimes = billable
+    .filter(observation => !observation.workLeaseToken)
     .map(observation => Date.parse(observation.observedAt))
     .filter(value => Number.isFinite(value))
     .sort((a, b) => a - b);
-  let windows = 0;
+  let historicalClaims = 0;
   let last = Number.NEGATIVE_INFINITY;
-  for (const at of times) {
+  for (const at of untokenedTimes) {
     if (at - last > 1_000) {
-      windows++;
+      historicalClaims++;
       last = at;
     }
   }
-  return Math.min(5, windows);
+  return Math.min(5, leaseClaims.size + historicalClaims);
 }
 
 export async function loadCommunityWorkObservations(
