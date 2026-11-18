@@ -8,6 +8,7 @@ import {
 } from './officialYouTubeQuotaFence';
 import { incrementQuota, getAppSetting, getDb, getYouTubeKeyPool, appendProviderCallEvent, recordYouTubeInvalidInput, isYouTubeInputQuarantined, recordYouTubeProviderSuspension } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
+import { YOUTUBE_INPUT_QUARANTINED_CODE } from './youtubeInputQuarantine';
 import {
   assertKeyCapReservationDayCurrent,
   assertProbeQuotaReservationDayCurrent,
@@ -441,7 +442,7 @@ export function buildYouTubeProvidersCoolingDownError(
  * or quota flags so no failure classifier (suspension, rate-limit, dead-key,
  * quota) can mistake a bad input for a bad key. */
 export class YouTubeQuarantinedInputError extends Error {
-  readonly code = 'YOUTUBE_INPUT_QUARANTINED';
+  readonly code = YOUTUBE_INPUT_QUARANTINED_CODE;
   constructor(
     readonly inputKind: YouTubeQuarantineInputKind,
     readonly inputValue: string,
@@ -454,7 +455,7 @@ export class YouTubeQuarantinedInputError extends Error {
 
 export function isYouTubeQuarantinedInput(error: unknown): boolean {
   return error instanceof YouTubeQuarantinedInputError
-    || (error as { code?: unknown } | null)?.code === 'YOUTUBE_INPUT_QUARANTINED';
+    || (error as { code?: unknown } | null)?.code === YOUTUBE_INPUT_QUARANTINED_CODE;
 }
 
 /** Pre-dispatch gate: throws when this call's input is quarantined, before

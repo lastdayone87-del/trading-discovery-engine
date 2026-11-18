@@ -69,6 +69,7 @@ import {
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
   isRetryableInfrastructureFailure,
+  coolQueryForProviderQuarantine,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -84,6 +85,7 @@ import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
 import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,hasRetainedLastKnownGoodDiscordInvite,isSameSelectedDiscordCandidate,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
+import { isYouTubeSearchQueryQuarantineFailure } from './youtubeInputQuarantine';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import './youtubeInnertubeProvider';
@@ -2841,6 +2843,19 @@ export async function processNextSearchJob(
       }
       if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
       return true;
+    }
+    if (isYouTubeSearchQueryQuarantineFailure(err)) {
+      const quarantineQueryId = Number(job.payload?.queryId);
+      const inputKind = String((err as { inputKind?: unknown }).inputKind || '');
+      if (inputKind === 'searchQuery' && Number.isFinite(quarantineQueryId) && quarantineQueryId > 0) {
+        await coolQueryForProviderQuarantine(
+          quarantineQueryId,
+          inputKind,
+          String((err as { inputValue?: unknown }).inputValue || ''),
+        ).catch(error => {
+          console.warn('[YouTubeQuarantine] Failed to cool the query:', error instanceof Error ? error.message : String(error));
+        });
+      }
     }
     const disposition=await failJob(job.id, err);
     const terminal=disposition==='FAILED';

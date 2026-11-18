@@ -5693,6 +5693,41 @@ export async function recordQueryRunSightings(runId: string, queryId: number, si
   }
 }
 
+/**
+ * A quarantined search input is a provider-input defect, not a novelty result.
+ * Cool the query until the quarantine expires so the UCB selector cannot keep
+ * spending cycles on the same invalid surface while other queries are eligible.
+ * The cooldown is reversible and never shortens a later existing cooldown.
+ */
+export async function coolQueryForProviderQuarantine(
+  queryId: number,
+  inputKind: string,
+  inputValue: string,
+  runner?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+): Promise<void> {
+  if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
+  const db = runner || await getDb();
+  const quarantine = await db.query(
+    `SELECT expires_at FROM youtube_invalid_input_quarantine
+      WHERE input_kind=$1 AND input_value=$2
+      LIMIT 1`,
+    [inputKind, inputValue],
+  );
+  const parsed = quarantine.rows[0]?.expires_at ? new Date(quarantine.rows[0].expires_at) : null;
+  // If the row expired or disappeared between the dispatch gate and failure
+  // handling, the quarantine is no longer active. Use a short cooldown instead
+  // of extending a stale seven-day quarantine.
+  const until = parsed && Number.isFinite(parsed.getTime()) && parsed.getTime() > Date.now()
+    ? parsed
+    : new Date(Date.now() + 60 * 60_000);
+  await db.query(
+    `UPDATE query_library
+        SET next_eligible_at=GREATEST(COALESCE(next_eligible_at,now()),$2::timestamptz)
+      WHERE id=$1`,
+    [queryId, until.toISOString()],
+  );
+}
+
 export async function failQueryRun(runId: string, error: unknown, terminal: boolean): Promise<void> {
   const db = await getDb();
   const message = String((error as any)?.message || error).slice(0, 2000);
