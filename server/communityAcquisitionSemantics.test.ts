@@ -83,7 +83,7 @@ test('mixed website acquisition is PARTIALLY_INSPECTED with per-URL provenance',
 test('queue compatibility projection keeps failed acquisition uncertain and observational writes failure-contained',()=>{
   const queue=readFileSync('server/queueManager.ts','utf8'),diagnostics=readFileSync('server/classificationDiagnostics.ts','utf8');
   assert.match(queue,/acquisitionStatus==='ACQUISITION_FAILED'\|\|inspection\.acquisitionStatus==='PARTIALLY_INSPECTED'/);
-  assert.match(queue,/channel\.discord_status='UNCERTAIN'/);assert.match(queue,/channel\.scan_status=alreadyValidatedSuccess\?'COMPLETED':'FAILED'/);
+  assert.match(queue,/channel\.discord_status='UNCERTAIN'/);assert.match(queue,/channel\.scan_status='FAILED'/);
   assert.doesNotMatch(queue,/appendDiscordCheckAttempts[\s\S]{0,300}\.catch/);assert.match(queue,/appendExternalAcquisitionObservations[\s\S]+\.catch/);
   assert.match(queue,/projectDiscordValidation\(channel,selected,selectedCandidate(?:,|\))/);assert.match(queue,/DISCOVERED_VALIDATION_FAILED/);
   assert.match(diagnostics,/persistClassificationEvidenceBundle/);
