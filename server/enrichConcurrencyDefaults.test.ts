@@ -13,7 +13,7 @@ test('startup resolves the worker count from env with the default as fallback', 
   assert.equal(resolveEnrichmentWorkerCount({ ENRICHMENT_WORKER_CONCURRENCY: '50' } as any), 20);
 });
 
-test('rendered fallback gate defaults to 1: the runtime lease serializes crawls', async () => {
+test('rendered fallback gate defaults to 1: the runtime lease defaults to one slot', async () => {
   const saved = process.env.RENDERED_FALLBACK_CONCURRENCY;
   delete process.env.RENDERED_FALLBACK_CONCURRENCY;
   try {

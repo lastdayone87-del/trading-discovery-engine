@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Configuration, RequestQueue, type Request } from 'crawlee';
 import {
+  beginRenderedQueueLifecycle,
   captureRenderedQueueLifecycleListeners,
   dropIsolatedRenderedQueue,
+  endRenderedQueueLifecycle,
   finalizeRenderedQueueLifecycle,
   openIsolatedRenderedRequestQueue,
   reclaimRenderedQueueLifecycleListeners,
@@ -120,36 +122,35 @@ test('queue opener mints a unique name per invocation', async () => {
   assert.equal(seen.length, 2);
 });
 
-test('crawler uses a per-invocation named queue, drops it, and reclaims its listeners under the lifecycle lock', async () => {
+test('crawler uses a per-invocation named queue and shared lifecycle bookkeeping', async () => {
   // Wiring contract: construction receives an explicitly opened queue; the
-  // finally drives the shared lifecycle finalizer (drop + listener
-  // reclamation) on every path so named queues cannot accumulate in storage
-  // and dropped queue graphs (including Crawlee's ~16 MB
-  // RequestDeduplicationCache per instance) do not stay retained by anonymous
-  // EventManager listeners; the whole window runs under the process-wide
-  // lifecycle lock so overlapping crawls cannot cross-remove listeners.
+  // finally drops it and ends the shared lifecycle on every path so named
+  // queues cannot accumulate in storage and dropped queue graphs (including
+  // Crawlee's ~16 MB RequestDeduplicationCache per instance) do not stay
+  // retained by anonymous EventManager listeners. The crawl itself is not
+  // serialized: begin/end only guard baseline capture and last-crawl cleanup.
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /openIsolatedRenderedRequestQueue\(\(name\) => RequestQueue\.open\(name\)\)/);
   assert.match(source, /requestQueue: isolated\.queue,/);
-  assert.match(source, /await finalizeRenderedQueueLifecycle\(\{/);
-  assert.match(source, /await dropIsolatedRenderedQueue\(options\.queue, options\.name\)/);
-  const lockIndex = source.indexOf('withRenderedQueueLifecycleLock(async () => {');
-  const captureIndex = source.indexOf('captureRenderedQueueLifecycleListeners(queueEventEmitter)');
+  assert.match(source, /await beginRenderedQueueLifecycle\(queueEventEmitter\)/);
+  assert.match(source, /await endRenderedQueueLifecycle\(queueEventEmitter\)/);
+  assert.match(source, /await dropIsolatedRenderedQueue\(isolated\.queue, isolated\.name\)/);
+  const beginIndex = source.indexOf('await beginRenderedQueueLifecycle(queueEventEmitter)');
   const openIndex = source.indexOf('openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name))');
-  const finalizeIndex = source.indexOf('await finalizeRenderedQueueLifecycle({');
-  assert.ok(lockIndex >= 0, 'lifecycle lock wraps the crawl');
-  assert.ok(captureIndex >= 0 && lockIndex < captureIndex, 'listener ledger capture happens under the lifecycle lock');
-  assert.ok(openIndex >= 0 && captureIndex < openIndex, 'ledger capture precedes opening the queue');
-  assert.ok(finalizeIndex >= 0 && openIndex < finalizeIndex, 'lifecycle finalizer runs after the queue open');
+  const endIndex = source.indexOf('await endRenderedQueueLifecycle(queueEventEmitter)');
+  assert.ok(beginIndex >= 0, 'lifecycle begins before opening the queue');
+  assert.ok(openIndex >= 0 && beginIndex < openIndex, 'lifecycle begin precedes queue open');
+  assert.ok(endIndex >= 0 && openIndex < endIndex, 'lifecycle end runs after the queue open');
+  assert.doesNotMatch(source, /gateAdmittedAtMs\) => withRenderedQueueLifecycleLock\(async \(\) => \{/,
+    'the full crawl must not be serialized by the lifecycle lock');
 });
 
-test('total-budget clock starts at gate admission, before the lifecycle lock', async () => {
-  // Regression guard: serializing the lifecycle must not delay the crawl's
-  // total-budget clock — an admitted crawl has to consume budget while it
-  // waits behind the lifecycle lock, so `startedAt` comes from the gate's
-  // admission timestamp rather than from lock acquisition time.
+test('total-budget clock starts at gate admission, not lifecycle bookkeeping', async () => {
+  // Regression guard: begin/end bookkeeping must not delay the crawl's
+  // total-budget clock — an admitted crawl has to consume budget from the
+  // gate's admission timestamp rather than from any later mutex acquisition.
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
-  assert.match(source, /renderedFallbackGate\.run(?:<[^>]+>)?\(\(gateAdmittedAtMs\) => withRenderedQueueLifecycleLock\(async \(\) => \{/);
+  assert.match(source, /renderedFallbackGate\.run(?:<[^>]+>)?\(\(gateAdmittedAtMs\) => \(async \(\) => \{/);
   assert.match(source, /const startedAt = gateAdmittedAtMs;/);
   assert.match(source, /await operation\(Date\.now\(\)\);/);
 });
@@ -373,6 +374,31 @@ test('lifecycle lock serializes overlapping crawls and reclaims exactly each que
   assert.deepEqual(sequence, ['a:opened', 'a:finalized', 'b:opened', 'b:finalized']);
   assert.equal(emitter.listeners('migrating').length, 0);
   assert.equal(emitter.listeners('aborting').length, 0);
+});
+
+test('concurrent lifecycle begin/end defers reclamation until the last crawl ends', async () => {
+  const baselineListener = () => undefined;
+  const firstListener = () => undefined;
+  const secondListener = () => undefined;
+  const emitter = createTestEmitter({ migrating: [baselineListener] });
+  await beginRenderedQueueLifecycle(emitter);
+  try {
+    emitter.add('migrating', firstListener);
+    await beginRenderedQueueLifecycle(emitter);
+    try {
+      emitter.add('migrating', secondListener);
+      assert.equal(await endRenderedQueueLifecycle(emitter), 0,
+        'the first crawl must not reclaim the still-live second crawl');
+      assert.deepEqual(emitter.listeners('migrating'), [baselineListener, firstListener, secondListener]);
+    } finally {
+      assert.equal(await endRenderedQueueLifecycle(emitter), 2,
+        'the last crawl reclaims every listener added since the shared baseline');
+      assert.deepEqual(emitter.listeners('migrating'), [baselineListener]);
+    }
+  } finally {
+    // If an assertion failed before the second end, keep module state clean.
+    await endRenderedQueueLifecycle(emitter);
+  }
 });
 
 test('unsynchronized reclamation would cross-remove a live queue (race documented, prevented by the lock)', async () => {

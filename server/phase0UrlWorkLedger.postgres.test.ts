@@ -237,7 +237,15 @@ maybe('the read-only report projects and reconciles a fixture backlog', async t 
         failureClass: null,
         required: false,
         observedAt: `now() - interval '1 minute'`,
-        telemetry: { mode: 'STATIC', pagesInspected: 2, requestsStarted: 0, requestsFinished: 0 },
+        telemetry: {
+          mode: 'STATIC',
+          pagesInspected: 2,
+          requestsStarted: 0,
+          requestsFinished: 0,
+          // A distinct inspection anchor: this static clean is its own run,
+          // not the static phase of the rendered failure below.
+          crawlStartedAt: new Date(Date.now() - 60_000).toISOString(),
+        },
       },
       {
         key: `phase0-ledger-mixed-failure-${suffix}`,
