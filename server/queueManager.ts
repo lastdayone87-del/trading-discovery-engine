@@ -112,6 +112,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromotedRecord } from './autonomousQueryAuthority';
+import { recordQueryArmOutcome } from './queryDiscoveryArms';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
 import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
@@ -125,6 +126,7 @@ import {
   getAutonomousContinuationState,
   getAutonomousPageMarginalMetrics,
   getAutonomousPageObservation,
+  getPageNoveltyMetrics,
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
   recordAutonomousPage,
@@ -727,6 +729,9 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
     // Opt-in trial linkage recorded on the job payload at schedule time.
     // Absent on every legacy run.
     ...(typeof args.trial?.trialId === 'string' && args.trial.trialId ? { trialCompletion: { trialId: args.trial.trialId } } : {}),
+  });
+  await recordQueryArmOutcome(args.queryRunId).catch(error => {
+    console.warn('[Novelty] Query arm outcome persistence failed:', error instanceof Error ? error.message : String(error));
   });
   if (args.queryId) {
     await addQueryExecutionLog({
@@ -2515,6 +2520,10 @@ export async function processNextSearchJob(
       }
       const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
       const marginal = await getAutonomousPageMarginalMetrics(queryRunId, pageNumber);
+      const novelty = await getPageNoveltyMetrics(queryRunId, pageNumber, Number(queryId), retrievalLane, searchOrdering).catch(error => {
+        console.warn('[Novelty] Page overlap measurement failed:', error instanceof Error ? error.message : String(error));
+        return undefined;
+      });
       const novelCandidateTerms = await countNovelCandidateTermsForPage(
         queryRunId,
         pageNumber,
@@ -2558,6 +2567,9 @@ export async function processNextSearchJob(
         deferredOnly: observations.length === 0 && deferredResults > 0,
         nextPageQuotaAdmitted,
         runBudgetExhausted,
+        globalSeenShare: novelty?.globalSeenShare,
+        freshCreatorCandidates: novelty?.freshCandidates,
+        freshConfirmedCreators: novelty?.freshConfirmed,
       });
       const legacyDecision = v2Enabled ? null : evaluateContinuation({
         pageNumber, maxPages: Math.min(effectiveMaxPages, treatmentCapPages ?? effectiveMaxPages, trialCapPages ?? effectiveMaxPages),
@@ -2603,6 +2615,7 @@ export async function processNextSearchJob(
         marginalQualityCreators: marginal.marginalQualityCreators,
         marginalFreshConfirmedCreators: marginal.marginalFreshConfirmedCreators,
         marginalFreshQualityCreators: marginal.marginalFreshQualityCreators,
+        novelty,
         marginalNonTradingCreators: marginal.marginalNonTradingCreators,
         novelCandidateTerms,
         crossPageRepeatCreators: marginal.crossPageRepeatCreators,

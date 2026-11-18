@@ -4,6 +4,7 @@ import {
   materializeAdmittedGeneratedQueriesForCountry,
   materializedGeneratedTargetDimensions,
 } from './generatedQueryMaterialization';
+import { laneAgnosticGeneratedLineage, lineageBaseDimensionsMatch } from './frontierLineage';
 
 const dimensions = {
   country: 'Canada',
@@ -48,6 +49,7 @@ function makeDb(rows: any[], options: { claimRowCount?: number; finalRowCount?: 
   const db = {
     query: async (sql: string, params: unknown[]) => {
       if (sql.includes('FROM frontier_discovery_proposals')) return { rows };
+      if (sql.includes('FROM query_library')) return { rows: [] };
       updates.push({ sql, params });
       if (sql.includes('RETURNING proposal_id')) return { rowCount: options.claimRowCount ?? 1, rows: [] };
       return { rowCount: options.finalRowCount ?? 1, rows: [] };
@@ -312,4 +314,17 @@ test('an unrunnable preserved lineage outcome is deferred, not consumed', async 
   assert.equal(result.materialized, 0);
   assert.ok(updates.some(update => update.sql.includes('materializationDeferredAt')));
   assert.equal(updates.some(update => update.sql.includes("trial_status='TRIED'")), false);
+});
+
+
+test('lane-agnostic generated lineage keeps base identity and allows another lane/order', () => {
+  const target = dimensions;
+  const channel = { ...dimensions, retrievalLane: 'CHANNEL', searchOrdering: 'RELEVANCE' };
+  const recency = { ...dimensions, retrievalLane: 'VIDEO', searchOrdering: 'DATE' };
+  assert.equal(laneAgnosticGeneratedLineage({ materialized: true, laneAgnostic: true }), true);
+  assert.equal(laneAgnosticGeneratedLineage({ materialized: true }), false);
+  assert.equal(lineageBaseDimensionsMatch(target, channel), true);
+  assert.equal(lineageBaseDimensionsMatch(target, recency), true);
+  assert.equal(lineageBaseDimensionsMatch(target, { ...channel, country: 'France' }), false);
+  assert.equal(lineageBaseDimensionsMatch(target, { ...channel, primaryTermFamily: 'other' }), false);
 });

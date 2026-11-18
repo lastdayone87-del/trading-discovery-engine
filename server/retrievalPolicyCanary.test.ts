@@ -47,6 +47,19 @@ test('selectLearnedRetrievalConfiguration is 100% deterministic for identical op
   assert.equal(result1.config.requestedPageDepth, result2.config.requestedPageDepth);
 });
 
+test('CHANNEL canary configurations never request DATE ordering', async () => {
+  const result = await selectLearnedRetrievalConfiguration({
+    opportunityKey: 'opp_channel_canary',
+    neighborhoodKey: 'neigh_channel_canary',
+    retrievalLane: 'CHANNEL',
+    defaultOrdering: 'RELEVANCE',
+    frontierState: 'ACTIVE'
+  });
+  assert.equal(result.eligibility.eligible, true);
+  assert.ok(result.eligibility.allowedOrderings.includes('DATE'), 'the base eligibility still describes the full search capability');
+  assert.equal(result.config.searchOrdering, 'RELEVANCE');
+});
+
 test('evaluateRetrievalPolicyEligibility rejects HARMFUL and SATURATED neighborhoods from deep retrieval', () => {
   const harmful = evaluateRetrievalPolicyEligibility({
     neighborhoodKey: 'neigh_harmful',

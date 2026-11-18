@@ -761,8 +761,14 @@ export async function selectLearnedRetrievalConfiguration(input: {
 
   const allowedDepth = eligibility.maxPageDepthCeiling;
   const candidateConfigs: RetrievalConfiguration[] = [];
+  // CHANNEL searches only support relevance ordering; a DATE treatment would
+  // be rejected by scheduling after the reservation was already taken.
+  const orderings = input.retrievalLane === 'CHANNEL'
+    ? eligibility.allowedOrderings.filter(ordering => ordering === 'RELEVANCE')
+    : eligibility.allowedOrderings;
+  const effectiveOrderings = orderings.length ? orderings : ['RELEVANCE' as SearchOrdering];
 
-  for (const ordering of eligibility.allowedOrderings) {
+  for (const ordering of effectiveOrderings) {
     for (let depth = 1; depth <= allowedDepth; depth++) {
       candidateConfigs.push(
         buildRetrievalConfiguration({

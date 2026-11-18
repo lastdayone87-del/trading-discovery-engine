@@ -115,7 +115,7 @@ export function countTrailingLowYieldPages(
 export type ContinuationReasonCodeV2 = ContinuationReasonCode
   | 'CONTINUE_GRACE' | 'PROVIDER_EXHAUSTED' | 'RUN_BUDGET_EXHAUSTED'
   | 'MARGINAL_VALUE_LOW' | 'QUOTA_DEFERRED' | 'TIME_BUDGET_EXHAUSTED'
-  | 'RESUME_UNAVAILABLE';
+  | 'RESUME_UNAVAILABLE' | 'LOW_NOVELTY' | 'LOW_NOVELTY_PROBE';
 
 export type ContinuationResumeMode = 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
 
@@ -158,6 +158,15 @@ export interface ContinuationV2Input {
   nextPageQuotaAdmitted?: boolean;
   /** The run's fair-share quota budget cannot fund another page. */
   runBudgetExhausted?: boolean;
+  /**
+   * Actual channel-ID overlap: share of this page's distinct channels seen in
+   * any earlier run. This is the primary duplicate signal for continuation.
+   */
+  globalSeenShare?: number;
+  /** Distinct channels on this page never seen in any earlier run. */
+  freshCreatorCandidates?: number;
+  /** Freshly persisted/confirmed creators on this page. */
+  freshConfirmedCreators?: number;
 }
 
 export interface ContinuationStreaks {
@@ -198,9 +207,10 @@ const PRODUCTIVE_V2_CODES = new Set<string>([
 /**
  * Productive-signal continuation policy. A page continues when it produced at
  * least one new creator, confirmed/quality creator, or novel candidate term,
- * regardless of its utility score. Low utility is recorded for ranking only;
- * it never abandons a productive page. Two consecutive pages with no
- * productive signal (the first gets one grace continuation) stop the run.
+ * unless actual channel-ID overlap shows it is a low-novelty probe. Low
+ * utility is recorded for ranking only; it never abandons a productive page.
+ * Two consecutive pages with no productive signal (the first gets one grace
+ * continuation) stop the run.
  */
 export function evaluateContinuationV2(input: ContinuationV2Input): ContinuationDecisionV2 {
   const effectiveMaxPages = Math.max(1, Math.trunc(input.effectiveMaxPages) || 1);
@@ -216,6 +226,7 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
   const pageQuality = Math.max(0, input.pageQualityCreators);
   const pageNonTrading = Math.max(0, input.pageNonTradingCreators);
   const novelCandidateTerms = Math.max(0, input.novelCandidateTerms);
+  const freshConfirmed = Math.max(0, input.freshConfirmedCreators || 0);
 
   const novelty = distinct ? clamp(input.newCreators / distinct) : 0;
   const confirmedYield = distinct ? clamp(pageConfirmed / distinct) : 0;
@@ -233,21 +244,25 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
   const lowValue = input.newCreators === 0
     && pageConfirmed === 0
     && pageQuality === 0
-    && novelCandidateTerms === 0;
+    && novelCandidateTerms === 0
+    && freshConfirmed === 0;
   const duplicateHeavy = clamp(input.duplicateRatio) >= 0.9
     && input.newCreators === 0
     && pageConfirmed === 0
     && pageQuality === 0
-    && novelCandidateTerms === 0;
+    && novelCandidateTerms === 0
+    && freshConfirmed === 0;
   const wrongCountry = clamp(input.countryPrecision) < 0.5
     && input.newCreators === 0
     && pageConfirmed === 0
     && pageQuality === 0
-    && novelCandidateTerms === 0;
+    && novelCandidateTerms === 0
+    && freshConfirmed === 0;
   const productive = input.newCreators >= 1
     || pageConfirmed >= 1
     || pageQuality >= 1
-    || novelCandidateTerms >= 1;
+    || novelCandidateTerms >= 1
+    || freshConfirmed >= 1;
 
   const streaks: ContinuationStreaks = transparent ? { ...priorStreaks } : {
     lowValue: lowValue ? priorStreaks.lowValue + 1 : 0,
@@ -317,6 +332,19 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
   if (lowValue) reasonCodes.push('ZERO_CONFIRMED_VALUE');
   if (duplicateHeavy) reasonCodes.push('DUPLICATE_HEAVY');
   if (wrongCountry) reasonCodes.push('WRONG_COUNTRY');
+  const globalSeenShare = input.globalSeenShare === undefined ? null : clamp(input.globalSeenShare);
+  const freshCandidates = Math.max(0, input.freshCreatorCandidates || 0);
+  // A small unconfirmed yield is not enough to keep a high-overlap page
+  // running. Confirmed/quality creators and novel terms still override the
+  // stop explicitly; `newCreators` alone does not.
+  const lowNovelty = globalSeenShare !== null
+    && distinct >= 5
+    && globalSeenShare >= 0.8
+    && freshConfirmed === 0
+    && pageConfirmed === 0
+    && pageQuality === 0
+    && novelCandidateTerms === 0
+    && freshCandidates < Math.max(1, Math.floor(distinct * 0.2));
 
   // A page with no productive signal can match several stop conditions at once
   // (e.g. duplicate-heavy also has zero confirmed value). The most specific
@@ -327,6 +355,10 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
   }
   if (streaks.wrongCountry >= Math.max(1, input.maxWrongCountryPages)) {
     return finish(false, 'WRONG_COUNTRY');
+  }
+  if (lowNovelty) {
+    reasonCodes.push('LOW_NOVELTY');
+    return finish(false, input.pageNumber === 1 ? 'LOW_NOVELTY_PROBE' : 'LOW_NOVELTY');
   }
   if (streaks.lowValue >= Math.max(1, input.maxLowValuePages)) {
     reasonCodes.push('MARGINAL_VALUE_LOW');
@@ -386,6 +418,8 @@ export function countTrailingContinuationStreaks(
     const productive = [...codes].some(code => PRODUCTIVE_V2_CODES.has(code));
     const lowMatch = !productive && (
       codes.has('CONTINUE_GRACE')
+      || codes.has('LOW_NOVELTY')
+      || codes.has('LOW_NOVELTY_PROBE')
       || codes.has('MARGINAL_VALUE_LOW')
       || codes.has('CONSECUTIVE_LOW_YIELD')
       || codes.has('ZERO_CONFIRMED_VALUE')

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { getDb, getAppSetting } from './db';
 import { authorizeCountryNativeAllocationQuery } from './queryIntelligence';
 import type { DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
+import { assessGeneratedSurface, loadGeneratedSurfaceHistory, surfaceDeferralEligibleSql } from './generatedQuerySurface';
 
 export interface GeneratedQueryMaterializationResult {
   enabled: boolean;
@@ -99,12 +100,35 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
             OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
        AND (supporting_evidence->>'materializationDeferredAt' IS NULL
             OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
+       AND ${surfaceDeferralEligibleSql('supporting_evidence')}
      ORDER BY confidence DESC, created_at ASC
      LIMIT $2`,
     [country, limit],
   );
 
   const authorize = options.authorize || authorizeCountryNativeAllocationQuery;
+  // Actual-history surface gate: near-duplicates of already-executed surfaces
+  // that yielded no new creators or no results are deferred before they enter
+  // the normal library. The gate is applied per country and per batch.
+  const surfaceHistory = rows.rows.length ? await loadGeneratedSurfaceHistory(country, db) : [];
+  const batchSurfaces: string[] = [];
+  const deferSurface = async (proposalId: string, reason: string): Promise<void> => {
+    await db.query(
+      `UPDATE frontier_discovery_proposals
+       SET supporting_evidence = supporting_evidence || jsonb_build_object(
+         'surfaceDeferredAt', now(),
+         'surfaceDeferredReason', $2::text
+       )
+       WHERE proposal_id=$1 AND trial_status='PENDING'`,
+      [proposalId, reason],
+    ).catch(error => {
+      console.warn('[GeneratedSupply] Surface deferral write failed:', {
+        proposalId,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  };
   const result: GeneratedQueryMaterializationResult = {
     enabled: true, attempted: 0, materialized: 0, rejected: 0, deferred: 0, queryIds: [],
   };
@@ -120,6 +144,13 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
     }
     const dimensions = parseJson(row.target_dimensions) as unknown as DiscoveryNeighborhoodDimensions;
     const evidence = parseJson(row.supporting_evidence);
+    const proposalSurface = String(evidence.nativeTerm || row.concept || '').trim();
+    const surfaceGate = assessGeneratedSurface(proposalSurface, surfaceHistory, batchSurfaces);
+    if (surfaceGate.allowed === false) {
+      await deferSurface(row.proposal_id, surfaceGate.reason);
+      result.deferred++;
+      continue;
+    }
     const snapshot = {
       proposalFamily: row.proposal_family,
       targetNeighborhoodKey: row.target_neighborhood_key,
@@ -143,6 +174,7 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
               OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
          AND (supporting_evidence->>'materializationDeferredAt' IS NULL
               OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
+         AND ${surfaceDeferralEligibleSql('supporting_evidence')}
          AND NOT EXISTS (
            SELECT 1 FROM frontier_allocation_decisions d
            WHERE d.proposal_id=$1
@@ -194,6 +226,7 @@ export async function materializeAdmittedGeneratedQueriesForCountry(
       );
       if (saved.rowCount) {
         result.materialized++;
+        batchSurfaces.push(proposalSurface);
         result.queryIds.push(outcome.queryRecord.id);
       } else {
         result.deferred++;
