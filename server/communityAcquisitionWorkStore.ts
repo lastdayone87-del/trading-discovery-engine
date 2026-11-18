@@ -109,6 +109,29 @@ function database(db?: CommunityWorkDb): Promise<CommunityWorkDb> | CommunityWor
   return db || getDb() as unknown as Promise<CommunityWorkDb>;
 }
 
+/**
+ * Historical billable attempts are inspection windows, not individual
+ * observation rows: one inspection can emit static and rendered observations
+ * for the same URL, but it is still one attempt. The inspector's current-run
+ * boundary is five minutes.
+ */
+function billableInspectionAttempts(observations: readonly CommunityWorkObservation[]): number {
+  const times = observations
+    .filter(countsTowardAttemptBudget)
+    .map(observation => Date.parse(observation.observedAt))
+    .filter(value => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  let windows = 0;
+  let last = Number.NEGATIVE_INFINITY;
+  for (const at of times) {
+    if (at - last > 5 * 60_000) {
+      windows++;
+      last = at;
+    }
+  }
+  return Math.min(5, windows);
+}
+
 export async function loadCommunityWorkObservations(
   channelId: string,
   options: { windowDays?: number; db?: CommunityWorkDb } = {},
@@ -140,6 +163,7 @@ export async function loadCommunityWorkObservations(
     observedAt: new Date(row.observed_at).toISOString(),
     id: row.id ? String(row.id) : undefined,
     provenance: row.provenance,
+    workLeaseToken: (row.provenance?.workLeaseToken ? String(row.provenance.workLeaseToken) : undefined),
   }));
 }
 
@@ -181,9 +205,19 @@ export async function materializeCommunityWorkForChannel(
   if (observations.length === 0) return { inserted: 0, projected: 0 };
   const projection = projectCommunityAcquisitionWork(observations, { maxAttempts: Number.MAX_SAFE_INTEGER });
 
+  const observationsByKey = new Map<string, CommunityWorkObservation[]>();
+  for (const observation of observations) {
+    const normalizedUrl = normalizeCommunityWorkUrl(observation.requestedUrl);
+    if (!normalizedUrl) continue;
+    const surface = String(asRecord(observation.provenance).surface || '').toUpperCase();
+    const key = communityAcquisitionWorkKey(channelId, normalizedUrl, surface);
+    const group = observationsByKey.get(key);
+    if (group) group.push(observation);
+    else observationsByKey.set(key, [observation]);
+  }
   const requiredRows = projection.rows.map(row => {
     const classified = initialLedgerState(row);
-    const attempts = Math.min(5, Math.max(row.neverExecuted ? 0 : 1, row.attempts));
+    const attempts = Math.min(5, Math.max(row.neverExecuted ? 0 : 1, billableInspectionAttempts(observationsByKey.get(row.workKey) || [])));
     const state = (classified.state === 'PENDING' || classified.state === 'PARKED_INFRA') && attempts >= 5 ? 'EXHAUSTED' : classified.state;
     return {
       work_key: row.workKey,
@@ -253,7 +287,7 @@ export async function materializeCommunityWorkForChannel(
     const directProcessed = hasDirectProcessedAcquisitionEvidence(latest);
     const browserExecuted = hasBrowserExecution(latest);
     const infra = isInfrastructureFailureClass(latest.failureClass);
-    const historicalAttempts = group.observations.reduce((count, observation) => count + (countsTowardAttemptBudget(observation) ? 1 : 0), 0);
+    const historicalAttempts = billableInspectionAttempts(group.observations);
     const attempts = Math.min(5, Math.max(directProcessed ? 1 : 0, historicalAttempts));
     const state: CommunityWorkState = terminal.terminal
       ? 'RESOLVED'
@@ -507,7 +541,6 @@ export async function completeCommunityWorkSlice(
     windowDays: options.windowDays,
   });
   const grouped = new Map<string, CommunityWorkObservation[]>();
-  const groupedByUrl = new Map<string, CommunityWorkObservation[]>();
   for (const observation of observations) {
     const normalized = normalizeCommunityWorkUrl(observation.requestedUrl);
     if (!normalized) continue;
@@ -516,9 +549,6 @@ export async function completeCommunityWorkSlice(
     const group = grouped.get(key);
     if (group) group.push(observation);
     else grouped.set(key, [observation]);
-    const urlGroup = groupedByUrl.get(normalized);
-    if (urlGroup) urlGroup.push(observation);
-    else groupedByUrl.set(normalized, [observation]);
   }
 
   let updated = 0;
@@ -528,7 +558,7 @@ export async function completeCommunityWorkSlice(
   let pending = 0;
 
   for (const row of claimed) {
-    const group = grouped.get(row.workKey) || groupedByUrl.get(row.normalizedUrl) || [];
+    const group = (grouped.get(row.workKey) || []).filter(observation => !row.leaseToken || observation.workLeaseToken === row.leaseToken);
     // Only observations created after this claim may decide this slice. A
     // claimed URL that never reached the inspector must not re-charge an old
     // failure from the 90-day history.

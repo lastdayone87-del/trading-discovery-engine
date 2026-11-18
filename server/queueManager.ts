@@ -1527,7 +1527,7 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
   }
 
   const allowedUrls = new Set(slice.map(row => row.normalizedUrl));
-  const seedUrls = slice.map(row => ({ url: row.url, surface: row.surface }));
+  const seedUrls = slice.map(row => ({ url: row.url, surface: row.surface, leaseToken: row.leaseToken }));
   let inspectionResult: Awaited<ReturnType<typeof inspectAndValidateChannel>>;
   try {
     inspectionResult = await inspectAndValidateChannel(
@@ -3937,7 +3937,7 @@ export async function inspectAndValidateChannel(
   scheduleRetry: boolean = true,
   executionMarker?: { jobId: string; attemptNumber: number; generation?: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> },
   attribution?: ChannelInspectionAttributionInput,
-  inspectionScope?: { allowedUrls?: ReadonlySet<string>; seedUrls?: Array<{url:string;surface:string}>; slicePass?: number },
+  inspectionScope?: { allowedUrls?: ReadonlySet<string>; seedUrls?: Array<{url:string;surface:string;leaseToken?:string|null}>; slicePass?: number },
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   // Phase 0 lane attribution: explicit caller lane > execution marker > the
   // inspection shape. The attribution is observational only and never changes
@@ -4164,15 +4164,15 @@ export async function inspectAndValidateChannel(
       // claimed surface on the durable observation so completion updates the
       // row it actually claimed instead of creating a duplicate surface row.
       if(inspectionScope?.seedUrls?.length){
-        const claimedSurfaceByUrl=new Map<string,string>();
+        const claimedSurfaceByUrl=new Map<string,{surface:string;leaseToken?:string|null}>();
         for(const seed of inspectionScope.seedUrls){
           const normalized=normalizeCommunityWorkUrl(seed.url);
-          if(normalized)claimedSurfaceByUrl.set(normalized,seed.surface);
+          if(normalized)claimedSurfaceByUrl.set(normalized,{surface:seed.surface,leaseToken:seed.leaseToken});
         }
         for(const outcome of inspection.acquisitionOutcomes){
           const normalized=normalizeCommunityWorkUrl(outcome.requestedUrl);
-          const surface=normalized?claimedSurfaceByUrl.get(normalized):undefined;
-          if(surface)outcome.surface=surface as typeof outcome.surface;
+          const claimed=normalized?claimedSurfaceByUrl.get(normalized):undefined;
+          if(claimed){outcome.surface=claimed.surface as typeof outcome.surface;if(claimed.leaseToken)(outcome as {workLeaseToken?:string}).workLeaseToken=claimed.leaseToken;}
         }
       }
       // WorkRemaining is a per-pass snapshot, not a caller-supplied guess.

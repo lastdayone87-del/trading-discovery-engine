@@ -103,6 +103,7 @@ export interface CommunityWorkObservation {
   /** Durable observation id. Used only for deterministic same-timestamp ties. */
   id?: string;
   provenance?: unknown;
+  workLeaseToken?: string;
 }
 
 /**
