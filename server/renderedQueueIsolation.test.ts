@@ -132,15 +132,30 @@ test('crawler uses a per-invocation named queue and shared lifecycle bookkeeping
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /openIsolatedRenderedRequestQueue\(open\)/);
   assert.match(source, /requestQueue: isolated\.queue,/);
-  assert.match(source, /await beginRenderedQueueLifecycle\(/);
-  assert.match(source, /await endRenderedQueueLifecycle\(/);
   assert.match(source, /await dropIsolatedRenderedQueue\(queue, name\)/);
   assert.doesNotMatch(source, /isolated = await openIsolatedRenderedRequestQueue\(/,
     'the crawl opens through the lifecycle helper, never directly');
-  const beginIndex = source.indexOf('await beginRenderedQueueLifecycle(');
+  const beginCall = source.match(/const lifecycleHandle = await beginRenderedQueueLifecycle\(([\s\S]*?)\);/);
+  assert.ok(beginCall, 'the crawl opens its queue through beginRenderedQueueLifecycle');
+  assert.match(beginCall[1], /queueEventEmitter/);
+  assert.match(beginCall[1], /\(name\) => RequestQueue\.open\(name\)/);
+  const assignmentIndex = source.indexOf('isolated = { name: lifecycleHandle.name, queue: lifecycleHandle.queue };');
+  assert.ok(assignmentIndex >= 0, 'the opened queue is the one assigned to the crawl');
+  const ownershipIndex = source.indexOf('ownedQueueListeners = lifecycleHandle.ownedListeners;');
+  assert.ok(ownershipIndex > assignmentIndex, 'the crawl retains the helper\'s owned listener set');
+  const requestQueueIndex = source.indexOf('requestQueue: isolated.queue,');
+  assert.ok(requestQueueIndex > assignmentIndex, 'the crawler uses the lifecycle-opened queue');
+  const endCall = source.match(/await endRenderedQueueLifecycle\(([\s\S]*?)\);/);
+  assert.ok(endCall, 'the crawl ends its lifecycle in the finally');
+  assert.match(endCall[1], /ownedQueueListeners/,
+    'cleanup uses this crawl\'s owned listener set');
+  assert.match(endCall[1], /isolated\?\.queue/);
+  assert.match(endCall[1], /isolated\?\.name/);
+  const beginIndex = source.indexOf('const lifecycleHandle = await beginRenderedQueueLifecycle(');
   const endIndex = source.indexOf('await endRenderedQueueLifecycle(');
-  assert.ok(beginIndex >= 0, 'lifecycle begins before opening the queue');
-  assert.ok(endIndex >= 0 && beginIndex < endIndex, 'lifecycle end runs after the queue open');
+  assert.ok(beginIndex >= 0 && assignmentIndex > beginIndex && requestQueueIndex > assignmentIndex,
+    'queue construction and use follow the lifecycle begin');
+  assert.ok(endIndex > requestQueueIndex, 'lifecycle end runs after the queue is used');
   assert.doesNotMatch(source, /gateAdmittedAtMs\) => withRenderedQueueLifecycleLock\(async \(\) => \{/,
     'the full crawl must not be serialized by the lifecycle lock');
 });
