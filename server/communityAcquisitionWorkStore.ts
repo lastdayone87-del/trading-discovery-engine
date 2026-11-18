@@ -113,18 +113,30 @@ function database(db?: CommunityWorkDb): Promise<CommunityWorkDb> | CommunityWor
  * Historical billable attempts are inspection windows, not individual
  * observation rows: one inspection can emit static and rendered observations
  * for the same URL, but it is still one attempt. The inspector's current-run
- * boundary is five minutes.
+ * boundary is one second; distinct genuine retries are spaced by at least
+ * the queue's 30-second backoff, while static and rendered rows from one
+ * inspection share the inspector's single `now` timestamp.
  */
 function billableInspectionAttempts(observations: readonly CommunityWorkObservation[]): number {
-  const times = observations
-    .filter(countsTowardAttemptBudget)
+  const billable = observations.filter(countsTowardAttemptBudget);
+  // New observations carry the exact claim lease. One lease is one attempt,
+  // even when the inspection emitted static and rendered rows.
+  const leaseClaims = new Set(
+    billable.map(observation => observation.workLeaseToken).filter((value): value is string => Boolean(value)),
+  );
+  if (leaseClaims.size > 0) return Math.min(5, leaseClaims.size);
+  // Historical rows predate the lease token. One inspector run shares a single
+  // `observedAt` (or a sub-second timestamp skew); genuine retries are spaced
+  // by the queue's at-least-30-second backoff, so a one-second window cannot
+  // merge separate retries.
+  const times = billable
     .map(observation => Date.parse(observation.observedAt))
     .filter(value => Number.isFinite(value))
     .sort((a, b) => a - b);
   let windows = 0;
   let last = Number.NEGATIVE_INFINITY;
   for (const at of times) {
-    if (at - last > 5 * 60_000) {
+    if (at - last > 1_000) {
       windows++;
       last = at;
     }

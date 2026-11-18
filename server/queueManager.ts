@@ -4164,15 +4164,24 @@ export async function inspectAndValidateChannel(
       // claimed surface on the durable observation so completion updates the
       // row it actually claimed instead of creating a duplicate surface row.
       if(inspectionScope?.seedUrls?.length){
-        const claimedSurfaceByUrl=new Map<string,{surface:string;leaseToken?:string|null}>();
+        const claimedByUrl=new Map<string,Array<{surface:string;leaseToken?:string|null}>>();
         for(const seed of inspectionScope.seedUrls){
           const normalized=normalizeCommunityWorkUrl(seed.url);
-          if(normalized)claimedSurfaceByUrl.set(normalized,{surface:seed.surface,leaseToken:seed.leaseToken});
+          if(!normalized)continue;
+          const claims=claimedByUrl.get(normalized);
+          const claim={surface:seed.surface,leaseToken:seed.leaseToken};
+          if(claims)claims.push(claim);else claimedByUrl.set(normalized,[claim]);
         }
         for(const outcome of inspection.acquisitionOutcomes){
           const normalized=normalizeCommunityWorkUrl(outcome.requestedUrl);
-          const claimed=normalized?claimedSurfaceByUrl.get(normalized):undefined;
-          if(claimed){outcome.surface=claimed.surface as typeof outcome.surface;if(claimed.leaseToken)(outcome as {workLeaseToken?:string}).workLeaseToken=claimed.leaseToken;}
+          const claims=normalized?claimedByUrl.get(normalized):undefined;
+          if(!claims?.length)continue;
+          // Prefer the claimed surface that already matches the inspector's
+          // observation; otherwise assign the first claim. A URL with two
+          // distinct surface rows cannot be resolved for both from one crawl.
+          const claimed=claims.find(entry=>entry.surface===String(outcome.surface||'').toUpperCase())||claims[0];
+          outcome.surface=claimed.surface as typeof outcome.surface;
+          if(claimed.leaseToken)(outcome as {workLeaseToken?:string}).workLeaseToken=claimed.leaseToken;
         }
       }
       // WorkRemaining is a per-pass snapshot, not a caller-supplied guess.
