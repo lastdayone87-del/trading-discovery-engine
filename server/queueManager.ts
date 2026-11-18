@@ -1816,7 +1816,8 @@ export async function processNextSearchJob(
       // Browser-capacity attempt-free deferral throws above and is untouched.
       if(shouldCompleteSuppressedRetryJob(inspectionResult,refreshed?.scan_status)){await completeJob(job.id);return true;}
       const outstandingRetryDirective=inspectionResult&&typeof inspectionResult==='object'&&Boolean(inspectionResult.retryDirective);
-      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'||outstandingRetryDirective){
+      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'||outstandingRetryDirective
+        ||(refreshed&&communityValidationStillPending(refreshed,job))){
         throw Object.assign(
           new Error('Retryable community acquisition remains unresolved'),
           inspectionAcquisitionEvidence?{acquisitionEvidence:inspectionAcquisitionEvidence}:{},
