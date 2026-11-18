@@ -89,7 +89,17 @@ async function main() {
         await client.query('BEGIN');
         await materializeCommunityWorkForChannel(channelId, { db: client });
         const work = await communityWorkSummary(channelId, client);
+        const channelState = await client.query(
+          `SELECT discord_validation_status,scan_status FROM channels WHERE channel_id=$1`,
+          [channelId],
+        );
+        const row = channelState.rows[0];
+        const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
+        const validationPending = payload?.ledgerValidationPending === true
+          || row?.discord_validation_status === 'RETRY_PENDING'
+          || row?.scan_status === 'FAILED';
         if (work.total === 0) summary.noLedgerRows++;
+        else if (validationPending) summary.leftActive++;
         else if (work.active === 0 && work.parkedInfra + work.parkedExternal === 0) summary.closedResolved++;
         else if (work.active > 0) summary.leftActive++;
         else summary.leftParked++;
@@ -133,9 +143,14 @@ async function main() {
         const row = channelState.rows[0];
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
         if (payload?.ledgerValidationPending === true
-          || row?.discord_validation_status === 'RETRY_PENDING') {
+          || row?.discord_validation_status === 'RETRY_PENDING'
+          || row?.scan_status === 'FAILED') {
           await client.query(
-            `UPDATE jobs SET run_after=now(),updated_at=now() WHERE id=$1 AND status='PENDING'`,
+            `UPDATE jobs
+                SET run_after=now(),
+                    payload=jsonb_set(payload,'{ledgerValidationPending}','true'::jsonb),
+                    updated_at=now()
+              WHERE id=$1 AND status='PENDING'`,
             [jobId],
           );
           await client.query(

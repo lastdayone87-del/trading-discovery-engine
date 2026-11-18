@@ -528,7 +528,7 @@ export async function completeCommunityWorkSlice(
     // Only observations created after this claim may decide this slice. A
     // claimed URL that never reached the inspector must not re-charge an old
     // failure from the 90-day history.
-    const claimBoundaryMs = row.lastAttemptAt ? Date.parse(row.lastAttemptAt) - 1_000 : 0;
+    const claimBoundaryMs = row.lastAttemptAt ? Date.parse(row.lastAttemptAt) : 0;
     const freshGroup = group.filter(observation => {
       const at = Date.parse(observation.observedAt);
       return Number.isFinite(at) && at >= claimBoundaryMs;
@@ -557,6 +557,8 @@ export async function completeCommunityWorkSlice(
                   to_jsonb(COALESCE((terminal_evidence->>'noObservationCount')::int,0)+1),
                   true
                 ),
+                retryable=CASE WHEN COALESCE((terminal_evidence->>'noObservationCount')::int,0)+1 >= 5
+                               THEN FALSE ELSE retryable END,
                 updated_at=now()
           WHERE work_key=$1
             AND state='RUNNING'
