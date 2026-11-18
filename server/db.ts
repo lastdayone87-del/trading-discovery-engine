@@ -9,6 +9,7 @@ import { getDb, isRetryableInfrastructureFailure, resolveGeminiSemanticCooldownE
 import { acquisitionJobClockV2Enabled, CAPACITY_LEASE_DURATION_MS, capacityLeaseRefreshSetSql, capacityLeaseRunAfter, isCapacityLeaseFailure, normalizeCapacityLeaseRunAfter } from './acquisitionJobClockPolicy';
 import { acquisitionEvidenceFromError, classifyAcquisitionFailure, type AcquisitionFailureClassification } from './acquisitionFailureClassification';
 import { bumpJobFailureClassification, bumpJobFailureClassificationFallback, bumpJobFailureDisposition, jobDispositionExecutionKey, markJobDispositionCounted, markJobFailureClassificationCounted } from './operationsTelemetry';
+import { isYouTubeSearchQueryQuarantineFailure } from './youtubeInputQuarantine';
 
 export type JobFailureDisposition='RETRYING_WITHOUT_ATTEMPT'|'RETRYING'|'FAILED';
 
@@ -184,7 +185,11 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
   // A capacity wait is attempt-free regardless of the generic classification:
   // no acquisition work ran, so it cannot spend a durable attempt or age into
   // a false terminal. The run_after schedule still honors provider hints.
-  const disposition:JobFailureDisposition=capacityLease?'RETRYING_WITHOUT_ATTEMPT':decision.disposition;
+  // A quarantined search input cannot recover by retrying the same query. The
+  // query is cooled separately; the job itself is terminal so it does not spin
+  // through its remaining attempts against the pre-dispatch quarantine gate.
+  const quarantinedInput=isYouTubeSearchQueryQuarantineFailure(error);
+  const disposition:JobFailureDisposition=quarantinedInput?'FAILED':capacityLease?'RETRYING_WITHOUT_ATTEMPT':decision.disposition;
   const runAfter=capacityLease
     ? normalizeCapacityLeaseRunAfter(error,decision.runAfter??capacityLeaseRunAfter(error,attempts,now),attempts,now)
     : decision.runAfter;
@@ -209,7 +214,7 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
     }
   };
   const terminalFailureClass = disposition !== 'FAILED' ? null
-    : isYouTubePermanentInputError(error) ? 'PERMANENT_INPUT'
+    : isYouTubePermanentInputError(error) || quarantinedInput ? 'PERMANENT_INPUT'
       : isOfficialYouTubeQuotaFenceError(error) || String(error?.code || '') === 'INVESTIGATION_DEADLINE_EXCEEDED' ? 'POLICY_TERMINAL'
         : decision.operationallyBlocked ? 'PROVIDER_QUOTA'
           : retryableInfrastructure ? 'RETRYABLE'
