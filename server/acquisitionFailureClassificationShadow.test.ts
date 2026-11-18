@@ -24,7 +24,7 @@ function makeDb(
     queries,
     async query(sql: string, values?: unknown[]) {
       queries.push({ sql, values });
-      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at FROM jobs')) {
+      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at,locked_by FROM jobs')) {
         return { rowCount: 1, rows: [row] };
       }
       if (sql.startsWith('SELECT id FROM job_attempts')) {
@@ -229,7 +229,7 @@ test('a missing shadow column warns, counts a fallback, and uses the legacy fina
   const db = {
     async query(sql: string, values?: unknown[]) {
       queries.push({ sql, values });
-      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at FROM jobs')) {
+      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at,locked_by FROM jobs')) {
         return { rowCount: 1, rows: [{ attempts: 1, max_attempts: 5, first_transient_failure_at: null }] };
       }
       if (sql.startsWith('SELECT id FROM job_attempts')) {

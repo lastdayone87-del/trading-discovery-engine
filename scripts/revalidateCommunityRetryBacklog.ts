@@ -90,14 +90,16 @@ async function main() {
         await materializeCommunityWorkForChannel(channelId, { db: client });
         const work = await communityWorkSummary(channelId, client);
         const channelState = await client.query(
-          `SELECT discord_validation_status,scan_status FROM channels WHERE channel_id=$1`,
+          `SELECT discord_validation_status,scan_status,discord_candidate_locator FROM channels WHERE channel_id=$1`,
           [channelId],
         );
         const row = channelState.rows[0];
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
+        const locator = String(row?.discord_candidate_locator || '').trim();
+        const validationStatus = String(row?.discord_validation_status || '').toUpperCase();
         const validationPending = payload?.ledgerValidationPending === true
-          || row?.discord_validation_status === 'RETRY_PENDING'
-          || row?.scan_status === 'FAILED';
+          || row?.scan_status === 'FAILED'
+          || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'));
         if (work.total === 0) summary.noLedgerRows++;
         else if (validationPending) summary.leftActive++;
         else if (work.active === 0 && work.parkedInfra + work.parkedExternal === 0) summary.closedResolved++;
@@ -137,14 +139,16 @@ async function main() {
       }
       if (work.active === 0 && work.parkedInfra + work.parkedExternal === 0) {
         const channelState = await client.query(
-          `SELECT discord_validation_status,scan_status FROM channels WHERE channel_id=$1`,
+          `SELECT discord_validation_status,scan_status,discord_candidate_locator FROM channels WHERE channel_id=$1`,
           [channelId],
         );
         const row = channelState.rows[0];
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
+        const locator = String(row?.discord_candidate_locator || '').trim();
+        const validationStatus = String(row?.discord_validation_status || '').toUpperCase();
         if (payload?.ledgerValidationPending === true
-          || row?.discord_validation_status === 'RETRY_PENDING'
-          || row?.scan_status === 'FAILED') {
+          || row?.scan_status === 'FAILED'
+          || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'))) {
           await client.query(
             `UPDATE jobs
                 SET run_after=now(),

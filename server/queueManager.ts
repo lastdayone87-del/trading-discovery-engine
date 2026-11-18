@@ -1488,6 +1488,22 @@ export async function admitDiscoveredChannel(input: {
  * Worker loop that processes one durable search or enrichment job.
  */
 /**
+ * A ledger row can be resolved while its discovered invite still needs the
+ * legacy Discord validation pass. Closing the batch on URL completion alone
+ * would silently drop that invite, so both closure points ask the channel's
+ * durable validation state. `NOT_STARTED` with a stored locator is just as
+ * unfinished as `RETRY_PENDING`; the failed-scan flag means the last pass did
+ * not establish a verdict.
+ */
+function communityValidationStillPending(channel: ChannelRecord, job: DurableJob): boolean {
+  const locator = String(channel.discord_candidate_locator || '').trim();
+  const validationStatus = String(channel.discord_validation_status || '').toUpperCase();
+  return job.payload?.ledgerValidationPending === true
+    || channel.scan_status === 'FAILED'
+    || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'));
+}
+
+/**
  * Phase 1 retry slice. Returns false only when the URL ledger has no rows and
  * the legacy whole-channel path should run. Throws a capacity-shaped error
  * when the slice is complete but more URL work remains; failJob will refund
@@ -1495,6 +1511,14 @@ export async function admitDiscoveredChannel(input: {
  */
 async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: DurableJob): Promise<boolean> {
   const db = await getDb();
+  // A terminal channel cannot acquire anything. Close its batch owner instead
+  // of cycling URL slices through the inspector's early terminal return.
+  if (channel.country_status === 'REJECTED'
+    || channel.trading_status === 'NON_TRADING'
+    || channel.trading_status === 'HUMAN_REJECTED') {
+    await completeJob(job.id);
+    return true;
+  }
   await resetStaleCommunityWork(db);
   await materializeCommunityWorkForChannel(channel.channel_id, { db });
   await retireUnusableCommunityWork(channel.channel_id, db);
@@ -1518,7 +1542,8 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
     // A prior slice can leave a Discord validation check pending after all URL
     // work resolved. Do not close the batch without giving the legacy
     // validation path its bounded retry.
-    if (job.payload?.ledgerValidationPending) return false;
+    const refreshed = await getChannelById(channel.channel_id);
+    if (refreshed && communityValidationStillPending(refreshed, job)) return false;
     if (summary.total > 0 && summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0) {
       await completeJob(job.id);
       return true;
@@ -1568,8 +1593,7 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
   if (summary.total > 0 && summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0) {
     const refreshed = await getChannelById(channel.channel_id);
     if ((inspectionResult && typeof inspectionResult === 'object' && inspectionResult.retryDirective)
-      || refreshed?.discord_validation_status === 'RETRY_PENDING'
-      || refreshed?.scan_status === 'FAILED') {
+      || (refreshed && communityValidationStillPending(refreshed, job))) {
       // Hand the unvalidated invite back to the legacy bounded validation
       // path; it must not be silently closed as a clean URL-ledger completion.
       await db.query(
@@ -4173,12 +4197,12 @@ export async function inspectAndValidateChannel(
           if(claims)claims.push(claim);else claimedByUrl.set(normalized,[claim]);
         }
         for(const outcome of inspection.acquisitionOutcomes){
+          // The inspector binds claimed surfaces and leases itself; this block
+          // is only a fallback for an outcome it could not match by URL.
+          if((outcome as {workLeaseToken?:string}).workLeaseToken)continue;
           const normalized=normalizeCommunityWorkUrl(outcome.requestedUrl);
           const claims=normalized?claimedByUrl.get(normalized):undefined;
           if(!claims?.length)continue;
-          // Prefer the claimed surface that already matches the inspector's
-          // observation; otherwise assign the first claim. A URL with two
-          // distinct surface rows cannot be resolved for both from one crawl.
           const claimed=claims.find(entry=>entry.surface===String(outcome.surface||'').toUpperCase())||claims[0];
           outcome.surface=claimed.surface as typeof outcome.surface;
           if(claimed.leaseToken)(outcome as {workLeaseToken?:string}).workLeaseToken=claimed.leaseToken;

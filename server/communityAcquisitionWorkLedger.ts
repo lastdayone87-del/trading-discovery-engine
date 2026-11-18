@@ -71,6 +71,40 @@ export const COMMUNITY_ACQUISITION_WORK_SURFACES: ReadonlySet<string> = new Set(
 ]);
 
 /**
+ * Historical observations and current crawls name the same creator surface
+ * differently (`LINKED_WEBSITES` vs `CREATOR_WEBSITES`, `SOCIAL_BIO` vs
+ * `SOCIAL_PROFILES`, ...). The work ledger must use one identity per surface,
+ * otherwise a claimed legacy row can never match the current crawl's evidence
+ * and loops until exhaustion. Aliases are collapsed before key construction.
+ */
+/**
+ * A direct invite URL is already the terminal locator. Its acquisition row is
+ * complete as soon as the invite is found, but the channel-level Discord
+ * validation is a separate step. Keep the row claimable for a repeat validation
+ * pass until completion records the ledger's terminal FOUND state.
+ */
+export function isDirectDiscordInviteUrl(raw: string): boolean {
+  const value = String(raw || '').trim();
+  return /^https?:\/\/(www\.)?(discord\.gg|discord\.com\/invite|discordapp\.com\/invite)\//i.test(value);
+}
+
+export function canonicalCommunityWorkSurface(surface: string): string {
+  const normalized = String(surface || '').trim().toUpperCase();
+  switch (normalized) {
+    case 'CHANNEL_LINKS':
+    case 'EXTERNAL_LINKS':
+      return 'CHANNEL_EXTERNAL_LINKS';
+    case 'LINKED_WEBSITES':
+    case 'CUSTOM_DOMAINS':
+      return 'CREATOR_WEBSITES';
+    case 'SOCIAL_BIO':
+      return 'SOCIAL_PROFILES';
+    default:
+      return normalized;
+  }
+}
+
+/**
  * Capacity/runtime failures park the URL without spending its attempt budget.
  * These are the observation-level classes actually persisted by the static and
  * rendered crawlers (browserCapability/browserCommunityFallback) plus the
@@ -309,6 +343,37 @@ export function countsTowardAttemptBudget(observation: CommunityWorkObservation)
 }
 
 /**
+ * Billable attempts are inspection claims, not observation rows. New rows carry
+ * the exact claim lease, so a static and rendered row from one claim count once.
+ * Legacy rows predate leases; their timestamp spread is bounded by the same
+ * five-minute window the projection uses for one inspection. Genuine retries
+ * are at least the queue's 30-second backoff apart, so this can under-count a
+ * dense legacy tail but can never exhaust a URL that was not actually retried.
+ */
+export function billableInspectionAttempts(observations: readonly CommunityWorkObservation[]): number {
+  const billable = observations.filter(countsTowardAttemptBudget);
+  const leaseClaims = new Set(
+    billable
+      .map(observation => observation.workLeaseToken)
+      .filter((value): value is string => Boolean(value)),
+  );
+  const untokenedTimes = billable
+    .filter(observation => !observation.workLeaseToken)
+    .map(observation => Date.parse(observation.observedAt))
+    .filter(value => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  let historicalClaims = 0;
+  let clusterStart = Number.NaN;
+  for (const at of untokenedTimes) {
+    if (!Number.isFinite(clusterStart) || at - clusterStart > COMMUNITY_INSPECTION_WINDOW_MS) {
+      historicalClaims++;
+      clusterStart = at;
+    }
+  }
+  return Math.min(5, leaseClaims.size + historicalClaims);
+}
+
+/**
  * Effective retry ownership. Delegate to the production predicate so the
  * ledger cannot drift from the worker:
  *
@@ -354,6 +419,14 @@ export function normalizeCommunityWorkUrl(raw: string): string | null {
     || (parsed.protocol === 'https:' && parsed.port === '443')) {
     parsed.port = '';
   }
+  // Tracking parameters never identify independent work. Strip them for the
+  // durable ledger identity so a claimed URL and the inspector's normalized
+  // seed cannot diverge solely because one side retained utm_/fbclid/gclid.
+  for (const key of [...parsed.searchParams.keys()]) {
+    if (/^utm_/i.test(key) || /^(fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid)$/i.test(key)) {
+      parsed.searchParams.delete(key);
+    }
+  }
   let pathname = parsed.pathname || '/';
   if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.replace(/\/+$/, '');
   parsed.pathname = pathname;
@@ -370,7 +443,7 @@ export function communityAcquisitionWorkKey(
   surface: string,
 ): string {
   return createHash('sha256')
-    .update(`${channelId}\n${surface}\n${normalizedUrl}`)
+    .update(`${channelId}\n${canonicalCommunityWorkSurface(surface)}\n${normalizedUrl}`)
     .digest('hex');
 }
 
@@ -534,7 +607,7 @@ export function projectCommunityAcquisitionWork(
   // admitted by required work or the static-gap exception. Optional evidence
   // for a different URL never creates a row.
   for (const observation of observations) {
-    const surface = surfaceFromObservation(observation);
+    const surface = canonicalCommunityWorkSurface(surfaceFromObservation(observation));
     if (!surfaces.has(surface)) {
       skippedRows++;
       continue;
@@ -598,10 +671,8 @@ export function projectCommunityAcquisitionWork(
     const latest = selectEffectiveInspectionObservation(inspectionCandidates);
     if (!latest) continue;
     let earliestAt = group.observations[0].observedAt;
-    let attempts = 0;
     let directProcessedExecutions = 0;
     let browserExecutions = 0;
-    let lastAttemptAt: string | null = null;
 
     for (const observation of group.observations) {
       if (Date.parse(observation.observedAt) < Date.parse(earliestAt)) {
@@ -609,13 +680,19 @@ export function projectCommunityAcquisitionWork(
       }
       if (hasDirectProcessedAcquisitionEvidence(observation)) directProcessedExecutions++;
       if (hasBrowserExecution(observation)) browserExecutions++;
-      if (countsTowardAttemptBudget(observation)) {
-        attempts++;
-        if (!lastAttemptAt || Date.parse(observation.observedAt) > Date.parse(lastAttemptAt)) {
-          lastAttemptAt = observation.observedAt;
-        }
-      }
     }
+    // One inspection can emit static and rendered observations for the same
+    // URL. Count inspection claims, never raw rows, or three partial scans fill
+    // a five-attempt budget and exhaust a URL that was actually tried three
+    // times. New observations carry the exact claim lease; legacy rows predate
+    // it and are clustered by the projection's inspection window.
+    const attempts = billableInspectionAttempts(group.observations);
+    const lastAttemptAt = group.observations
+      .filter(countsTowardAttemptBudget)
+      .reduce<string | null>((latest, observation) =>
+        !latest || Date.parse(observation.observedAt) > Date.parse(latest)
+          ? observation.observedAt
+          : latest, null);
 
     const { state, terminalReason } = resolveCommunityWorkState(latest, attempts, maxAttempts);
     const neverExecuted = directProcessedExecutions === 0;

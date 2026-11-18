@@ -40,6 +40,15 @@ test('work keys are stable and scoped to channel, surface, and normalized URL', 
   assert.notEqual(first, communityAcquisitionWorkKey('UC-a', 'https://example.com/y', 'CREATOR_WEBSITES'));
   assert.notEqual(first, communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_PROFILES'));
   assert.match(first, /^[0-9a-f]{64}$/);
+  // Legacy surface names are aliases, not independent work identities.
+  assert.equal(
+    communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'LINKED_WEBSITES'),
+    first,
+  );
+  assert.equal(
+    communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_BIO'),
+    communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_PROFILES'),
+  );
 });
 
 test('URL normalization ignores host case, fragments, default ports, and trailing path slashes', () => {
@@ -58,6 +67,11 @@ test('URL normalization ignores host case, fragments, default ports, and trailin
   );
   assert.equal(normalizeCommunityWorkUrl('not a url'), null);
   assert.equal(normalizeCommunityWorkUrl('mailto:user@example.com'), null);
+  assert.equal(
+    normalizeCommunityWorkUrl('https://example.com/x?utm_source=a&fbclid=b&keep=1'),
+    'https://example.com/x?keep=1',
+    'tracking parameters are not durable work identity',
+  );
 });
 
 test('a started request never clears never_executed', () => {

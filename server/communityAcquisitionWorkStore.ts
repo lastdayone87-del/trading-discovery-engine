@@ -19,9 +19,11 @@ import { isCommunityRelevantObservation } from './inspector';
 import {
   COMMUNITY_ACQUISITION_WORK_SURFACES,
   communityAcquisitionWorkKey,
+  canonicalCommunityWorkSurface,
+  isDirectDiscordInviteUrl,
+  billableInspectionAttempts,
   hasBrowserExecution,
   hasDirectProcessedAcquisitionEvidence,
-  countsTowardAttemptBudget,
   hasProcessedAcquisitionEvidence,
   isCommunityLedgerWorkObservation,
   isInfrastructureFailureClass,
@@ -109,44 +111,6 @@ function database(db?: CommunityWorkDb): Promise<CommunityWorkDb> | CommunityWor
   return db || getDb() as unknown as Promise<CommunityWorkDb>;
 }
 
-/**
- * Historical billable attempts are inspection windows, not individual
- * observation rows: one inspection can emit static and rendered observations
- * for the same URL, but it is still one attempt. The inspector's current-run
- * boundary is one second; distinct genuine retries are spaced by at least
- * the queue's 30-second backoff, while static and rendered rows from one
- * inspection share the inspector's single `now` timestamp.
- */
-function billableInspectionAttempts(observations: readonly CommunityWorkObservation[]): number {
-  const billable = observations.filter(countsTowardAttemptBudget);
-  // New observations carry the exact claim lease. One lease is one attempt,
-  // even when the inspection emitted static and rendered rows.
-  const leaseClaims = new Set(
-    billable
-      .map(observation => observation.workLeaseToken)
-      .filter((value): value is string => Boolean(value)),
-  );
-  // Historical rows predate the lease token. One inspector run shares a
-  // single `observedAt` or a sub-second timestamp skew; genuine retries are
-  // spaced by the queue's at-least-30-second backoff. Keep the historical
-  // fallback separate from exact lease claims so a URL with both does not
-  // lose its historical attempts.
-  const untokenedTimes = billable
-    .filter(observation => !observation.workLeaseToken)
-    .map(observation => Date.parse(observation.observedAt))
-    .filter(value => Number.isFinite(value))
-    .sort((a, b) => a - b);
-  let historicalClaims = 0;
-  let last = Number.NEGATIVE_INFINITY;
-  for (const at of untokenedTimes) {
-    if (at - last > 1_000) {
-      historicalClaims++;
-      last = at;
-    }
-  }
-  return Math.min(5, leaseClaims.size + historicalClaims);
-}
-
 export async function loadCommunityWorkObservations(
   channelId: string,
   options: { windowDays?: number; db?: CommunityWorkDb } = {},
@@ -183,6 +147,15 @@ export async function loadCommunityWorkObservations(
 }
 
 function initialLedgerState(row: CommunityWorkProjectionRow): { state: CommunityWorkState; reason: string | null } {
+  // URL acquisition and Discord validation are separate steps. A direct invite
+  // is found as soon as its URL is observed, but its channel-level validation
+  // may still be NOT_STARTED/RETRY_PENDING. Keep the row claimable so the next
+  // bounded slice can validate it; completion writes the terminal RESOLVED
+  // state and the materializer's latestObservedAt guard prevents reopening it
+  // from the same historical observation.
+  if (row.lastOutcome === 'FOUND' && !row.retryOwned && isDirectDiscordInviteUrl(row.normalizedUrl || row.url)) {
+    return { state: 'PENDING', reason: null };
+  }
   if (row.state === 'RESOLVED') return { state: 'RESOLVED', reason: row.terminalReason || 'RESOLVED' };
   // A FOUND row with an outstanding retryable gap is still work for this URL;
   // ordinary FOUND rows are resolved. Multi-invite recall for other URLs is
@@ -224,7 +197,7 @@ export async function materializeCommunityWorkForChannel(
   for (const observation of observations) {
     const normalizedUrl = normalizeCommunityWorkUrl(observation.requestedUrl);
     if (!normalizedUrl) continue;
-    const surface = String(asRecord(observation.provenance).surface || '').toUpperCase();
+    const surface = canonicalCommunityWorkSurface(String(asRecord(observation.provenance).surface || ''));
     const key = communityAcquisitionWorkKey(channelId, normalizedUrl, surface);
     const group = observationsByKey.get(key);
     if (group) group.push(observation);
@@ -480,7 +453,26 @@ export async function claimCommunityWorkSlice(
                 s.terminal_reason,s.terminal_evidence`,
     [channelId, Math.max(1, Math.floor(limit)), String(RUNNING_LEASE_MINUTES)],
   );
-  return result.rows.map(rowToCommunityWorkRow);
+  const claimed = result.rows.map(row => rowToCommunityWorkRow(row));
+  // A URL can have historical rows under more than one accepted surface name.
+  // Never put two surfaces for the same URL in one slice: one crawl result is
+  // ambiguous for surface-scoped completion, and the queue/inspector mapping is
+  // intentionally URL-based. Release the extra claim without charging it; the
+  // next slice inspects that surface under its own lease.
+  const seenUrls = new Set<string>();
+  const unique: CommunityWorkRow[] = [];
+  const duplicates: CommunityWorkRow[] = [];
+  for (const row of claimed) {
+    if (seenUrls.has(row.normalizedUrl)) duplicates.push(row);
+    else {
+      seenUrls.add(row.normalizedUrl);
+      unique.push(row);
+    }
+  }
+  if (duplicates.length > 0) {
+    await releaseCommunityWorkSlice(duplicates, databaseClient, new Date(Date.now() + 60_000).toISOString());
+  }
+  return unique;
 }
 
 function rowToCommunityWorkRow(row: any): CommunityWorkRow {
@@ -559,7 +551,7 @@ export async function completeCommunityWorkSlice(
   for (const observation of observations) {
     const normalized = normalizeCommunityWorkUrl(observation.requestedUrl);
     if (!normalized) continue;
-    const surface = String(asRecord(observation.provenance).surface || '').toUpperCase();
+    const surface = canonicalCommunityWorkSurface(String(asRecord(observation.provenance).surface || ''));
     const key = communityAcquisitionWorkKey(channelId, normalized, surface);
     const group = grouped.get(key);
     if (group) group.push(observation);
@@ -574,14 +566,17 @@ export async function completeCommunityWorkSlice(
 
   for (const row of claimed) {
     const group = (grouped.get(row.workKey) || []).filter(observation => !row.leaseToken || observation.workLeaseToken === row.leaseToken);
-    // Only observations created after this claim may decide this slice. A
-    // claimed URL that never reached the inspector must not re-charge an old
-    // failure from the 90-day history.
+    // A lease token is the exact inspection identity: every observation this
+    // claim persisted carries it, and no older observation can. The timestamp
+    // watermark is only a fallback for a legacy/manual row without a lease;
+    // using it for leased rows would reintroduce clock-boundary flakiness.
     const claimBoundaryMs = row.lastAttemptAt ? Date.parse(row.lastAttemptAt) : 0;
-    const freshGroup = group.filter(observation => {
-      const at = Date.parse(observation.observedAt);
-      return Number.isFinite(at) && at >= claimBoundaryMs;
-    });
+    const freshGroup = row.leaseToken
+      ? group
+      : group.filter(observation => {
+          const at = Date.parse(observation.observedAt);
+          return Number.isFinite(at) && at >= claimBoundaryMs;
+        });
     const latest = selectEffectiveInspectionObservation(latestInspectionObservations(freshGroup));
     const latestObservedAt = freshGroup.reduce(
       (latestAt, observation) => Date.parse(observation.observedAt) > Date.parse(latestAt) ? observation.observedAt : latestAt,

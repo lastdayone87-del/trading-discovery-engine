@@ -124,9 +124,13 @@ test('Phase 1 wires the URL ledger into the retry worker', () => {
   const queueSource = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const storeSource = readFileSync(new URL('./communityAcquisitionWorkStore.ts', import.meta.url), 'utf8');
   assert.match(queueSource, /communityAcquisitionWorkStore|community_acquisition_url_state/);
-  assert.match(queueSource, /claimCommunityWorkSlice/);
   assert.match(queueSource, /await runCommunityLedgerRetrySlice\(channel, job\)/);
-  assert.match(queueSource, /await claimCommunityWorkSlice\(channel\.channel_id/);
+  const sliceStart = queueSource.indexOf('async function runCommunityLedgerRetrySlice');
+  assert.ok(sliceStart >= 0, 'retry slice function exists');
+  const nextFunction = queueSource.indexOf('\nasync function ', sliceStart + 10);
+  const sliceSource = queueSource.slice(sliceStart, nextFunction > sliceStart ? nextFunction : undefined);
+  assert.match(sliceSource, /await claimCommunityWorkSlice\(channel\.channel_id/);
+  assert.match(sliceSource, /await completeCommunityWorkSlice\(channel\.channel_id/);
   assert.match(storeSource, /community_acquisition_url_state/);
   assert.match(storeSource, /claimCommunityWorkSlice/);
 });

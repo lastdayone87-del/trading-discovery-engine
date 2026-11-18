@@ -10,6 +10,7 @@ import { decideFrontierStep, scoreFrontierCandidate, classifyBlockedAcquisition,
 import { canonicalSiteIdentity, isSiteInspectionReusable, buildBorrowedSiteInspection, hasSameOwnerPendingCandidates, siteInspectionCoversRequest, isSufficientRenderedCoverage, rootCoverageTerminal, mergeRedirectBinding, redirectBindingFor, redirectDestinations, REDIRECT_BINDING_KIND, checksumSiteFacts, SITE_INSPECTION_POLICY_VERSION, isExactBarrierPageCover, aggregateSeedOutcome, SITE_INSPECTION_CLAIM_STATUS, type SiteIdentity, type SiteInspectionStore } from './siteInspectionCache';
 import { fetchRecentVideoDescriptionsWithIds, type RecentVideoDescription } from './youtube';
 import {candidateFromNativeInvite,extractDiscordCandidates,makeDiscordCandidate,mergeDiscordCandidates,type DiscordCandidate} from './discordCandidates';
+import {canonicalCommunityWorkSurface,normalizeCommunityWorkUrl} from './communityAcquisitionWorkLedger';
 import {acquireDiscordPublicSurface,discordPublicSurfaceFor,type DiscordPublicSurfaceRef} from './discordPublicSurface';
 import { bumpRepeatFailureHistoryOutage, bumpRepeatFailureSkip } from './operationsTelemetry';
 import type { BrowserFallbackResult } from './browserCommunityFallback';
@@ -145,7 +146,7 @@ export interface InspectionResult {
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
 export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'PINNED_COMMENT'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
-export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Body-level confirmation from the bounded static 404/410 probe. This is not a skip: the whole seed predicate must also pass. */staticNotFoundBodyConfirmed?:boolean;staticNotFoundBodyReason?:string;/** True only when rendered escalation was actually skipped for this seed; persisted provenance for post-deploy measurement. The observation itself stays FAILED/non-retryable. */staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string}
+export interface ExternalAcquisitionObservation {requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:AcquisitionSurface;required:boolean;outcome:ExternalAcquisitionStatus;retryable:boolean;httpStatus?:number;failureClass?:string;retryAt?:number;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;rootUrl?:string;/** Body-level confirmation from the bounded static 404/410 probe. This is not a skip: the whole seed predicate must also pass. */staticNotFoundBodyConfirmed?:boolean;staticNotFoundBodyReason?:string;/** True only when rendered escalation was actually skipped for this seed; persisted provenance for post-deploy measurement. The observation itself stays FAILED/non-retryable. */staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;/** Lender seed URL when this row references shared same-inspection evidence instead of a direct fetch. The lender inspected the bytes; this row carries no page counters of its own. */sharedEvidenceFrom?:string;/** Exact ledger claim that owns this observation, when the pass is a bounded retry slice. */workLeaseToken?:string}
 
 /** Advance per-seed click-window progress by work this inspection actually
  * examined. A failed click or a zero-page run contributes nothing, so a retry
@@ -1506,7 +1507,7 @@ export function orderVideoDescriptionsForInspection(
     .filter(Boolean)));
 }
 
-export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];videoDescriptionsAuthoritative?:boolean;recentVideoDescriptions?:SampledVideoInput[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:(channelId:string)=>Promise<Array<string|{videoId?:string|null;description?:string|null}>>;externalFetchImpl?:typeof fetch;destinationResolver?:DnsResolver;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string,budget?:Partial<BrowserFallbackBudget>)=>Promise<BrowserFallbackResult>;renderedAdmissionLane?:AcquisitionLane;renderedFallbackMaxWaitMs?:number;urlFailureHistoryLoader?:(channelId:string,urls?:string[])=>Promise<UrlFailureRow[]>;siteInspectionStore?:SiteInspectionStore;bypassBorrowedCoverage?:boolean;scanAttempts?:number;clickOffsets?:Record<string,number>;allowedCommunityUrl?:(url:string)=>boolean;ledgerSeedUrls?:Array<{url:string;surface:string}>;}):Promise<InspectionResult>{
+export async function runChannelInspection(channelData:{enableDebug?:boolean;channelId:string;channelName?:string;channelBio:string;channelLinks?:string[];pinnedComment?:string;videoDescriptions?:string[];videoDescriptionsAuthoritative?:boolean;recentVideoDescriptions?:SampledVideoInput[];socialLinks?:string[];youtubeUrl?:string;forceLiveFetch?:boolean;liveChannelDataLoader?:typeof fetchLiveYouTubeChannelData;recentVideoDescriptionsLoader?:(channelId:string)=>Promise<Array<string|{videoId?:string|null;description?:string|null}>>;externalFetchImpl?:typeof fetch;destinationResolver?:DnsResolver;creatorLikelyTrading?:boolean;renderedFallback?:(seedUrl:string,budget?:Partial<BrowserFallbackBudget>)=>Promise<BrowserFallbackResult>;renderedAdmissionLane?:AcquisitionLane;renderedFallbackMaxWaitMs?:number;urlFailureHistoryLoader?:(channelId:string,urls?:string[])=>Promise<UrlFailureRow[]>;siteInspectionStore?:SiteInspectionStore;bypassBorrowedCoverage?:boolean;scanAttempts?:number;clickOffsets?:Record<string,number>;allowedCommunityUrl?:(url:string)=>boolean;ledgerSeedUrls?:Array<{url:string;surface:string;leaseToken?:string|null}>;}):Promise<InspectionResult>{
   const steps:InspectionStep[]=[];const now=new Date().toISOString();let extractedThumbnailUrl:string|undefined;
   const markSsrfSeedRequired = (observations: ExternalAcquisitionObservation[], seedUrl: string): void => {
     const key = normalizeVisitUrl(seedUrl);
@@ -1611,13 +1612,95 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
 
   function addStep(stepName:InspectionStep['step'],title:string,status:InspectionStep['status'],detailsArr:string[],foundInvite:string|null=null,inviteLocation:string|undefined=undefined,foundInvites:string[]=[]){steps.push({step:stepName,title,status,details:detailsArr.join('\n'),detectedInvite:foundInvite||undefined,detectedInvites:foundInvites.length?foundInvites:foundInvite?[foundInvite]:undefined,inviteLocation,timestamp:now});if(debugLog&&status==='NOT_FOUND'&&!debugLog.failureStep)debugLog.failureStep=stepName;}
   let collectedExternalUrls:{url:string;wrapperUrl?:string;kind:'WEBSITE'|'SOCIAL'|'MESSAGING'|'DISCORD';contextMatches:boolean;source:string}[]=[];const checkContext=(text:string,url:string):boolean=>{const contextKeywords=['discord','community','join','trading floor','members','server'],lowerText=text.toLowerCase(),urlIndex=lowerText.indexOf(url.toLowerCase());if(urlIndex===-1)return false;const window=lowerText.substring(Math.max(0,urlIndex-100),Math.min(lowerText.length,urlIndex+url.length+100));return contextKeywords.some(kw=>window.includes(kw));};
+  // The ledger and the crawler must canonicalize a claimed URL identically.
+  // Tracking parameters are not work identity, and the claimed scope is built
+  // from the durable ledger's normalized_url. Canonicalizing both sides here
+  // prevents a matching seed from being filtered out and looping unobserved.
+  const canonicalClaimKey=(raw:string):string|null=>normalizeCommunityWorkUrl(raw);
+  const allowedByClaim=(raw:string):boolean=>{
+    if(!channelData.allowedCommunityUrl)return true;
+    const key=canonicalClaimKey(raw);
+    return channelData.allowedCommunityUrl(key||raw);
+  };
+  const candidateInClaimScope=(candidate:DiscordCandidate):boolean=>{
+    if(!channelData.allowedCommunityUrl)return true;
+    return [candidate.sourceUrl,candidate.normalizedLocator,candidate.rawLocator]
+      .some(value=>typeof value==='string'&&value.length>0&&allowedByClaim(value));
+  };
+  const ledgerClaimsByKey=new Map<string,Array<{surface:string;leaseToken?:string|null}>>();
+  for(const seed of channelData.ledgerSeedUrls||[]){
+    const key=canonicalClaimKey(seed.url);
+    if(!key)continue;
+    const claims=ledgerClaimsByKey.get(key);
+    const claim={surface:seed.surface,leaseToken:seed.leaseToken};
+    if(claims)claims.push(claim);else ledgerClaimsByKey.set(key,[claim]);
+  }
   // R6 admission audit trail: every candidate rejected by the shared admission
   // boundary is logged with its stable reason code (no silent drops).
   const admissionRejectionLogs:string[]=[];
   const logAdmissionRejection=(raw:string)=>{const decision=assessCrawlAdmission(raw);if(!decision.eligible)admissionRejectionLogs.push(`Admission rejected (${decision.reasonCode}): ${raw}; not admitted.`);return decision.eligible;};
   const addExternalUrls=(text:string,source:string)=>{const urls=extractExternalUrlsFromText(text);if(debugLog)debugLog.extractedUrls.push(...urls);for(const url of urls){if(!logAdmissionRejection(url))continue;const normalized=normalizeExternalUrl(url);if(!normalized||isPageAssetInfrastructureUrl(normalized.url))continue;collectedExternalUrls.push({...normalized,contextMatches:checkContext(text,url),source});}};
-  for(const link of links)if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);if(!logAdmissionRejection(link))continue;const normalizedLink=normalizeExternalUrl(link);if(!normalizedLink||isPageAssetInfrastructureUrl(normalizedLink.url))continue;collectedExternalUrls.push({...normalizedLink,contextMatches:false,source:'CHANNEL_LINKS'});}for(const link of channelData.socialLinks||[])if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);if(!logAdmissionRejection(link))continue;const normalizedSocial=normalizeExternalUrl(link);if(!normalizedSocial||isPageAssetInfrastructureUrl(normalizedSocial.url))continue;collectedExternalUrls.push({...normalizedSocial,contextMatches:false,source:'SOCIAL_LINKS'});}for(const seed of channelData.ledgerSeedUrls||[]){if(!seed.url||!logAdmissionRejection(seed.url))continue;const normalizedSeed=normalizeExternalUrl(seed.url);if(!normalizedSeed||isPageAssetInfrastructureUrl(normalizedSeed.url))continue;collectedExternalUrls.push({...normalizedSeed,contextMatches:true,source:'LEDGER_SLICE'});}
+  for(const link of links)if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);if(!logAdmissionRejection(link))continue;const normalizedLink=normalizeExternalUrl(link);if(!normalizedLink||isPageAssetInfrastructureUrl(normalizedLink.url))continue;collectedExternalUrls.push({...normalizedLink,contextMatches:false,source:'CHANNEL_LINKS'});}for(const link of channelData.socialLinks||[])if(link&&typeof link==='string'){if(debugLog)debugLog.extractedUrls.push(link);if(!logAdmissionRejection(link))continue;const normalizedSocial=normalizeExternalUrl(link);if(!normalizedSocial||isPageAssetInfrastructureUrl(normalizedSocial.url))continue;collectedExternalUrls.push({...normalizedSocial,contextMatches:false,source:'SOCIAL_LINKS'});}
   const discoveredCandidates:DiscordCandidate[]=[];const retainCandidates=(items:DiscordCandidate[])=>{discoveredCandidates.push(...items.filter(item=>item.nativeInviteCode));};
+  // A bounded URL slice must not let an unclaimed direct candidate masquerade
+  // as claimed work, but it must never discard the invite either. Candidates
+  // outside the slice stay in the channel-level validation set and are
+  // accounted on the non-ledger DISCORD_VALIDATION surface, which the URL work
+  // projection deliberately ignores.
+  const partitionClaimScopedCandidates=(items:DiscordCandidate[]):DiscordCandidate[]=>{
+    if(!channelData.allowedCommunityUrl)return items;
+    const inScope:DiscordCandidate[]=[];
+    const outside:DiscordCandidate[]=[];
+    for(const item of items){
+      if(candidateInClaimScope(item))inScope.push(item);
+      else outside.push(item);
+    }
+    if(outside.length){
+      retainCandidates(outside);
+      for(const candidate of outside){
+        const locator=candidate.normalizedLocator||candidate.rawLocator||candidate.sourceUrl||'';
+        if(!locator)continue;
+        acquisitionOutcomes.push({
+          requestedUrl:locator,
+          surface:'DISCORD_VALIDATION',
+          required:false,
+          outcome:'FOUND',
+          retryable:false,
+          detail:'Direct Discord candidate retained outside the bounded URL slice for channel validation',
+          observedAt:now,
+        });
+      }
+    }
+    return inScope;
+  };
+  for(const seed of channelData.ledgerSeedUrls||[]){
+    if(!seed.url)continue;
+    // Direct Discord invites are deliberately rejected by the website URL
+    // normalizer because they are terminal candidates, not crawl seeds. Seed
+    // them through the candidate path so a claimed direct-invite row can be
+    // validated and completed instead of being dropped forever.
+    const directSeeds=extractDiscordCandidates(seed.url,(seed.surface||'CHANNEL_EXTERNAL_LINKS') as AcquisitionSurface,seed.url)
+      .filter(candidate=>candidate.nativeInviteCode);
+    if(directSeeds.length){
+      retainCandidates(directSeeds);
+      acquisitionOutcomes.push({
+        requestedUrl:seed.url,
+        finalUrl:seed.url,
+        surface:seed.surface as AcquisitionSurface,
+        required:true,
+        outcome:'FOUND',
+        retryable:false,
+        detail:'Direct Discord invite claimed from the durable URL ledger',
+        observedAt:now,
+        ...(seed.leaseToken?{workLeaseToken:seed.leaseToken}:{}),
+      });
+      continue;
+    }
+    if(!logAdmissionRejection(seed.url))continue;
+    const normalizedSeed=normalizeExternalUrl(seed.url);
+    if(!normalizedSeed||isPageAssetInfrastructureUrl(normalizedSeed.url))continue;
+    collectedExternalUrls.push({...normalizedSeed,contextMatches:true,source:'LEDGER_SLICE'});
+  }
   // L1: a URL that entered the crawl from the pinned comment must carry that
   // seed provenance onto every invite retained from it, not only into ranking.
   const withSeedProvenance=(candidates:DiscordCandidate[],seed:{url:string;source:string}):DiscordCandidate[]=>{
@@ -1641,9 +1724,9 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const creatorWebsiteHosts = creatorWebsiteHostsFromLinks(links);
   const ownershipInput = { creatorName, creatorWebsiteHosts };
 
-  const step1Logs:string[]=[];step1Logs.push(`Inspecting channel bio text (${bio.length} characters) and embedded links.`);const bioCandidates=extractDiscordCandidates(bio,'YOUTUBE_ABOUT',channelData.youtubeUrl).filter(c=>c.nativeInviteCode),directBioInvite=bioCandidates[0]?.nativeInviteCode||null;if(debugLog)debugLog.discordRegexAttempts.push({source:'CHANNEL_ABOUT',textLength:bio.length,result:bioCandidates.map(c=>c.nativeInviteCode)});addExternalUrls(bio,'CHANNEL_ABOUT');retainCandidates(bioCandidates);if(directBioInvite){step1Logs.push(`${bioCandidates.length} direct Discord candidate(s) detected in Channel Bio.`);addStep('BIO','Step 1 — Channel Bio & About Panel','FOUND',step1Logs,directBioInvite,'CHANNEL_ABOUT');acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl||`youtube:channel:${channelData.channelId}`,surface:'YOUTUBE_ABOUT',required:true,outcome:'FOUND',retryable:false,detail:`${bioCandidates.length} Discord candidate(s) discovered in YouTube About content`,observedAt:now});}else{if(acquiredAboutUrl)acquisitionOutcomes.push({requestedUrl:acquiredAboutUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'YouTube About page acquired and inspected without a Discord invite',observedAt:now});step1Logs.push('No direct Discord invite found in channel bio.');addStep('BIO','Step 1 — Channel Bio & About Panel','NOT_FOUND',step1Logs);}
+  const step1Logs:string[]=[];step1Logs.push(`Inspecting channel bio text (${bio.length} characters) and embedded links.`);const bioCandidates=partitionClaimScopedCandidates(extractDiscordCandidates(bio,'YOUTUBE_ABOUT',channelData.youtubeUrl).filter(c=>c.nativeInviteCode)),directBioInvite=bioCandidates[0]?.nativeInviteCode||null;if(debugLog)debugLog.discordRegexAttempts.push({source:'CHANNEL_ABOUT',textLength:bio.length,result:bioCandidates.map(c=>c.nativeInviteCode)});addExternalUrls(bio,'CHANNEL_ABOUT');retainCandidates(bioCandidates);if(directBioInvite){step1Logs.push(`${bioCandidates.length} direct Discord candidate(s) detected in Channel Bio.`);addStep('BIO','Step 1 — Channel Bio & About Panel','FOUND',step1Logs,directBioInvite,'CHANNEL_ABOUT');acquisitionOutcomes.push({requestedUrl:channelData.youtubeUrl||`youtube:channel:${channelData.channelId}`,surface:'YOUTUBE_ABOUT',required:true,outcome:'FOUND',retryable:false,detail:`${bioCandidates.length} Discord candidate(s) discovered in YouTube About content`,observedAt:now});}else{if(acquiredAboutUrl)acquisitionOutcomes.push({requestedUrl:acquiredAboutUrl,surface:'YOUTUBE_ABOUT',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:'YouTube About page acquired and inspected without a Discord invite',observedAt:now});step1Logs.push('No direct Discord invite found in channel bio.');addStep('BIO','Step 1 — Channel Bio & About Panel','NOT_FOUND',step1Logs);}
 
-  const step2Logs:string[]=[];const rawLinkCandidates=links.flatMap(link=>{const sources=[link];const destination=youtubeRedirectDestination(link);if(destination)sources.push(destination);return sources.flatMap(text=>extractDiscordCandidates(text,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);});const linkCandidates=mergeDiscordCandidates(rawLinkCandidates,ownershipInput);retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){const inviteCodes=linkCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step2Logs.push(`${linkCandidates.length} distinct direct Discord candidate(s) retained from channel links.`);step2Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS',inviteCodes);}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);
+  const step2Logs:string[]=[];const rawLinkCandidates=links.flatMap(link=>{const sources=[link];const destination=youtubeRedirectDestination(link);if(destination)sources.push(destination);return sources.flatMap(text=>extractDiscordCandidates(text,'CHANNEL_EXTERNAL_LINKS',link)).filter(c=>c.nativeInviteCode);});const linkCandidates=mergeDiscordCandidates(partitionClaimScopedCandidates(rawLinkCandidates),ownershipInput);retainCandidates(linkCandidates);if(links.length){step2Logs.push(`Scanning ${links.length} channel links.`);if(linkCandidates.length){const inviteCodes=linkCandidates.map(candidate=>candidate.nativeInviteCode!).filter(Boolean);step2Logs.push(`${linkCandidates.length} distinct direct Discord candidate(s) retained from channel links.`);step2Logs.push(`Retained invite code${inviteCodes.length===1?'':'s'}: ${inviteCodes.join(', ')}`);for(const candidate of linkCandidates)acquisitionOutcomes.push({requestedUrl:candidate.sourceUrl||candidate.rawLocator,surface:'CHANNEL_EXTERNAL_LINKS',required:true,outcome:'FOUND',retryable:false,detail:'Discord invite discovered in channel links',observedAt:now});addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','FOUND',step2Logs,linkCandidates[0].nativeInviteCode||null,'CHANNEL_LINKS',inviteCodes);}else{step2Logs.push('No direct Discord invite found in channel links.');addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','NOT_FOUND',step2Logs);}}else addStep('EXTERNAL_LINKS','Step 2 — Channel External Links','SKIPPED',['No channel links found.']);
 
   // L1: the pinned comment is creator-curated channel text, distinct from
   // channel links and video descriptions. Direct invites retain PINNED_COMMENT
@@ -1654,7 +1737,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   const pinnedCandidates:DiscordCandidate[]=[];
   if(pinnedComment){
     stepPinnedLogs.push(`Scanning pinned comment (${pinnedComment.length} characters).`);
-    const candidates=extractDiscordCandidates(pinnedComment,'PINNED_COMMENT',`youtube:channel:${channelData.channelId}:pinned-comment`).filter(c=>c.nativeInviteCode);
+    const candidates=partitionClaimScopedCandidates(extractDiscordCandidates(pinnedComment,'PINNED_COMMENT',`youtube:channel:${channelData.channelId}:pinned-comment`).filter(c=>c.nativeInviteCode));
     pinnedCandidates.push(...candidates);
     addExternalUrls(pinnedComment,'PINNED_COMMENT');
     retainCandidates(pinnedCandidates);
@@ -1670,7 +1753,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     }
   }else addStep('PINNED_COMMENT','Step 2b — Pinned YouTube Comment','SKIPPED',['No pinned comment available.']);
 
-  const orderedVideoDescs=orderVideoDescriptionsForInspection(channelSampledDescs(),videoDescs);const descriptionsToInspect=orderedVideoDescs.slice(0,MAX_INSPECTED_VIDEO_DESCRIPTIONS),step3Logs:string[]=[];const videoCandidates:DiscordCandidate[]=[];if(descriptionsToInspect.length){step3Logs.push(`Scanning ${descriptionsToInspect.length} recent video descriptions${orderedVideoDescs.length>descriptionsToInspect.length?` (${orderedVideoDescs.length} available; newest authoritative descriptions are prioritized).`:'.'}`);for(let i=0;i<descriptionsToInspect.length;i++){const d=descriptionsToInspect[i],sourceName=`VIDEO_${i+1}_DESCRIPTION`;addExternalUrls(d,sourceName);const candidates=extractDiscordCandidates(d,'RECENT_VIDEO_DESCRIPTIONS',`youtube:channel:${channelData.channelId}:${sourceName}`).filter(c=>c.nativeInviteCode);videoCandidates.push(...candidates);if(debugLog)debugLog.discordRegexAttempts.push({source:sourceName,textLength:d.length,result:candidates.map(c=>c.nativeInviteCode)});if(candidates.length)acquisitionOutcomes.push({requestedUrl:`youtube:channel:${channelData.channelId}:${sourceName}`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'FOUND',retryable:false,detail:`${candidates.length} Discord candidate(s) discovered in recent video description`,observedAt:now});}retainCandidates(videoCandidates);if(videoCandidates.length){step3Logs.push(`${videoCandidates.length} Discord candidate observation(s) retained across the inspected descriptions.`);addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','FOUND',step3Logs,videoCandidates[0].nativeInviteCode||null,'RECENT_VIDEO_DESCRIPTIONS');}else{step3Logs.push('No direct Discord invite found in the descriptions actually inspected.');addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','NOT_FOUND',step3Logs);}}else addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','SKIPPED',['No video descriptions available.']);for(const surface of acquiredRecentDescriptionSurfaces)if(!videoCandidates.length)acquisitionOutcomes.push({requestedUrl:surface,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:`Recent video descriptions acquired; ${descriptionsToInspect.length} description(s) inspected without a Discord invite`,observedAt:now});
+  const orderedVideoDescs=orderVideoDescriptionsForInspection(channelSampledDescs(),videoDescs);const descriptionsToInspect=orderedVideoDescs.slice(0,MAX_INSPECTED_VIDEO_DESCRIPTIONS),step3Logs:string[]=[];const videoCandidates:DiscordCandidate[]=[];if(descriptionsToInspect.length){step3Logs.push(`Scanning ${descriptionsToInspect.length} recent video descriptions${orderedVideoDescs.length>descriptionsToInspect.length?` (${orderedVideoDescs.length} available; newest authoritative descriptions are prioritized).`:'.'}`);for(let i=0;i<descriptionsToInspect.length;i++){const d=descriptionsToInspect[i],sourceName=`VIDEO_${i+1}_DESCRIPTION`;addExternalUrls(d,sourceName);const candidates=partitionClaimScopedCandidates(extractDiscordCandidates(d,'RECENT_VIDEO_DESCRIPTIONS',`youtube:channel:${channelData.channelId}:${sourceName}`).filter(c=>c.nativeInviteCode));videoCandidates.push(...candidates);if(debugLog)debugLog.discordRegexAttempts.push({source:sourceName,textLength:d.length,result:candidates.map(c=>c.nativeInviteCode)});if(candidates.length)acquisitionOutcomes.push({requestedUrl:`youtube:channel:${channelData.channelId}:${sourceName}`,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'FOUND',retryable:false,detail:`${candidates.length} Discord candidate(s) discovered in recent video description`,observedAt:now});}retainCandidates(videoCandidates);if(videoCandidates.length){step3Logs.push(`${videoCandidates.length} Discord candidate observation(s) retained across the inspected descriptions.`);addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','FOUND',step3Logs,videoCandidates[0].nativeInviteCode||null,'RECENT_VIDEO_DESCRIPTIONS');}else{step3Logs.push('No direct Discord invite found in the descriptions actually inspected.');addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','NOT_FOUND',step3Logs);}}else addStep('VIDEO_DESCRIPTIONS','Step 3 — Latest Video Descriptions','SKIPPED',['No video descriptions available.']);for(const surface of acquiredRecentDescriptionSurfaces)if(!videoCandidates.length)acquisitionOutcomes.push({requestedUrl:surface,surface:'RECENT_VIDEO_DESCRIPTIONS',required:true,outcome:'INSPECTED_NO_MATCH',retryable:false,detail:`Recent video descriptions acquired; ${descriptionsToInspect.length} description(s) inspected without a Discord invite`,observedAt:now});
 
   // Recall-safe acquisition (PR #434 items 1-3): ranking reorders but never
   // discards — the complete deduplicated candidate list is attempted in rank
@@ -1702,7 +1785,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // unrelated subdomains can never merge).
   const wwwSchemeCollapseKey=(rawUrl:string):string|null=>{let parsed:URL;try{parsed=new URL(rawUrl);}catch{return null;}const identity=canonicalSiteIdentity(rawUrl)?.siteIdentity;if(!identity)return null;const host=parsed.hostname.toLowerCase();const stripped=host.replace(/^www\./,'');return `${identity}\u0000${parsed.protocol}\u0000${stripped}\u0000${parsed.port}\u0000${parsed.pathname}\u0000${parsed.search}`;};
   const hostsDifferOnlyByWww=(a:string,b:string):boolean=>{let pa:URL,pb:URL;try{pa=new URL(a);pb=new URL(b);}catch{return false;}const ha=pa.hostname.toLowerCase(),hb=pb.hostname.toLowerCase();return ha!==hb&&(ha===`www.${hb}`||hb===`www.${ha}`)&&pa.port===pb.port;};
-  for(const item of collectedExternalUrls){let seedUrl=item.url;if(item.kind==='WEBSITE'){try{const host=new URL(seedUrl).hostname.toLowerCase();const recovered=recoverTruncatedQueryToRoot(seedUrl,siblingValuedKeysByHost.get(host)??new Set());if(recovered&&recovered!==seedUrl){admissionRecoveryLogs.push(`Recovered truncated query to host root (TRUNCATED_QUERY_PREFIX): ${seedUrl} → ${recovered}`);seedUrl=recovered;}else if(isPossiblyTruncatedPath(seedUrl,siblingPathsByHost.get(host)??new Set())){admissionTruncationSignals.push(`Possibly truncated path (signal only, still eligible): ${seedUrl}`);}}catch{/* recovery never breaks collection */}}const key=seedUrl;const existing=uniqueUrls.get(key);if(existing){if(item.contextMatches)existing.contextMatches=true;continue;}if(item.kind==='WEBSITE'){const collapseKey=wwwSchemeCollapseKey(seedUrl);if(collapseKey){const primaryKey=collapseIndex.get(collapseKey);const primary=primaryKey?uniqueUrls.get(primaryKey):undefined;if(primary&&hostsDifferOnlyByWww(primary.url,seedUrl)){if(item.contextMatches)primary.contextMatches=true;seedDedupeLogs.push(`Seed deduplicated (BARE_WWW_DUPLICATE): ${seedUrl} → kept ${primary.url}`);continue;}if(!primaryKey)collapseIndex.set(collapseKey,key);}}uniqueUrls.set(key,{...item,url:seedUrl});}const allCollectedUrls=Array.from(uniqueUrls.values());let websiteUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='WEBSITE'));let socialBioUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='SOCIAL')),messagingUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='MESSAGING'));if(channelData.allowedCommunityUrl){const allowed=channelData.allowedCommunityUrl;websiteUrls=websiteUrls.filter(item=>allowed(item.url));socialBioUrls=socialBioUrls.filter(item=>allowed(item.url));messagingUrls=messagingUrls.filter(item=>allowed(item.url));}
+  for(const item of collectedExternalUrls){let seedUrl=item.url;if(item.kind==='WEBSITE'){try{const host=new URL(seedUrl).hostname.toLowerCase();const recovered=recoverTruncatedQueryToRoot(seedUrl,siblingValuedKeysByHost.get(host)??new Set());if(recovered&&recovered!==seedUrl){admissionRecoveryLogs.push(`Recovered truncated query to host root (TRUNCATED_QUERY_PREFIX): ${seedUrl} → ${recovered}`);seedUrl=recovered;}else if(isPossiblyTruncatedPath(seedUrl,siblingPathsByHost.get(host)??new Set())){admissionTruncationSignals.push(`Possibly truncated path (signal only, still eligible): ${seedUrl}`);}}catch{/* recovery never breaks collection */}}const key=seedUrl;const existing=uniqueUrls.get(key);if(existing){if(item.contextMatches)existing.contextMatches=true;continue;}if(item.kind==='WEBSITE'){const collapseKey=wwwSchemeCollapseKey(seedUrl);if(collapseKey){const primaryKey=collapseIndex.get(collapseKey);const primary=primaryKey?uniqueUrls.get(primaryKey):undefined;if(primary&&hostsDifferOnlyByWww(primary.url,seedUrl)){if(item.contextMatches)primary.contextMatches=true;seedDedupeLogs.push(`Seed deduplicated (BARE_WWW_DUPLICATE): ${seedUrl} → kept ${primary.url}`);continue;}if(!primaryKey)collapseIndex.set(collapseKey,key);}}uniqueUrls.set(key,{...item,url:seedUrl});}const allCollectedUrls=Array.from(uniqueUrls.values());let websiteUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='WEBSITE'));let socialBioUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='SOCIAL')),messagingUrls=rankCommunitySurfaces(allCollectedUrls.filter(u=>u.kind==='MESSAGING'));if(channelData.allowedCommunityUrl){websiteUrls=websiteUrls.filter(item=>allowedByClaim(item.url));socialBioUrls=socialBioUrls.filter(item=>allowedByClaim(item.url));messagingUrls=messagingUrls.filter(item=>allowedByClaim(item.url));}
 
   // H1: Discord server-directory and widget URLs carry no terminal invite in
   // the URL. They are admitted as a distinct kind and resolved after every
@@ -1711,7 +1794,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // that named it. Acquisition observations use CHANNEL_EXTERNAL_LINKS as the
   // retry-owning surface because these are external community locators; the
   // candidate itself keeps the original source surface for ownership scoring.
-  const discordSurfaceSeeds=allCollectedUrls.filter(item=>item.kind==='DISCORD'&&(!channelData.allowedCommunityUrl||channelData.allowedCommunityUrl(item.url)));
+  const discordSurfaceSeeds=allCollectedUrls.filter(item=>item.kind==='DISCORD'&&(!channelData.allowedCommunityUrl||allowedByClaim(item.url)));
   const stepDiscordLogs:string[]=[];
   const discordSurfaceCandidates:DiscordCandidate[]=[];
   const discordSurfaceForSource=(source:string):AcquisitionSurface=>
@@ -1886,7 +1969,7 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
         }
       }
       let admittedSitemapSeeds=0;
-      if(sitemapSeeds.length){const allowedSitemapSeeds=channelData.allowedCommunityUrl?sitemapSeeds.filter(item=>channelData.allowedCommunityUrl!(item.url)):sitemapSeeds;admittedSitemapSeeds=allowedSitemapSeeds.length;if(allowedSitemapSeeds.length)websiteUrls=rankCommunitySurfaces([...websiteUrls,...allowedSitemapSeeds]);}
+      if(sitemapSeeds.length){const allowedSitemapSeeds=channelData.allowedCommunityUrl?sitemapSeeds.filter(item=>allowedByClaim(item.url)):sitemapSeeds;admittedSitemapSeeds=allowedSitemapSeeds.length;if(allowedSitemapSeeds.length)websiteUrls=rankCommunitySurfaces([...websiteUrls,...allowedSitemapSeeds]);}
       ladderSeedAdmission={admitted:admittedSitemapSeeds,considered:ladderSeedsConsidered};
     }catch{/* sitemap seeding never breaks seed selection */}
   }
@@ -2496,5 +2579,20 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
   // is unchanged.
   const coveredRetryUrls=new Set(communityRequired.map(o=>(o as {requestedUrl?:unknown}).requestedUrl));
   const staticGapExtras=acquisitionOutcomes.filter(o=>!o.required&&(o as {failureClass?:unknown}).failureClass===STATIC_BUDGET_GAP_FAILURE_CLASS&&(o as {retryable?:unknown}).retryable===true&&isCommunityRetryableObservation(o as never)&&!coveredRetryUrls.has((o as {requestedUrl?:unknown}).requestedUrl));
-  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,MAX_INSPECTED_VIDEO_DESCRIPTIONS),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes,retryDirective:communityAcquisitionRetryDirective([...communityRequired,...staticGapExtras],consecutiveTimeoutSuppressed)||(optionalCommunityIncomplete.length?{attemptFree:false,code:COMMUNITY_ACQUISITION_REQUIRED,reason:`Optional community surface was not inspected: ${optionalCommunityIncomplete.map(item=>item.failureClass||item.outcome||'UNKNOWN').join(', ')}`,retryReason:COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE}:undefined),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates,communityIntent:communityIntentEvidence.length?communityIntentEvidence:undefined,nextClickOffsets:nextRenderedClickOffsets(channelData.clickOffsets,acquisitionOutcomes)};
+  // A claimed ledger row may carry a legacy surface alias (LINKED_WEBSITES,
+  // SOCIAL_BIO) while the crawler emits its canonical successor. Attach the
+  // claimed surface and exact lease to every outcome for that URL here, so the
+  // inspector itself preserves the identity the completion path will look up.
+  // The queue's URL-only mapping remains only as a fallback for untokenized
+  // outcomes.
+  const ledgerBoundOutcomes=acquisitionOutcomes.map(outcome=>{
+    if(outcome.workLeaseToken)return outcome;
+    const key=canonicalClaimKey(outcome.requestedUrl);
+    const claims=key?ledgerClaimsByKey.get(key):undefined;
+    if(!claims?.length)return outcome;
+    const outcomeSurface=canonicalCommunityWorkSurface(String(outcome.surface||''));
+    const claim=claims.find(entry=>canonicalCommunityWorkSurface(entry.surface)===outcomeSurface)||claims[0];
+    return {...outcome,surface:claim.surface as AcquisitionSurface,...(claim.leaseToken?{workLeaseToken:claim.leaseToken}:{})};
+  });
+  return {foundInvite:mergedCandidates[0]?.nativeInviteCode||null,foundLocation:mergedCandidates[0]?.sourceUrl?.match(/VIDEO_\d+_DESCRIPTION/)?.[0]||mergedCandidates[0]?.sourceSurface,steps,extractedThumbnailUrl,debugLog,observedAboutBio:bio,observedChannelLinks:links,observedVideoDescriptions:channelSampledDescs().slice(0,MAX_INSPECTED_VIDEO_DESCRIPTIONS),observedVideoDescriptionsAuthoritative:channelSampled.length>0,acquisitionStatus:mergedCandidates.length?'FOUND':acquisitionStatus,acquisitionOutcomes:ledgerBoundOutcomes,retryDirective:communityAcquisitionRetryDirective([...communityRequired,...staticGapExtras],consecutiveTimeoutSuppressed)||(optionalCommunityIncomplete.length?{attemptFree:false,code:COMMUNITY_ACQUISITION_REQUIRED,reason:`Optional community surface was not inspected: ${optionalCommunityIncomplete.map(item=>item.failureClass||item.outcome||'UNKNOWN').join(', ')}`,retryReason:COMMUNITY_RETRY_REASON.COMMUNITY_REQUIRED_ACQUISITION_FAILURE}:undefined),retrySuppressedUrls:[...consecutiveTimeoutSuppressed],discordCandidates:mergedCandidates,communityIntent:communityIntentEvidence.length?communityIntentEvidence:undefined,nextClickOffsets:nextRenderedClickOffsets(channelData.clickOffsets,acquisitionOutcomes)};
 }
