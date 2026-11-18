@@ -304,3 +304,24 @@ Any classifier change must retain cases for:
 ## Priority 10 governed knowledge input
 
 The classifier may consume an immutable classification-lane feature projection. Every feature retains concept and surface identity, concept version, publication version/checksum, and policy version. Governed features may add explainable candidate or corroboration evidence, but cannot bypass availability, sufficiency, independent corroboration, contradiction, or lifecycle stages. Missing or invalid knowledge abstains and uses the existing deterministic path; it is never negative evidence. Mutable graph, terminology, semantic, and discovery state are not classifier dependencies.
+
+## Precision-adjudicator deferral and recovery
+
+When a first-pass relevant channel is unresolved by the deterministic guard and
+the precision adjudicator is unavailable, the decision is not confirmed and is
+not sent to human review. It is written as `UNCERTAIN` with
+`PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED` and routed to `ENRICH`.
+
+Recovery uses the existing `ENRICH_CHANNEL` queue. The retry policy is defined
+by `server/evidenceEngine/adjudicatorRetryPolicy.ts`:
+
+- backoff: 1m, 5m, 30m, 2h, 6h, 24h (capped)
+- each deferred channel records attempts, last error and `nextRetryAt`
+- quota-aware workers retry due channels after provider recovery
+- a channel is finalized only after an adjudicator result (downgrade or keep)
+- while deferred it is never confirmed and never becomes review debt
+- `summarizeAdjudicatorDeferrals` exposes total, due, resolved, oldest age,
+  max attempts and reason counts for operations
+
+The same policy applies after quota resets; a deferred channel cannot become
+permanently stuck without an operational alert.
