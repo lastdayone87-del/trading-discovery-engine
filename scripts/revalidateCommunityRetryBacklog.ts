@@ -97,8 +97,9 @@ async function main() {
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
         const locator = String(row?.discord_candidate_locator || '').trim();
         const validationStatus = String(row?.discord_validation_status || '').toUpperCase();
-        const validationPending = payload?.ledgerValidationPending === true
-          || row?.scan_status === 'FAILED'
+        const validationUnfinished = validationStatus !== 'COMPLETED' && validationStatus !== 'SUCCEEDED';
+        const validationPending = (payload?.ledgerValidationPending === true && validationUnfinished)
+          || (row?.scan_status === 'FAILED' && validationUnfinished)
           || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'));
         if (work.total === 0) summary.noLedgerRows++;
         else if (validationPending) summary.leftActive++;
@@ -146,8 +147,9 @@ async function main() {
         const payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
         const locator = String(row?.discord_candidate_locator || '').trim();
         const validationStatus = String(row?.discord_validation_status || '').toUpperCase();
-        if (payload?.ledgerValidationPending === true
-          || row?.scan_status === 'FAILED'
+        const validationUnfinished = validationStatus !== 'COMPLETED' && validationStatus !== 'SUCCEEDED';
+        if ((payload?.ledgerValidationPending === true && validationUnfinished)
+          || (row?.scan_status === 'FAILED' && validationUnfinished)
           || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'))) {
           await client.query(
             `UPDATE jobs

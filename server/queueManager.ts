@@ -1498,8 +1498,11 @@ export async function admitDiscoveredChannel(input: {
 function communityValidationStillPending(channel: ChannelRecord, job: DurableJob): boolean {
   const locator = String(channel.discord_candidate_locator || '').trim();
   const validationStatus = String(channel.discord_validation_status || '').toUpperCase();
-  return job.payload?.ledgerValidationPending === true
-    || channel.scan_status === 'FAILED'
+  // COMPLETED/SUCCEEDED is a durable verdict. A stale payload marker or a scan
+  // failure from an unrelated later pass must not keep re-entering validation.
+  const validationUnfinished = validationStatus !== 'COMPLETED' && validationStatus !== 'SUCCEEDED';
+  return (job.payload?.ledgerValidationPending === true && validationUnfinished)
+    || (channel.scan_status === 'FAILED' && validationUnfinished)
     || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'));
 }
 
