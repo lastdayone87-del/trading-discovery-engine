@@ -8,6 +8,7 @@ import {
 } from './discoveryNeighborhood';
 import type { NeighborhoodFrontierState } from './discoveryFrontierState';
 import { effectiveProjectionProposalEvidence } from './discoveryProposalGenerators';
+import { surfaceDeferralActiveSql, surfaceDeferralEligibleSql } from './generatedQuerySurface';
 import { isOsintSnapshotFresh } from './externalOsint';
 import { ADAPTIVE_PILOT_POLICY_VERSION } from './adaptiveDiscoveryPilotPolicy';
 import { isShadowBraveCanaryAllowed, providerSnapshot, rotateActiveProviderRow, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
@@ -308,6 +309,7 @@ export async function getNeighborhoodCandidates(
              OR (supporting_evidence->>'materializingAt')::timestamptz < now()-interval '15 minutes')
         AND (supporting_evidence->>'materializationDeferredAt' IS NULL
              OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < now()-interval '15 minutes')
+        AND ${surfaceDeferralEligibleSql('supporting_evidence')}
         AND (expires_at IS NULL OR expires_at > $1)
         AND (proposal_family <> 'EXTERNAL_OSINT'
           OR COALESCE((supporting_evidence->>'expiresAt')::timestamptz, '-infinity'::timestamptz) > $1)
@@ -342,6 +344,7 @@ export async function getNeighborhoodCandidates(
         AND (
           (mp.supporting_evidence->>'materializingAt')::timestamptz >= $1::timestamptz - interval '15 minutes'
           OR (mp.supporting_evidence->>'materializationDeferredAt')::timestamptz >= $1::timestamptz - interval '15 minutes'
+          OR ${surfaceDeferralActiveSql('mp.supporting_evidence', '$1::timestamptz')}
         )
     )
     ${targetCountry ? 'AND LOWER(n.country) = LOWER($4)' : ''}
@@ -893,7 +896,8 @@ export async function evaluateFrontierCanaryAllocation(input: {
       `SELECT 1 FROM frontier_discovery_proposals
         WHERE target_neighborhood_key=$1 AND trial_status='PENDING'
           AND ((supporting_evidence->>'materializingAt')::timestamptz >= $2::timestamptz - interval '15 minutes'
-            OR (supporting_evidence->>'materializationDeferredAt')::timestamptz >= $2::timestamptz - interval '15 minutes')
+            OR (supporting_evidence->>'materializationDeferredAt')::timestamptz >= $2::timestamptz - interval '15 minutes'
+            OR ${surfaceDeferralActiveSql('supporting_evidence', '$2::timestamptz')})
         FOR SHARE`,
       [topCandidate.neighborhoodKey, now.toISOString()],
     );
@@ -933,6 +937,7 @@ export async function evaluateFrontierCanaryAllocation(input: {
                 OR (supporting_evidence->>'materializingAt')::timestamptz < $2::timestamptz - interval '15 minutes')
            AND (supporting_evidence->>'materializationDeferredAt' IS NULL
                 OR (supporting_evidence->>'materializationDeferredAt')::timestamptz < $2::timestamptz - interval '15 minutes')
+           AND ${surfaceDeferralEligibleSql('supporting_evidence', '$2::timestamptz')}
          FOR UPDATE`,
         [topCandidate.proposalId, now.toISOString()]
       );

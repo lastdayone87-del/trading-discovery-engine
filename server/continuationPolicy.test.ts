@@ -116,3 +116,101 @@ test('v1 duplicate ratio reduces marginal utility', () => {
   const duplicateHeavy = evaluateContinuation({ ...base, duplicateRatio: 0.7 });
   assert.ok(duplicateHeavy.marginalUtility < clean.marginalUtility);
 });
+
+
+const noveltyBase = {
+  pageNumber: 1, effectiveMaxPages: 10, hasNextPage: true,
+  distinctCreators: 20, cumulativeDistinctCreators: 20,
+  newCreators: 0, pageConfirmedCreators: 0, pageQualityCreators: 0,
+  pageNonTradingCreators: 0, novelCandidateTerms: 0,
+  countryPrecision: 0.95, duplicateRatio: 0.1,
+  priorLowValueStreak: 0, priorDuplicateHeavyStreak: 0,
+  priorWrongCountryStreak: 0, maxLowValuePages: 2,
+  maxDuplicateHeavyPages: 2, maxWrongCountryPages: 2,
+  explorationPagesRemaining: 1,
+};
+
+test('high actual channel overlap stops the first-page probe', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    globalSeenShare: 0.9,
+    freshCreatorCandidates: 0,
+  });
+  assert.equal(decision.shouldContinue, false);
+  assert.equal(decision.primaryReason, 'LOW_NOVELTY_PROBE');
+});
+
+test('a complementary lane with unseen candidates continues', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    globalSeenShare: 0.9,
+    freshCreatorCandidates: 6,
+  });
+  assert.equal(decision.shouldContinue, true);
+  assert.notEqual(decision.primaryReason, 'LOW_NOVELTY_PROBE');
+});
+
+test('a page that is 90% seen with one fresh candidate is still a low-novelty probe', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    distinctCreators: 20,
+    globalSeenShare: 0.9,
+    freshCreatorCandidates: 1,
+  });
+  assert.equal(decision.shouldContinue, false);
+  assert.equal(decision.primaryReason, 'LOW_NOVELTY_PROBE');
+});
+
+test('freshly confirmed creators override the low-novelty stop', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    globalSeenShare: 0.95,
+    freshCreatorCandidates: 0,
+    freshConfirmedCreators: 1,
+    pageConfirmedCreators: 0,
+  });
+  assert.equal(decision.shouldContinue, true);
+  assert.notEqual(decision.primaryReason, 'LOW_NOVELTY_PROBE');
+});
+
+
+test('a tiny page does not trigger the low-novelty stop', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    distinctCreators: 2,
+    globalSeenShare: 1,
+    freshCreatorCandidates: 0,
+  });
+  assert.notEqual(decision.primaryReason, 'LOW_NOVELTY_PROBE');
+});
+
+test('a freshly confirmed creator prevents duplicate, wrong-country and low-value stops', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    pageNumber: 3,
+    duplicateRatio: 0.95,
+    countryPrecision: 0.2,
+    priorLowValueStreak: 1,
+    priorDuplicateHeavyStreak: 1,
+    priorWrongCountryStreak: 1,
+    freshConfirmedCreators: 1,
+  });
+  assert.equal(decision.shouldContinue, true);
+  assert.equal(decision.primaryReason, 'CONTINUE_PRODUCTIVE');
+});
+
+test('a single unconfirmed new creator does not keep a 95%-overlap page running', () => {
+  const decision = evaluateContinuationV2({
+    ...noveltyBase,
+    newCreators: 1,
+    pageNumber: 2,
+    globalSeenShare: 0.95,
+    freshCreatorCandidates: 1,
+    freshConfirmedCreators: 0,
+    pageConfirmedCreators: 0,
+    pageQualityCreators: 0,
+    novelCandidateTerms: 0,
+  });
+  assert.equal(decision.shouldContinue, false);
+  assert.equal(decision.primaryReason, 'LOW_NOVELTY');
+});

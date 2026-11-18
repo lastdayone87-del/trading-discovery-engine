@@ -59,3 +59,31 @@ export function preservedCollisionAction(input: {
   if (preservedRowBlocksNormalScheduling(input.storedGenerationMetadata)) return 'DEFER';
   return 'NONE';
 }
+
+
+/** Materialized generated surfaces may execute through any supported lane/order. */
+export function laneAgnosticGeneratedLineage(nativeLineage: Record<string, any> | null | undefined): boolean {
+  return nativeLineage?.materialized === true && nativeLineage?.laneAgnostic === true;
+}
+
+/**
+ * Generated lane-agnostic lineage keeps country/language/intent/term/source
+ * identity but treats retrieval lane/order as an execution arm, not an
+ * immutable allocation dimension. Frontier allocations still use the exact key.
+ */
+export function lineageBaseDimensionsMatch(
+  target: DiscoveryNeighborhoodDimensions | null | undefined,
+  actual: DiscoveryNeighborhoodDimensions | null | undefined,
+): boolean {
+  if (!target || !actual) return false;
+  const normalize = (value: unknown) => {
+    const normalized = String(value ?? 'none').normalize('NFKC').trim().toLowerCase();
+    return normalized.length > 0 ? normalized : 'none';
+  };
+  return normalize(target.country) === normalize(actual.country)
+    && normalize(target.language) === normalize(actual.language)
+    && normalize(target.queryIntent) === normalize(actual.queryIntent)
+    && normalize(target.primaryTermFamily) === normalize(actual.primaryTermFamily)
+    && normalize(target.instrumentOrTheme) === normalize(actual.instrumentOrTheme)
+    && normalize(target.sourceFamily) === normalize(actual.sourceFamily);
+}

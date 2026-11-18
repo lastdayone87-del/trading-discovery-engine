@@ -1750,9 +1750,11 @@ async function buildSelectorPool(
     ? await getQueryTerminologyCurrentStatuses(terminologyQueryIds)
     : new Map();
   const digestedById = new Map<number, QueryRecord>();
+  const noveltyCooldownCutoff = options.now.getTime();
   for (const query of queries) {
     const admissionInfo = revalidateQueryRecordAdmission(query, { now: options.nowIso, history: historyFor(query) });
     admissions.set(query.id, admissionInfo);
+    if (query.novelty_cooldown_until && Date.parse(query.novelty_cooldown_until) > noveltyCooldownCutoff) continue;
     if (!admissionInfo.eligible) continue;
     if (admissionInfo.admission.tier === 'SPECULATIVE') continue;
     // The execution authority is the last gate before quota spend. Applying it
@@ -2318,7 +2320,8 @@ export async function authorizeCountryNativeAllocationQuery(args: CountryNativeA
         evidenceRevision: evidence.evidenceRevision ?? null,
         generationProvenance: evidence.generationProvenance ?? null,
         sourceProvenanceFamily: evidence.sourceProvenanceFamily ?? null,
-        materialized: args.materialized === true
+        materialized: args.materialized === true,
+        laneAgnostic: args.materialized === true
       },
       generationSource: String(evidence.sourceProvenanceFamily || '').toUpperCase() === 'YOUTUBE_AUTOCOMPLETE'
         || evidence.generationProvenance?.source === 'AUTOCOMPLETE'

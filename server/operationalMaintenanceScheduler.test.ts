@@ -8,7 +8,7 @@ import {
 } from './operationalMaintenanceScheduler';
 import { STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS } from './staleChannelLockRecovery';
 
-const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'phaseb', 'resume', 'classification'];
+const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'novelty', 'phaseb', 'resume', 'classification'];
 
 function createDeps(failAt?: string) {
   const calls: string[] = [];
@@ -25,6 +25,7 @@ function createDeps(failAt?: string) {
     projectProviderDeferredEnrichment: make('projection'),
     reconcileOperationalEnrichmentRecovery: make('enrichment'),
     reconcileClassificationResolutionGaps: make('resolution'),
+    reconcileQueryArmOutcomes: make('novelty'),
     triggerPhaseBObservationReconciliation: make('phaseb'),
     resumeOrphanedAutonomousPages: make('resume'),
     reconcileStaleClassificationSightings: make('classification')
@@ -71,6 +72,52 @@ test('classification sighting sweep is throttled by the scheduler clock', async 
   clock += 30_000;
   await scheduler.run();
   assert.equal(classificationCalls(), 2, 'the sweep runs once the interval elapses');
+});
+
+test('query arm reconciliation is throttled by the scheduler clock', async () => {
+  const { calls, dependencies } = createDeps();
+  let clock = 1_000_000;
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    now: () => clock,
+    queryArmReconcileIntervalMs: 60_000,
+  });
+  const noveltyCalls = () => calls.filter(call => call === 'novelty').length;
+
+  await scheduler.run();
+  assert.equal(noveltyCalls(), 1, 'the first tick reconciles arm outcomes');
+
+  clock += 30_000;
+  await scheduler.run();
+  assert.equal(noveltyCalls(), 1, 'a tick inside the interval does not rescan');
+
+  clock += 30_000;
+  await scheduler.run();
+  assert.equal(noveltyCalls(), 2, 'the sweep runs once the interval elapses');
+});
+
+test('query arm reconciliation is optional and its failure is isolated', async () => {
+  const { calls, dependencies } = createDeps();
+  delete (dependencies as Partial<OperationalMaintenanceDependencies>).reconcileQueryArmOutcomes;
+  const schedulerWithout = createOperationalMaintenanceScheduler(dependencies, { now: () => 1_100_000 });
+  await schedulerWithout.run();
+  assert.equal(calls.includes('novelty'), false, 'no dependency means no sweep');
+
+  const failing = createDeps('novelty');
+  const scheduler = createOperationalMaintenanceScheduler(failing.dependencies, { now: () => 1_200_000 });
+  const errors: unknown[][] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args); };
+  try {
+    await scheduler.run();
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(scheduler.snapshot().failures, 1);
+  assert.match(scheduler.snapshot().lastError || '', /query_arm_outcome_reconciliation: novelty failed/);
+  assert.ok(failing.calls.includes('phaseb'), 'a novelty failure must not suppress later maintenance');
+  assert.ok(failing.calls.includes('resume'));
+  assert.ok(failing.calls.includes('classification'));
+  assert.equal(errors.length, 1);
 });
 
 test('classification sweep repair counts are logged only when rows changed', async () => {

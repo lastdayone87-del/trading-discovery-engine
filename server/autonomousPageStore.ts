@@ -48,6 +48,7 @@ export interface AutonomousPageObservation {
   marginalQualityCreators?: number;
   marginalFreshConfirmedCreators?: number;
   marginalFreshQualityCreators?: number;
+  novelty?: PageNoveltyMetrics;
   marginalNonTradingCreators?: number;
   novelCandidateTerms?: number;
   crossPageRepeatCreators?: number;
@@ -83,11 +84,11 @@ export async function recordAutonomousPage(p: AutonomousPageObservation): Promis
          novel_candidate_terms,cross_page_repeat_creators,cumulative_unique_creators,
          provider_page_cost_units,provider_page_cost_usd,relevance,marginal_utility_v2,
          continuation_decision_v2,resume_mode,deferred_reason,
-         marginal_fresh_confirmed_creators,marginal_fresh_quality_creators
+         marginal_fresh_confirmed_creators,marginal_fresh_quality_creators,novelty
        ) VALUES(
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
          $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,
-         $44,$45
+         $44,$45,$46
        ) ON CONFLICT(query_run_id,page_number) DO NOTHING RETURNING id`,
       [
         p.queryRunId, p.pageNumber, p.inputPageToken, p.nextPageToken, p.retrievalLane, p.searchOrdering,
@@ -106,6 +107,7 @@ export async function recordAutonomousPage(p: AutonomousPageObservation): Promis
         JSON.stringify(decisionV2 || {}), p.resumeMode || 'NONE', p.deferredReason || null,
         p.marginalFreshConfirmedCreators === undefined ? null : Math.max(0, Math.trunc(p.marginalFreshConfirmedCreators)),
         p.marginalFreshQualityCreators === undefined ? null : Math.max(0, Math.trunc(p.marginalFreshQualityCreators)),
+        p.novelty ? JSON.stringify(p.novelty) : null,
       ],
     );
     if (r.rowCount) {
@@ -270,6 +272,17 @@ export async function getAutonomousRunMetrics(runId: string, clientOverride?: Pa
   };
 }
 
+export interface PageNoveltyMetrics {
+  distinctCreators: number;
+  globalSeenCreators: number;
+  laneSeenCreators: number;
+  freshCandidates: number;
+  freshConfirmed: number;
+  globalSeenShare: number;
+  laneSeenShare: number;
+  unseenShare: number;
+}
+
 export interface AutonomousPageMarginalMetrics {
   pageDistinctCreators: number;
   marginalNewCreators: number;
@@ -398,6 +411,87 @@ export interface AutonomousContinuationState {
   cumulativeNonTradingCreators: number;
   v2Streaks: ContinuationStreaks;
   lastDecisionV2: ContinuationDecisionV2 | null;
+}
+
+/**
+ * Measures actual channel-ID novelty for one page against the global discovery
+ * universe and the same query/lane/order arm. This is the primary duplicate
+ * signal: lexical query similarity is deliberately not used here.
+ */
+export async function getPageNoveltyMetrics(
+  runId: string,
+  pageNumber: number,
+  queryId: number,
+  retrievalLane: string,
+  searchOrdering: string,
+  clientOverride?: PageStoreRunner,
+): Promise<PageNoveltyMetrics> {
+  const db = clientOverride || await getDb();
+  const result = await db.query(
+    `WITH run AS (
+       SELECT COALESCE(started_at,scheduled_at,now()) AS cutoff
+         FROM query_runs WHERE id=$1::uuid
+     ), page_channels AS (
+       SELECT cs.channel_id,
+              bool_or(cs.was_known) AS was_known,
+              bool_or(cs.persisted) AS persisted,
+              bool_or(cs.funnel_outcome='TRADING_CONFIRMED') AS confirmed
+         FROM channel_sightings cs
+        WHERE cs.query_run_id=$1::uuid AND cs.page_number=$2
+        GROUP BY cs.channel_id
+     ), seen AS (
+       SELECT pc.channel_id,pc.was_known,pc.persisted,pc.confirmed,
+              EXISTS (
+                SELECT 1 FROM channels c
+                 WHERE c.channel_id=pc.channel_id
+                   AND COALESCE(c.created_at,run.cutoff) < run.cutoff
+              ) OR EXISTS (
+                SELECT 1 FROM channel_sightings prior
+                 WHERE prior.channel_id=pc.channel_id
+                   AND prior.query_run_id<>$1::uuid
+                   AND prior.observed_at < run.cutoff
+              ) OR EXISTS (
+                SELECT 1 FROM channel_sightings same
+                 WHERE same.channel_id=pc.channel_id
+                   AND same.query_run_id=$1::uuid
+                   AND same.page_number<$2
+              ) AS global_seen,
+              EXISTS (
+                SELECT 1 FROM channel_sightings prior
+                  JOIN query_runs pr ON pr.id=prior.query_run_id
+                 WHERE prior.channel_id=pc.channel_id
+                   AND prior.query_run_id<>$1::uuid
+                   AND pr.query_id=$3
+                   AND pr.retrieval_lane=$4
+                   AND pr.search_ordering=$5
+                   AND prior.observed_at < run.cutoff
+              ) AS lane_seen
+         FROM page_channels pc CROSS JOIN run
+     )
+     SELECT
+       COUNT(*)::int AS distinct_creators,
+       COUNT(*) FILTER (WHERE global_seen)::int AS global_seen_creators,
+       COUNT(*) FILTER (WHERE lane_seen)::int AS lane_seen_creators,
+       COUNT(*) FILTER (WHERE NOT global_seen)::int AS fresh_candidates,
+       COUNT(*) FILTER (WHERE NOT global_seen AND confirmed AND persisted)::int AS fresh_confirmed
+     FROM seen`,
+    [runId, pageNumber, queryId, retrievalLane, searchOrdering],
+  );
+  const row = result.rows[0] || {};
+  const distinct = Math.max(0, Number(row.distinct_creators || 0));
+  const globalSeen = Math.max(0, Number(row.global_seen_creators || 0));
+  const laneSeen = Math.max(0, Number(row.lane_seen_creators || 0));
+  const freshCandidates = Math.max(0, Number(row.fresh_candidates || 0));
+  return {
+    distinctCreators: distinct,
+    globalSeenCreators: globalSeen,
+    laneSeenCreators: laneSeen,
+    freshCandidates,
+    freshConfirmed: Math.max(0, Number(row.fresh_confirmed || 0)),
+    globalSeenShare: distinct > 0 ? globalSeen / distinct : 0,
+    laneSeenShare: distinct > 0 ? laneSeen / distinct : 0,
+    unseenShare: distinct > 0 ? freshCandidates / distinct : 0,
+  };
 }
 
 export async function getAutonomousContinuationState(runId: string, pageNumber?: number, clientOverride?: PageStoreRunner): Promise<AutonomousContinuationState> {

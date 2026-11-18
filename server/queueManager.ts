@@ -70,6 +70,7 @@ import {
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
   isRetryableInfrastructureFailure,
+  coolQueryForProviderQuarantine,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
 import { reserveIncrementalTreatmentPageQuota, releaseIncrementalTreatmentPageReservation, enqueueChildAndCommitPageReservation } from './retrievalPolicyCanary';
@@ -85,6 +86,7 @@ import { applyCommunityIntentEvidence } from './communityIntent';
 import { validateDiscordInvite } from './discordValidator';
 import {canProjectDiscordValidation,hasEstablishedValidatedDiscordSelection,hasRetainedLastKnownGoodDiscordInvite,isSameSelectedDiscordCandidate,projectDiscordValidation,reconcileDiscordDiscoveryFromInspection} from './discordProjection';
 import { searchYouTubeChannels, searchYouTubeChannelPage, generateCountryQueries, fetchYouTubeChannelEnrichment, fetchYouTubeChannelCountryMetadata, DiscoveredChannelRaw, RetrievalLane } from './youtube';
+import { isYouTubeSearchQueryQuarantineFailure } from './youtubeInputQuarantine';
 import {buildProviderRequestBaseId,executeAllocatedRetrievalPage,providerSnapshot,YOUTUBE_SEARCH_PROVIDER,type ProviderAllocation} from './providerAwareRetrieval';
 import './braveSearch';
 import './youtubeInnertubeProvider';
@@ -113,6 +115,7 @@ import { randomUUID } from 'node:crypto';
 import { createManualSearchSession, getManualSearchSession, recordManualSearchPage, failManualSearch, cancelManualSearch } from './manualSearchStore';
 import { computeEffectivePageBudget, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, resumeModeForProvider, shouldCreateContinuationSegment, type ContinuationDecisionV2, type ContinuationResumeMode } from './continuationPolicy';
 import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromotedRecord } from './autonomousQueryAuthority';
+import { recordQueryArmOutcome } from './queryDiscoveryArms';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
 import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
@@ -126,6 +129,7 @@ import {
   getAutonomousContinuationState,
   getAutonomousPageMarginalMetrics,
   getAutonomousPageObservation,
+  getPageNoveltyMetrics,
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
   recordAutonomousPage,
@@ -741,6 +745,9 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
     // Opt-in trial linkage recorded on the job payload at schedule time.
     // Absent on every legacy run.
     ...(typeof args.trial?.trialId === 'string' && args.trial.trialId ? { trialCompletion: { trialId: args.trial.trialId } } : {}),
+  });
+  await recordQueryArmOutcome(args.queryRunId).catch(error => {
+    console.warn('[Novelty] Query arm outcome persistence failed:', error instanceof Error ? error.message : String(error));
   });
   if (args.queryId) {
     await addQueryExecutionLog({
@@ -2682,6 +2689,10 @@ export async function processNextSearchJob(
       }
       const prior = await getAutonomousContinuationState(queryRunId, pageNumber);
       const marginal = await getAutonomousPageMarginalMetrics(queryRunId, pageNumber);
+      const novelty = await getPageNoveltyMetrics(queryRunId, pageNumber, Number(queryId), retrievalLane, searchOrdering).catch(error => {
+        console.warn('[Novelty] Page overlap measurement failed:', error instanceof Error ? error.message : String(error));
+        return undefined;
+      });
       const novelCandidateTerms = await countNovelCandidateTermsForPage(
         queryRunId,
         pageNumber,
@@ -2725,6 +2736,9 @@ export async function processNextSearchJob(
         deferredOnly: observations.length === 0 && deferredResults > 0,
         nextPageQuotaAdmitted,
         runBudgetExhausted,
+        globalSeenShare: novelty?.globalSeenShare,
+        freshCreatorCandidates: novelty?.freshCandidates,
+        freshConfirmedCreators: novelty?.freshConfirmed,
       });
       const legacyDecision = v2Enabled ? null : evaluateContinuation({
         pageNumber, maxPages: Math.min(effectiveMaxPages, treatmentCapPages ?? effectiveMaxPages, trialCapPages ?? effectiveMaxPages),
@@ -2770,6 +2784,7 @@ export async function processNextSearchJob(
         marginalQualityCreators: marginal.marginalQualityCreators,
         marginalFreshConfirmedCreators: marginal.marginalFreshConfirmedCreators,
         marginalFreshQualityCreators: marginal.marginalFreshQualityCreators,
+        novelty,
         marginalNonTradingCreators: marginal.marginalNonTradingCreators,
         novelCandidateTerms,
         crossPageRepeatCreators: marginal.crossPageRepeatCreators,
@@ -2995,6 +3010,19 @@ export async function processNextSearchJob(
       }
       if(investigationId&&investigationStepId)await completeInvestigationStep({investigationId,stepId:investigationStepId,jobId:job.id,resultingStatus:'POLICY_REJECTED',output:{reason:'COUNTRY_POLICY_CHANGED'}});else await completeJob(job.id);
       return true;
+    }
+    if (isYouTubeSearchQueryQuarantineFailure(err)) {
+      const quarantineQueryId = Number(job.payload?.queryId);
+      const inputKind = String((err as { inputKind?: unknown }).inputKind || '');
+      if (inputKind === 'searchQuery' && Number.isFinite(quarantineQueryId) && quarantineQueryId > 0) {
+        await coolQueryForProviderQuarantine(
+          quarantineQueryId,
+          inputKind,
+          String((err as { inputValue?: unknown }).inputValue || ''),
+        ).catch(error => {
+          console.warn('[YouTubeQuarantine] Failed to cool the query:', error instanceof Error ? error.message : String(error));
+        });
+      }
     }
     const disposition=await failJob(job.id, err);
     const terminal=disposition==='FAILED';

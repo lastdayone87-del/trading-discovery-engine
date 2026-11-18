@@ -34,7 +34,7 @@ import { acquisitionJobClockV2Enabled, claimOrderByClause, isCapacityLeaseFailur
 import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
-import { lineageBoundDimensions } from './frontierLineage';
+import { laneAgnosticGeneratedLineage, lineageBaseDimensionsMatch, lineageBoundDimensions } from './frontierLineage';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
@@ -2193,7 +2193,7 @@ export async function incrementQuota(
 
 export async function getSchemaInfo(): Promise<{currentVersion:number;migrations:Array<{version:number;name:string;applied_at:string}>;channelCount:number}> { const db=await getDb(); const mig=await db.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version'); const cnt=await db.query('SELECT COUNT(*)::int count FROM channels'); return {currentVersion:mig.rows.at(-1)?.version||0,migrations:mig.rows.map(r=>({version:r.version,name:r.name,applied_at:iso(r.applied_at)!})),channelCount:cnt.rows[0].count}; }
 
-export function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at)} as QueryRecord;}
+export function rowToQuery(r:any):QueryRecord{return {id:r.id,query:r.query,country:r.country,collection:r.collection,intent:r.intent,times_executed:r.times_executed||0,last_executed:iso(r.last_executed),total_channels_found:r.total_channels_found||0,unique_channels_found:r.unique_channels_found||0,quality_channels_found:r.quality_channels_found||0,community_channels_found:r.community_channels_found||0,avg_quality_score:r.avg_quality_score||0,performance_score:r.performance_score||0,created_at:iso(r.created_at)||new Date().toISOString(),status:r.status||'ACTIVE',knowledge_tiers:r.knowledge_tiers||[1],generation_mode:r.generation_mode||'LEGACY',generation_reason:r.generation_reason||'Legacy query',discovery_objective:r.discovery_objective||'Discover relevant trading creators.',primary_term:r.primary_term||undefined,generation_metadata:parseJson(r.generation_metadata,{}),reserved_until:iso(r.reserved_until),next_eligible_at:iso(r.next_eligible_at),novelty_cooldown_until:iso(r.novelty_cooldown_until),novelty_state:r.novelty_state||null} as QueryRecord;}
 export async function getAllQueries():Promise<QueryRecord[]>{const db=await getDb(); const res=await db.query('SELECT * FROM query_library ORDER BY performance_score DESC,times_executed DESC'); return res.rows.map(rowToQuery);}
 /** Bounded Query Library page for dashboard transport. */
 export async function getQueryLibraryPage(country?:string,collection?:string,limit=500,offset=0):Promise<QueryRecord[]>{const db=await getDb(); const bounded=Math.max(1,Math.min(1000,Math.trunc(limit))); const skipped=Math.max(0,Math.min(100000,Math.trunc(offset))); const res=await db.query(`SELECT * FROM query_library WHERE ($1::text IS NULL OR (LOWER(country)=LOWER($1) AND status='ACTIVE')) AND ($2::text IS NULL OR collection=$2) ORDER BY performance_score DESC,times_executed DESC,id DESC LIMIT $3 OFFSET $4`,[country||null,collection||null,bounded,skipped]); return res.rows.map(rowToQuery);}
@@ -4144,6 +4144,9 @@ export interface AutonomousQueryCandidate {
   allocationOrigin?: 'FRONTIER_CANARY' | 'LEGACY';
   frontierDecisionId?: string;
   targetNeighborhoodDimensions?: DiscoveryNeighborhoodDimensions;
+  /** Explicit novelty-arm lane/order. Frontier allocations keep target dimensions authoritative. */
+  retrievalLane?: 'VIDEO' | 'CHANNEL';
+  searchOrdering?: 'RELEVANCE' | 'DATE';
   provider?: ProviderAllocation;
   /**
    * Selection proved the official portfolio floor is exhausted and chose this
@@ -4444,8 +4447,12 @@ export async function scheduleAutonomousQueryRuns(
         nativeLineage,
         candidate.targetNeighborhoodDimensions,
       );
+      const laneAgnosticLineage = candidate.allocationOrigin !== 'FRONTIER_CANARY'
+        && laneAgnosticGeneratedLineage(nativeLineage);
       if (nativeLineage.targetNeighborhoodKey && (!allocatedDimensions ||
-          createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey)) {
+          (laneAgnosticLineage
+            ? !lineageBaseDimensionsMatch(nativeLineage.targetNeighborhoodDimensions as DiscoveryNeighborhoodDimensions, allocatedDimensions)
+            : createNeighborhoodKey(allocatedDimensions) !== nativeLineage.targetNeighborhoodKey))) {
         throw new Error('FRONTIER_ALLOCATION_NEIGHBORHOOD_LINEAGE_MISMATCH');
       }
       activeOperation = 'query_run_orphan_reconciliation';
@@ -4460,6 +4467,7 @@ export async function scheduleAutonomousQueryRuns(
          WHERE id=$1 AND status='ACTIVE' AND collection<>'REJECTED'
            AND (reserved_until IS NULL OR reserved_until <= now())
            AND (next_eligible_at IS NULL OR next_eligible_at <= now())
+           AND (novelty_cooldown_until IS NULL OR novelty_cooldown_until <= now())
            AND (last_executed IS NULL OR last_executed <= now()-($3||' minutes')::interval)
            AND NOT EXISTS (SELECT 1 FROM query_runs qr WHERE qr.query_id=query_library.id AND qr.status IN ('SCHEDULED','RUNNING','RETRYING'))
          RETURNING *`,
@@ -4482,8 +4490,9 @@ export async function scheduleAutonomousQueryRuns(
       );
       const video = laneCounts.rows[0]?.video || 0;
       const total = laneCounts.rows[0]?.total || 0;
-      const controlRetrievalLane = allocatedDimensions
-        ? allocatedDimensions.retrievalLane as RetrievalLane
+      const requestedLane = allocatedDimensions?.retrievalLane || candidate.retrievalLane;
+      const controlRetrievalLane = requestedLane === 'CHANNEL' || requestedLane === 'VIDEO'
+        ? requestedLane as RetrievalLane
         : allocateRetrievalLane(video, total, videoLanePercent);
       activeOperation = 'search_ordering_counts';
       const orderingCounts = await client.query(
@@ -4494,10 +4503,11 @@ export async function scheduleAutonomousQueryRuns(
       // retargeted to the official provider after the portfolio floor is
       // exhausted. Pin these candidates to RELEVANCE before the ordering draw
       // rather than drawing DATE and failing closed.
+      const requestedOrdering = allocatedDimensions?.searchOrdering || candidate.searchOrdering;
       const controlSearchOrdering: SearchOrdering = candidate.quotaFreeRequired
         ? 'RELEVANCE'
-        : allocatedDimensions
-          ? allocatedDimensions.searchOrdering as SearchOrdering
+        : requestedOrdering === 'DATE' || requestedOrdering === 'RELEVANCE'
+          ? requestedOrdering as SearchOrdering
           : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
 
       const controlConfig = buildRetrievalConfiguration({
@@ -4554,6 +4564,10 @@ export async function scheduleAutonomousQueryRuns(
       // A quota-free run cannot accept a DATE treatment config: the free
       // provider has no date ordering and there is no official budget left to
       // retarget. Keep these exceptional runs on RELEVANCE.
+      // Lineage-bound runs cannot change lane/order without invalidating the
+      // neighborhood key. Legacy novelty arms are not lineage-bound: Phase 9
+      // may override them, and the arm that actually ran is recorded from
+      // query_runs, so canary learning continues for ordinary queries.
       const canarySkipReason = canaryTreatmentSkipReason({
         lineageBound: Boolean(allocatedDimensions),
         quotaFreeRequired: candidate.quotaFreeRequired === true,
@@ -5788,6 +5802,41 @@ export async function recordQueryRunSightings(runId: string, queryId: number, si
   } finally {
     client.release();
   }
+}
+
+/**
+ * A quarantined search input is a provider-input defect, not a novelty result.
+ * Cool the query until the quarantine expires so the UCB selector cannot keep
+ * spending cycles on the same invalid surface while other queries are eligible.
+ * The cooldown is reversible and never shortens a later existing cooldown.
+ */
+export async function coolQueryForProviderQuarantine(
+  queryId: number,
+  inputKind: string,
+  inputValue: string,
+  runner?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+): Promise<void> {
+  if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
+  const db = runner || await getDb();
+  const quarantine = await db.query(
+    `SELECT expires_at FROM youtube_invalid_input_quarantine
+      WHERE input_kind=$1 AND input_value=$2
+      LIMIT 1`,
+    [inputKind, inputValue],
+  );
+  const parsed = quarantine.rows[0]?.expires_at ? new Date(quarantine.rows[0].expires_at) : null;
+  // If the row expired or disappeared between the dispatch gate and failure
+  // handling, the quarantine is no longer active. Use a short cooldown instead
+  // of extending a stale seven-day quarantine.
+  const until = parsed && Number.isFinite(parsed.getTime()) && parsed.getTime() > Date.now()
+    ? parsed
+    : new Date(Date.now() + 60 * 60_000);
+  await db.query(
+    `UPDATE query_library
+        SET next_eligible_at=GREATEST(COALESCE(next_eligible_at,now()),$2::timestamptz)
+      WHERE id=$1`,
+    [queryId, until.toISOString()],
+  );
 }
 
 export async function failQueryRun(runId: string, error: unknown, terminal: boolean): Promise<void> {
