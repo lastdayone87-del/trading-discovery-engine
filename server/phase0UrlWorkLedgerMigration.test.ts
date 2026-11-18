@@ -120,13 +120,11 @@ test('the Phase 0 report is read-only and reconciles the two bounds', () => {
   assert.doesNotMatch(reportScript, /INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM/i);
 });
 
-test('Phase 0 wires no worker to the ledger', () => {
-  for (const file of ['dbCore.ts', 'queueManager.ts', 'inspector.ts', 'communityRecovery.ts', 'browserCommunityFallback.ts']) {
-    const source = readFileSync(new URL(`./${file}`, import.meta.url), 'utf8');
-    assert.doesNotMatch(
-      source,
-      /communityAcquisitionWorkLedger|community_acquisition_url_state/,
-      `${file} must not read or write the Phase 0 ledger`,
-    );
-  }
+test('Phase 1 wires the URL ledger into the retry worker', () => {
+  const queueSource = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const storeSource = readFileSync(new URL('./communityAcquisitionWorkStore.ts', import.meta.url), 'utf8');
+  assert.match(queueSource, /communityAcquisitionWorkStore|community_acquisition_url_state/);
+  assert.match(queueSource, /claimCommunityWorkSlice/);
+  assert.match(storeSource, /community_acquisition_url_state/);
+  assert.match(storeSource, /claimCommunityWorkSlice/);
 });
