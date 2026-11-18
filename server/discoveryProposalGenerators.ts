@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getAppSetting, getCountryVocabularies, getDb, getQueriesByCountry, setAppSetting } from './db';
 import { buildDiscoveryNeighborhood, createNeighborhoodChecksum, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
 import { canonicalCountry, countryIsoAlias } from './countryInference';
+import { assessGeneratedSurface, loadGeneratedSurfaceHistory } from './generatedQuerySurface';
 import { computeEvidenceChecksum } from './countryNativeIntelligence';
 import { QUALITY_CREATOR_SCORE_THRESHOLD } from './queryPerformance';
 import { assertCountryAllowed } from './countryExclusion';
@@ -1048,16 +1049,22 @@ export async function materializeGeneratedQueryProposalsForCountry(country: stri
     const proposals = [...llmBatch.proposals, ...autocompleteBatch.proposals];
     if (!proposals.length) return { generated: 0, persisted: 0, proposals: [] };
     const seen = new Set<string>();
+    const history = await loadGeneratedSurfaceHistory(canonicalC);
+    const batchSurfaces: string[] = [];
     const deduped = proposals.filter(proposal => {
       if (seen.has(proposal.dedupKey)) return false;
       seen.add(proposal.dedupKey);
+      const text = String(proposal.supportingEvidence?.nativeTerm || proposal.concept || '').trim();
+      const gate = assessGeneratedSurface(text, history, batchSurfaces);
+      if (gate.allowed === false) return false;
+      batchSurfaces.push(text);
       return true;
     });
     const persisted = await persistFrontierProposals(deduped);
     // Advance the cached-batch selection cursor only after persistence
     // completed without throwing. A failed write keeps the previous cursor so
     // the next cycle retries the same candidates instead of skipping them.
-    if (deduped.length > 0) {
+    if (proposals.length > 0) {
       if (llmBatch.nextSelectionCursors) {
         await setAppSetting(
           `native_query_generation_selection_cursor:${canonicalC}`,

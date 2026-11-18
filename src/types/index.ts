@@ -308,6 +308,8 @@ export interface QueryRecord {
   discovery_objective?: string;
   primary_term?: string;
   generation_metadata?: Record<string, unknown>;
+  novelty_cooldown_until?: string | null;
+  novelty_state?: string | null;
 }
 
 export interface QueryExecutionLog {

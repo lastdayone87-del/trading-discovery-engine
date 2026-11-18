@@ -30,6 +30,7 @@ import { sweepRelationshipCanarySeeds } from './relationshipCanarySeeds';
 import { materializeGeneratedQueryProposalsForCountry } from './discoveryProposalGenerators';
 import { materializeAdmittedGeneratedQueriesForCountry, materializedGeneratedTargetDimensions } from './generatedQueryMaterialization';
 import { discoveryDiversityKeys } from './discoveryDiversity';
+import { selectQueryArm } from './queryDiscoveryArms';
 import { runPersistentResearchCycle } from './persistentResearchController';
 import { creatorIntelligenceChecksum } from './creatorIntelligence/contracts';
 import { bindCreatorCanaryQueryRun, type CreatorCanaryAssignment } from './creatorIntelligence/canary';
@@ -862,6 +863,39 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         recordCandidateDiagnostic(candidateDiagnostic);
         continue;
       }
+      const generatedTargetDimensions = materializedGeneratedTargetDimensions(selected.queryRecord.generation_metadata);
+      const selectedArm = frontierAllocationInfo?.authorized
+        ? null
+        : await selectQueryArm(
+            selected.queryRecord.id,
+            selected.queryRecord.query,
+            selected.queryRecord.intent,
+            selected.queryRecord.primary_term || selected.queryRecord.query,
+            { quotaFreeRequired: selected.quotaFreeRequired === true },
+          );
+      if (!frontierAllocationInfo?.authorized && !selectedArm) {
+        if (research) {
+          await rejectResearchAction(research.actionId, 'Query surface is in novelty cooldown', research.reservationOwner)
+            .catch(error => console.warn('[Autonomous Producer] Failed to settle novelty-cooled research action:', error));
+        }
+        candidateDiagnostic = {
+          ...candidateDiagnostic,
+          disposition: 'SKIPPED',
+          reasonCode: 'QUERY_NOVELTY_COOLDOWN',
+          schedulingOutcome: 'NOT_REACHED',
+        };
+        recordCandidateDiagnostic(candidateDiagnostic);
+        continue;
+      }
+      const routedTargetDimensions = frontierAllocationInfo?.authorized
+        ? frontierAllocationInfo.targetNeighborhoodDimensions
+        : generatedTargetDimensions && selectedArm
+          ? {
+              ...generatedTargetDimensions,
+              retrievalLane: selectedArm.lane,
+              searchOrdering: selectedArm.ordering,
+            }
+          : undefined;
       const created = await scheduleAutonomousQueryRuns([{
         query: selected.queryRecord,
         strategy: selected.selectionStrategy,
@@ -869,9 +903,9 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
         quotaFreeRequired: selected.quotaFreeRequired === true,
         allocationOrigin: frontierAllocationInfo?.authorized ? 'FRONTIER_CANARY' : 'LEGACY',
         frontierDecisionId: frontierAllocationInfo?.authorized ? frontierAllocationInfo.decision?.decisionId : undefined,
-        targetNeighborhoodDimensions: frontierAllocationInfo?.authorized
-          ? frontierAllocationInfo.targetNeighborhoodDimensions
-          : materializedGeneratedTargetDimensions(selected.queryRecord.generation_metadata),
+        retrievalLane: selectedArm?.lane,
+        searchOrdering: selectedArm?.ordering,
+        targetNeighborhoodDimensions: routedTargetDimensions,
         allowShadowProvider: providerTarget?.allowShadowProvider,
         allocationProvenance: creatorAllocation ? {
           assignmentId: creatorAllocation.assignmentId,
