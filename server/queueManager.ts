@@ -1552,7 +1552,7 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
       { allowedUrls, seedUrls, slicePass: Math.max(1, job.attempts || 1) },
     );
   } catch (error) {
-    await releaseCommunityWorkSlice(slice.map(row => row.workKey), db, new Date(Date.now() + 60_000).toISOString());
+    await releaseCommunityWorkSlice(slice, db, new Date(Date.now() + 60_000).toISOString());
     throw error;
   }
 
@@ -1561,7 +1561,7 @@ async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: Durable
   } catch (error) {
     // Completion can fail after some rows were updated. Release only rows that
     // are still RUNNING; the stale sweep remains the final backstop.
-    await releaseCommunityWorkSlice(slice.map(row => row.workKey), db, new Date(Date.now() + 60_000).toISOString());
+    await releaseCommunityWorkSlice(slice, db, new Date(Date.now() + 60_000).toISOString());
     throw error;
   }
   const summary = await communityWorkSummary(channel.channel_id, db);

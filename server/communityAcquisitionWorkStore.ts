@@ -184,7 +184,7 @@ export async function materializeCommunityWorkForChannel(
   const requiredRows = projection.rows.map(row => {
     const classified = initialLedgerState(row);
     const attempts = Math.min(5, Math.max(row.neverExecuted ? 0 : 1, row.attempts));
-    const state = classified.state === 'PENDING' && attempts >= 5 ? 'EXHAUSTED' : classified.state;
+    const state = (classified.state === 'PENDING' || classified.state === 'PARKED_INFRA') && attempts >= 5 ? 'EXHAUSTED' : classified.state;
     return {
       work_key: row.workKey,
       channel_id: row.channelId,
@@ -257,10 +257,10 @@ export async function materializeCommunityWorkForChannel(
     const attempts = Math.min(5, Math.max(directProcessed ? 1 : 0, historicalAttempts));
     const state: CommunityWorkState = terminal.terminal
       ? 'RESOLVED'
-      : infra
-        ? 'PARKED_INFRA'
-        : attempts >= 5
-          ? 'EXHAUSTED'
+      : attempts >= 5
+        ? 'EXHAUSTED'
+        : infra
+          ? 'PARKED_INFRA'
           : 'PENDING';
     const lastObservedAt = group.observations.reduce((latestAt, observation) => Date.parse(observation.observedAt) > Date.parse(latestAt) ? observation.observedAt : latestAt, group.observations[0].observedAt);
     return {
@@ -478,6 +478,9 @@ function terminalFor(latest: CommunityWorkObservation): { terminal: boolean; rea
     return { terminal: true, reason: 'INSPECTED_NO_MATCH' };
   }
   const failureClass = String(latest.failureClass || '').toUpperCase();
+  // Capacity/runtime classes must park before the generic terminal check; a
+  // non-retryable transport observation is still not a semantic dead URL.
+  if (isInfrastructureFailureClass(failureClass)) return { terminal: false, reason: '' };
   if (TERMINAL_FAILURE_CLASSES.has(failureClass)) return { terminal: true, reason: failureClass };
   if (latest.outcome === 'ACQUISITION_FAILED' && latest.retryable === false) {
     return { terminal: true, reason: failureClass || 'TERMINAL_FAILURE' };
@@ -531,16 +534,30 @@ export async function completeCommunityWorkSlice(
       return Number.isFinite(at) && at >= claimBoundaryMs;
     });
     const latest = selectEffectiveInspectionObservation(latestInspectionObservations(freshGroup));
+    const latestObservedAt = freshGroup.reduce(
+      (latestAt, observation) => Date.parse(observation.observedAt) > Date.parse(latestAt) ? observation.observedAt : latestAt,
+      freshGroup[0]?.observedAt || new Date().toISOString(),
+    );
     if (!latest) {
       // The URL was not present in this slice's collected links. Do not charge
       // an attempt; keep it available for a future inspection but back off so a
       // stale ledger row cannot spin.
       const released = await db.query(
         `UPDATE community_acquisition_url_state
-            SET state='PENDING',
-                next_eligible_at=now() + interval '5 minutes',
-                updated_at=now(),
-                terminal_evidence=terminal_evidence || $2::jsonb
+            SET state=CASE WHEN COALESCE((terminal_evidence->>'noObservationCount')::int,0)+1 >= 5
+                           THEN 'EXHAUSTED' ELSE 'PENDING' END,
+                next_eligible_at=CASE WHEN COALESCE((terminal_evidence->>'noObservationCount')::int,0)+1 >= 5
+                                      THEN now() + interval '24 hours'
+                                      ELSE now() + interval '5 minutes' END,
+                terminal_reason=CASE WHEN COALESCE((terminal_evidence->>'noObservationCount')::int,0)+1 >= 5
+                                     THEN 'UNREACHED_SLICE' ELSE terminal_reason END,
+                terminal_evidence=jsonb_set(
+                  terminal_evidence || $2::jsonb,
+                  '{noObservationCount}',
+                  to_jsonb(COALESCE((terminal_evidence->>'noObservationCount')::int,0)+1),
+                  true
+                ),
+                updated_at=now()
           WHERE work_key=$1
             AND state='RUNNING'
             AND lease_token=$3::uuid`,
@@ -569,13 +586,13 @@ export async function completeCommunityWorkSlice(
     if (terminal.terminal) {
       state = 'RESOLVED';
       reason = terminal.reason;
+    } else if (attempts >= row.maxAttempts) {
+      state = 'EXHAUSTED';
+      reason = 'MAX_ATTEMPTS';
     } else if (infra) {
       state = 'PARKED_INFRA';
       reason = String(latest.failureClass || 'CAPACITY');
       nextEligibleAt = new Date(Date.now() + backoffSeconds(row.attempts, true) * 1000).toISOString();
-    } else if (attempts >= row.maxAttempts) {
-      state = 'EXHAUSTED';
-      reason = 'MAX_ATTEMPTS';
     } else {
       state = 'PENDING';
       nextEligibleAt = new Date(Date.now() + backoffSeconds(attempts, false) * 1000).toISOString();
@@ -614,7 +631,7 @@ export async function completeCommunityWorkSlice(
         JSON.stringify({
           observationId: latest.id || null,
           observedAt: latest.observedAt,
-          latestObservedAt: latest.observedAt,
+          latestObservedAt,
           outcome: latest.outcome,
           failureClass: latest.failureClass || null,
           processed,
@@ -641,20 +658,27 @@ export async function completeCommunityWorkSlice(
 
 /** Release claimed rows after a pre-persistence worker failure without charging an attempt. */
 export async function releaseCommunityWorkSlice(
-  workKeys: readonly string[],
+  rows: readonly (string | { workKey: string; leaseToken?: string | null })[],
   db?: CommunityWorkDb,
   nextEligibleAt = new Date(Date.now() + 60_000).toISOString(),
 ): Promise<number> {
-  if (workKeys.length === 0) return 0;
+  if (rows.length === 0) return 0;
   const databaseClient = await database(db);
-  const result = await databaseClient.query(
-    `UPDATE community_acquisition_url_state
-        SET state='PENDING', lease_token=NULL, next_eligible_at=$2, updated_at=now()
-      WHERE work_key = ANY($1::text[])
-        AND state='RUNNING'`,
-    [[...workKeys], nextEligibleAt],
-  );
-  return result.rowCount || 0;
+  let released = 0;
+  for (const entry of rows) {
+    const workKey = typeof entry === 'string' ? entry : entry.workKey;
+    const leaseToken = typeof entry === 'string' ? null : entry.leaseToken || null;
+    const result = await databaseClient.query(
+      `UPDATE community_acquisition_url_state
+          SET state='PENDING', lease_token=NULL, next_eligible_at=$2, updated_at=now()
+        WHERE work_key=$1
+          AND state='RUNNING'
+          AND ($3::uuid IS NULL OR lease_token=$3::uuid)`,
+      [workKey, nextEligibleAt, leaseToken],
+    );
+    released += result.rowCount || 0;
+  }
+  return released;
 }
 
 export async function communityWorkSummary(channelId: string, db?: CommunityWorkDb): Promise<CommunityWorkSummary> {

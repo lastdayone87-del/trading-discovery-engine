@@ -1,3 +1,5 @@
+SET LOCAL lock_timeout = '10s';
+
 -- Acquisition reliability: Phase 1 URL work ledger runtime + retry claim indexes.
 --
 -- Additive only. The URL work ledger table already exists from migration 166;

@@ -1,3 +1,5 @@
+SET LOCAL lock_timeout = '10s';
+
 -- Preserve multi-invite recall: the ledger must retain relevant optional
 -- community URLs, not only required retry-owning URLs. Required work gets
 -- priority 100; recall work gets priority 10 and is processed when required

@@ -125,6 +125,8 @@ test('Phase 1 wires the URL ledger into the retry worker', () => {
   const storeSource = readFileSync(new URL('./communityAcquisitionWorkStore.ts', import.meta.url), 'utf8');
   assert.match(queueSource, /communityAcquisitionWorkStore|community_acquisition_url_state/);
   assert.match(queueSource, /claimCommunityWorkSlice/);
+  assert.match(queueSource, /await runCommunityLedgerRetrySlice\(channel, job\)/);
+  assert.match(queueSource, /await claimCommunityWorkSlice\(channel\.channel_id/);
   assert.match(storeSource, /community_acquisition_url_state/);
   assert.match(storeSource, /claimCommunityWorkSlice/);
 });

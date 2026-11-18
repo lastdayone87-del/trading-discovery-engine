@@ -17,7 +17,7 @@ function makeDb(row: Record<string, unknown>) {
     queries,
     async query(sql: string, values?: unknown[]) {
       queries.push({ sql, values });
-      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at FROM jobs')) {
+      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at')) {
         return { rowCount: 1, rows: [row] };
       }
       if (sql.startsWith('SELECT id FROM job_attempts')) {

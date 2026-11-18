@@ -103,10 +103,9 @@ async function main() {
     const client = await db.connect();
     try {
       await client.query('BEGIN');
-      // Serialize ledger materialization/closure with any worker materializing
-      // or completing a URL for this channel, then lock the batch owner. If a
-      // worker claimed it after the initial scan, skip it entirely.
-      await client.query('LOCK TABLE community_acquisition_url_state IN SHARE ROW EXCLUSIVE MODE');
+      // Lock the batch owner. If a worker claimed it after the initial scan,
+      // skip it entirely; never touch its attempt. The job lock is sufficient
+      // to serialize this channel because workers cannot claim a locked job.
       const locked = await client.query(
         `SELECT 1 FROM jobs
           WHERE id=$1 AND status='PENDING' AND closed_at IS NULL
@@ -131,6 +130,8 @@ async function main() {
           `UPDATE jobs
               SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,
                   terminal_failure_class=NULL,last_error=$2,updated_at=now(),
+                  capacity_deferrals=0,capacity_wait_started_at=NULL,
+                  parked_reason=NULL,parked_at=NULL,last_progress_at=now(),
                   closed_reason='LEDGER_ALL_TERMINAL',
                   closed_by='revalidateCommunityRetryBacklog',
                   closed_at=now(),
@@ -164,6 +165,12 @@ async function main() {
             WHERE job_id=$1 AND finished_at IS NULL`,
           [jobId],
         );
+        await client.query(
+          `UPDATE retry_backlog_triage
+              SET undone_at=now(),undone_by='revalidateCommunityRetryBacklog'
+            WHERE job_id=$1 AND bucket='QUARANTINE' AND undone_at IS NULL`,
+          [jobId],
+        );
         await client.query('COMMIT');
         summary.closedResolved++;
       } else {
@@ -176,8 +183,9 @@ async function main() {
             [jobId],
           );
           await client.query(
-            `UPDATE retry_backlog_triage SET undone_at=now()
-              WHERE job_id=$1 AND undone_at IS NULL`,
+            `UPDATE retry_backlog_triage
+                SET undone_at=now(),undone_by='revalidateCommunityRetryBacklog'
+              WHERE job_id=$1 AND bucket='QUARANTINE' AND undone_at IS NULL`,
             [jobId],
           );
         }
