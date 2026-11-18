@@ -4131,8 +4131,6 @@ export async function withRenderedQueueLifecycleLock<T>(operation: () => Promise
 }
 
 let renderedQueueLifecycleMutexTail: Promise<void> = Promise.resolve();
-let renderedQueueActiveCrawls = 0;
-let renderedQueueBaseline: RenderedQueueListenerLedger | undefined;
 
 async function withRenderedQueueLifecycleMutex<T>(operation: () => T | Promise<T>): Promise<T> {
   const previous = renderedQueueLifecycleMutexTail;
@@ -4146,38 +4144,66 @@ async function withRenderedQueueLifecycleMutex<T>(operation: () => T | Promise<T
   }
 }
 
-/**
- * Begin one rendered crawl. The baseline listener set is captured only when no
- * other rendered crawl is live, so concurrent crawls share one baseline and no
- * crawl can reclaim another live crawl's listeners. The crawl itself runs
- * outside the mutex; only this bookkeeping is serialized.
- */
-export async function beginRenderedQueueLifecycle(
-  emitter: RenderedQueueLifecycleEmitter | undefined,
-): Promise<void> {
-  await withRenderedQueueLifecycleMutex(() => {
-    if (renderedQueueActiveCrawls === 0) {
-      renderedQueueBaseline = captureRenderedQueueLifecycleListeners(emitter);
-    }
-    renderedQueueActiveCrawls++;
-  });
+export interface RenderedQueueLifecycleHandle<T> {
+  name: string;
+  queue: T;
+  /** Listeners added by this queue construction and owned by this crawl. */
+  ownedListeners: RenderedQueueListenerLedger;
 }
 
 /**
- * End one rendered crawl. The last live crawl reclaims every listener added
- * since the shared baseline, including listeners from concurrent crawls, while
- * overlapping crawls never reclaim each other's still-live registrations.
+ * Open one isolated rendered queue while serializing only the construction
+ * window. The before/after emitter diff is therefore exact for this queue, and
+ * the crawl can run concurrently with other crawls. Each crawl later removes
+ * exactly the listeners it owns, so a continuously replenished gate cannot
+ * retain finished queues just because the process never reaches zero active
+ * crawls.
+ */
+export async function beginRenderedQueueLifecycle<T extends { drop(): Promise<void> }>(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+  open: (name: string) => Promise<T>,
+): Promise<RenderedQueueLifecycleHandle<T>> {
+  return withRenderedQueueLifecycleMutex(async () => {
+    const before = captureRenderedQueueLifecycleListeners(emitter);
+    const opened = await openIsolatedRenderedRequestQueue(open);
+    const after = captureRenderedQueueLifecycleListeners(emitter);
+    return {
+      ...opened,
+      ownedListeners: {
+        migrating: new Set([...after.migrating].filter(listener => !before.migrating.has(listener))),
+        aborting: new Set([...after.aborting].filter(listener => !before.aborting.has(listener))),
+      },
+    };
+  });
+}
+
+export function reclaimOwnedRenderedQueueLifecycleListeners(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+  owned: RenderedQueueListenerLedger,
+): number {
+  if (!emitter) return 0;
+  let reclaimed = 0;
+  for (const event of RENDERED_QUEUE_LIFECYCLE_EVENTS) {
+    for (const listener of owned[event]) {
+      emitter.off(event, listener);
+      reclaimed++;
+    }
+  }
+  return reclaimed;
+}
+
+/**
+ * Drop this crawl's queue and remove exactly the listeners its construction
+ * added. Does not wait for, or remove, any other live crawl's listeners.
  */
 export async function endRenderedQueueLifecycle(
   emitter: RenderedQueueLifecycleEmitter | undefined,
+  owned: RenderedQueueListenerLedger,
+  queue?: { drop(): Promise<void> },
+  name?: string,
 ): Promise<number> {
-  return withRenderedQueueLifecycleMutex(() => {
-    if (renderedQueueActiveCrawls > 0) renderedQueueActiveCrawls--;
-    if (renderedQueueActiveCrawls !== 0 || !renderedQueueBaseline) return 0;
-    const baseline = renderedQueueBaseline;
-    renderedQueueBaseline = undefined;
-    return reclaimRenderedQueueLifecycleListeners(emitter, baseline);
-  });
+  if (queue && name !== undefined) await dropIsolatedRenderedQueue(queue, name);
+  return withRenderedQueueLifecycleMutex(() => reclaimOwnedRenderedQueueLifecycleListeners(emitter, owned));
 }
 
 /**
@@ -4713,19 +4739,25 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       // rates (FATAL ERROR: Reached heap limit). Capture the emitter state
       // before opening and reclaim the new listeners in the finally below:
       // the fresh-queue-per-crawl isolation semantics stay unchanged while the
-      // dropped queue graph becomes collectable. A shared active-crawl counter
-      // defers reclamation until the last live crawl ends, so overlapping
-      // crawls (env concurrency 2) never cross-remove each other's listeners.
+      // dropped queue graph becomes collectable. Queue construction is
+      // serialized only long enough to diff exactly the listeners this queue
+      // added; each crawl reclaims its own set, so overlapping crawls (env
+      // concurrency 2) can run without retaining finished queue graphs.
       const queueEventEmitter = renderedQueueLifecycleEmitter(Configuration.getGlobalConfig().getEventManager());
-      await beginRenderedQueueLifecycle(queueEventEmitter);
       let isolated: { name: string; queue: InstanceType<typeof RequestQueue> } | undefined;
+      let ownedQueueListeners: RenderedQueueListenerLedger | undefined;
       let egressProxy: BrowserEgressProxy | undefined;
       const renderedRouteGuards = new Map<object, RenderedRouteGuard>();
       try {
         // Per-invocation isolated queue: never the process-default persisted
         // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
         // below on every path so named queues cannot accumulate.
-        isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
+        const lifecycleHandle = await beginRenderedQueueLifecycle(
+          queueEventEmitter,
+          (name) => RequestQueue.open(name),
+        );
+        isolated = { name: lifecycleHandle.name, queue: lifecycleHandle.queue };
+        ownedQueueListeners = lifecycleHandle.ownedListeners;
         // The route checks below are only a preflight. Chromium resolves again
         // when it connects, so all browser traffic goes through a loopback
         // proxy that resolves once, rejects mixed/private answers, and pins
@@ -6433,15 +6465,16 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // the context route already; this is the launch-failure/fallback path.
         await disposeRenderedRouteGuards(renderedRouteGuards.values());
         try {
-          if (isolated) await dropIsolatedRenderedQueue(isolated.queue, isolated.name);
+          await endRenderedQueueLifecycle(
+            queueEventEmitter,
+            ownedQueueListeners || { migrating: new Set(), aborting: new Set() },
+            isolated?.queue,
+            isolated?.name,
+          );
         } finally {
-          try {
-            await endRenderedQueueLifecycle(queueEventEmitter);
-          } finally {
-            // The loopback proxy must not outlive the browser session; closing
-            // is best-effort and never changes the crawl result.
-            await egressProxy?.close().catch(() => undefined);
-          }
+          // The loopback proxy must not outlive the browser session; closing
+          // is best-effort and never changes the crawl result.
+          await egressProxy?.close().catch(() => undefined);
         }
       }
     })(), limits.admissionLane || 'UNKNOWN', { isWorkStarted: renderedCrawlStarted, maxWaitMs: limits.maxGateWaitMs });
