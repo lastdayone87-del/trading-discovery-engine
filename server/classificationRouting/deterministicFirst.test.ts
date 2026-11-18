@@ -548,6 +548,17 @@ test('LEGACY routing returns the legacy route vocabulary', () => {
   assert.equal(nonTrading.route, 'SEMANTIC_NON_TRADING');
 });
 
+test('an unavailable precision adjudicator defers instead of confirming or reviewing', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN',
+    confidenceScore: 50,
+    policyReasons: ['PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED'],
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.humanReview, false);
+  assert.equal(routed.fallbackReason, 'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED');
+});
+
 test('a category precision guard is terminal non-trading, not review', () => {
   const routed = resolveClassificationRouting(decision({
     status: 'NON_TRADING',

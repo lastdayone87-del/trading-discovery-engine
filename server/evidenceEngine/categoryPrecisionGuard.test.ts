@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   applyCategoryPrecisionGuard,
+  evaluateCategoryPrecisionGuard,
   adjudicateCategory,
   buildCategoryAdjudicatorPrompt,
   deterministicCategoryGuard,
@@ -168,6 +169,16 @@ test('adjudicator may downgrade only to the approved precision categories', asyn
   assert.equal(low, null);
   const invalid = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'ACTIVE_TRADING', confidence: 99 }) });
   assert.equal(invalid, null);
+});
+
+test('adjudicator outage is reported as unavailable, not keep', async () => {
+  const c = GENUINE_EDUCATION_CASES.find(value => value.name.includes('Thomas R. Trading')) || GENUINE_EDUCATION_CASES[0];
+  const throwing = { classify: async () => { throw new Error('provider down'); } };
+  const unavailable = await evaluateCategoryPrecisionGuard(input(c), 'INVESTING_EDUCATION', { client: throwing });
+  assert.equal(unavailable.status, 'UNAVAILABLE');
+  assert.equal(unavailable.result, null);
+  const noClient = await evaluateCategoryPrecisionGuard(input(c), 'INVESTING_EDUCATION', { client: null });
+  assert.equal(noClient.status, 'UNAVAILABLE');
 });
 
 test('adjudicator failure or absence keeps the first-pass result', async () => {

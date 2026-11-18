@@ -248,6 +248,19 @@ export function resolveClassificationRouting(
     });
   }
 
+  // A precision-adjudicator outage must defer/retry, never confirm the
+  // first-pass label and never create human review.
+  if (decision.status === 'UNCERTAIN'
+    && (decision.decisionPolicy?.reasonCodes || []).includes('PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED')) {
+    return result({
+      route: 'ENRICH', confidence, evidenceSufficiency: sufficiency,
+      recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
+      enrich: true,
+      fallbackReason: 'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED',
+      reasonCodes: ['PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED'],
+    });
+  }
+
   // The staged lifecycle already decided that the evidence bundle needs more
   // acquisition. Do not turn that into human review just because the semantic
   // layer served evidence. Preserve the lifecycle's specific cause so routing

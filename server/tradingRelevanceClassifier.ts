@@ -1,7 +1,7 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
 import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
 import { resolveClassificationRouting, resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
-import { applyCategoryPrecisionGuard } from './evidenceEngine/categoryPrecisionGuard';
+import { evaluateCategoryPrecisionGuard } from './evidenceEngine/categoryPrecisionGuard';
 
 /**
  * Semantic provider outcomes only. A deterministic provider failure must not
@@ -86,9 +86,10 @@ export async function classifyTradingRelevanceDetailed(
   // A precision downgrade is only meaningful on a relevant result produced by
   // a semantic provider. A provider outage must defer, never be relabelled.
   const precision = decision.status !== 'NON_TRADING' && semantic.served
-    ? await applyCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel)
-    : null;
-  if (precision) {
+    ? await evaluateCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel)
+    : { status: 'KEEP' as const, result: null };
+  if (precision.status === 'DOWNGRADE' && precision.result) {
+    const guard = precision.result;
     // A precision guard may only downgrade a first-pass relevant category.
     // It never upgrades, and the evidence safeguards are untouched.
     decision.status = 'NON_TRADING';
@@ -96,15 +97,27 @@ export async function classifyTradingRelevanceDetailed(
     decision.geminiSemanticSummary = {
       ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),
       isTrading: 'NO',
-      taxonomyLabel: precision.category,
-      reason: `[${precision.category}] Precision guard: ${precision.reasonCodes.join(', ')}`,
+      taxonomyLabel: guard.category,
+      reason: `[${guard.category}] Precision guard: ${guard.reasonCodes.join(', ')}`,
     };
     decision.decisionPolicy = {
       ...(decision.decisionPolicy || { version: 'precision-guard-v1', tradingProbability: 0, nonTradingProbability: 0, coverageConfidence: 0, reasonCodes: [] }),
       reasonCodes: [
         ...(decision.decisionPolicy?.reasonCodes || []),
         'CONTENT_CATEGORY_PRECISION_GUARD',
-        ...precision.reasonCodes,
+        ...guard.reasonCodes,
+      ],
+    };
+  } else if (precision.status === 'UNAVAILABLE') {
+    // A provider outage must never silently confirm a first-pass relevant
+    // result that the adjudicator could not clear. Defer/retry instead of
+    // creating human review.
+    decision.status = 'UNCERTAIN';
+    decision.decisionPolicy = {
+      ...(decision.decisionPolicy || { version: 'precision-guard-v1', tradingProbability: 0, nonTradingProbability: 0, coverageConfidence: 0, reasonCodes: [] }),
+      reasonCodes: [
+        ...(decision.decisionPolicy?.reasonCodes || []),
+        'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED',
       ],
     };
   }

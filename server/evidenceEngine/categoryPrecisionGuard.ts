@@ -20,6 +20,13 @@ export interface PrecisionGuardOptions {
   client?: SemanticModelClient | null;
 }
 
+export type PrecisionGuardStatus = 'DOWNGRADE' | 'KEEP' | 'UNAVAILABLE';
+
+export interface PrecisionGuardEvaluation {
+  status: PrecisionGuardStatus;
+  result: PrecisionGuardResult | null;
+}
+
 const PRECISION_CATEGORIES: ReadonlySet<string> = new Set([
   'MARKET_INSTITUTION', 'HYPE', 'FINANCIAL_NEWS', 'UNRELATED',
 ]);
@@ -51,6 +58,8 @@ const FIRST_PERSON_TRADER = /\b(?:i am|i'm|my (?:journey|trades|trading|account|
 const SIGNAL_RECAP = /\b(?:recap|review|education|lesson|course|academy|tutorial|read charts|not chase signals)\b/iu;
 const NEGATED_SIGNALS = /\b(?:no|not|never)\s+(?:paid|vip|free)?\s*signals?\b/iu;
 const PRODUCT_SELF = /\b(?:automated trading software|autotrader|trading software)\b/iu;
+const OFFICIAL_CHANNEL = /\b(?:official (?:youtube )?(?:channel|page)|canal oficial|chaîne officielle|offizieller (?:youtube )?kanal|canale ufficiale|القناة الرسمية)\b/iu;
+const FINANCIAL_INSTITUTION = /\b(?:broker|brokerage|exchange|bank|banco|banque|prop firm|funded|asset management|investment management|securities|cfd|forex broker|trading platform|trading software|scanner|terminal)\b/iu;
 
 function decodeEntities(value: unknown): string {
   return String(value || '')
@@ -138,6 +147,14 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_DATA_PLATFORM'] };
   }
 
+  // Official financial-company channels are institutions even when they
+  // publish educational or analytical videos.
+  if (OFFICIAL_CHANNEL.test(nameAndBio)
+    && FINANCIAL_INSTITUTION.test(nameAndBio)
+    && !FIRST_PERSON_TRADER.test(nameAndBio)) {
+    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_OFFICIAL_CHANNEL'] };
+  }
+
   // FINANCIAL_NEWS: explicit news product, not an educator that publishes updates.
   if (/\bnews\b/iu.test(nameAndBio)
     && /\b(?:daily|updates?|financial market|headlines?)\b/iu.test(nameAndBio)
@@ -209,6 +226,10 @@ const ADJUDICATOR_EXAMPLES: Array<[string, string]> = [
   ['TiaBTC — Bitcoin technical analysis with support levels and trade scenarios', 'KEEP_RELEVANT'],
   ['A channel that republishes crypto news clips and headlines with no original analysis', 'FINANCIAL_NEWS'],
   ['Market event reporting: CPI/FOMC headlines and company announcements without trade analysis', 'FINANCIAL_NEWS'],
+  ['Active NQ trader with a free Discord community and broker affiliate links', 'KEEP_RELEVANT'],
+  ['ICT teacher with a free signals recap in Discord and structured lessons', 'KEEP_RELEVANT'],
+  ['Official YouTube channel of a CFD broker that also publishes educational videos', 'MARKET_INSTITUTION'],
+  ['Official channel of a trading-software platform that publishes market analysis', 'MARKET_INSTITUTION'],
 ];
 
 export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabel: string): string {
@@ -239,6 +260,8 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
     'FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading decisions.',
     'A broker comparison, review, or research site is FINANCIAL_NEWS, not education.',
     'An independent trader who uses affiliate links or promotes a tool, or who offers account management or mentorship, remains active trading or education when the videos are trade recaps, backtests, or lessons. Only the official institution channel, or a channel whose primary product is the tool or managed account, is MARKET_INSTITUTION.',
+    'An active trader who publishes live sessions, trade recaps, or a documented trading journey is ACTIVE_TRADING even when the bio mentions free signals, a Discord/Telegram community, or broker affiliate links. HYPE requires the signal or promotional-returns product to be the primary offer, not a side community.',
+    'An official channel of a broker, exchange, bank, fund, data/software platform, or trading-robot vendor is MARKET_INSTITUTION even when it publishes educational videos or market analysis.',
     'A free Telegram or Discord community is not HYPE by itself; HYPE requires a signals or promotional-returns product to be the primary offer.',
     '',
     'Examples:',
@@ -256,40 +279,79 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
   return lines.join('\n');
 }
 
-export async function adjudicateCategory(
+export async function adjudicateCategoryDetailed(
   input: RawChannelInput,
   firstLabel: string,
   options: { client?: SemanticModelClient | null } = {},
-): Promise<PrecisionGuardResult | null> {
+): Promise<PrecisionGuardEvaluation> {
   const client = options.client === undefined ? defaultClient() : options.client;
-  if (!client) return null;
+  if (!client) return { status: 'UNAVAILABLE', result: null };
   const model = process.env.CONTENT_CATEGORY_ADJUDICATOR_MODEL || DEFAULT_CATEGORY_ADJUDICATOR_MODEL;
   try {
     const value = await client.classify(buildCategoryAdjudicatorPrompt(input, firstLabel), model);
-    if (!value || typeof value !== 'object') return null;
+    if (!value || typeof value !== 'object') return { status: 'UNAVAILABLE', result: null };
     const raw = value as Record<string, unknown>;
     const label = String(raw.label || '').toUpperCase();
-    if (label === 'KEEP_RELEVANT' || label === 'AMBIGUOUS') return null;
-    if (!PRECISION_CATEGORIES.has(label)) return null;
+    if (label === 'KEEP_RELEVANT' || label === 'AMBIGUOUS') return { status: 'KEEP', result: null };
+    if (!PRECISION_CATEGORIES.has(label)) return { status: 'KEEP', result: null };
     const rawConfidence = Number(raw.confidence);
     // Providers may return a 0..1 probability or a 0..100 percentage. Accept
     // both scales so a correctly confident downgrade is never discarded.
     const confidence = Number.isFinite(rawConfidence)
       ? (rawConfidence <= 1 ? rawConfidence * 100 : rawConfidence)
       : Number.NaN;
-    if (!Number.isFinite(confidence) || confidence < 70) return null;
+    if (!Number.isFinite(confidence) || confidence < 70) return { status: 'KEEP', result: null };
     return {
-      category: label as PrecisionCategory,
-      source: 'ADJUDICATOR',
-      confidence,
-      reasonCodes: ['PRECISION_ADJUDICATOR_DOWNGRADE', `PRECISION_CATEGORY_${label}`],
-      explanation: String(raw.explanation || '').slice(0, 500),
+      status: 'DOWNGRADE',
+      result: {
+        category: label as PrecisionCategory,
+        source: 'ADJUDICATOR',
+        confidence,
+        reasonCodes: ['PRECISION_ADJUDICATOR_DOWNGRADE', `PRECISION_CATEGORY_${label}`],
+        explanation: String(raw.explanation || '').slice(0, 500),
+      },
     };
   } catch {
-    // A precision guard must never create review debt or block a genuine
-    // educator because the adjudicator is unavailable.
-    return null;
+    return { status: 'UNAVAILABLE', result: null };
   }
+}
+
+export async function adjudicateCategory(
+  input: RawChannelInput,
+  firstLabel: string,
+  options: { client?: SemanticModelClient | null } = {},
+): Promise<PrecisionGuardResult | null> {
+  return (await adjudicateCategoryDetailed(input, firstLabel, options)).result;
+}
+
+/**
+ * Tri-state evaluation used by the classifier. Unlike the compatibility
+ * wrapper, this distinguishes "adjudicator said keep" from "adjudicator was
+ * unavailable" so an outage can defer confirmation instead of silently
+ * confirming a first-pass false positive.
+ */
+export async function evaluateCategoryPrecisionGuard(
+  input: RawChannelInput,
+  firstLabel: string | undefined,
+  options: PrecisionGuardOptions = {},
+): Promise<PrecisionGuardEvaluation> {
+  if (!firstLabel) return { status: 'KEEP', result: null };
+  if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION'].includes(firstLabel)) {
+    return { status: 'KEEP', result: null };
+  }
+  const enabled = options.enabled ?? process.env.CONTENT_CATEGORY_PRECISION_GUARD_ENABLED !== 'false';
+  if (!enabled) return { status: 'KEEP', result: null };
+  const deterministic = deterministicCategoryGuard(input);
+  if (deterministic) return { status: 'DOWNGRADE', result: deterministic };
+  if (options.adjudicator) {
+    try {
+      const result = await options.adjudicator(input, firstLabel);
+      return result ? { status: 'DOWNGRADE', result } : { status: 'KEEP', result: null };
+    } catch {
+      return { status: 'UNAVAILABLE', result: null };
+    }
+  }
+  return adjudicateCategoryDetailed(input, firstLabel, { client: options.client });
 }
 
 export async function applyCategoryPrecisionGuard(
@@ -297,12 +359,5 @@ export async function applyCategoryPrecisionGuard(
   firstLabel: string | undefined,
   options: PrecisionGuardOptions = {},
 ): Promise<PrecisionGuardResult | null> {
-  if (!firstLabel) return null;
-  if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION'].includes(firstLabel)) return null;
-  const enabled = options.enabled ?? process.env.CONTENT_CATEGORY_PRECISION_GUARD_ENABLED !== 'false';
-  if (!enabled) return null;
-  const deterministic = deterministicCategoryGuard(input);
-  if (deterministic) return deterministic;
-  if (options.adjudicator) return options.adjudicator(input, firstLabel);
-  return adjudicateCategory(input, firstLabel, { client: options.client });
+  return (await evaluateCategoryPrecisionGuard(input, firstLabel, options)).result;
 }
