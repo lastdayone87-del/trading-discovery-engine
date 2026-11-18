@@ -274,10 +274,12 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
       };
     }
 
-    // Strict discovery reserve: non-discovery admissions can never occupy the
-    // 35% of the selected limit reserved for DISCOVERY. Unused reserve is not
-    // reassigned to non-discovery work.
-    if (lane !== 'DISCOVERY') {
+    // Discovery reserve: while discovery demand is actually queued,
+    // non-discovery admissions cannot consume the reserved share. When no
+    // discovery waiter exists, the reserve is borrowable so retry/enrichment
+    // are not starved by a strict unused reservation. Discovery immediately
+    // regains its share at the next admission when it has demand.
+    if (lane !== 'DISCOVERY' && pendingLanes.has('DISCOVERY')) {
       const floorBasisPoints = Math.round(this.config.discoveryFloorPct * 100);
       const discoveryReserve = Math.ceil(limit * floorBasisPoints / 10000);
       const nonDiscoveryLimit = Math.max(0, limit - discoveryReserve);

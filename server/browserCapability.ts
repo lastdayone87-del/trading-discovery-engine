@@ -55,10 +55,11 @@ export function browserLaunchOptions(): { headless: true; args: string[]; timeou
   // Railway containers can expose a small /dev/shm. Keep the capability attestation
   // on the same resilient Chromium launch path used by the crawler instead of allowing
   // the health probe to fail solely because Chromium's shared-memory segment is full.
-  const args = ['--disable-dev-shm-usage'];
+  const args: string[] = [];
   if (process.getuid?.() === 0) {
     args.push('--no-sandbox', '--disable-setuid-sandbox');
   }
+  args.push('--disable-dev-shm-usage');
   return { headless: true, timeout, args };
 }
 
@@ -68,14 +69,45 @@ let snapshot: BrowserCapabilitySnapshot = {
   attestation: 'CHROMIUM_LAUNCH_CLOSE'
 };
 let activeProbe: Promise<BrowserCapabilitySnapshot> | undefined;
-let browserRuntimeLeaseTail: Promise<void> = Promise.resolve();
+const DEFAULT_BROWSER_RUNTIME_CONCURRENCY = 1;
+const MAX_BROWSER_RUNTIME_CONCURRENCY = 2;
 
-/** Serialize attestation and real crawler browser launches in one process. */
+function browserRuntimeConcurrency(): number {
+  const parsed = Number(process.env.BROWSER_RUNTIME_CONCURRENCY);
+  if (!Number.isFinite(parsed)) return DEFAULT_BROWSER_RUNTIME_CONCURRENCY;
+  return Math.min(MAX_BROWSER_RUNTIME_CONCURRENCY, Math.max(1, Math.floor(parsed)));
+}
+
+const browserRuntimeLimit = browserRuntimeConcurrency();
+let browserRuntimeActive = 0;
+const browserRuntimeWaiters: Array<() => void> = [];
+
+function acquireBrowserRuntimeLease(): Promise<() => void> {
+  const grant = (): (() => void) => {
+    browserRuntimeActive++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      browserRuntimeActive--;
+      const next = browserRuntimeWaiters.shift();
+      if (next) next();
+    };
+  };
+  if (browserRuntimeActive < browserRuntimeLimit) return Promise.resolve(grant());
+  return new Promise<() => void>(resolve => {
+    browserRuntimeWaiters.push(() => resolve(grant()));
+  });
+}
+
+/**
+ * Bound attestation and real crawler browser launches to the measured number
+ * of browser slots. The default remains one for existing deployments; an
+ * operator can enable a second slot only after the production benchmark proves
+ * CPU/DB headroom.
+ */
 export async function withBrowserRuntimeLease<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = browserRuntimeLeaseTail;
-  let release!: () => void;
-  browserRuntimeLeaseTail = new Promise<void>(resolve => { release = resolve; });
-  await previous;
+  const release = await acquireBrowserRuntimeLease();
   try {
     return await operation();
   } finally {
