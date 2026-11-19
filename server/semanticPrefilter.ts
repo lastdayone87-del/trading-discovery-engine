@@ -345,7 +345,7 @@ export interface SemanticPrefilterFalseNegativeSample {
 
 const FALSE_NEGATIVE_SAMPLE_LIMIT = 20;
 
-const SEMANTIC_POSITIVE_LABELS = new Set(['ACTIVE_TRADING', 'INVESTING_EDUCATION']);
+const SEMANTIC_POSITIVE_LABELS = new Set(['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION']);
 
 let metrics: SemanticPrefilterMetrics = {
   mode: semanticPrefilterMode(),

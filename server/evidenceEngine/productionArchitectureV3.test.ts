@@ -27,6 +27,8 @@ test('selective policy preserves abstention and affirmative-negative safety',()=
   const collection:EvidenceCollectionReport={sufficiency:'SUFFICIENT',sparseMetadata:false,degraded:false,fieldsPresent:['channel_name'],reasonCodes:[],providers:[]};
   const item=(polarity:'POSITIVE'|'NEGATIVE',weight:number):EvidenceItem=>({id:polarity,source:'channel_metadata',polarity,category:polarity==='POSITIVE'?'METHODOLOGY_CONCEPT':'IRRELEVANT_DOMAIN',fact:polarity,rawMatches:['x'],confidence:90,reliability:'HIGH',reliabilityMultiplier:.85,rawWeight:Math.abs(weight),finalWeight:weight,provenance:{provider:'channel_metadata',type:'test',matchedTerm:'x',sourceRef:'test',fields:[{field:'channel_bio',sourceId:'d1',sourceFamilyId:'f1'}]},timestamp:'2026-01-01T00:00:00Z'});
   assert.equal(evaluateUnifiedDecisionPolicy({evidence:[item('POSITIVE',40)],collection,lifecycleAction:'REVIEW',minimumPositiveWeight:15,minimumTradingScore:65}).status,'UNCERTAIN');
-  assert.equal(evaluateUnifiedDecisionPolicy({evidence:[item('NEGATIVE',-30)],collection,lifecycleAction:'REJECT',minimumPositiveWeight:15,minimumTradingScore:65}).status,'NON_TRADING');
+  // A negative item alone is not terminal evidence. REJECT without a
+  // sufficient creator-level negative assessment must abstain safely.
+  assert.equal(evaluateUnifiedDecisionPolicy({evidence:[item('NEGATIVE',-30)],collection,lifecycleAction:'REJECT',minimumPositiveWeight:15,minimumTradingScore:65}).status,'UNCERTAIN');
   assert.equal(evaluateUnifiedDecisionPolicy({evidence:[],collection:{...collection,sufficiency:'INSUFFICIENT'},lifecycleAction:'ENRICH',minimumPositiveWeight:15,minimumTradingScore:65}).status,'UNCERTAIN');
 });

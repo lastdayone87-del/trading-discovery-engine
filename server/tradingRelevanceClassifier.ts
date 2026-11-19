@@ -1,11 +1,24 @@
 import { TradingClassificationResult, TradingRelevanceBreakdown } from '../src/types';
 import { buildCanonicalEvidenceCorpus, verifyChannelTradingRelevance, VerificationDecision, type RawChannelInput } from './evidenceEngine';
 import { resolveClassificationRouting, resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
+import { evaluateCategoryPrecisionGuard } from './evidenceEngine/categoryPrecisionGuard';
 
 /**
  * Semantic provider outcomes only. A deterministic provider failure must not
  * relabel a semantic attempt as degraded or abstained.
  */
+/**
+ * Only a semantic verdict that actually served may own the content category.
+ * An abstention can retain a relevant label (no citations, low confidence, or
+ * unsupported language) but must not disable the video-focus review guard.
+ */
+export function routingContentCategory(
+  summary?: { isTrading?: string; taxonomyLabel?: string },
+): string | undefined {
+  if (!summary || summary.isTrading === 'UNCERTAIN') return undefined;
+  return summary.taxonomyLabel;
+}
+
 export function semanticProviderOutcomeFlags(
   providers: Array<{ provider?: string; outcome?: string }>,
 ): { abstained: boolean; failed: boolean; served: boolean } {
@@ -69,6 +82,130 @@ export async function classifyTradingRelevanceDetailed(
   // the cache key covers documents the ledger's checksum omits.
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
+  const semantic = semanticProviderOutcomeFlags(decision.evidenceCollection.providers);
+  const servingSemanticProvider = decision.evidenceCollection.providers.find(provider =>
+    /semantic/.test(String(provider.provider)) && provider.outcome === 'EXECUTED_WITH_EVIDENCE',
+  )?.provider;
+  // The guard is a terminal classifier only for a first-pass confirmation with
+  // sufficient evidence and a served semantic verdict. A thin or already
+  // uncertain result must never be turned into a terminal non-trading decision
+  // by a keyword rule; those cases route to review or enrichment instead.
+  const precisionEligible = decision.status === 'TRADING_CONFIRMED'
+    && semantic.served
+    && decision.evidenceCollection.sufficiency === 'SUFFICIENT';
+  const precision = precisionEligible
+    ? await evaluateCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel, { provider: servingSemanticProvider })
+    : { status: 'KEEP' as const, result: null, reasonCode: undefined };
+  const precisionApplied = precision.status === 'DOWNGRADE' || precision.status === 'UNAVAILABLE';
+  const uncertainConfidence = (score: number) => Math.max(23, Math.min(79, score));
+  const policyBase = decision.decisionPolicy || {
+    version: 'precision-guard-v1',
+    tradingProbability: 0,
+    nonTradingProbability: 0,
+    coverageConfidence: 0,
+    reasonCodes: [],
+  };
+  if (precision.status === 'DOWNGRADE' && precision.result) {
+    const guard = precision.result;
+    // Commercial institutions, broker/platform channels, signal sellers and
+    // promotional channels are still trading/investing content. The guard may
+    // refine their category, but must not turn them into a non-trading result.
+    const relevantRefinement = guard.category === 'MARKET_INSTITUTION' || guard.category === 'HYPE';
+    const financeAdjacent = guard.category === 'FINANCIAL_NEWS';
+    decision.category = guard.category;
+    decision.geminiSemanticSummary = {
+      ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),
+      isTrading: relevantRefinement ? 'YES' : 'NO',
+      taxonomyLabel: guard.category,
+      calibratedConfidence: guard.source === 'ADJUDICATOR' ? guard.confidence : undefined,
+      reason: `[${guard.category}] Precision guard: ${guard.reasonCodes.join(', ')}`,
+    };
+    if (relevantRefinement) {
+      // Keep the first-pass confirmation and its confidence; only the refined
+      // content category and its own confidence change.
+      decision.decisionPolicy = {
+        ...policyBase,
+        version: 'precision-guard-v1',
+        reasonCodes: [
+          ...(policyBase.reasonCodes || []),
+          'PRECISION_CATEGORY_REFINED_RELEVANT',
+          ...guard.reasonCodes,
+        ],
+      };
+      decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_CATEGORY_REFINED ${guard.category}: ${guard.reasonCodes.join(', ')}`;
+    } else {
+      // UNRELATED is the hard exclusion. FINANCIAL_NEWS/PERSONAL_FINANCE are
+      // finance-adjacent and may be non-trading, but they are never relabelled
+      // as unrelated.
+      decision.status = 'NON_TRADING';
+      decision.confidenceScore = Math.min(22, decision.confidenceScore);
+      const tradingProbability = Math.min(22, Number(policyBase.tradingProbability) || 0);
+      decision.decisionPolicy = {
+        ...policyBase,
+        version: 'precision-guard-v1',
+        tradingProbability,
+        nonTradingProbability: Math.max(0, 100 - tradingProbability),
+        reasonCodes: [
+          ...(policyBase.reasonCodes || []),
+          'PRECISION_GUARD_CONFIRMED_FIRST_PASS',
+          'CONTENT_CATEGORY_PRECISION_GUARD',
+          ...(financeAdjacent ? ['PRECISION_GUARD_FINANCE_ADJACENT'] : []),
+          ...guard.reasonCodes,
+        ],
+      };
+      decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_GUARD ${guard.category}: ${guard.reasonCodes.join(', ')}`;
+    }
+  } else if (precision.status === 'UNAVAILABLE') {
+    // A provider outage must never silently confirm a first-pass relevant
+    // result that the adjudicator could not clear. Defer/retry instead of
+    // creating human review, and keep the decision envelope internally
+    // consistent with the uncertain status.
+    decision.status = 'UNCERTAIN';
+    decision.confidenceScore = uncertainConfidence(decision.confidenceScore);
+    decision.geminiSemanticSummary = {
+      ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),
+      isTrading: 'UNCERTAIN',
+      calibratedConfidence: undefined,
+      reason: `[PRECISION DEFERRAL] ${precision.reasonCode || 'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED'}`,
+    };
+    decision.decisionPolicy = {
+      ...policyBase,
+      version: 'precision-guard-v1',
+      tradingProbability: decision.confidenceScore,
+      nonTradingProbability: Math.max(0, 100 - decision.confidenceScore),
+      reasonCodes: [
+        ...(policyBase.reasonCodes || []),
+        'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED',
+        ...(precision.reasonCode ? [precision.reasonCode] : []),
+      ],
+    };
+    decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED`;
+  }
+  // Keep the lifecycle projection aligned with the post-guard status. The
+  // evidence stages remain the record of how the first pass was reached; the
+  // action is the final machine disposition used by routing and diagnostics.
+  if (precisionApplied && decision.stagedClassification) {
+    const lifecycleAction = decision.status === 'NON_TRADING' ? 'REJECT' as const
+      : decision.status === 'UNCERTAIN' ? 'ENRICH' as const
+        : null;
+    if (lifecycleAction) {
+      decision.stagedClassification = {
+        ...decision.stagedClassification,
+        lifecycleAction,
+        stages: decision.stagedClassification.stages.map(stage => stage.stage === 'LIFECYCLE'
+          ? {
+            ...stage,
+            metrics: { ...stage.metrics, action: lifecycleAction },
+            reasonCodes: [
+              ...stage.reasonCodes.filter(code => !code.startsWith('ROUTE_')),
+              `ROUTE_${lifecycleAction}`,
+              'PRECISION_GUARD_FINAL_DISPOSITION',
+            ],
+          }
+          : stage),
+      };
+    }
+  }
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
   const lifecycleStage = decision.stagedClassification?.stages.find(stage => stage.stage === 'LIFECYCLE');
   const routingMode = resolveClassificationRoutingMode();
@@ -88,6 +225,7 @@ export async function classifyTradingRelevanceDetailed(
     acquisitionEnrich: lifecycleStage?.reasonCodes.includes('ACQUISITION_ENRICH') ?? false,
     acquisitionReason: lifecycleStage?.reasonCodes.find(code =>
       code === 'COMPOSITION_EVIDENCE_REQUIRED' || code === 'THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'),
+    contentCategory: routingContentCategory(decision.geminiSemanticSummary),
   });
   if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 
@@ -158,6 +296,8 @@ export async function classifyTradingRelevanceDetailed(
     // which returns a calibrated probability regardless of semantic serving.
     confidence_basis: noEvidence ? 'NEUTRAL_PRIOR' : 'CALIBRATED',
     ai_model: decision.geminiSemanticSummary?.modelUsed || decision.versions.geminiModelVersion,
+    content_category: decision.geminiSemanticSummary?.taxonomyLabel,
+    content_category_confidence: decision.geminiSemanticSummary?.calibratedConfidence,
     ai_prompt_payload: decision.geminiSemanticSummary ? JSON.stringify(decision.geminiSemanticSummary) : undefined,
     ai_raw_response: decision.geminiSemanticSummary ? decision.geminiSemanticSummary.reason : undefined,
     ...(legacyReporting ? {} : {

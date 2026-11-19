@@ -15,7 +15,9 @@ export function semanticFieldDocuments(input: RawChannelInput): Array<{ ref: Evi
     return input.evidence_corpus
       .filter(document => !['activity_metadata', 'search_match_context', 'country', 'language'].includes(document.field))
       .slice(0, 40)
-      .map(document => ({ ref: documentRef(document), text: document.text }));
+      // The provider contract caps every document at 1,200 characters. The
+      // corpus path must enforce the same cap as the field-built path.
+      .map(document => ({ ref: documentRef(document), text: document.text.slice(0, 1200) }));
   }
   return [
     { ref: { field: 'channel_title' as const }, text: input.channel_name },

@@ -1,3 +1,4 @@
+import type { SemanticResultLabel } from './semanticResultShape';
 import { TradingStatus, TradingCategory } from '../../src/types';
 import type { ClaimPolarity } from './utils/claimPolarity';
 import type { ContextualCompositionReport } from './contextualComposition';
@@ -225,6 +226,8 @@ export interface VerificationDecision {
   };
   geminiSemanticSummary?: {
     isTrading: 'YES' | 'NO' | 'UNCERTAIN';
+    taxonomyLabel?: SemanticResultLabel;
+    calibratedConfidence?: number;
     concepts: string[];
     instruments: string[];
     reason: string;

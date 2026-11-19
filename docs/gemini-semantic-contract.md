@@ -17,10 +17,13 @@
 
 ## 2. Structured output contract (call site 1)
 
-Request: JSON `{task: CANDIDATE|ADJUDICATION, promptVersion: 'priority2-multilingual-structured-1', closedTaxonomy (7 labels), instructions[5], declaredCountry, declaredLanguageHints, documents[{ref,text}]}` with `responseMimeType: application/json`, `temperature: 0`. Documents: ≤40 corpus docs (or title+bio+≤12 videos+≤6 playlists+≤4 transcripts), each text sliced to 1200 chars; country/language/activity surfaces excluded.
+Request: JSON `{task: CANDIDATE|ADJUDICATION, promptVersion: 'priority2-multilingual-structured-4', closedTaxonomy (9 labels), structured focus reason codes, declaredCountry, declaredLanguageHints, documents[{ref,text}]}` with `responseMimeType: application/json`, `temperature: 0`. Documents: ≤40 corpus docs (or title+bio+≤12 videos+≤6 playlists+≤4 transcripts), each text sliced to 1200 chars; country/language/activity surfaces excluded.
 
 `SemanticModelResult` fields/types (`GeminiSemanticProvider.ts:15-23`, normalized by `parse()`, `:131-141`):
-- `label`: one of `ACTIVE_TRADING, INVESTING_EDUCATION, FINANCIAL_NEWS, PERSONAL_FINANCE, HYPE, UNRELATED, AMBIGUOUS`, else forced `AMBIGUOUS`
+- `label`: one of `ACTIVE_TRADING, TRADING_EDUCATION, INVESTING_EDUCATION, FINANCIAL_NEWS, PERSONAL_FINANCE, MARKET_INSTITUTION, HYPE, UNRELATED, AMBIGUOUS`, else forced `AMBIGUOUS`
+- `TRADING_EDUCATION` includes analysis-only and forecast-style trading channels that produce charts, price action, market structure, support/resistance, trends, scenarios, setups, or trade ideas intended to inform trading decisions; step-by-step lessons are not required.
+- `INVESTING_EDUCATION` includes investment analysis, stock/ETF/portfolio/valuation/company analysis, price targets, and long-term investing ideas without step-by-step lessons.
+- `FINANCIAL_NEWS` is reserved for reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading/investment analysis or actionable trade ideas.
 - `confidence`: number clamped 0..100
 - `supportedLanguage`: strict `=== true`
 - `reasonCodes`: string[], max 8
@@ -31,7 +34,7 @@ Request: JSON `{task: CANDIDATE|ADJUDICATION, promptVersion: 'priority2-multilin
 
 ## 3. Evidence categories + scoring mapping
 
-Derived per collection (`:179-192`): `calibrated = calibrateSemanticConfidence(confidence)` via bootstrap bins 49→35, 64→50, 79→64, 89→75, 100→84 (`semanticCalibration.ts`, top tier 84 — policy confidence, not production probability). Abstain iff `!supportedLanguage || label===AMBIGUOUS || calibrated<50 || citations.length===0`. Categories: abstain→`SEMANTIC_ABSTENTION`; `ACTIVE_TRADING|INVESTING_EDUCATION`→`METHODOLOGY_CONCEPT`; `HYPE`→`HYPE_SPECULATION`; `UNRELATED`→`IRRELEVANT_DOMAIN`; else `NON_TRADING_ADJACENT`. Weights: abstain 0; positive raw 24 else 26; final `rawWeight × .65 × (calibrated/100) × (±1 polarity)`. Reliability MEDIUM×.65 (LOWER×.4 when abstained). Provenance: `structured-semantic:{model}` + semantic block (model/prompt/feature/calibration versions, taxonomy label, raw+calibrated confidence, languages, reasonCodes). Second-tier adjudication runs only when supported + (AMBIGUOUS or confidence<70) + `MULTILINGUAL_ADJUDICATION_ENABLED==='true'` + the candidate was not already served from the adjudicator model via 404 fallback.
+Derived per collection (`:179-192`): `calibrated = calibrateSemanticConfidence(confidence)` via bootstrap bins 49→35, 64→50, 79→64, 89→75, 100→84 (`semanticCalibration.ts`, top tier 84 — policy confidence, not production probability). Abstain iff `!supportedLanguage || label===AMBIGUOUS || calibrated<50 || citations.length===0`. Positive relevance labels are `ACTIVE_TRADING|TRADING_EDUCATION|INVESTING_EDUCATION|MARKET_INSTITUTION|HYPE`; `FINANCIAL_NEWS|PERSONAL_FINANCE` are finance-adjacent and `UNRELATED` is the hard exclusion. Categories: abstain→`SEMANTIC_ABSTENTION`; `HYPE`→`HYPE_SPECULATION` (positive polarity; category is content type, not relevance); `UNRELATED`→`IRRELEVANT_DOMAIN`; positive labels→`METHODOLOGY_CONCEPT`; remaining finance-adjacent labels→`NON_TRADING_ADJACENT`. Weights: abstain 0; positive raw 24 else 26; final `rawWeight × .65 × (calibrated/100) × (±1 polarity)`. Reliability MEDIUM×.65 (LOWER×.4 when abstained). Provenance: `structured-semantic:{model}` + semantic block (model/prompt/feature/calibration versions, taxonomy label, raw+calibrated confidence, languages, reasonCodes). Second-tier adjudication runs only when supported + (AMBIGUOUS or confidence<70) + `MULTILINGUAL_ADJUDICATION_ENABLED==='true'` + the candidate was not already served from the adjudicator model via 404 fallback.
 
 ## 4. Degraded/missing behavior (must-match for any fallback)
 

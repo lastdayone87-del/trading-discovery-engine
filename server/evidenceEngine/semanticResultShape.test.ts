@@ -41,3 +41,10 @@ test('the field set includes the canonical pinned-comment and location evidence'
   assert.ok(SEMANTIC_RESULT_FIELD_NAMES.has('pinned_comment'));
   assert.ok(SEMANTIC_RESULT_FIELD_NAMES.has('location'));
 });
+
+test('the closed taxonomy includes trading education and market institutions', () => {
+  for (const label of ['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'MARKET_INSTITUTION', 'HYPE', 'UNRELATED', 'AMBIGUOUS']) {
+    assert.equal(isSemanticResultShape(result({ label })), true, label);
+  }
+  assert.equal(isSemanticResultShape(result({ label: 'BROKER_PLATFORM' })), false);
+});

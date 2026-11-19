@@ -80,8 +80,8 @@ used by discovery.
 The compact multilingual model is the primary generalization provider for
 meaning not represented in static packs. It receives separately identified
 fields rather than flattened text and must return a closed taxonomy:
-`ACTIVE_TRADING`, `INVESTING_EDUCATION`, `FINANCIAL_NEWS`,
-`PERSONAL_FINANCE`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. Its assertion includes
+`ACTIVE_TRADING`, `TRADING_EDUCATION`, `INVESTING_EDUCATION`, `FINANCIAL_NEWS`,
+`PERSONAL_FINANCE`, `MARKET_INSTITUTION`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. `ACTIVE_TRADING`, `TRADING_EDUCATION`, `INVESTING_EDUCATION`, `MARKET_INSTITUTION`, and `HYPE` are positive trading-relevance labels: commercial operation, broker/platform identity, signal selling, VIP communities and promotional claims do not make trading content non-relevant. `FINANCIAL_NEWS` and `PERSONAL_FINANCE` map to finance-adjacent non-trading evidence; `UNRELATED` maps to negative/alternative evidence. `TRADING_EDUCATION` includes analysis-only and forecast-style trading channels that produce charts, price action, market structure, support/resistance, trends, scenarios, setups, or trade ideas intended to inform trading decisions; step-by-step lessons are not required. `INVESTING_EDUCATION` likewise includes investment analysis, price targets, and company/portfolio analysis without step-by-step lessons. `FINANCIAL_NEWS` is reserved for reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading/investment analysis or actionable trade ideas. Its assertion includes
 field citations, detected language and script per field, concepts, reason codes,
 and pinned model, prompt, feature, and calibration versions. Unsupported language,
 missing citations, ambiguity, and confidence below policy threshold produce a
@@ -304,3 +304,33 @@ Any classifier change must retain cases for:
 ## Priority 10 governed knowledge input
 
 The classifier may consume an immutable classification-lane feature projection. Every feature retains concept and surface identity, concept version, publication version/checksum, and policy version. Governed features may add explainable candidate or corroboration evidence, but cannot bypass availability, sufficiency, independent corroboration, contradiction, or lifecycle stages. Missing or invalid knowledge abstains and uses the existing deterministic path; it is never negative evidence. Mutable graph, terminology, semantic, and discovery state are not classifier dependencies.
+
+## Precision-adjudicator deferral and recovery
+
+When a first-pass relevant channel is unresolved by the deterministic guard and
+the precision adjudicator is unavailable, the decision is not confirmed and is
+not sent to human review. It is written as `UNCERTAIN` with
+`PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED` and routed to `ENRICH`.
+
+Recovery uses the existing `ENRICH_CHANNEL` queue. The retry policy is defined
+by `server/evidenceEngine/adjudicatorRetryPolicy.ts`:
+
+- backoff: 1m, 5m, 30m, 2h, 6h, 24h (capped)
+- the deferred job keeps the same enrichment stage and sets `run_after` to
+  `nextRetryAt`, so ordinary stage exhaustion cannot turn it into review debt
+- the job payload records `adjudicatorDeferralAttempts`,
+  `adjudicatorFirstDeferredAt`, `adjudicatorDeferralReason` and
+  `adjudicatorNextRetryAt`; `last_error` carries the operational reason
+- quota-aware workers retry due channels after provider recovery
+- a channel is finalized only after an adjudicator result (downgrade or keep),
+  or after the bounded deferral ceiling (`ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS`)
+  projects an explicit human-review item
+- while deferred it is never confirmed and never becomes review debt
+- `/api/provider-metrics` includes `adjudicatorDeferrals` from
+  `getAdjudicatorDeferralMetrics`: total, due, resolved, oldest deferral age,
+  max overdue time, max attempts and reason counts
+
+The same policy applies after quota resets. Operators must alert on the
+`adjudicatorDeferrals` due/overdue/attempt metrics; after the bounded ceiling
+the channel is projected into explicit human review rather than retried
+forever.

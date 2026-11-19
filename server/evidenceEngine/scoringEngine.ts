@@ -79,7 +79,8 @@ export class ConfigurableWeightedStrategy {
     const hasMethodologyConcept = positiveItems.some(i => i.category === 'METHODOLOGY_CONCEPT' || i.category === 'TERMINOLOGY');
 
     const policyMinimum=(hasMethodologyConcept||hasHighReliabilityMatch||hasPlatformOrPropFirm)?15:this.config.minPositiveWeightTrading;
-    const policy=evaluateUnifiedDecisionPolicy({evidence:evidenceItems,collection:evidenceCollection,lifecycleAction:stages.lifecycleAction,minimumPositiveWeight:policyMinimum,minimumTradingScore:this.config.minVerifiedTradingScore,composition,recognition});
+    const semanticItem = evidenceItems.find(i => isSemanticClassificationSource(i.source));
+    const policy=evaluateUnifiedDecisionPolicy({evidence:evidenceItems,collection:evidenceCollection,lifecycleAction:stages.lifecycleAction,minimumPositiveWeight:policyMinimum,minimumTradingScore:this.config.minVerifiedTradingScore,composition,recognition,contentCategory:semanticItem?.category === 'SEMANTIC_ABSTENTION' ? undefined : semanticItem?.provenance?.semantic?.taxonomyLabel});
     status=policy.status;confidenceScore=policy.confidenceScore;
     if(status==='TRADING_CONFIRMED')justifications.push('DECISION: VERIFIED_TRADING. Calibrated support and independent corroboration satisfied.');
     else if(status==='NON_TRADING')justifications.push('DECISION: VERIFIED_NON_TRADING. Explicit negative-domain evidence forms a dominant attributed contradiction.');
@@ -98,13 +99,14 @@ export class ConfigurableWeightedStrategy {
     // this evaluation (routing guarantees at most one). The field name stays
     // provider-neutral-compatible for existing consumers; the model reports
     // the actual serving model from semantic provenance.
-    const semanticItem = evidenceItems.find(i => isSemanticClassificationSource(i.source));
     let geminiSemanticSummary = undefined;
     if (semanticItem) {
       geminiSemanticSummary = {
         // Abstentions carry positive polarity with zero weight: an abstention
         // is uncertainty, never a trading approval, for either provider.
         isTrading: semanticItem.category === 'SEMANTIC_ABSTENTION' ? ('UNCERTAIN' as const) : semanticItem.polarity === 'POSITIVE' ? ('YES' as const) : semanticItem.polarity === 'NEGATIVE' ? ('NO' as const) : ('UNCERTAIN' as const),
+        taxonomyLabel: semanticItem.provenance?.semantic?.taxonomyLabel,
+        calibratedConfidence: semanticItem.provenance?.semantic?.calibratedConfidence,
         concepts: semanticItem.rawMatches,
         instruments: [],
         reason: semanticItem.fact,

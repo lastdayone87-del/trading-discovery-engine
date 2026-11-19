@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GeminiSemanticProvider, type SemanticModelClient } from './providers/GeminiSemanticProvider';
+import { DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from './modelDefaults';
 import { calibrateSemanticConfidence } from './semanticCalibration';
 
 const knowledge = { globalInstruments: [], globalPlatformsPropFirms: [], globalAdvancedConcepts: [], globalNegativeTerms: [] };
@@ -35,14 +36,17 @@ test('unsupported languages explicitly abstain and never manufacture positive or
 
 test('ambiguous first-tier results can be escalated to the versioned adjudicator', async () => {
   const previous = process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  const previousModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL;
   process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  delete process.env.MULTILINGUAL_ADJUDICATOR_MODEL;
   try {
     const ambiguous = { ...trading, label: 'AMBIGUOUS', confidence: 52 };
     const [item] = await new GeminiSemanticProvider(client(ambiguous, trading)).collectEvidence({ channel_name: 'Code Switch', description: 'Opero live with risk controls' }, knowledge);
-    assert.equal(item.provenance?.semantic?.modelVersion, 'gemini-2.5-flash');
+    assert.equal(item.provenance?.semantic?.modelVersion, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL);
     assert.equal(item.category, 'METHODOLOGY_CONCEPT');
   } finally {
     if (previous === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED; else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = previous;
+    if (previousModel === undefined) delete process.env.MULTILINGUAL_ADJUDICATOR_MODEL; else process.env.MULTILINGUAL_ADJUDICATOR_MODEL = previousModel;
   }
 });
 

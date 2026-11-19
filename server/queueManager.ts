@@ -1973,6 +1973,8 @@ export async function processNextSearchJob(
         queryRunId?:string;
       };
       const enrichmentStage=Math.min(3,Math.max(1,Number(job.payload.enrichmentStage||1))) as 1|2|3;
+      candidate.adjudicatorDeferralAttempts=Number(job.payload.adjudicatorDeferralAttempts||candidate.adjudicatorDeferralAttempts||0)||undefined;
+      candidate.adjudicatorFirstDeferredAt=typeof job.payload.adjudicatorFirstDeferredAt==='string'?job.payload.adjudicatorFirstDeferredAt:candidate.adjudicatorFirstDeferredAt;
       if(investigationId)candidate.investigationId=investigationId;
       await assertCountryAllowed(targetCountry, `enrichment_worker:${job.id}`);
       // A contained probe refusal defers the original discovery pipeline, not
@@ -2261,6 +2263,11 @@ export async function processNextSearchJob(
           });
           if(!toppedUp)throw new QuotaAllocationExhaustedError('ENRICHMENT');
         });
+        // Hydration returns a fresh candidate. Carry the adjudicator retry
+        // bookkeeping across it so the next deferral increments the same
+        // durable attempt record instead of restarting at one.
+        enriched.adjudicatorDeferralAttempts=candidate.adjudicatorDeferralAttempts;
+        enriched.adjudicatorFirstDeferredAt=candidate.adjudicatorFirstDeferredAt;
         if(!candidateAlreadyEnriched){
           const db=await getDb();
           await db.query(`UPDATE jobs SET payload=jsonb_set(payload,'{candidate}',$2::jsonb,true),updated_at=now() WHERE id=$1`,[job.id,JSON.stringify(enriched)]);

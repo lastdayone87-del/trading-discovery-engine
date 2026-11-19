@@ -10,7 +10,7 @@ import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchCon
 import { semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
-export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-1';
+export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-4';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
 import { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from '../modelDefaults';
@@ -338,7 +338,16 @@ export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 
       'Infer meaning across languages, scripts, transliteration, loanwords, and code-switching.',
       'Classify creator focus, not isolated keywords. Cite only supplied field references.',
       'Set supportedLanguage=false and label=AMBIGUOUS when meaning cannot be reliably interpreted.',
-      'Distinguish active trading, investing education, financial news, personal finance, hype, and unrelated content.',
+      'Distinguish active trading, trading education, investing education, financial news, personal finance, market institutions, hype, and unrelated content.',
+      'Before choosing a label, determine the channel primary identity, primary commercial offer, and primary video content. Encode them in reasonCodes using only: PRIMARY_TRADER, PRIMARY_EDUCATOR, PRIMARY_ANALYST, PRIMARY_INSTITUTION, PRIMARY_VENDOR, PRIMARY_EDUCATION_BUSINESS, PRIMARY_NEWS_MEDIA, PRIMARY_HYPE, PRIMARY_UNRELATED; OFFER_NONE, OFFER_COURSE, OFFER_COMMUNITY, OFFER_SIGNALS, OFFER_SOFTWARE, OFFER_MANAGED_ACCOUNT, OFFER_BROKERAGE, OFFER_EVENTS, OFFER_NEWS; CONTENT_ANALYSIS, CONTENT_LIVE, CONTENT_RECAPS, CONTENT_LESSONS, CONTENT_NEWS, CONTENT_PROMO, CONTENT_ENTERTAINMENT, CONTENT_MIXED.',
+      'Use TRADING_EDUCATION when the creator teaches trading method, psychology, platform use, or risk management, or primarily produces market or technical analysis intended to inform trading decisions: charts, price action, market structure, support and resistance, trends, scenarios, setups, or trade ideas. Analysis-only and forecast-style trading channels qualify; step-by-step lessons are not required.',
+      'Use ACTIVE_TRADING when the creator primarily publishes live execution, trade recaps, or a documented trading journey. A free Discord, Telegram community, affiliate link, or side signal offer does not make an active trader HYPE when live execution/recaps are the primary content.',
+      'Use INVESTING_EDUCATION when the creator primarily produces investment analysis, stock, ETF, portfolio, valuation or company analysis, price targets, or long-term investing ideas, even without step-by-step lessons.',
+      'Use FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading or investing decisions.',
+      'Use MARKET_INSTITUTION for a broker, exchange, bank, fund, asset manager, data/software platform, trading-robot vendor, stock-pick service, or event business, including the official channel of such an institution even when it publishes educational videos. An independent trader who uses or reviews a platform is not the platform.',
+      'Use HYPE only when signals, VIP/paid access, guaranteed returns, 100x/memecoin/presale promotion, or affiliate-first promotion is the primary offer. A channel that publishes original analysis, lessons, live execution, or trade recaps is not HYPE merely because it mentions signals, a free Discord, a VIP community, or a broker affiliate link.',
+      'Use UNRELATED when the primary content is non-financial, even if finance appears in a minority of videos.',
+      'Use PERSONAL_FINANCE for budgeting, banking, taxes, insurance, savings products and consumer finance.',
       'Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'
     ],
     declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: semanticFieldDocuments(input)
@@ -456,8 +465,14 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     recordSemanticPrefilterOutcome(input, this.name, result.label);
     const calibrated = calibrateSemanticConfidence(result.confidence);
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
-    const positive = result.label === 'ACTIVE_TRADING' || result.label === 'INVESTING_EDUCATION';
-    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
+    const positive = result.label === 'ACTIVE_TRADING'
+      || result.label === 'TRADING_EDUCATION'
+      || result.label === 'INVESTING_EDUCATION'
+      // Commercial, broker/platform, signal and promotional channels are
+      // trading/investing content when their actual material is trading.
+      || result.label === 'MARKET_INSTITUTION'
+      || result.label === 'HYPE';
+    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : positive ? 'METHODOLOGY_CONCEPT' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
     const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : [])] };

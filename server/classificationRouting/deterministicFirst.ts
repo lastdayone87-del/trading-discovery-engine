@@ -55,6 +55,8 @@ export interface ClassificationRoutingOptions {
   acquisitionEnrich?: boolean;
   /** Specific acquisition cause from the lifecycle stage, when known. */
   acquisitionReason?: string;
+  /** Refined semantic category; relevant categories own the decision. */
+  contentCategory?: string;
 }
 
 type RoutingInput = Pick<
@@ -161,10 +163,16 @@ function semanticSignals(decision: RoutingInput) {
 }
 
 function hasTerminalNegativeEvidence(decision: RoutingInput): boolean {
+  const reasons = decision.decisionPolicy?.reasonCodes || [];
+  // A high-precision category guard is terminal only when it was applied to a
+  // first-pass confirmation with sufficient evidence. Thin or first-pass
+  // uncertain results never receive this marker and cannot be rejected here.
+  if (reasons.includes('PRECISION_GUARD_CONFIRMED_FIRST_PASS')
+    && reasons.includes('CONTENT_CATEGORY_PRECISION_GUARD')) return true;
   if (decision.evidenceCollection.terminalNegativeSufficiency?.status !== 'SUFFICIENT') return false;
   // The policy layer only terminalizes creator-level unrelated-domain
   // evidence. The status cannot be terminalized by isolated keywords.
-  return (decision.decisionPolicy?.reasonCodes || []).some(code =>
+  return reasons.some(code =>
     code === 'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'
     || code === 'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION',
   );
@@ -240,6 +248,19 @@ export function resolveClassificationRouting(
     });
   }
 
+  // A precision-adjudicator outage must defer/retry, never confirm the
+  // first-pass label and never create human review.
+  if (decision.status === 'UNCERTAIN'
+    && (decision.decisionPolicy?.reasonCodes || []).includes('PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED')) {
+    return result({
+      route: 'ENRICH', confidence, evidenceSufficiency: sufficiency,
+      recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
+      enrich: true,
+      fallbackReason: 'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED',
+      reasonCodes: ['PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED'],
+    });
+  }
+
   // The staged lifecycle already decided that the evidence bundle needs more
   // acquisition. Do not turn that into human review just because the semantic
   // layer served evidence. Preserve the lifecycle's specific cause so routing
@@ -263,7 +284,14 @@ export function resolveClassificationRouting(
     // the case to human review. This never rejects and never overrides a
     // video sample that actually contains trading analysis.
     const videoTexts = stripRepeatedFooterLines((options.videoTexts || []).map(text => String(text || '').trim()).filter(Boolean));
-    if (videoTexts.length >= 3) {
+    const categoryOwnsDecision = options.contentCategory === 'ACTIVE_TRADING'
+      || options.contentCategory === 'TRADING_EDUCATION'
+      || options.contentCategory === 'INVESTING_EDUCATION'
+      // Commercial, broker/platform, signal and promotional channels are
+      // still trading-relevant when their actual content is trading.
+      || options.contentCategory === 'MARKET_INSTITUTION'
+      || options.contentCategory === 'HYPE';
+    if (!categoryOwnsDecision && videoTexts.length >= 3) {
       const focusByVideo = videoTexts.map(text => nonTradingContentFocus(text));
       const focusedVideos = focusByVideo.filter(focus => focus.total >= 1);
       const strongAnalysisVideos = videoTexts.filter(text => {
