@@ -101,7 +101,6 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     if (admission.rowCount) {
       candidate = candidateFromAdmissionRow(admission.rows[0] as AdmissionCandidateRow);
       candidate.admissionConfirmedTrading = false;
-      candidate.admissionDecisionSource = 'SEMANTIC';
       targetCountry = String(admission.rows[0].target_country || targetCountry);
       source = sourceOf(admission.rows[0].source);
       queryRunId = admission.rows[0].query_run_id || undefined;
@@ -145,7 +144,6 @@ for (const row of rows.rows as Array<Record<string, any>>) {
 
   // Never let a recovered job reuse the admission shortcut.
   candidate.admissionConfirmedTrading = false;
-  if (candidate.admissionDecisionSource === 'SEMANTIC') candidate.admissionConfirmedTrading = false;
 
   const payload = buildClassificationJobPayload({
     candidate,

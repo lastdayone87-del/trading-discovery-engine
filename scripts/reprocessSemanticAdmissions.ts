@@ -123,7 +123,7 @@ for (const row of rows.rows as Array<Record<string, any>>) {
   const idempotencyKey = `semantic-admission-reprocess:${row.channel_id}:${row.admission_decision_id}:v1`;
   const summary = {
     channelId: row.channel_id,
-    channelName: row.channel_name,
+    channelName: candidate.channelName,
     status: row.trading_status,
     confidence: Number(row.trading_confidence_score || 0),
     admissionDecision: row.decision,
