@@ -199,6 +199,36 @@ test('completed negative legacy retry is reclassified without deleting its audit
   assert.equal(decision.retryReason, 'NO_SURFACE');
 });
 
+test('legacy active retry classification preserves the fairness clock', async () => {
+  const queries: Array<{ sql: string; values: unknown[] }> = [];
+  const summary = await reconcileLegacyCommunityRetryOwnership(
+    async () => ({
+      query: async (sql: string, values: unknown[] = []) => {
+        queries.push({ sql, values });
+        if (sql.includes('SELECT j.id')) return {
+          rows: [{
+            id: 'retry-active-1',
+            status: 'PENDING',
+            payload: { channelId: 'UC_test_active', retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
+            channel_id: 'UC_test_active',
+            created_at: '2026-08-25T10:00:00.000Z',
+            inspection_trail: [{ step: 'CHANNEL_EXTERNAL_LINKS', status: 'PARTIAL' }],
+            has_current_community_retryable_failure: true,
+            has_current_upstream_retryable_failure: false,
+          }]
+        };
+        return { rows: [] };
+      }
+    }),
+    100,
+  );
+  assert.equal(summary.activeCommunity, 1);
+  const update = queries.find(item => item.sql.startsWith('UPDATE jobs SET payload'));
+  assert.ok(update, 'the active retry payload is updated');
+  assert.doesNotMatch(update!.sql, /updated_at/,
+    'classification must not move an ancient retry behind newer work in the fairness order');
+});
+
 test('legacy completed-negative retry is completed as audit history without stale lifecycle markers', async () => {
   const queries: Array<{ sql: string; values: unknown[] }> = [];
   const summary = await reconcileLegacyCommunityRetryOwnership(
