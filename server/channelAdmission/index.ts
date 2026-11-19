@@ -174,6 +174,21 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
   };
 }
 
+/**
+ * Explicit review decisions carry a HUMAN key. Everything else is machine
+ * provenance: deterministic-first rows are deterministic, and missing or
+ * legacy semantic provenance stays semantic. Never infer HUMAN from absent
+ * fields; that would reopen the confirmation shortcut.
+ */
+export function resumeAdmissionDecisionSource(input: {
+  decisionKey?: string | null;
+  semanticOutput?: Record<string, any> | null;
+}): 'HUMAN' | 'DETERMINISTIC' | 'SEMANTIC' {
+  if (String(input.decisionKey || '').includes(':HUMAN:')) return 'HUMAN';
+  if (input.semanticOutput?.model === 'deterministic-first-v1') return 'DETERMINISTIC';
+  return 'SEMANTIC';
+}
+
 export type AdmissionReviewAction = 'ADMIT' | 'REJECT' | 'REQUEUE';
 
 export function parseAdmissionReviewAction(flags: {
@@ -403,7 +418,7 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
   const db = await getDb();
   const decision = await db.query(
-    `SELECT id,decision,semantic_output,evidence_hash FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
+    `SELECT id,decision,decision_key,semantic_output,evidence_hash FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
     [row.id],
   ).catch(() => null);
   let channel = await getChannelById(row.channel_id);
@@ -452,14 +467,14 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   // The decision ledger is authoritative. A stale candidate projection must
   // not change the confidence or citations used by resumed classification.
   const semanticOutput = (decision?.rows[0]?.semantic_output || row.semantic_output) as Record<string, any> | null;
-  // A human admission has no semantic judgment at all. Legacy semantic
-  // judgments may have lost their provider field; they must still be treated
-  // as semantic, never promoted to HUMAN and allowed to take the shortcut.
-  const decisionSource = semanticOutput?.model === 'deterministic-first-v1'
-    ? 'DETERMINISTIC'
-    : semanticOutput && (semanticOutput.provider || semanticOutput.model)
-      ? 'SEMANTIC'
-      : 'HUMAN';
+  // Only the review path's explicit HUMAN decision key may claim human
+  // provenance. Legacy semantic judgments may have lost both provider and
+  // model; defaulting them to HUMAN would let them take the shortcut. Default
+  // to SEMANTIC so the full classifier owns the decision.
+  const decisionSource = resumeAdmissionDecisionSource({
+    decisionKey: decision?.rows[0]?.decision_key,
+    semanticOutput,
+  });
   input.candidate.admissionDecisionId = decisionId;
   input.candidate.admissionStatus = admissionStatus;
   input.candidate.admissionDecisionSource = decisionSource;

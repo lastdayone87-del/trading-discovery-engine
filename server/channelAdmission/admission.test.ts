@@ -9,7 +9,7 @@ import { ADMISSION_VERIFICATION_PRIORITY, admissionModeFromOverrides, admissionV
 import { CLASSIFICATION_JOB_PRIORITY_DEFAULT } from '../classificationDecoupling';
 import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from '../operationalEnrichmentRecovery';
 import { judgeRoutePoolHealthy } from './routeHealth';
-import { candidateFromAdmissionRow, classificationCandidateForAdmission } from './index';
+import { candidateFromAdmissionRow, classificationCandidateForAdmission, resumeAdmissionDecisionSource } from './index';
 import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus, providerDeferredCandidateFields } from './types';
 import { ambiguousAdmitRate, evaluateQueryAdmissionGuard } from './queryGuard';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
@@ -1200,6 +1200,15 @@ test('classification candidate preserves discovery accounting and replaces only 
   assert.equal(merged.admissionConfirmedTrading, false);
 });
 
+
+test('resume infers human provenance only from the explicit review key', () => {
+  assert.equal(resumeAdmissionDecisionSource({ decisionKey: 'candidate:ADMIT:HUMAN:123', semanticOutput: null }), 'HUMAN');
+  assert.equal(resumeAdmissionDecisionSource({ decisionKey: 'candidate:ADMIT:ABC', semanticOutput: { model: 'deterministic-first-v1' } }), 'DETERMINISTIC');
+  assert.equal(resumeAdmissionDecisionSource({ decisionKey: 'candidate:ADMIT:ABC', semanticOutput: { model: 'gemini-3.6-flash' } }), 'SEMANTIC');
+  assert.equal(resumeAdmissionDecisionSource({ decisionKey: 'candidate:ADMIT:ABC', semanticOutput: { provider: 'gemini_semantic' } }), 'SEMANTIC');
+  assert.equal(resumeAdmissionDecisionSource({ decisionKey: null, semanticOutput: null }), 'SEMANTIC');
+  assert.equal(resumeAdmissionDecisionSource({}), 'SEMANTIC');
+});
 
 test('finance-adjacent evidence is held back from deterministic fast-pass without active trading anchors', () => {
   const financeTexts = [
