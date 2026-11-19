@@ -289,7 +289,12 @@ export async function reconcileLegacyCommunityRetryOwnership(
     };
     if (decision.disposition === 'ACTIVE_COMMUNITY_RETRY') {
       if (row.status === 'PENDING') {
-        await db.query(`UPDATE jobs SET payload=$2::jsonb,updated_at=now() WHERE id=$1 AND status='PENDING'`, [row.id, JSON.stringify(nextPayload)]);
+        // Classifying legacy ownership is not a claim. Updating `updated_at` here
+        // would move an ancient retry behind newer work in the community-retry
+        // fairness order (priority DESC, updated_at ASC), starving the exact
+        // backlog this sweep is meant to rehabilitate. Payload changes are
+        // persisted without touching the fairness clock.
+        await db.query(`UPDATE jobs SET payload=$2::jsonb WHERE id=$1 AND status='PENDING'`, [row.id, JSON.stringify(nextPayload)]);
       }
       summary.activeCommunity++;
       continue;

@@ -154,8 +154,7 @@ async function main() {
           await client.query(
             `UPDATE jobs
                 SET run_after=now(),
-                    payload=jsonb_set(payload,'{ledgerValidationPending}','true'::jsonb),
-                    updated_at=now()
+                    payload=jsonb_set(payload,'{ledgerValidationPending}','true'::jsonb)
               WHERE id=$1 AND status='PENDING'`,
             [jobId],
           );
@@ -221,7 +220,7 @@ async function main() {
         // 30-day quarantine: both new and old work must keep progressing.
         if (work.active > 0 || work.parkedInfra + work.parkedExternal > 0) {
           await client.query(
-            `UPDATE jobs SET run_after=now(),updated_at=now()
+            `UPDATE jobs SET run_after=now()
               WHERE id=$1 AND status='PENDING'`,
             [jobId],
           );
