@@ -377,7 +377,7 @@ export async function getAdjudicatorDeferralMetrics(now:number=Date.now()):Promi
   const [rows,resolved]=await Promise.all([db.query(`SELECT payload->>'channelId' AS channel_id,
       COALESCE((payload->>'adjudicatorDeferralAttempts')::int,1) AS attempts,
       COALESCE(payload->>'adjudicatorDeferralReason',$1) AS reason,
-      (payload->>'adjudicatorNextRetryAt')::timestamptz AS next_retry_at,
+      COALESCE(run_after,(payload->>'adjudicatorNextRetryAt')::timestamptz) AS next_retry_at,
       (payload->>'adjudicatorFirstDeferredAt')::timestamptz AS first_deferred_at
     FROM jobs
     WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')

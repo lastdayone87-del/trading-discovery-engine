@@ -322,11 +322,15 @@ by `server/evidenceEngine/adjudicatorRetryPolicy.ts`:
   `adjudicatorFirstDeferredAt`, `adjudicatorDeferralReason` and
   `adjudicatorNextRetryAt`; `last_error` carries the operational reason
 - quota-aware workers retry due channels after provider recovery
-- a channel is finalized only after an adjudicator result (downgrade or keep)
+- a channel is finalized only after an adjudicator result (downgrade or keep),
+  or after the bounded deferral ceiling (`ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS`)
+  projects an explicit human-review item
 - while deferred it is never confirmed and never becomes review debt
 - `/api/provider-metrics` includes `adjudicatorDeferrals` from
   `getAdjudicatorDeferralMetrics`: total, due, resolved, oldest deferral age,
   max overdue time, max attempts and reason counts
 
-The same policy applies after quota resets; a deferred channel cannot become
-permanently stuck without an operational alert.
+The same policy applies after quota resets. Operators must alert on the
+`adjudicatorDeferrals` due/overdue/attempt metrics; after the bounded ceiling
+the channel is projected into explicit human review rather than retried
+forever.

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS,
+  adjudicatorDeferralExhausted,
   nextAdjudicatorDeferralPayload,
   nextAdjudicatorRetryAt,
   adjudicatorRetryDelayMs,
@@ -16,6 +18,11 @@ test('adjudicator retry backoff grows and caps at 24 hours', () => {
   assert.equal(adjudicatorRetryDelayMs(6), 24 * 60 * 60_000);
   assert.equal(adjudicatorRetryDelayMs(99), 24 * 60 * 60_000);
   assert.equal(nextAdjudicatorRetryAt(1, 1_000), 61_000);
+});
+
+test('deferrals are bounded and exhaust into explicit review', () => {
+  assert.equal(adjudicatorDeferralExhausted(ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS), false);
+  assert.equal(adjudicatorDeferralExhausted(ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS + 1), true);
 });
 
 test('deferral payload preserves the first deferral time across retries', () => {

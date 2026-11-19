@@ -96,6 +96,7 @@ export async function classifyTradingRelevanceDetailed(
   const precision = precisionEligible
     ? await evaluateCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel, { provider: servingSemanticProvider })
     : { status: 'KEEP' as const, result: null, reasonCode: undefined };
+  const precisionApplied = precision.status === 'DOWNGRADE' || precision.status === 'UNAVAILABLE';
   const uncertainConfidence = (score: number) => Math.max(23, Math.min(79, score));
   const policyBase = decision.decisionPolicy || {
     version: 'precision-guard-v1',
@@ -179,6 +180,16 @@ export async function classifyTradingRelevanceDetailed(
       ],
     };
     decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED`;
+  }
+  // Keep the lifecycle projection aligned with the post-guard status. The
+  // evidence stages remain the record of how the first pass was reached; the
+  // action is the final machine disposition used by routing and diagnostics.
+  if (precisionApplied && decision.stagedClassification) {
+    if (decision.status === 'NON_TRADING') {
+      decision.stagedClassification = { ...decision.stagedClassification, lifecycleAction: 'REJECT' };
+    } else if (decision.status === 'UNCERTAIN') {
+      decision.stagedClassification = { ...decision.stagedClassification, lifecycleAction: 'ENRICH' };
+    }
   }
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
   const lifecycleStage = decision.stagedClassification?.stages.find(stage => stage.stage === 'LIFECYCLE');

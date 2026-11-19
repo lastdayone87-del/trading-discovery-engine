@@ -17,6 +17,17 @@ export const ADJUDICATOR_RETRY_DELAYS_MS = [
   24 * 60 * 60_000,
 ] as const;
 
+/**
+ * A provider can be down longer than the bounded enrichment budget. After this
+ * many deferrals the channel is projected into the explicit human-review
+ * fallback instead of scheduling another 24h retry forever.
+ */
+export const ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS = 8;
+
+export function adjudicatorDeferralExhausted(attempts: number): boolean {
+  return Number(attempts) > ADJUDICATOR_MAX_DEFERRAL_ATTEMPTS;
+}
+
 export interface AdjudicatorDeferralRecord {
   channelId: string;
   attempts: number;

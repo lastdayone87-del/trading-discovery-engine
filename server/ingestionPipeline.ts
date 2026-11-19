@@ -55,7 +55,7 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
-import { ADJUDICATOR_DEFERRAL_REASON, nextAdjudicatorDeferralPayload, type AdjudicatorDeferralPayload } from './evidenceEngine/adjudicatorRetryPolicy';
+import { ADJUDICATOR_DEFERRAL_REASON, adjudicatorDeferralExhausted, nextAdjudicatorDeferralPayload, type AdjudicatorDeferralPayload } from './evidenceEngine/adjudicatorRetryPolicy';
 import { materializeExhaustedReview } from './reviewEligibility/exhaustedReview';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
@@ -470,7 +470,9 @@ export function buildAdjudicatorDeferralJob(args: {
       source,
       candidate: {
         ...candidate,
-        enrichmentStage: currentStage,
+        // Preserve the candidate's actual hydration stage. The top-level job
+        // stage is the one that must not be zero; marking the candidate as
+        // already enriched would skip the paid hydration fetch.
         adjudicatorDeferralAttempts: retry.attempts,
         adjudicatorFirstDeferredAt: firstDeferredAt,
       },
@@ -507,10 +509,11 @@ async function deferAdjudicatorUnavailableClassification(args: {
   now: string;
   countryValidationStep: NonNullable<ChannelRecord['inspection_trail']>[number];
   input: RawChannelInput;
+  classificationDiagnosticId?: string;
 }): Promise<IngestionPipelineOutcome> {
   const {
     candidate, existing, countryVal, tradingVal, creatorCountry,
-    source, targetCountry, now, countryValidationStep, input,
+    source, targetCountry, now, countryValidationStep, input, classificationDiagnosticId,
   } = args;
   // The queue treats stage 0 as a retrieval-only probe; a deferred retry is a
   // real enrichment pass, so never enqueue stage 0.
@@ -551,7 +554,7 @@ async function deferAdjudicatorUnavailableClassification(args: {
 
   const vitality = deriveVitalityScheduling(input.activity_metadata, now);
   const priority = 10 + vitality.jobPriorityDelta;
-  const { payload, options } = buildAdjudicatorDeferralJob({
+  const built = buildAdjudicatorDeferralJob({
     candidate,
     targetCountry,
     source,
@@ -559,7 +562,43 @@ async function deferAdjudicatorUnavailableClassification(args: {
     now,
     priority,
   });
-  const job = await enqueueJob('ENRICH_CHANNEL', payload, options);
+  if (adjudicatorDeferralExhausted(built.retry.attempts)) {
+    // Bound the retry loop. After the ceiling the channel becomes an explicit
+    // operator review item; it is never confirmed and never left as a pending
+    // row without a scheduled job.
+    try {
+      await materializeExhaustedReview({
+        channelId: candidate.channelId,
+        classificationDiagnosticId,
+        reasonCode: 'PRECISION_ADJUDICATOR_DEFERRAL_EXHAUSTED',
+        reasonCodes: ['MACHINE_EXHAUSTED_UNCERTAIN'],
+        evidenceSummary: {
+          confidence: tradingVal.confidenceScore,
+          sufficiency: 'SUFFICIENT',
+          adjudicatorDeferralAttempts: built.retry.attempts,
+          firstDeferredAt: new Date(built.retry.firstDeferredAt).toISOString(),
+        },
+        decidedAt: now,
+      });
+    } catch (error) {
+      console.error(`[ClassificationResolution] Adjudicator deferral exhaustion failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error);
+      await projectBlockedEnrichmentScanStatus(candidate.channelId, 'FAILED', now, undefined);
+    }
+    const authoritative = (await getChannelById(candidate.channelId)) || channel;
+    return {
+      channelId: candidate.channelId,
+      channelName: candidate.channelName,
+      isNew: !existing,
+      wasKnown: !!existing,
+      persisted: true,
+      countryStatus: countryVal.status,
+      tradingStatus: authoritative.trading_status,
+      discordStatus: authoritative.discord_status,
+      discordInvite: authoritative.discord_invite ?? null,
+      channelRecord: authoritative,
+    };
+  }
+  const job = await enqueueJob('ENRICH_CHANNEL', built.payload, built.options);
   // The job row is the durable deferral record. Keep the operational reason
   // visible on the queue row without turning it into a failed attempt.
   const db = await getDb();
@@ -1450,6 +1489,7 @@ async function processChannelThroughPipelineInContext(
         now,
         countryValidationStep,
         input: productionClassification.input,
+        classificationDiagnosticId,
       });
     }
     const currentStage=candidate.enrichmentStage||0;

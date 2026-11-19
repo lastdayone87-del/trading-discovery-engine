@@ -36,7 +36,9 @@ test('unsupported languages explicitly abstain and never manufacture positive or
 
 test('ambiguous first-tier results can be escalated to the versioned adjudicator', async () => {
   const previous = process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
+  const previousModel = process.env.MULTILINGUAL_ADJUDICATOR_MODEL;
   process.env.MULTILINGUAL_ADJUDICATION_ENABLED = 'true';
+  delete process.env.MULTILINGUAL_ADJUDICATOR_MODEL;
   try {
     const ambiguous = { ...trading, label: 'AMBIGUOUS', confidence: 52 };
     const [item] = await new GeminiSemanticProvider(client(ambiguous, trading)).collectEvidence({ channel_name: 'Code Switch', description: 'Opero live with risk controls' }, knowledge);
@@ -44,6 +46,7 @@ test('ambiguous first-tier results can be escalated to the versioned adjudicator
     assert.equal(item.category, 'METHODOLOGY_CONCEPT');
   } finally {
     if (previous === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED; else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = previous;
+    if (previousModel === undefined) delete process.env.MULTILINGUAL_ADJUDICATOR_MODEL; else process.env.MULTILINGUAL_ADJUDICATOR_MODEL = previousModel;
   }
 });
 

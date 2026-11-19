@@ -1532,7 +1532,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // trading/investing content when their actual material is trading.
       || result.label === 'MARKET_INSTITUTION'
       || result.label === 'HYPE';
-    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
+    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : positive ? 'METHODOLOGY_CONCEPT' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
     const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, ...(repairSurvived() ? { repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION } : {}), taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...(repairSurvived() ? ['SEMANTIC_CITATION_REPAIR'] : []), ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : []), ...(abstained && isDecisiveButUncited(result) ? ['SEMANTIC_ABSTAIN_NO_CITATIONS'] : [])] };
