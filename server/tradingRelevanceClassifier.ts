@@ -62,6 +62,7 @@ export async function classifyTradingRelevanceDetailed(
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
+  const lifecycleStage = decision.stagedClassification?.stages.find(stage => stage.stage === 'LIFECYCLE');
   const routingMode = resolveClassificationRoutingMode();
   const videoDocuments = input.videos?.length
     ? input.videos
@@ -76,8 +77,9 @@ export async function classifyTradingRelevanceDetailed(
     videoTexts,
     mode: routingMode,
     lifecycleAction: decision.stagedClassification?.lifecycleAction,
-    acquisitionEnrich: decision.stagedClassification?.stages
-      .find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('ACQUISITION_ENRICH') ?? false,
+    acquisitionEnrich: lifecycleStage?.reasonCodes.includes('ACQUISITION_ENRICH') ?? false,
+    acquisitionReason: lifecycleStage?.reasonCodes.find(code =>
+      code === 'COMPOSITION_EVIDENCE_REQUIRED' || code === 'THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'),
   });
   if (routingMode === 'ACTIVE') decision.deterministicRouting = routing;
 

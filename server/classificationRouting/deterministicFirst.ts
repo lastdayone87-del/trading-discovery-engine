@@ -53,6 +53,8 @@ export interface ClassificationRoutingOptions {
   lifecycleAction?: LifecycleAction;
   /** True only when ENRICH is an evidence-acquisition state, not ambiguity. */
   acquisitionEnrich?: boolean;
+  /** Specific acquisition cause from the lifecycle stage, when known. */
+  acquisitionReason?: string;
 }
 
 type RoutingInput = Pick<
@@ -238,14 +240,16 @@ export function resolveClassificationRouting(
 
   // The staged lifecycle already decided that the evidence bundle needs more
   // acquisition. Do not turn that into human review just because the semantic
-  // layer served evidence.
+  // layer served evidence. Preserve the lifecycle's specific cause so routing
+  // diagnostics do not label ordinary missing evidence as a composition gap.
   if (decision.status === 'UNCERTAIN' && options.lifecycleAction === 'ENRICH' && options.acquisitionEnrich) {
+    const acquisitionReason = String(options.acquisitionReason || '').trim() || 'EVIDENCE_ACQUISITION_REQUIRED';
     return result({
       route: 'ENRICH', confidence, evidenceSufficiency: sufficiency,
       recognitionState, semanticPolicy, semanticUsed: semantic.used, semanticAttempted: semantic.attempted,
       enrich: true,
-      fallbackReason: 'COMPOSITION_EVIDENCE_REQUIRED',
-      reasonCodes: ['COMPOSITION_EVIDENCE_REQUIRED'],
+      fallbackReason: acquisitionReason,
+      reasonCodes: [acquisitionReason, 'ACQUISITION_ENRICH'],
     });
   }
 

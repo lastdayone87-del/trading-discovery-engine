@@ -71,11 +71,40 @@ test('evidence-limited lifecycle routes to ENRICH even with independent semantic
   const routed = resolveClassificationRouting(decision({
     status: 'UNCERTAIN',
     providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
-  }), { independentEvidence: true, lifecycleAction: 'ENRICH', acquisitionEnrich: true });
+  }), {
+    independentEvidence: true,
+    lifecycleAction: 'ENRICH',
+    acquisitionEnrich: true,
+    acquisitionReason: 'COMPOSITION_EVIDENCE_REQUIRED',
+  });
   assert.equal(routed.route, 'ENRICH');
   assert.equal(routed.enrich, true);
   assert.equal(routed.humanReview, false);
   assert.equal(routed.fallbackReason, 'COMPOSITION_EVIDENCE_REQUIRED');
+  assert.ok(routed.reasonCodes.includes('ACQUISITION_ENRICH'));
+});
+
+test('thin-retrieval enrichment preserves its specific acquisition cause', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), {
+    independentEvidence: true,
+    lifecycleAction: 'ENRICH',
+    acquisitionEnrich: true,
+    acquisitionReason: 'THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION',
+  });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.fallbackReason, 'THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION');
+});
+
+test('acquisition enrichment without a specific cause uses a generic diagnostic', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'UNCERTAIN',
+    providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
+  }), { independentEvidence: true, lifecycleAction: 'ENRICH', acquisitionEnrich: true });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.fallbackReason, 'EVIDENCE_ACQUISITION_REQUIRED');
 });
 
 test('evidence-complete lifecycle ENRICH still goes to human review', () => {
