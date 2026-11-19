@@ -209,7 +209,7 @@ test('legacy active retry classification preserves the fairness clock', async ()
           rows: [{
             id: 'retry-active-1',
             status: 'PENDING',
-            payload: { channelId: 'UC_test_active', retryReason: 'COMMUNITY_REQUIRED_ACQUISITION_FAILURE' },
+            payload: { channelId: 'UC_test_active', retryReason: 'UPSTREAM_REQUIRED_ACQUISITION_FAILURE' },
             channel_id: 'UC_test_active',
             created_at: '2026-08-25T10:00:00.000Z',
             inspection_trail: [{ step: 'CHANNEL_EXTERNAL_LINKS', status: 'PARTIAL' }],
