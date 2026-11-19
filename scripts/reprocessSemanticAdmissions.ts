@@ -28,10 +28,12 @@ function sourceOf(value: unknown): DiscoverySource {
 
 const config = resolveClassificationDecouplingConfig();
 const db = await getDb();
+let capacityFull = false;
 if (apply) {
   const capacity = await getClassificationBackpressureState('semantic-admission-reprocess');
   const remaining = Math.max(0, capacity.maxPending - capacity.globalPending);
   if (remaining === 0) {
+    capacityFull = true;
     console.log(JSON.stringify({
       apply,
       capacityFull: true,
@@ -40,14 +42,12 @@ if (apply) {
       selected: 0,
       enqueued: 0,
     }));
-    process.exit(0);
-  }
-  if (remaining < limit) {
+  } else if (remaining < limit) {
     console.log(JSON.stringify({ apply, capacityLimited: true, requested: limit, effectiveLimit: remaining }));
+    limit = remaining;
   }
-  limit = Math.min(limit, remaining);
 }
-const rows = await db.query(
+const rows = capacityFull ? { rows: [] as Array<Record<string, any>> } : await db.query(
   `select cand.*,
           c.channel_id as channel_id,
           c.trading_status,
@@ -64,7 +64,9 @@ const rows = await db.query(
       and (c.admission_status = 'ADMITTED' or c.admission_status = 'ADMITTED_AMBIGUOUS')
       -- Semantic admission only. Deterministic and human admissions are
       -- legitimate first-class decisions and keep their fast path.
-      and coalesce(s.semantic_output->>'model', '') not in ('', 'deterministic-first-v1')
+      -- Missing model provenance is still semantic (legacy rows); only the
+      -- deterministic fast path and explicit human review are excluded.
+      and coalesce(s.semantic_output->>'model', '') <> 'deterministic-first-v1'
       and coalesce(s.decision_key, '') not like '%:HUMAN:%'
       and ($2::boolean or c.trading_status in ('NEEDS_REVIEW', 'UNCERTAIN'))
       and not exists (
@@ -135,6 +137,13 @@ for (const row of rows.rows as Array<Record<string, any>>) {
   if (!apply) {
     console.log(JSON.stringify({ dryRun: true, ...summary }));
     continue;
+  }
+  // Re-check before every insert so a batch cannot keep enqueueing after the
+  // queue fills from normal discovery or a concurrent operator run.
+  const capacity = await getClassificationBackpressureState('semantic-admission-reprocess');
+  if (capacity.globalPending >= capacity.maxPending) {
+    console.log(JSON.stringify({ stopped: true, reason: 'CLASSIFICATION_CAPACITY_FULL', globalPending: capacity.globalPending, maxPending: capacity.maxPending, ...summary }));
+    break;
   }
   const job = await enqueueClassificationJobAtomic(row.channel_id, payload, {
     priority: config.priority,

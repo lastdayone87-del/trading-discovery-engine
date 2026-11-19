@@ -29,10 +29,12 @@ function sourceOf(value: unknown): DiscoverySource {
 
 const config = resolveClassificationDecouplingConfig();
 const db = await getDb();
+let capacityFull = false;
 if (apply) {
   const capacity = await getClassificationBackpressureState('enrich-backlog-recovery');
   const remaining = Math.max(0, capacity.maxPending - capacity.globalPending);
   if (remaining === 0) {
+    capacityFull = true;
     console.log(JSON.stringify({
       apply,
       capacityFull: true,
@@ -41,14 +43,12 @@ if (apply) {
       selected: 0,
       enqueued: 0,
     }));
-    process.exit(0);
-  }
-  if (remaining < limit) {
+  } else if (remaining < limit) {
     console.log(JSON.stringify({ apply, capacityLimited: true, requested: limit, effectiveLimit: remaining }));
+    limit = remaining;
   }
-  limit = Math.min(limit, remaining);
 }
-const rows = await db.query(
+const rows = capacityFull ? { rows: [] as Array<Record<string, any>> } : await db.query(
   `select c.channel_id, c.channel_name, c.youtube_url, c.country, c.country_status,
           c.discovery_source, c.subscriber_count, c.scan_status, c.trading_status,
           c.trading_confidence_score,
@@ -181,6 +181,13 @@ for (const row of rows.rows as Array<Record<string, any>>) {
   if (!apply) {
     console.log(JSON.stringify({ dryRun: true, ...summary }));
     continue;
+  }
+  // Re-check before every insert so the batch stops at the configured cap even
+  // when normal workers or a concurrent operator run add pending jobs.
+  const capacity = await getClassificationBackpressureState('enrich-backlog-recovery');
+  if (capacity.globalPending >= capacity.maxPending) {
+    console.log(JSON.stringify({ stopped: true, reason: 'CLASSIFICATION_CAPACITY_FULL', globalPending: capacity.globalPending, maxPending: capacity.maxPending, ...summary }));
+    break;
   }
   const job = await enqueueClassificationJobAtomic(channelId, payload, {
     priority: config.priority,
