@@ -1,0 +1,75 @@
+# CodeRabbit review configuration — Trading Discovery Engine (frozen P0-P6 baseline).
+# Every option used here is taken from the CodeRabbit configuration reference
+# (auto-generated from the configuration schema): top-level `language`,
+# `reviews.profile`, `reviews.path_instructions`, `reviews.pre_merge_checks`
+# with `custom_checks`, and `reviews.tools` (squawk, sqlfluff, eslint, yamllint).
+language: en-US
+reviews:
+  profile: chill
+  path_instructions:
+    - path: "server/**/*.ts"
+      instructions: |
+        This repo implements the frozen Discovery Frontier P0-P6 architecture. Enforce these invariants on every TypeScript/server change:
+        1. UCB1 in server/queryIntelligence.ts is the CONTROL discovery path. Thompson/contextual challengers (server/allocationChallengers.ts) are shadow-only challengers. Flag any change that replaces, bypasses, or weakens the UCB1 control without a gated experiment.
+        2. No unauthorized tuning. Cooldowns, exploration ratios/floors, DATE percentages, allocator weights, terminology lifecycle thresholds, confidence constants, and quota caps are experiment/pilot values (B/C/D/E), not architecture. Flag production-value changes made outside the replay/live experiment process with statistical gates.
+        3. New mechanisms (surface extractors, windowed retrieval, depth-2 graph, allocation challengers, OSINT adapters, conditional gates) must stay EXPERIMENTAL: disabled by default, gated by explicit flags/policy versions, shadow/paused/fail-closed, with provenance. Flag any silent promotion into the control/serving path.
+        4. No `relatedToVideoId` in executable code. It is deprecated/removed upstream. Mentions in comments/docs explaining the deprecation are acceptable.
+        5. No uncontrolled LLM-invented discovery queries. LLM output may only classify/extract observed literal surfaces; every query string needs observed-surface provenance plus governance (capability, independence, checksum, trial caps).
+        6. No auto-merge logic. Entity resolution defaults to ABSTAIN; PROPOSE_LINK requires >=2 families and >=2 source entities plus human moderation. Flag automaticMerge:true or weakened corroboration.
+        7. Frozen-pool rule: a pool-changing mechanism must not be compared against an allocation mechanism on an uncontrolled pool. Flag experiment wiring that mixes candidate pools between control and treatment.
+        8. Replay determinism: allocation/assignment must use deterministic hashing (never Math.random), stable ordering, and idempotency keys. Existing immutable triggers, ON CONFLICT semantics, and advisory locks must not be weakened.
+        9. Provenance: every new discovery path (query, creator, relationship, candidate) must retain source refs, checksums, policy/model versions, and decision-state transitions (PROMOTE/RETAIN/DEFER/REJECT/INCONCLUSIVE). Early candidate/phrase/edge volume is never sufficient for promotion; the delayed primary outcome is verified new creators per unit budget.
+        10. Kill-switches: every new adapter/experiment needs an enabled/paused/kill-switch control defaulting to off, plus servingAuthority=false until acceptance. Flag new execution paths without a kill switch.
+        11. YouTube quota accounting is per Cloud project (QUOTA_GROUP), not raw key count. Flag budget logic that sums keys while ignoring quota groups; ungrouped-key legacy fallback must be preserved.
+    - path: "server/db/migrations/*.sql"
+      instructions: |
+        Migration safety for this repo. Migrations are append-only and replay-critical:
+        1. Additive only: use IF NOT EXISTS and additive columns/constraints. Never DROP TABLE/COLUMN, rewrite history tables, or weaken immutable triggers (reject_immutable_event_mutation).
+        2. Avoid long/locking DDL on large tables. Prefer NOT VALID + VALIDATE CONSTRAINT patterns and CONCURRENTLY-style online-safe approaches where supported. Flag exclusive-lock rewrites.
+        3. New tables carrying discovery evidence need idempotency keys, checksum columns where lineage requires them, and serving_authority=false defaults where the architecture mandates shadow-first.
+        4. New kill-switch/control columns must default to the safe state (paused=true, kill_switch=true, authority=false, caps=0) matching existing adapter-control conventions.
+        5. Squawk and sqlfluff findings on migration files should be treated as blocking unless the PR explains why the flagged change is safe.
+    - path: "server/benchmarks/**"
+      instructions: |
+        Benchmark integrity. Fixtures are evidence, never filler:
+        1. Never fabricate benchmark fixtures or channel data. Every positive fixture entry needs the 5-point source-validation protocol (identity, domicile tier, trading, market relevance, 90-day liveness) with independent per-fact sources.
+        2. Sealed datasets are immutable: checksums, cutoffs, and ESS floors must not change to make results look better. A poor result is INCONCLUSIVE or REJECT, never a reason to edit fixtures.
+        3. Keep the harness honest: pilot status (e.g. NOT YET MEASURED, pipeline-sourced vs five-point-audited) must reflect reality. Flag claims of measured recall/yield without a sealed evaluation behind them.
+    - path: "scripts/**"
+      instructions: |
+        Experiment and ops scripts must keep experiment-specific values (sample sizes, treatment ratios, margins, slice counts, windows) as script parameters/metadata, never silently convert them into production architecture constants. Seal/replay scripts must fail closed when readiness floors are unmet.
+  pre_merge_checks:
+    custom_checks:
+      - mode: error
+        name: "No relatedToVideoId in code"
+        instructions: "FAIL if relatedToVideoId is introduced in executable code (server/**, scripts/**). PASS for comments or docs that only explain its upstream deprecation."
+      - mode: error
+        name: "No automatic entity merge"
+        instructions: "FAIL if the change enables automatic merging of entities (automaticMerge true, merge without human moderation, or PROPOSE_LINK with fewer than 2 independent families and 2 source entities). ABSTAIN-by-default must hold."
+      - mode: error
+        name: "No fabricated benchmark fixtures"
+        instructions: "FAIL if benchmark fixtures are added without complete 5-point per-fact sources, or if sealed dataset checksums, cutoffs, or ESS floors are altered to improve results. Poor results must not mutate fixtures."
+      - mode: warning
+        name: "Experimental stays gated"
+        instructions: "WARN if a new discovery mechanism is wired into the control or serving path without its required gate (explicit enable flag, policy version, paused/kill-switch default off, servingAuthority false, trial caps, provenance). Promotion requires measured evidence through the acceptance gates."
+      - mode: warning
+        name: "No production parameter tuning"
+        instructions: "WARN if exploration ratios/floors, DATE percentages, allocator weights, terminology thresholds, confidence constants, cooldowns, or quota caps are changed as production constants rather than experiment metadata with replay/live evaluation and statistical decision rules."
+      - mode: warning
+        name: "Quota by project not key count"
+        instructions: "WARN if YouTube budget logic sums API keys while ignoring QUOTA_GROUP project boundaries, or removes the ungrouped-key legacy fallback. Effective budget is distinct projects plus ungrouped keys."
+      - mode: warning
+        name: "Provenance and replay preserved"
+        instructions: "WARN if a new discovery path lacks provenance (source refs, checksums, policy/model versions, decision-state transitions), uses nondeterministic assignment such as Math.random, or weakens idempotency keys, immutable triggers, ON CONFLICT semantics, or advisory locks."
+      - mode: warning
+        name: "Delayed primary outcome respected"
+        instructions: "WARN if a mechanism is promoted on early volume signals alone (more candidates, phrases, edges, pages, results) without validated linkage to verified new creators per unit budget plus precision, diversity, cost, reliability, provenance, and safety gates."
+  tools:
+    squawk:
+      enabled: true
+    sqlfluff:
+      enabled: true
+    eslint:
+      enabled: true
+    yamllint:
+      enabled: true
