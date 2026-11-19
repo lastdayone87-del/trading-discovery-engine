@@ -172,7 +172,7 @@ function positiveItem(id: string, category: string, field: string, family: strin
   } as EvidenceItem;
 }
 
-test('thin input with affirmative positives keeps REVIEW (never forced to ENRICH)', () => {
+test('thin input with affirmative positives routes to ENRICH, not REVIEW', () => {
   const evidence = [
     positiveItem('pos-1', 'TERMINOLOGY', 'channel_bio', 'fam-bio', 20),
     positiveItem('pos-2', 'INSTRUMENT', 'external_link_domain', 'fam-link', 18),
@@ -203,7 +203,10 @@ test('thin input with affirmative positives keeps REVIEW (never forced to ENRICH
   const corroboration = stages.stages.find(stage => stage.stage === 'CORROBORATION');
   assert.equal(candidate?.disposition, 'PASS');
   assert.equal(corroboration?.disposition, 'PASS');
-  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(stages.lifecycleAction, 'ENRICH');
+  const lifecycle = stages.stages.find(stage => stage.stage === 'LIFECYCLE');
+  assert.ok(lifecycle?.reasonCodes.includes('ACQUISITION_ENRICH'));
+  assert.ok(lifecycle?.reasonCodes.includes('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'));
   assert.equal(decision.status, 'UNCERTAIN');
 });
 
@@ -251,25 +254,26 @@ function mixedNegative(): EvidenceItem {
   } as EvidenceItem;
 }
 
-test('query-only composition preserves affirmative REVIEW and never confirms', () => {
+test('query-only composition enriches and never confirms', () => {
   const input = retrievalOnlyInput();
   const composition = buildContextualComposition(input);
   assert.equal(composition.focus, 'QUERY_ONLY');
 
   // Candidate and corroboration both pass with no contradiction: base routing
-  // would CONFIRM, but a retrieval-only composition must stop at REVIEW.
+  // would CONFIRM, but a retrieval-only composition must enrich instead.
   const { stages, decision } = decide(input, affirmativeEvidence(), sufficientCollection(), composition);
   assert.equal(stages.stages.find(stage => stage.stage === 'CANDIDATE_DETECTION')?.disposition, 'PASS');
   assert.equal(stages.stages.find(stage => stage.stage === 'CORROBORATION')?.disposition, 'PASS');
-  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(stages.lifecycleAction, 'ENRICH');
+  assert.ok(stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('COMPOSITION_EVIDENCE_REQUIRED'));
   assert.equal(decision.status, 'UNCERTAIN');
 
   // The mixed-evidence route is now penalty-only: hype no longer withholds
   // confirmation, so the contradiction stage passes. Query-only routing still
-  // preserves REVIEW instead of confirming.
+  // enriches instead of confirming.
   const abstained = decide(input, [...affirmativeEvidence(), mixedNegative()], sufficientCollection(), composition);
   assert.equal(abstained.stages.stages.find(stage => stage.stage === 'CONTRADICTION')?.disposition, 'PASS');
-  assert.equal(abstained.stages.lifecycleAction, 'REVIEW');
+  assert.equal(abstained.stages.lifecycleAction, 'ENRICH');
   assert.equal(abstained.decision.status, 'UNCERTAIN');
 });
 
@@ -289,7 +293,7 @@ test('policy-level confirmation gate rejects a query-only composition', () => {
   assert.ok(decision.reasonCodes.includes('CONTEXTUAL_COMPOSITION_CONFIRMATION_REQUIRED'));
 });
 
-test('insufficient coverage preserves affirmative REVIEW and a supported terminal REJECT', () => {
+test('insufficient coverage enriches affirmative evidence and preserves a terminal REJECT', () => {
   // An authoritative creator bio is present, so a terminal creator-level
   // rejection is supportable even though the overall composition is still
   // thin. An empty description would rely on the mocked collection alone.
@@ -303,7 +307,8 @@ test('insufficient coverage preserves affirmative REVIEW and a supported termina
   assert.equal(composition.focus, 'INSUFFICIENT_COVERAGE');
 
   const affirmative = decide(input, affirmativeEvidence(), sufficientCollection(), composition);
-  assert.equal(affirmative.stages.lifecycleAction, 'REVIEW');
+  assert.equal(affirmative.stages.lifecycleAction, 'ENRICH');
+  assert.ok(affirmative.stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('COMPOSITION_EVIDENCE_REQUIRED'));
   assert.equal(affirmative.decision.status, 'UNCERTAIN');
 
   const terminalNegative = decide(input, [semanticUnrelated()], sufficientCollection(), composition);
@@ -365,7 +370,8 @@ test('a short keyword bio is not enough for the thin-retrieval exception', () =>
     positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
   ];
   const { stages } = decide({ ...thinRetrievalInput, description: 'Forex trading signals' }, evidence, sufficientCollection(), strongCreatorComposition);
-  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(stages.lifecycleAction, 'ENRICH');
+  assert.ok(stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'));
 });
 
 test('LEGACY restores the thin-retrieval review guard', () => {
@@ -384,11 +390,12 @@ test('LEGACY restores the thin-retrieval review guard', () => {
   }
 });
 
-test('thin retrieval input without a strong creator-owned composition still routes to review', () => {
+test('thin retrieval input without a strong creator-owned composition routes to enrich', () => {
   const evidence = [
     positiveItem('pos-bio', 'TERMINOLOGY', 'channel_bio', 'fam-bio', 20),
     positiveItem('pos-link', 'INSTRUMENT', 'external_link_domain', 'fam-link', 18),
   ];
   const { stages } = decide(thinRetrievalInput, evidence, sufficientCollection());
-  assert.equal(stages.lifecycleAction, 'REVIEW');
+  assert.equal(stages.lifecycleAction, 'ENRICH');
+  assert.ok(stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'));
 });
