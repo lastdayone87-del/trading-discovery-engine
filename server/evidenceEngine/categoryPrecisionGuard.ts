@@ -1,8 +1,10 @@
 import type { RawChannelInput } from './types';
 import {
-  defaultClient,
+  defaultClient as defaultGeminiClient,
   type SemanticModelClient,
 } from './providers/GeminiSemanticProvider';
+import { defaultClient as defaultGroqClient, DEFAULT_GROQ_ADJUDICATOR_MODEL } from './providers/GroqSemanticProvider';
+import { defaultClient as defaultGeminiFreeClient, DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL } from './providers/GeminiFreeSemanticProvider';
 
 export type PrecisionCategory = 'MARKET_INSTITUTION' | 'HYPE' | 'FINANCIAL_NEWS' | 'UNRELATED';
 
@@ -18,6 +20,8 @@ export interface PrecisionGuardOptions {
   enabled?: boolean;
   adjudicator?: (input: RawChannelInput, firstLabel: string) => Promise<PrecisionGuardResult | null>;
   client?: SemanticModelClient | null;
+  /** Provider that served the first-pass verdict; prefer it for adjudication. */
+  provider?: string;
 }
 
 export type PrecisionGuardStatus = 'DOWNGRADE' | 'KEEP' | 'UNAVAILABLE';
@@ -25,6 +29,7 @@ export type PrecisionGuardStatus = 'DOWNGRADE' | 'KEEP' | 'UNAVAILABLE';
 export interface PrecisionGuardEvaluation {
   status: PrecisionGuardStatus;
   result: PrecisionGuardResult | null;
+  reasonCode?: string;
 }
 
 const PRECISION_CATEGORIES: ReadonlySet<string> = new Set([
@@ -33,10 +38,66 @@ const PRECISION_CATEGORIES: ReadonlySet<string> = new Set([
 
 /**
  * The adjudicator runs only on first-pass relevant channels that survive the
- * deterministic prefilter. It is a separate, conservative model call with its
- * own quota budget; it must never share the candidate classifier's budget.
+ * deterministic prefilter. It is a separate operation with its own bounded
+ * admission budget and concurrency cap. It may use the same configured
+ * provider routes as the candidate classifier, but never the candidate batch
+ * scheduler; provider events are attributed to `precision-adjudicator`.
  */
 export const DEFAULT_CATEGORY_ADJUDICATOR_MODEL = 'gemini-3.1-flash-lite';
+
+const ADJUDICATOR_WINDOW_MS = 60_000;
+let adjudicatorWindowStartedAt = 0;
+let adjudicatorWindowCalls = 0;
+
+function takeAdjudicatorBudget(now: number = Date.now()): boolean {
+  const configured = Number(process.env.CONTENT_CATEGORY_ADJUDICATOR_MAX_CALLS_PER_MINUTE ?? 120);
+  const maximum = Number.isFinite(configured) ? Math.max(0, Math.floor(configured)) : 120;
+  if (maximum === 0) return true;
+  if (now - adjudicatorWindowStartedAt >= ADJUDICATOR_WINDOW_MS) {
+    adjudicatorWindowStartedAt = now;
+    adjudicatorWindowCalls = 0;
+  }
+  if (adjudicatorWindowCalls >= maximum) return false;
+  adjudicatorWindowCalls += 1;
+  return true;
+}
+
+function configuredAdjudicatorClient(preferred?: string): SemanticModelClient | undefined {
+  const preference = String(
+    preferred || process.env.CONTENT_CATEGORY_ADJUDICATOR_PROVIDER || process.env.SEMANTIC_PROVIDER || '',
+  ).toLowerCase();
+  const factories: Array<() => SemanticModelClient | undefined> = [];
+  if (preference.includes('groq')) factories.push(defaultGroqClient);
+  else if (preference.includes('free')) factories.push(defaultGeminiFreeClient);
+  else if (preference.includes('gemini')) factories.push(defaultGeminiClient);
+  // A configured first-pass provider may be the only route available. Prefer
+  // the serving provider, then try every configured route before declaring the
+  // adjudicator unavailable.
+  factories.push(defaultGeminiClient, defaultGroqClient, defaultGeminiFreeClient);
+  for (const factory of factories) {
+    try {
+      const client = factory();
+      if (client) return client;
+    } catch {
+      // A route-specific configuration failure must not hide another route.
+    }
+  }
+  return undefined;
+}
+
+function adjudicatorModelFor(client: SemanticModelClient): string {
+  if (client.batchGroup === 'groq-semantic') {
+    return process.env.GROQ_ADJUDICATOR_MODEL
+      || process.env.CONTENT_CATEGORY_ADJUDICATOR_MODEL
+      || DEFAULT_GROQ_ADJUDICATOR_MODEL;
+  }
+  if (client.batchGroup === 'gemini-free-semantic') {
+    return process.env.GEMINI_FREE_ADJUDICATOR_MODEL
+      || process.env.CONTENT_CATEGORY_ADJUDICATOR_MODEL
+      || DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL;
+  }
+  return process.env.CONTENT_CATEGORY_ADJUDICATOR_MODEL || DEFAULT_CATEGORY_ADJUDICATOR_MODEL;
+}
 
 const EDUCATION = /\b(?:course|learn|learning|education|educational|academy|training|tutorial|guide|lesson|mentor|coaching|explained|how to|strategy|strategies|analysis|backtest)\b/iu;
 const FINANCE = /\b(?:trading|trade|trader|forex|fx|stock|stocks|equity|equities|crypto|bitcoin|btc|eth|ethereum|xauusd|market|markets|finance|financial|broker|exchange|portfolio|etf|gold|silver|nasdaq|futures?|options?|fund|wealth|invest|investing|investment|bourse|aktien|acciones|ações|bolsa|investir|investieren|inversión|investimento)\b/iu;
@@ -45,7 +106,10 @@ const NEWS = /\b(?:news|headlines?|updates?|commentary|interviews?|market recap|
 // Analysis intended to inform trading/investing decisions is trading content,
 // not news. These terms prevent the news rule from downgrading analysis-only
 // channels that happen to mention news or updates in their bio.
-const TRADING_ANALYSIS_TERMS = /\b(?:technical analysis|market analysis|analisi tecnica|analyse technique|análisis técnico|analysis|charts?|price action|market structure|support|resistance|trends?|scenarios?|setups?|entries|key levels|levels|trade ideas?|forecast|forecasts|分析|分析技術)\b/iu;
+const TRADING_ANALYSIS_TERMS = /\b(?:technical analysis|market analysis|analisi tecnica|analyse technique|análisis técnico|analysis|charts?|price action|market structure|support|resistance|trends?|scenarios?|setups?|entries|key levels|levels|trade ideas?|forecast|forecasts)\b/iu;
+// CJK has no ASCII word boundaries. Keep these alternatives separate so
+// 技術分析 and similar compounds are still recognized as analysis.
+const TRADING_ANALYSIS_CJK = /(?:分析|分析技術)/u;
 const EDUCATION_TERMS = /\b(?:course|learn|learning|education|educational|academy|training|tutorial|guide|lesson|mentor|coaching|explained|how to)\b/iu;
 // Explicit teaching/branding terms only. "Strategy" or "analysis" appear in
 // almost every signal-seller bio and must not exempt a signal-first channel.
@@ -57,8 +121,9 @@ const VENDOR_SELF = /\b(?:official (?:youtube )?channel|we are|we're|our (?:comp
 const FIRST_PERSON_TRADER = /\b(?:i am|i'm|my (?:journey|trades|trading|account|strategy|portfolio)|educator|coach|mentor)\b/iu;
 const SIGNAL_RECAP = /\b(?:recap|review|education|lesson|course|academy|tutorial|read charts|not chase signals)\b/iu;
 const NEGATED_SIGNALS = /\b(?:no|not|never)\s+(?:paid|vip|free)?\s*signals?\b/iu;
-const PRODUCT_SELF = /\b(?:automated trading software|autotrader|trading software)\b/iu;
-const OFFICIAL_CHANNEL = /\b(?:official (?:youtube )?(?:channel|page)|canal oficial|chaîne officielle|offizieller (?:youtube )?kanal|canale ufficiale|القناة الرسمية)\b/iu;
+const OFFICIAL_CHANNEL = /\b(?:official (?:youtube )?(?:channel|page)|canal oficial|chaîne officielle|offizieller (?:youtube )?kanal|canale ufficiale)\b/iu;
+// Arabic script has no ASCII word boundaries; match it without \b.
+const OFFICIAL_CHANNEL_ARABIC = /القناة الرسمية/u;
 const FINANCIAL_INSTITUTION = /\b(?:broker|brokerage|exchange|bank|banco|banque|prop firm|funded|asset management|investment management|securities|cfd|forex broker|trading platform|trading software|scanner|terminal)\b/iu;
 
 function decodeEntities(value: unknown): string {
@@ -74,11 +139,24 @@ function decodeEntities(value: unknown): string {
     .replace(/&nbsp;/giu, ' ');
 }
 
-function normalizedInput(input: RawChannelInput): { name: string; bio: string; all: string; videoTitles: string[] } {
+function normalizedInput(input: RawChannelInput): {
+  name: string;
+  bio: string;
+  all: string;
+  videoTitles: string[];
+  videoTexts: string[];
+} {
   const name = decodeEntities(input.channel_name);
   const bio = decodeEntities(input.description);
-  const videoTitles = (input.videos?.map(video => video.title) || input.video_titles || []).map(decodeEntities).filter(Boolean);
-  return { name, bio, all: `${name} ${bio} ${videoTitles.join(' ')}`.toLocaleLowerCase('en'), videoTitles };
+  // Use the field-aware sample even when `videos` is present but empty, and
+  // keep each description with its title so generic titles cannot hide the
+  // trading focus of the actual upload.
+  const videos = input.videos?.length
+    ? input.videos
+    : (input.video_titles || []).map((title, index) => ({ title, description: input.video_descriptions?.[index] }));
+  const videoTitles = videos.map(video => decodeEntities(video.title)).filter(Boolean);
+  const videoTexts = videos.map(video => decodeEntities(`${video.title || ''} ${video.description || ''}`.trim())).filter(Boolean);
+  return { name, bio, all: `${name} ${bio} ${videoTexts.join(' ')}`.toLocaleLowerCase('en'), videoTitles, videoTexts };
 }
 
 /**
@@ -87,7 +165,7 @@ function normalizedInput(input: RawChannelInput): { name: string; bio: string; a
  * purpose: the conservative adjudicator handles anything not unambiguous.
  */
 export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGuardResult | null {
-  const { name, bio, all, videoTitles } = normalizedInput(input);
+  const { name, bio, all, videoTitles, videoTexts } = normalizedInput(input);
   const nameAndBio = `${name} ${bio}`.toLocaleLowerCase('en');
 
   // HYPE: explicit signals/VIP/promo products. Require a real signal offer:
@@ -133,7 +211,9 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_SIMULATED_PROGRAMS'] };
   }
   if (/\b(?:automated trading software|autotrader|trading software|trading platform)\b/iu.test(nameAndBio)
-    && (VENDOR_SELF.test(nameAndBio) || PRODUCT_SELF.test(nameAndBio))
+    // A product mention is not ownership. Require an explicit vendor cue so a
+    // platform tutorial is left to the adjudicator instead of being rejected.
+    && VENDOR_SELF.test(nameAndBio)
     && /\b(?:software|platform|system|service|vendor)\b/iu.test(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)) {
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_TRADING_SOFTWARE'] };
@@ -149,7 +229,7 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
 
   // Official financial-company channels are institutions even when they
   // publish educational or analytical videos.
-  if (OFFICIAL_CHANNEL.test(nameAndBio)
+  if ((OFFICIAL_CHANNEL.test(nameAndBio) || OFFICIAL_CHANNEL_ARABIC.test(nameAndBio))
     && FINANCIAL_INSTITUTION.test(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)) {
     return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_OFFICIAL_CHANNEL'] };
@@ -159,7 +239,8 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
   if (/\bnews\b/iu.test(nameAndBio)
     && /\b(?:daily|updates?|financial market|headlines?)\b/iu.test(nameAndBio)
     && !EDUCATION_TERMS.test(nameAndBio)
-    && !TRADING_ANALYSIS_TERMS.test(nameAndBio)) {
+    && !TRADING_ANALYSIS_TERMS.test(nameAndBio)
+    && !TRADING_ANALYSIS_CJK.test(nameAndBio)) {
     return { category: 'FINANCIAL_NEWS', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_NEWS_PRODUCT'] };
   }
 
@@ -167,10 +248,10 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
   // at most one financial video title. This avoids penalising non-English
   // educators whose bio is sparse.
   if (videoTitles.length >= 1 && !FINANCE.test(nameAndBio) && !EDUCATION_TERMS.test(nameAndBio)) {
-    const financeTitles = videoTitles.filter(title => FINANCE.test(title)).length;
+    const financeTitles = videoTexts.filter(text => FINANCE.test(text)).length;
     const nonFinanceBio = (nameAndBio.match(NON_FINANCE) || []).length;
-    const newsTitles = videoTitles.filter(title => NEWS.test(title)).length;
-    const liveTitles = videoTitles.filter(title => /\b(?:live|trade recap|setup|entry|exit|signal)\b/iu.test(title)).length;
+    const newsTitles = videoTexts.filter(text => NEWS.test(text)).length;
+    const liveTitles = videoTexts.filter(text => /\b(?:live|trade recap|setup|entry|exit|signal)\b/iu.test(text)).length;
     if (financeTitles <= 1 && nonFinanceBio >= 2) {
       return { category: 'UNRELATED', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_UNRELATED_PRIMARY_FOCUS'] };
     }
@@ -282,25 +363,47 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
 export async function adjudicateCategoryDetailed(
   input: RawChannelInput,
   firstLabel: string,
-  options: { client?: SemanticModelClient | null } = {},
+  options: { client?: SemanticModelClient | null; provider?: string } = {},
 ): Promise<PrecisionGuardEvaluation> {
-  const client = options.client === undefined ? defaultClient() : options.client;
-  if (!client) return { status: 'UNAVAILABLE', result: null };
-  const model = process.env.CONTENT_CATEGORY_ADJUDICATOR_MODEL || DEFAULT_CATEGORY_ADJUDICATOR_MODEL;
+  const client = options.client === undefined
+    ? configuredAdjudicatorClient(options.provider)
+    : options.client;
+  if (!client) return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_UNCONFIGURED' };
+  if (!takeAdjudicatorBudget()) {
+    return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_CAPACITY_DEFERRED' };
+  }
+  const model = adjudicatorModelFor(client);
   try {
-    const value = await client.classify(buildCategoryAdjudicatorPrompt(input, firstLabel), model);
-    if (!value || typeof value !== 'object') return { status: 'UNAVAILABLE', result: null };
+    const value = await client.classify(
+      buildCategoryAdjudicatorPrompt(input, firstLabel),
+      model,
+      {
+        jobId: input.job_id,
+        runId: input.run_id,
+        requestMetadata: { semanticOperation: 'precision-adjudicator', precisionGuard: 'category' },
+      },
+    );
+    if (!value || typeof value !== 'object') {
+      return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_MALFORMED' };
+    }
     const raw = value as Record<string, unknown>;
     const label = String(raw.label || '').toUpperCase();
     if (label === 'KEEP_RELEVANT' || label === 'AMBIGUOUS') return { status: 'KEEP', result: null };
-    if (!PRECISION_CATEGORIES.has(label)) return { status: 'KEEP', result: null };
+    if (!PRECISION_CATEGORIES.has(label)) {
+      // A valid JSON response with a missing or unexpected label is not a
+      // keep verdict; it is a malformed adjudication and must defer.
+      return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_MALFORMED' };
+    }
     const rawConfidence = Number(raw.confidence);
-    // Providers may return a 0..1 probability or a 0..100 percentage. Accept
-    // both scales so a correctly confident downgrade is never discarded.
+    // The prompt asks for 0..100. Only a strict fraction is treated as a
+    // probability; the exact value 1 is 1%, not 100%.
     const confidence = Number.isFinite(rawConfidence)
-      ? (rawConfidence <= 1 ? rawConfidence * 100 : rawConfidence)
+      ? (rawConfidence > 0 && rawConfidence < 1 ? rawConfidence * 100 : rawConfidence)
       : Number.NaN;
-    if (!Number.isFinite(confidence) || confidence < 70) return { status: 'KEEP', result: null };
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 100) {
+      return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_MALFORMED' };
+    }
+    if (confidence < 70) return { status: 'KEEP', result: null };
     return {
       status: 'DOWNGRADE',
       result: {
@@ -312,14 +415,14 @@ export async function adjudicateCategoryDetailed(
       },
     };
   } catch {
-    return { status: 'UNAVAILABLE', result: null };
+    return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_OUTAGE' };
   }
 }
 
 export async function adjudicateCategory(
   input: RawChannelInput,
   firstLabel: string,
-  options: { client?: SemanticModelClient | null } = {},
+  options: { client?: SemanticModelClient | null; provider?: string } = {},
 ): Promise<PrecisionGuardResult | null> {
   return (await adjudicateCategoryDetailed(input, firstLabel, options)).result;
 }
@@ -336,7 +439,7 @@ export async function evaluateCategoryPrecisionGuard(
   options: PrecisionGuardOptions = {},
 ): Promise<PrecisionGuardEvaluation> {
   if (!firstLabel) return { status: 'KEEP', result: null };
-  if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION'].includes(firstLabel)) {
+  if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'MARKET_INSTITUTION', 'HYPE'].includes(firstLabel)) {
     return { status: 'KEEP', result: null };
   }
   const enabled = options.enabled ?? process.env.CONTENT_CATEGORY_PRECISION_GUARD_ENABLED !== 'false';
@@ -351,7 +454,7 @@ export async function evaluateCategoryPrecisionGuard(
       return { status: 'UNAVAILABLE', result: null };
     }
   }
-  return adjudicateCategoryDetailed(input, firstLabel, { client: options.client });
+  return adjudicateCategoryDetailed(input, firstLabel, { client: options.client, provider: options.provider });
 }
 
 export async function applyCategoryPrecisionGuard(

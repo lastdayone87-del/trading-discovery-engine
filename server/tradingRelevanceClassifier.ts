@@ -83,43 +83,102 @@ export async function classifyTradingRelevanceDetailed(
   input.evidence_corpus = buildCanonicalEvidenceCorpus(input);
   const decision: VerificationDecision = await verifyChannelTradingRelevance(input);
   const semantic = semanticProviderOutcomeFlags(decision.evidenceCollection.providers);
-  // A precision downgrade is only meaningful on a relevant result produced by
-  // a semantic provider. A provider outage must defer, never be relabelled.
-  const precision = decision.status !== 'NON_TRADING' && semantic.served
-    ? await evaluateCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel)
-    : { status: 'KEEP' as const, result: null };
+  const servingSemanticProvider = decision.evidenceCollection.providers.find(provider =>
+    /semantic/.test(String(provider.provider)) && provider.outcome === 'EXECUTED_WITH_EVIDENCE',
+  )?.provider;
+  // The guard is a terminal classifier only for a first-pass confirmation with
+  // sufficient evidence and a served semantic verdict. A thin or already
+  // uncertain result must never be turned into a terminal non-trading decision
+  // by a keyword rule; those cases route to review or enrichment instead.
+  const precisionEligible = decision.status === 'TRADING_CONFIRMED'
+    && semantic.served
+    && decision.evidenceCollection.sufficiency === 'SUFFICIENT';
+  const precision = precisionEligible
+    ? await evaluateCategoryPrecisionGuard(input, decision.geminiSemanticSummary?.taxonomyLabel, { provider: servingSemanticProvider })
+    : { status: 'KEEP' as const, result: null, reasonCode: undefined };
+  const uncertainConfidence = (score: number) => Math.max(23, Math.min(79, score));
+  const policyBase = decision.decisionPolicy || {
+    version: 'precision-guard-v1',
+    tradingProbability: 0,
+    nonTradingProbability: 0,
+    coverageConfidence: 0,
+    reasonCodes: [],
+  };
   if (precision.status === 'DOWNGRADE' && precision.result) {
     const guard = precision.result;
-    // A precision guard may only downgrade a first-pass relevant category.
-    // It never upgrades, and the evidence safeguards are untouched.
-    decision.status = 'NON_TRADING';
-    decision.confidenceScore = Math.min(22, decision.confidenceScore);
+    // Commercial institutions, broker/platform channels, signal sellers and
+    // promotional channels are still trading/investing content. The guard may
+    // refine their category, but must not turn them into a non-trading result.
+    const relevantRefinement = guard.category === 'MARKET_INSTITUTION' || guard.category === 'HYPE';
+    const financeAdjacent = guard.category === 'FINANCIAL_NEWS';
+    decision.category = guard.category;
     decision.geminiSemanticSummary = {
       ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),
-      isTrading: 'NO',
+      isTrading: relevantRefinement ? 'YES' : 'NO',
       taxonomyLabel: guard.category,
+      calibratedConfidence: guard.source === 'ADJUDICATOR' ? guard.confidence : undefined,
       reason: `[${guard.category}] Precision guard: ${guard.reasonCodes.join(', ')}`,
     };
-    decision.decisionPolicy = {
-      ...(decision.decisionPolicy || { version: 'precision-guard-v1', tradingProbability: 0, nonTradingProbability: 0, coverageConfidence: 0, reasonCodes: [] }),
-      reasonCodes: [
-        ...(decision.decisionPolicy?.reasonCodes || []),
-        'CONTENT_CATEGORY_PRECISION_GUARD',
-        ...guard.reasonCodes,
-      ],
-    };
+    if (relevantRefinement) {
+      // Keep the first-pass confirmation and its confidence; only the refined
+      // content category and its own confidence change.
+      decision.decisionPolicy = {
+        ...policyBase,
+        version: 'precision-guard-v1',
+        reasonCodes: [
+          ...(policyBase.reasonCodes || []),
+          'PRECISION_CATEGORY_REFINED_RELEVANT',
+          ...guard.reasonCodes,
+        ],
+      };
+      decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_CATEGORY_REFINED ${guard.category}: ${guard.reasonCodes.join(', ')}`;
+    } else {
+      // UNRELATED is the hard exclusion. FINANCIAL_NEWS/PERSONAL_FINANCE are
+      // finance-adjacent and may be non-trading, but they are never relabelled
+      // as unrelated.
+      decision.status = 'NON_TRADING';
+      decision.confidenceScore = Math.min(22, decision.confidenceScore);
+      const tradingProbability = Math.min(22, Number(policyBase.tradingProbability) || 0);
+      decision.decisionPolicy = {
+        ...policyBase,
+        version: 'precision-guard-v1',
+        tradingProbability,
+        nonTradingProbability: Math.max(0, 100 - tradingProbability),
+        reasonCodes: [
+          ...(policyBase.reasonCodes || []),
+          'PRECISION_GUARD_CONFIRMED_FIRST_PASS',
+          'CONTENT_CATEGORY_PRECISION_GUARD',
+          ...(financeAdjacent ? ['PRECISION_GUARD_FINANCE_ADJACENT'] : []),
+          ...guard.reasonCodes,
+        ],
+      };
+      decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_GUARD ${guard.category}: ${guard.reasonCodes.join(', ')}`;
+    }
   } else if (precision.status === 'UNAVAILABLE') {
     // A provider outage must never silently confirm a first-pass relevant
     // result that the adjudicator could not clear. Defer/retry instead of
-    // creating human review.
+    // creating human review, and keep the decision envelope internally
+    // consistent with the uncertain status.
     decision.status = 'UNCERTAIN';
+    decision.confidenceScore = uncertainConfidence(decision.confidenceScore);
+    decision.geminiSemanticSummary = {
+      ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),
+      isTrading: 'UNCERTAIN',
+      calibratedConfidence: undefined,
+      reason: `[PRECISION DEFERRAL] ${precision.reasonCode || 'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED'}`,
+    };
     decision.decisionPolicy = {
-      ...(decision.decisionPolicy || { version: 'precision-guard-v1', tradingProbability: 0, nonTradingProbability: 0, coverageConfidence: 0, reasonCodes: [] }),
+      ...policyBase,
+      version: 'precision-guard-v1',
+      tradingProbability: decision.confidenceScore,
+      nonTradingProbability: Math.max(0, 100 - decision.confidenceScore),
       reasonCodes: [
-        ...(decision.decisionPolicy?.reasonCodes || []),
+        ...(policyBase.reasonCodes || []),
         'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED',
+        ...(precision.reasonCode ? [precision.reasonCode] : []),
       ],
     };
+    decision.mathematicalJustification = `${decision.mathematicalJustification} | PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED`;
   }
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
   const lifecycleStage = decision.stagedClassification?.stages.find(stage => stage.stage === 'LIFECYCLE');
