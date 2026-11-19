@@ -179,3 +179,13 @@ test('deterministic provider failures do not make a semantic attempt look degrad
     { abstained: false, failed: true, served: false },
   );
 });
+
+test('a completed no-match is neither an abstention nor a provider failure', () => {
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'gemini_semantic', outcome: 'FAILED_PROVIDER' },
+      { provider: 'groq_semantic', outcome: 'EXECUTED_NO_MATCH' },
+    ]),
+    { abstained: false, failed: false, served: false },
+  );
+});

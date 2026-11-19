@@ -138,7 +138,7 @@ export async function classifyTradingRelevanceDetailed(
       : semanticServed
         ? 'AI_SEMANTIC_CLASSIFIER'
         : routing.semanticAttempted
-          ? semanticAbstained ? 'SEMANTIC_ABSTAINED' : semanticFailed ? 'DEGRADED_HEURISTIC' : 'SEMANTIC_ABSTAINED'
+          ? semanticAbstained ? 'SEMANTIC_ABSTAINED' : semanticFailed ? 'DEGRADED_HEURISTIC' : 'SEMANTIC_NO_MATCH'
           : decision.classificationMethod === 'DEGRADED_HEURISTIC'
             ? 'DEGRADED_HEURISTIC'
             : 'HEURISTIC_ONLY';
