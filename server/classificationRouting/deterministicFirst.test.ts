@@ -281,7 +281,7 @@ test('a confirmed channel whose video sample contradicts its bio is sent to huma
 });
 
 test('a relevant refined category owns the decision over the video-focus heuristic', () => {
-  for (const contentCategory of ['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION']) {
+  for (const contentCategory of ['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'MARKET_INSTITUTION', 'HYPE']) {
     const routed = resolveClassificationRouting(decision({
       status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
       providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
@@ -294,8 +294,8 @@ test('a relevant refined category owns the decision over the video-focus heurist
   }
 });
 
-test('non-relevant refined categories still use the video-focus guard', () => {
-  for (const category of ['MARKET_INSTITUTION', 'HYPE', 'UNRELATED', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE']) {
+test('finance-adjacent and unrelated refined categories still use the video-focus guard', () => {
+  for (const category of ['UNRELATED', 'FINANCIAL_NEWS', 'PERSONAL_FINANCE']) {
     const routed = resolveClassificationRouting(decision({
       status: 'TRADING_CONFIRMED', confidenceScore: 90, recognitionState: 'AMBIGUOUS_THIN', semanticPolicy: 'BOUNDED_WAIT',
       providers: [semanticProvider('EXECUTED_WITH_EVIDENCE')],
@@ -559,14 +559,24 @@ test('an unavailable precision adjudicator defers instead of confirming or revie
   assert.equal(routed.fallbackReason, 'PRECISION_ADJUDICATOR_UNAVAILABLE_DEFERRED');
 });
 
-test('a category precision guard is terminal non-trading, not review', () => {
+test('a confirmed first-pass category guard is terminal non-trading, not review', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'NON_TRADING',
+    confidenceScore: 15,
+    policyReasons: ['PRECISION_GUARD_CONFIRMED_FIRST_PASS', 'CONTENT_CATEGORY_PRECISION_GUARD', 'PRECISION_CATEGORY_HYPE'],
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'SEMANTIC_NON_TRADING');
+  assert.equal(routed.humanReview, false);
+});
+
+test('a category guard without a confirmed first pass cannot terminally reject', () => {
   const routed = resolveClassificationRouting(decision({
     status: 'NON_TRADING',
     confidenceScore: 15,
     policyReasons: ['CONTENT_CATEGORY_PRECISION_GUARD', 'PRECISION_CATEGORY_HYPE'],
   }), { independentEvidence: true });
-  assert.equal(routed.route, 'SEMANTIC_NON_TRADING');
-  assert.equal(routed.humanReview, false);
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.fallbackReason, 'NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW');
 });
 
 test('a serving semantic NO assessment sends a confirmed decision to review', () => {

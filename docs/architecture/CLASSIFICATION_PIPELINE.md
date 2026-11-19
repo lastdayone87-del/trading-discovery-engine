@@ -81,7 +81,7 @@ The compact multilingual model is the primary generalization provider for
 meaning not represented in static packs. It receives separately identified
 fields rather than flattened text and must return a closed taxonomy:
 `ACTIVE_TRADING`, `TRADING_EDUCATION`, `INVESTING_EDUCATION`, `FINANCIAL_NEWS`,
-`PERSONAL_FINANCE`, `MARKET_INSTITUTION`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. `ACTIVE_TRADING`, `TRADING_EDUCATION`, and `INVESTING_EDUCATION` are positive trading-relevance labels; `FINANCIAL_NEWS`, `PERSONAL_FINANCE`, and `MARKET_INSTITUTION` map to non-trading-adjacent evidence; `HYPE` and `UNRELATED` map to negative/alternative evidence. `TRADING_EDUCATION` includes analysis-only and forecast-style trading channels that produce charts, price action, market structure, support/resistance, trends, scenarios, setups, or trade ideas intended to inform trading decisions; step-by-step lessons are not required. `INVESTING_EDUCATION` likewise includes investment analysis, price targets, and company/portfolio analysis without step-by-step lessons. `FINANCIAL_NEWS` is reserved for reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading/investment analysis or actionable trade ideas. Its assertion includes
+`PERSONAL_FINANCE`, `MARKET_INSTITUTION`, `HYPE`, `UNRELATED`, or `AMBIGUOUS`. `ACTIVE_TRADING`, `TRADING_EDUCATION`, `INVESTING_EDUCATION`, `MARKET_INSTITUTION`, and `HYPE` are positive trading-relevance labels: commercial operation, broker/platform identity, signal selling, VIP communities and promotional claims do not make trading content non-relevant. `FINANCIAL_NEWS` and `PERSONAL_FINANCE` map to finance-adjacent non-trading evidence; `UNRELATED` maps to negative/alternative evidence. `TRADING_EDUCATION` includes analysis-only and forecast-style trading channels that produce charts, price action, market structure, support/resistance, trends, scenarios, setups, or trade ideas intended to inform trading decisions; step-by-step lessons are not required. `INVESTING_EDUCATION` likewise includes investment analysis, price targets, and company/portfolio analysis without step-by-step lessons. `FINANCIAL_NEWS` is reserved for reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading/investment analysis or actionable trade ideas. Its assertion includes
 field citations, detected language and script per field, concepts, reason codes,
 and pinned model, prompt, feature, and calibration versions. Unsupported language,
 missing citations, ambiguity, and confidence below policy threshold produce a
@@ -316,12 +316,17 @@ Recovery uses the existing `ENRICH_CHANNEL` queue. The retry policy is defined
 by `server/evidenceEngine/adjudicatorRetryPolicy.ts`:
 
 - backoff: 1m, 5m, 30m, 2h, 6h, 24h (capped)
-- each deferred channel records attempts, last error and `nextRetryAt`
+- the deferred job keeps the same enrichment stage and sets `run_after` to
+  `nextRetryAt`, so ordinary stage exhaustion cannot turn it into review debt
+- the job payload records `adjudicatorDeferralAttempts`,
+  `adjudicatorFirstDeferredAt`, `adjudicatorDeferralReason` and
+  `adjudicatorNextRetryAt`; `last_error` carries the operational reason
 - quota-aware workers retry due channels after provider recovery
 - a channel is finalized only after an adjudicator result (downgrade or keep)
 - while deferred it is never confirmed and never becomes review debt
-- `summarizeAdjudicatorDeferrals` exposes total, due, resolved, oldest age,
-  max attempts and reason counts for operations
+- `/api/provider-metrics` includes `adjudicatorDeferrals` from
+  `getAdjudicatorDeferralMetrics`: total, due, resolved, oldest deferral age,
+  max overdue time, max attempts and reason counts
 
 The same policy applies after quota resets; a deferred channel cannot become
 permanently stuck without an operational alert.

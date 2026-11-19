@@ -52,9 +52,14 @@ export function observedTradingFamilies(
     ?? ((composition.tradingCoreFamilies ?? 0) + (composition.tradingAdjacentFamilies ?? 0));
 }
 
-/** Explicit non-relevant categories. Unknown/future labels keep legacy behavior. */
+/**
+ * Relevance is not the same as active trading. Commercial institutions, hype
+ * and signal channels are still trading/investing content; only non-financial
+ * content and finance without market analysis are excluded from confirmation.
+ * Unknown/future labels keep legacy behavior.
+ */
 const NON_RELEVANT_CONTENT_CATEGORIES = new Set([
-  'FINANCIAL_NEWS','PERSONAL_FINANCE','MARKET_INSTITUTION','HYPE','UNRELATED','AMBIGUOUS',
+  'FINANCIAL_NEWS','PERSONAL_FINANCE','UNRELATED','AMBIGUOUS',
 ]);
 
 export function isTradingRelevantCategory(category?:string):boolean{

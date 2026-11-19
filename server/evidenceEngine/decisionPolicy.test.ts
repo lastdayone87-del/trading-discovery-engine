@@ -111,7 +111,7 @@ test('a channel title is not an independent creator-owned positive field', () =>
   assert.equal(hasIndependentCreatorOwnedPositiveField([searchOnly]), false);
 });
 
-test('only active, trading-education and investing-education categories confirm', () => {
+test('trading, investing, institution and hype categories confirm; adjacent and unrelated do not', () => {
   const confirm = (contentCategory?: string) => evaluateUnifiedDecisionPolicy({
     evidence: [positive('channel_bio')],
     collection: collection(),
@@ -120,10 +120,15 @@ test('only active, trading-education and investing-education categories confirm'
     minimumTradingScore: 1,
     contentCategory,
   });
-  for (const category of ['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION']) {
+  for (const category of [
+    'ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION',
+    // Commercial, broker/platform, signal and promotional channels remain
+    // trading-relevant when their actual content is trading/investing.
+    'MARKET_INSTITUTION', 'HYPE',
+  ]) {
     assert.equal(confirm(category).status, 'TRADING_CONFIRMED', category);
   }
-  for (const category of ['FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'MARKET_INSTITUTION', 'HYPE', 'UNRELATED', 'AMBIGUOUS']) {
+  for (const category of ['FINANCIAL_NEWS', 'PERSONAL_FINANCE', 'UNRELATED', 'AMBIGUOUS']) {
     const decision = confirm(category);
     assert.equal(decision.status, 'UNCERTAIN', category);
     assert.ok(decision.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'), category);
@@ -176,7 +181,7 @@ test('Cali Bourse shape: 0 core + 5 adjacent investing education confirms', () =
   assert.equal(decision.status, 'TRADING_CONFIRMED');
 });
 
-test('Cali Bourse shape is blocked when the refined category is a market institution', () => {
+test('Cali Bourse shape still confirms as a market institution', () => {
   const decision = evaluateUnifiedDecisionPolicy({
     evidence: [positive('channel_bio')],
     collection: collection(),
@@ -186,11 +191,10 @@ test('Cali Bourse shape is blocked when the refined category is a market institu
     composition: caliComposition,
     contentCategory: 'MARKET_INSTITUTION',
   });
-  assert.equal(decision.status, 'UNCERTAIN');
-  assert.ok(decision.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'));
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
 });
 
-test('Cali Bourse shape is blocked when the refined category is hype', () => {
+test('Cali Bourse shape still confirms as hype', () => {
   const decision = evaluateUnifiedDecisionPolicy({
     evidence: [positive('channel_bio')],
     collection: collection(),
@@ -200,6 +204,5 @@ test('Cali Bourse shape is blocked when the refined category is hype', () => {
     composition: caliComposition,
     contentCategory: 'HYPE',
   });
-  assert.equal(decision.status, 'UNCERTAIN');
-  assert.ok(decision.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'));
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
 });

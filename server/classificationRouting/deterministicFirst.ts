@@ -164,11 +164,11 @@ function semanticSignals(decision: RoutingInput) {
 
 function hasTerminalNegativeEvidence(decision: RoutingInput): boolean {
   const reasons = decision.decisionPolicy?.reasonCodes || [];
-  // A high-precision category guard is a terminal non-trading decision. It
-  // does not need the unrelated-domain evidence threshold because it never
-  // rejects on weak keywords; it only confirms a commercial/promo/news/
-  // unrelated category after the first-pass relevant result.
-  if (reasons.includes('CONTENT_CATEGORY_PRECISION_GUARD')) return true;
+  // A high-precision category guard is terminal only when it was applied to a
+  // first-pass confirmation with sufficient evidence. Thin or first-pass
+  // uncertain results never receive this marker and cannot be rejected here.
+  if (reasons.includes('PRECISION_GUARD_CONFIRMED_FIRST_PASS')
+    && reasons.includes('CONTENT_CATEGORY_PRECISION_GUARD')) return true;
   if (decision.evidenceCollection.terminalNegativeSufficiency?.status !== 'SUFFICIENT') return false;
   // The policy layer only terminalizes creator-level unrelated-domain
   // evidence. The status cannot be terminalized by isolated keywords.
@@ -286,7 +286,11 @@ export function resolveClassificationRouting(
     const videoTexts = stripRepeatedFooterLines((options.videoTexts || []).map(text => String(text || '').trim()).filter(Boolean));
     const categoryOwnsDecision = options.contentCategory === 'ACTIVE_TRADING'
       || options.contentCategory === 'TRADING_EDUCATION'
-      || options.contentCategory === 'INVESTING_EDUCATION';
+      || options.contentCategory === 'INVESTING_EDUCATION'
+      // Commercial, broker/platform, signal and promotional channels are
+      // still trading-relevant when their actual content is trading.
+      || options.contentCategory === 'MARKET_INSTITUTION'
+      || options.contentCategory === 'HYPE';
     if (!categoryOwnsDecision && videoTexts.length >= 3) {
       const focusByVideo = videoTexts.map(text => nonTradingContentFocus(text));
       const focusedVideos = focusByVideo.filter(focus => focus.total >= 1);

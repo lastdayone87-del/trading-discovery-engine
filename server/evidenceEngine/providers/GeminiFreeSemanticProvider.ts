@@ -460,7 +460,11 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     const abstained = !result.supportedLanguage || result.label === 'AMBIGUOUS' || calibrated < 50 || result.citations.length === 0;
     const positive = result.label === 'ACTIVE_TRADING'
       || result.label === 'TRADING_EDUCATION'
-      || result.label === 'INVESTING_EDUCATION';
+      || result.label === 'INVESTING_EDUCATION'
+      // Commercial, broker/platform, signal and promotional channels are
+      // trading/investing content when their actual material is trading.
+      || result.label === 'MARKET_INSTITUTION'
+      || result.label === 'HYPE';
     const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : positive ? 'METHODOLOGY_CONCEPT' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
