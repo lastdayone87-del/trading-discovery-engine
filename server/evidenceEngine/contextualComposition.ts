@@ -486,7 +486,9 @@ export function buildContextualComposition(
     && unrelatedCoverage < 0.34) {
     focus = 'TRADING_DOMINANT';
     reasons.push('EXPLICIT_CREATOR_TRADING_STATEMENT');
-  } else if (tradingCoreFamilies >= 2
+  } else if (tradingFamilies >= 2
+    && !explicitCreatorAlternative
+    && !(recentAlternativeFamilies > recentTradingFamilies && alternativeFamilies > 0)
     && tradingCoverage >= 0.5
     && alternativeCoverage < 0.34
     && unrelatedCoverage < 0.34) {
