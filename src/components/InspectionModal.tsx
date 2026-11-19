@@ -107,6 +107,8 @@ export const InspectionModal: React.FC<Props> = ({ channel, onClose }) => {
                       ? 'Semantic admission'
                       : channel.trading_relevance_breakdown.classification_method === 'SEMANTIC_ABSTAINED'
                         ? 'Semantic abstained'
+                        : channel.trading_relevance_breakdown.classification_method === 'SEMANTIC_NO_MATCH'
+                        ? 'Semantic no match'
                         : channel.trading_relevance_breakdown.classification_method === 'DETERMINISTIC_EVIDENCE'
                         ? 'Deterministic evidence'
                         : channel.trading_relevance_breakdown.classification_method === 'DEGRADED_HEURISTIC'

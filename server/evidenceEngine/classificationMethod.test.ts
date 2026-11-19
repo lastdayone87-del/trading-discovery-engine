@@ -148,13 +148,44 @@ test('deterministic provider failures do not make a semantic attempt look degrad
       { provider: 'channel_metadata', outcome: 'FAILED_PROVIDER' },
       { provider: 'gemini_semantic', outcome: 'ABSTAINED_LOW_CONFIDENCE' },
     ]),
-    { abstained: true, failed: false },
+    { abstained: true, failed: false, served: false },
   );
   assert.deepEqual(
     semanticProviderOutcomeFlags([
-      { provider: 'channel_metadata', outcome: 'FAILED_PROVIDER' },
-      { provider: 'gemini_semantic', outcome: 'EXECUTED_WITH_EVIDENCE' },
+      { provider: 'gemini_semantic', outcome: 'FAILED_PROVIDER' },
+      { provider: 'groq_semantic', outcome: 'EXECUTED_WITH_EVIDENCE' },
     ]),
-    { abstained: false, failed: false },
+    { abstained: false, failed: false, served: true },
+  );
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'gemini_semantic', outcome: 'FAILED_PROVIDER' },
+      { provider: 'groq_semantic', outcome: 'FAILED_TIMEOUT' },
+    ]),
+    { abstained: false, failed: true, served: false },
+  );
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'gemini_semantic', outcome: 'UNAVAILABLE_CONFIGURATION' },
+      { provider: 'groq_semantic', outcome: 'FAILED_PROVIDER' },
+    ]),
+    { abstained: false, failed: true, served: false },
+  );
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'gemini_semantic', outcome: 'SUPPRESSED_BY_POLICY' },
+      { provider: 'groq_semantic', outcome: 'FAILED_PROVIDER' },
+    ]),
+    { abstained: false, failed: true, served: false },
+  );
+});
+
+test('a completed no-match is neither an abstention nor a provider failure', () => {
+  assert.deepEqual(
+    semanticProviderOutcomeFlags([
+      { provider: 'gemini_semantic', outcome: 'FAILED_PROVIDER' },
+      { provider: 'groq_semantic', outcome: 'EXECUTED_NO_MATCH' },
+    ]),
+    { abstained: false, failed: false, served: false },
   );
 });

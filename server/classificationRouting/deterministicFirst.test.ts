@@ -53,9 +53,9 @@ function decision(overrides: DecisionOverrides = {}): VerificationDecision {
   } as VerificationDecision;
 }
 
-const semanticProvider = (outcome: string) => ({
-  provider: 'gemini_semantic' as const,
-  availability: 'AVAILABLE' as const,
+const semanticProvider = (outcome: string, provider: 'gemini_semantic' | 'groq_semantic' = 'gemini_semantic', availability: 'AVAILABLE' | 'FAILED' = 'AVAILABLE') => ({
+  provider,
+  availability,
   evidenceCount: 1,
   outcome: outcome as any,
   reasonCodes: [],
@@ -172,14 +172,69 @@ test('non-trading without terminal creator-level negative evidence goes to human
   assert.ok(routed.reasonCodes.includes('NON_TERMINAL_NEGATIVE_EVIDENCE_REQUIRES_REVIEW'));
 });
 
-test('sufficient independent evidence with failed semantic goes to human review', () => {
+test('all semantic providers failed defers to enrich, not review', () => {
   const routed = resolveClassificationRouting(decision({
-    providers: [semanticProvider('FAILED_PROVIDER')],
+    providers: [semanticProvider('FAILED_PROVIDER', 'gemini_semantic', 'FAILED'), semanticProvider('FAILED_TIMEOUT', 'groq_semantic', 'FAILED')],
+    recognitionState: 'AMBIGUOUS_THIN',
+    semanticPolicy: 'BOUNDED_WAIT',
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.enrich, true);
+  assert.equal(routed.humanReview, false);
+  assert.equal(routed.fallbackReason, 'PROVIDER_DEFERRED_RETRY');
+});
+
+test('an unavailable route does not hide a total outage of attempted providers', () => {
+  const routed = resolveClassificationRouting(decision({
+    providers: [
+      semanticProvider('UNAVAILABLE_CONFIGURATION', 'gemini_semantic', 'AVAILABLE'),
+      semanticProvider('FAILED_PROVIDER', 'groq_semantic', 'FAILED'),
+    ],
+    recognitionState: 'AMBIGUOUS_THIN',
+    semanticPolicy: 'BOUNDED_WAIT',
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.fallbackReason, 'PROVIDER_DEFERRED_RETRY');
+});
+
+test('a failed primary with a successful fallback is not a provider failure', () => {
+  const routed = resolveClassificationRouting(decision({
+    providers: [semanticProvider('FAILED_PROVIDER', 'gemini_semantic', 'FAILED'), semanticProvider('EXECUTED_WITH_EVIDENCE', 'groq_semantic')],
     recognitionState: 'AMBIGUOUS_THIN',
     semanticPolicy: 'BOUNDED_WAIT',
   }), { independentEvidence: true });
   assert.equal(routed.route, 'HUMAN_REVIEW');
-  assert.equal(routed.fallbackReason, 'SEMANTIC_FAILED_WITH_SUFFICIENT_EVIDENCE');
+  assert.equal(routed.fallbackReason, 'SEMANTIC_AMBIGUOUS_WITH_SUFFICIENT_EVIDENCE');
+});
+
+test('a failed primary with an abstaining fallback is completed ambiguity, not a provider failure', () => {
+  const routed = resolveClassificationRouting(decision({
+    providers: [semanticProvider('FAILED_PROVIDER', 'gemini_semantic', 'FAILED'), semanticProvider('ABSTAINED_LOW_CONFIDENCE', 'groq_semantic')],
+    recognitionState: 'AMBIGUOUS_THIN',
+    semanticPolicy: 'BOUNDED_WAIT',
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.fallbackReason, 'SEMANTIC_ABSTAINED_WITH_SUFFICIENT_EVIDENCE');
+});
+
+test('a completed semantic call with no match goes to human review, not capacity enrichment', () => {
+  const routed = resolveClassificationRouting(decision({
+    providers: [semanticProvider('EXECUTED_NO_MATCH')],
+    recognitionState: 'AMBIGUOUS_THIN',
+    semanticPolicy: 'BOUNDED_WAIT',
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'HUMAN_REVIEW');
+  assert.equal(routed.fallbackReason, 'SEMANTIC_NO_MATCH_WITH_SUFFICIENT_EVIDENCE');
+});
+
+test('no semantic capacity defers to enrich, not review', () => {
+  const routed = resolveClassificationRouting(decision({
+    providers: [],
+    recognitionState: 'AMBIGUOUS_THIN',
+    semanticPolicy: 'BOUNDED_WAIT',
+  }), { independentEvidence: true });
+  assert.equal(routed.route, 'ENRICH');
+  assert.equal(routed.fallbackReason, 'SEMANTIC_CAPACITY_REQUIRED');
 });
 
 test('sufficient evidence without independent corroboration keeps enriching', () => {
