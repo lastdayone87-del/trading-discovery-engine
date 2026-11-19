@@ -16,7 +16,11 @@ jobs:
       checks: write
     name: PR Agent review
     steps:
+      - name: Check PR Agent API key
+        id: key
+        run: echo "available=${{ secrets.GEMINI_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
       - name: Run PR Agent
+        if: steps.key.outputs.available == 'true'
         uses: the-pr-agent/pr-agent@main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

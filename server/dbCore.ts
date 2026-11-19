@@ -30,7 +30,7 @@ import { sanitizeAcquisitionAttribution, type AcquisitionAttribution } from './a
 import { hasRetainedLastKnownGoodDiscordInvite, hasServingLastKnownGoodDiscordInvite } from './discordProjection';
 import { validateLedgerInput, type ValidationKind, type ValidationStatus } from './phase3Validation';
 import { browserCapabilityIsUnavailable } from './browserCapability';
-import { acquisitionJobClockV2Enabled, claimOrderByClause, isCommunityRetryOnlyClaim, reopenClockUpdateSql } from './acquisitionJobClockPolicy';
+import { acquisitionJobClockV2Enabled, claimOrderByClause, isCapacityLeaseFailure, isCommunityRetryOnlyClaim, reopenClockUpdateSql } from './acquisitionJobClockPolicy';
 import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
@@ -349,7 +349,7 @@ export async function countDiscordInvalidObservations(channelId:string,candidate
  * of looping RETRY_PENDING forever.
  */
 export async function countDiscordProviderFailureObservations(channelId:string,candidateId:string|undefined,inviteLocator:string):Promise<number>{const db=await getDb();const result=await db.query(`SELECT count(*)::int count FROM discord_check_attempts WHERE channel_id=$1 AND (candidate_id=$2 OR (candidate_id IS NULL AND invite_locator=$3)) AND operational_outcome='PROVIDER_FAILURE' AND http_status=404`,[channelId,candidateId||null,inviteLocator]);return Number(result.rows[0]?.count||0);}
-export async function appendExternalAcquisitionObservations(channelId:string,observations:Array<{requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:string;required:boolean;outcome:string;retryable:boolean;httpStatus?:number;failureClass?:string;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;relevanceTier?:unknown;relevanceReason?:unknown}>,attribution?:AcquisitionAttribution):Promise<void>{
+export async function appendExternalAcquisitionObservations(channelId:string,observations:Array<{requestedUrl:string;finalUrl?:string;wrapperUrl?:string;surface:string;required:boolean;outcome:string;retryable:boolean;httpStatus?:number;failureClass?:string;detail:string;observedAt:string;telemetry?:CrawlerTelemetry;staticTerminalNotFound?:boolean;staticTerminalNotFoundReason?:string;relevanceTier?:unknown;relevanceReason?:unknown;workLeaseToken?:string}>,attribution?:AcquisitionAttribution):Promise<void>{
   // Additive provenance only: the lane attribution is sanitized/bounded and
   // persisted under a distinct key. Historical rows are never rewritten and
   // absent attribution keeps the exact legacy provenance shape.
@@ -361,7 +361,7 @@ export async function appendExternalAcquisitionObservations(channelId:string,obs
     const staticTerminalNotFound=observation.staticTerminalNotFound===true;
     const relevanceTier=typeof (observation as {relevanceTier?:unknown}).relevanceTier==='string'?(observation as {relevanceTier:string}).relevanceTier:undefined;
     const relevanceReason=typeof (observation as {relevanceReason?:unknown}).relevanceReason==='string'?(observation as {relevanceReason:string}).relevanceReason:undefined;
-    await db.query(`INSERT INTO external_acquisition_observations(observation_key,channel_id,requested_url,final_url,outcome,retryable,http_status,failure_class,detail,provenance,policy_version,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'external-community-acquisition-v2',$11) ON CONFLICT(observation_key) DO NOTHING`,[`${channelId}:${observation.observedAt}:${index}:${observation.requestedUrl}`,channelId,observation.requestedUrl,observation.finalUrl||null,observation.outcome,observation.retryable,observation.httpStatus||null,observation.failureClass||null,observation.detail,JSON.stringify({provider:'external-link',boundedDepth:2,surface:observation.surface,required:observation.required,wrapperUrl:observation.wrapperUrl||null,...(laneAttribution?{acquisitionAttribution:laneAttribution}:{}),...(telemetryWithAttribution?{crawlerTelemetry:telemetryWithAttribution}:{}),...(staticTerminalNotFound?{staticTerminalNotFound:true,staticTerminalNotFoundReason:observation.staticTerminalNotFoundReason||null}:{}),...(relevanceTier?{relevanceTier,relevanceReason:relevanceReason||null,relevancePolicyVersion:'acquisition-relevance-v1'}:{})}),observation.observedAt]);
+    await db.query(`INSERT INTO external_acquisition_observations(observation_key,channel_id,requested_url,final_url,outcome,retryable,http_status,failure_class,detail,provenance,policy_version,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'external-community-acquisition-v2',$11) ON CONFLICT(observation_key) DO NOTHING`,[`${channelId}:${observation.observedAt}:${index}:${observation.requestedUrl}`,channelId,observation.requestedUrl,observation.finalUrl||null,observation.outcome,observation.retryable,observation.httpStatus||null,observation.failureClass||null,observation.detail,JSON.stringify({provider:'external-link',boundedDepth:2,surface:observation.surface,required:observation.required,wrapperUrl:observation.wrapperUrl||null,...(laneAttribution?{acquisitionAttribution:laneAttribution}:{}),...(telemetryWithAttribution?{crawlerTelemetry:telemetryWithAttribution}:{}),...(staticTerminalNotFound?{staticTerminalNotFound:true,staticTerminalNotFoundReason:observation.staticTerminalNotFoundReason||null}:{}),...(relevanceTier?{relevanceTier,relevanceReason:relevanceReason||null,relevancePolicyVersion:'acquisition-relevance-v1'}:{}),...(observation.workLeaseToken?{workLeaseToken:observation.workLeaseToken}:{})}),observation.observedAt]);
   }
 }
 export async function getProviderOperationalMetrics(hours=24):Promise<any>{const db=await getDb();const bounded=Math.min(Math.max(hours,1),720);const [summary,queue]=await Promise.all([db.query(`SELECT provider,operation,CASE WHEN provider='gemini' THEN COALESCE(NULLIF(request_metadata->>'geminiRoute',''),'legacy') WHEN provider='groq' THEN COALESCE(NULLIF(request_metadata->>'groqRoute',''),'legacy') ELSE NULL END route,COUNT(*)::int calls,COUNT(*) FILTER(WHERE status='SUCCESS')::int successes,COUNT(*) FILTER(WHERE status='TIMEOUT')::int timeouts,COUNT(*) FILTER(WHERE status NOT IN('SUCCESS','TIMEOUT'))::int errors,ROUND(AVG(latency_ms))::int average_latency_ms,COALESCE(SUM(reserved_cost),0)::float reserved_cost,COALESCE(SUM(actual_cost),0)::float actual_cost FROM provider_call_events WHERE occurred_at>=now()-($1||' hours')::interval AND COALESCE(request_metadata->>'${GEMINI_FREE_COOLDOWN_DEFERRAL_METADATA_KEY}','') <> 'true' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' GROUP BY provider,operation,route ORDER BY provider,operation,route`,[String(bounded)]),db.query(`SELECT type,COUNT(*)::int depth,COUNT(*) FILTER(WHERE run_after<=now())::int runnable_depth,COUNT(*) FILTER(WHERE run_after>now())::int deferred_depth,MIN(run_after) FILTER(WHERE run_after>now()) next_run_at,COALESCE(ROUND(AVG(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint average_age_ms,COALESCE(ROUND(MAX(EXTRACT(EPOCH FROM(now()-created_at))*1000)),0)::bigint oldest_age_ms FROM jobs WHERE status='PENDING' GROUP BY type ORDER BY type`)]);const routeHealth=await import('./semanticRouteHealth').then(module=>module.getSemanticRouteHealth()).catch(()=>undefined);return {windowHours:bounded,policyVersion:'provider-resilience-v1',providers:summary.rows,queueLatency:queue.rows,routeHealth,alertThresholds:{timeoutRate:Number(process.env.PROVIDER_TIMEOUT_ALERT_RATE||'0.05'),errorRate:Number(process.env.PROVIDER_ERROR_ALERT_RATE||'0.10')},runbook:'docs/phase-2-provider-resilience.md'};}
@@ -736,6 +736,15 @@ async function ensureQuerySaturationIndexes(client: { query: (text: string, valu
  * Build every index concurrently before the loop's BEGIN; migration 170 then
  * only adopts a valid index or verifies an empty table.
  */
+async function ensureAcquisitionReliabilityIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  await ensureConcurrentIndex(client, 'idx_jobs_retry_fair_claim', 'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_retry_fair_claim ON public.jobs (priority DESC, updated_at ASC, id ASC) WHERE status='PENDING' AND type='RETRY_COMMUNITY_ACQUISITION'`);
+  await ensureConcurrentIndex(client, 'idx_jobs_retry_channel_active', 'jobs',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_retry_channel_active ON public.jobs ((payload->>'channelId')) WHERE type='RETRY_COMMUNITY_ACQUISITION' AND status IN ('PENDING','PROCESSING')`);
+  await ensureConcurrentIndex(client, 'idx_community_url_state_claim_v2', 'community_acquisition_url_state',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_community_url_state_claim_v2 ON public.community_acquisition_url_state (channel_id, priority DESC, never_executed DESC, first_observed_at ASC, work_key) WHERE state='PENDING'`);
+}
+
 async function ensurePhase4ScaleIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
   await ensureConcurrentIndex(client,
     'idx_jobs_enrich_created_at',
@@ -810,6 +819,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // idempotent and also repairs a build that failed on a previous boot.
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
+    const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');
+    if (acquisitionReliabilityMigration.rowCount) await ensureAcquisitionReliabilityIndexes(client);
     // Phase 0 queue/capacity indexes and the partial backfill index require
     // migration 162's columns. Build them concurrently first, then run the
     // idempotent historical clock backfill in bounded batches. The partial
@@ -3632,7 +3643,7 @@ export async function enqueueJob(type:string,payload:any,opts:{priority?:number;
   try{
   db=opts.clientOverride||await getDb();
   const reopenClockSql=reopenClockUpdateSql(acquisitionJobClockV2Enabled());
-  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,terminal_failure_class=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.terminal_failure_class END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
+  const reopenSet=`payload=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.payload ELSE jobs.payload END,status=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 'PENDING' ELSE jobs.status END,priority=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.priority ELSE jobs.priority END,max_attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.max_attempts ELSE jobs.max_attempts END,attempts=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.attempts END,run_after=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN excluded.run_after ELSE jobs.run_after END,locked_by=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_by END,locked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.locked_at END,last_error=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.last_error END,completed_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.completed_at END,terminal_failure_class=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.terminal_failure_class END,capacity_deferrals=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN 0 ELSE jobs.capacity_deferrals END,capacity_wait_started_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.capacity_wait_started_at END,parked_reason=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.parked_reason END,parked_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN NULL ELSE jobs.parked_at END,last_progress_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.last_progress_at END,updated_at=CASE WHEN jobs.status IN ('COMPLETED','FAILED') THEN now() ELSE jobs.updated_at END${reopenClockSql}`;
   // Three explicit conflict policies:
   //  - preventReopen: never reopen any terminal row (explicit recovery only).
   //  - preventCompletedReopen: keep a completed job terminal, but still let a
@@ -3715,7 +3726,65 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
   const traceId=String(claimed?.payload?.traceId||'');
   if(traceId){try{await db.query(`INSERT INTO discovery_execution_trace(trace_id,stage,outcome,detail) VALUES($1,'WORKER_POLLING','REACHED',$2),($1,'QUEUE_CLAIM','REACHED',$3)`,[traceId,JSON.stringify({workerId,claimableTypes:types||null}),JSON.stringify({workerId,jobId:claimed!.id,type:claimed!.type})]);}catch(error){console.warn('[Execution Trace] Claim trace unavailable; discovery claim remains committed.',error instanceof Error?error.message:error);}}
   return claimed;}
-export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
+export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,capacity_deferrals=0,capacity_wait_started_at=NULL,parked_reason=NULL,parked_at=NULL,last_progress_at=now(),updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
+/**
+ * Return a batch-owner job to PENDING after a completed URL-ledger slice. The
+ * per-URL ledger owns the real attempt budget, so the channel-level claim is
+ * refunded; otherwise a channel with more than five URL slices would exhaust
+ * before its URL work could be processed.
+ */
+export async function rescheduleJob(
+  jobId:string,
+  runAfter:string,
+  note:string,
+  claim?:{workerId?:string|null;attemptNumber?:number;generation?:number},
+):Promise<boolean>{
+  const db=await getDb();
+  const client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    const message=note.slice(0,2000);
+    const updated=await client.query(
+      `UPDATE jobs
+          SET status='PENDING',
+              attempts=GREATEST(0,attempts-1),
+              last_error=$2,
+              locked_by=NULL,
+              locked_at=NULL,
+              run_after=$3,
+              capacity_deferrals=0,
+              capacity_wait_started_at=NULL,
+              parked_reason=NULL,
+              parked_at=NULL,
+              last_progress_at=now(),
+              updated_at=now()
+        WHERE id=$1
+          AND status='PROCESSING'
+          AND ($4::text IS NULL OR locked_by=$4)
+          AND ($5::int IS NULL OR attempts=$5)
+          AND ($6::int IS NULL OR reopen_generation=$6)
+      RETURNING id`,
+      [jobId,message,runAfter,claim?.workerId??null,claim?.attemptNumber??null,claim?.generation??null],
+    );
+    if(!updated.rowCount){await client.query('ROLLBACK');return false;}
+    await client.query(
+      `UPDATE job_attempts
+          SET status='COMPLETED',finished_at=now(),error=$2
+        WHERE job_id=$1
+          AND ($3::int IS NULL OR attempt_number=$3)
+          AND ($4::int IS NULL OR generation=$4)
+          AND finished_at IS NULL`,
+      [jobId,message,claim?.attemptNumber??null,claim?.generation??null],
+    );
+    await client.query('COMMIT');
+    return true;
+  }catch(error){
+    await client.query('ROLLBACK').catch(()=>undefined);
+    throw error;
+  }finally{
+    client.release();
+  }
+}
 
 /**
  * Durable affirmative proof that community inspection genuinely began for one
@@ -3960,7 +4029,49 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
   }
   return {disposition:attempts>=maxAttempts?'FAILED':'RETRYING'};
 }
-export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,Date.now()):await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY')){const failedGeminiOrg=failedProviderOrg(error,['GEMINI_ORG_TOKEN_BUCKET_EMPTY'],['gemini_semantic']);const bucketExpiry=failedGeminiOrg?await resolveGeminiOrgBucketExpiryMs(failedGeminiOrg,Date.now()):undefined;if(bucketExpiry!==undefined)geminiSemanticCooldownExpiryMs=bucketExpiry;} if(providerReasons.includes('GROQ_RATE_LIMITED')){const failedGroqOrg=failedProviderOrg(error,['GROQ_RATE_LIMITED']);groqSemanticCooldownExpiryMs=failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,Date.now()):await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,new Date(decision.runAfter!).toISOString()]);}else if(decision.disposition==='FAILED'){await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);}else{const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1))); await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);} await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
+export async function failJob(jobId:string,error:any):Promise<JobFailureDisposition|null>{const db=await getDb(); const res=await db.query('SELECT attempts,max_attempts,created_at FROM jobs WHERE id=$1',[jobId]); if(!res.rowCount)return null; const {attempts,max_attempts,created_at}=res.rows[0]; const msg=String(error?.message||error).slice(0,2000); let geminiSemanticCooldownExpiryMs: number|undefined=undefined; let groqSemanticCooldownExpiryMs: number|undefined=undefined; let geminiFreeSemanticCooldownExpiryMs: number|undefined=undefined; const providerReasons=Array.isArray(error?.providerReasons)?error.providerReasons.map(String):[]; if(providerReasons.includes('SEMANTIC_DEFERRED_RATE_PRESSURE')||providerReasons.includes('GEMINI_CAPACITY_DEFERRED')||(providerReasons.includes('PROVIDER_RATE_LIMIT')&&failedProviderOrg(error,['PROVIDER_RATE_LIMIT'],['gemini_semantic'])!==undefined)){const failedGeminiOrg=failedProviderOrg(error,['SEMANTIC_DEFERRED_RATE_PRESSURE','GEMINI_CAPACITY_DEFERRED','PROVIDER_RATE_LIMIT'],['gemini_semantic']);geminiSemanticCooldownExpiryMs=failedGeminiOrg?await resolveGeminiOrgSemanticCooldownExpiryMs(failedGeminiOrg,Date.now()):await resolveGeminiSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_ORG_TOKEN_BUCKET_EMPTY')){const failedGeminiOrg=failedProviderOrg(error,['GEMINI_ORG_TOKEN_BUCKET_EMPTY'],['gemini_semantic']);const bucketExpiry=failedGeminiOrg?await resolveGeminiOrgBucketExpiryMs(failedGeminiOrg,Date.now()):undefined;if(bucketExpiry!==undefined)geminiSemanticCooldownExpiryMs=bucketExpiry;} if(providerReasons.includes('GROQ_RATE_LIMITED')){const failedGroqOrg=failedProviderOrg(error,['GROQ_RATE_LIMITED']);groqSemanticCooldownExpiryMs=failedGroqOrg?await resolveGroqOrgCooldownExpiryMs(failedGroqOrg,Date.now()):await resolveGroqSemanticCooldownExpiryMs(Date.now());} if(providerReasons.includes('GEMINI_FREE_RATE_LIMITED')){geminiFreeSemanticCooldownExpiryMs=await resolveGeminiFreeSemanticCooldownExpiryMs(Date.now());}const decision=decideJobFailure(error,attempts,max_attempts,Date.now(),new Date(created_at).getTime(),geminiSemanticCooldownExpiryMs,groqSemanticCooldownExpiryMs,geminiFreeSemanticCooldownExpiryMs);const persistedMessage=decision.operationallyBlocked?`OPERATIONALLY_BLOCKED_RETRY_REQUIRED: ${msg}`:msg;const capacityLease=isCapacityLeaseFailure(error);
+    if(decision.disposition==='RETRYING_WITHOUT_ATTEMPT'){
+      const fallbackRunAfter=Date.now()+Math.min(15*60_000,30_000*Math.pow(2,Math.max(0,attempts-1)));
+      const retryRunAfter=new Date(Number.isFinite(decision.runAfter)?decision.runAfter!:fallbackRunAfter).toISOString();
+      if(capacityLease){
+        await db.query(`UPDATE jobs
+             SET status='PENDING',
+                 attempts=GREATEST(0,attempts-1),
+                 last_error=$2,
+                 locked_by=NULL,
+                 locked_at=NULL,
+                 run_after=CASE
+                   WHEN capacity_deferrals+1>=10
+                     OR (capacity_wait_started_at IS NOT NULL AND capacity_wait_started_at < now()-interval '24 hours')
+                   THEN now()+interval '6 hours'
+                   ELSE $3
+                 END,
+                 capacity_deferrals=capacity_deferrals+1,
+                 capacity_wait_started_at=COALESCE(capacity_wait_started_at,now()),
+                 parked_reason=CASE
+                   WHEN capacity_deferrals+1>=10
+                     OR (capacity_wait_started_at IS NOT NULL AND capacity_wait_started_at < now()-interval '24 hours')
+                   THEN 'CAPACITY_WAIT'
+                   ELSE parked_reason
+                 END,
+                 parked_at=CASE
+                   WHEN capacity_deferrals+1>=10
+                     OR (capacity_wait_started_at IS NOT NULL AND capacity_wait_started_at < now()-interval '24 hours')
+                   THEN now()
+                   ELSE parked_at
+                 END,
+                 updated_at=now()
+           WHERE id=$1`,[jobId,persistedMessage,retryRunAfter]);
+      }else{
+        await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,updated_at=now() WHERE id=$1`,[jobId,persistedMessage,retryRunAfter]);
+      }
+    }else if(decision.disposition==='FAILED'){
+      await db.query(`UPDATE jobs SET status='FAILED',last_error=$2,locked_by=NULL,locked_at=NULL,updated_at=now() WHERE id=$1`,[jobId,persistedMessage]);
+    }else{
+      const seconds=Math.min(900,30*Math.pow(2,Math.max(0,attempts-1)));
+      await db.query(`UPDATE jobs SET status='PENDING',last_error=$2,locked_by=NULL,locked_at=NULL,run_after=now()+($3||' seconds')::interval,capacity_deferrals=0,capacity_wait_started_at=NULL,parked_reason=NULL,parked_at=NULL,last_progress_at=now(),updated_at=now() WHERE id=$1`,[jobId,persistedMessage,String(seconds)]);
+    }
+    await db.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=$2 WHERE job_id=$1 AND finished_at IS NULL`,[jobId,persistedMessage]);return decision.disposition;}
 export async function recoverStaleJobs(staleAfterMinutes=15):Promise<number>{const db=await getDb(); const client=await db.connect(); try{await client.query('BEGIN'); const stuck=await client.query(`SELECT id,type,locked_by,locked_at,attempts FROM jobs WHERE status='PROCESSING' AND locked_at < now()-($1||' minutes')::interval FOR UPDATE`,[String(staleAfterMinutes)]); const res=await client.query(`UPDATE jobs SET status='PENDING',locked_by=NULL,locked_at=NULL,updated_at=now(),last_error=COALESCE(last_error,'Recovered stale processing lock') WHERE id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); if(res.rowCount) await client.query(`UPDATE job_attempts SET status='FAILED',finished_at=now(),error=COALESCE(error,'Worker heartbeat expired; job recovered for retry') WHERE finished_at IS NULL AND job_id=ANY($1::uuid[])`,[stuck.rows.map(row=>row.id)]); await client.query('COMMIT'); const summary=summarizeRecoveredStaleJobs(stuck.rows,Date.now()); if(summary.recovered>0)console.warn(JSON.stringify({event:'stale_jobs_recovered',...summary,staleAfterMinutes,timestamp:new Date().toISOString()})); return res.rowCount||0;}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}
 
 /**

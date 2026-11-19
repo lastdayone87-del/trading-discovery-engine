@@ -71,6 +71,40 @@ export const COMMUNITY_ACQUISITION_WORK_SURFACES: ReadonlySet<string> = new Set(
 ]);
 
 /**
+ * Historical observations and current crawls name the same creator surface
+ * differently (`LINKED_WEBSITES` vs `CREATOR_WEBSITES`, `SOCIAL_BIO` vs
+ * `SOCIAL_PROFILES`, ...). The work ledger must use one identity per surface,
+ * otherwise a claimed legacy row can never match the current crawl's evidence
+ * and loops until exhaustion. Aliases are collapsed before key construction.
+ */
+/**
+ * A direct invite URL is already the terminal locator. Its acquisition row is
+ * complete as soon as the invite is found, but the channel-level Discord
+ * validation is a separate step. Keep the row claimable for a repeat validation
+ * pass until completion records the ledger's terminal FOUND state.
+ */
+export function isDirectDiscordInviteUrl(raw: string): boolean {
+  const value = String(raw || '').trim();
+  return /^https?:\/\/(www\.)?(discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite|dsc\.gg|discord\.me|discord\.io)\//i.test(value);
+}
+
+export function canonicalCommunityWorkSurface(surface: string): string {
+  const normalized = String(surface || '').trim().toUpperCase();
+  switch (normalized) {
+    case 'CHANNEL_LINKS':
+    case 'EXTERNAL_LINKS':
+      return 'CHANNEL_EXTERNAL_LINKS';
+    case 'LINKED_WEBSITES':
+    case 'CUSTOM_DOMAINS':
+      return 'CREATOR_WEBSITES';
+    case 'SOCIAL_BIO':
+      return 'SOCIAL_PROFILES';
+    default:
+      return normalized;
+  }
+}
+
+/**
  * Capacity/runtime failures park the URL without spending its attempt budget.
  * These are the observation-level classes actually persisted by the static and
  * rendered crawlers (browserCapability/browserCommunityFallback) plus the
@@ -103,6 +137,7 @@ export interface CommunityWorkObservation {
   /** Durable observation id. Used only for deterministic same-timestamp ties. */
   id?: string;
   provenance?: unknown;
+  workLeaseToken?: string;
 }
 
 /**
@@ -124,12 +159,14 @@ export interface CommunityWorkProjectionRow {
   attempts: number;
   maxAttempts: number;
   firstObservedAt: string;
+  lastObservedAt: string;
   lastAttemptAt: string | null;
   lastFailureClass: string | null;
   lastOutcome: string;
   terminalReason: string | null;
   terminalEvidence: Record<string, unknown>;
   retryOwned: boolean;
+  required: boolean;
   observations: number;
 }
 
@@ -306,16 +343,65 @@ export function countsTowardAttemptBudget(observation: CommunityWorkObservation)
 }
 
 /**
- * Effective retry ownership. Delegate to the production predicate so the
- * ledger cannot drift from the worker:
- *
- *   * required retryable `ACQUISITION_FAILED` / `PARTIALLY_INSPECTED`;
- *   * required `FOUND` rows with an outstanding bounded gap class;
- *   * eligible `PARTIALLY_INSPECTED` `STATIC_BUDGET_GAP` rows even when
- *     `required=false`;
- *   * no deterministic permanent failure, BLOCK/DEMOTE tier, auxiliary URL,
- *     or borrowed shared evidence.
+ * Billable attempts are inspection claims, not observation rows. New rows carry
+ * the exact claim lease, so a static and rendered row from one claim count once.
+ * Legacy rows predate leases; their timestamp spread is bounded by the same
+ * five-minute window the projection uses for one inspection. Genuine retries
+ * are at least the queue's 30-second backoff apart, so this can under-count a
+ * dense legacy tail but can never exhaust a URL that was not actually retried.
  */
+export function billableInspectionAttempts(observations: readonly CommunityWorkObservation[]): number {
+  const billable = observations.filter(countsTowardAttemptBudget);
+  const leaseClaims = new Set(
+    billable
+      .map(observation => observation.workLeaseToken)
+      .filter((value): value is string => Boolean(value)),
+  );
+  // A rendered observation is stamped at the inspection's start. Those timestamps
+  // are exact anchors: static rows from the same run finish later and fold into
+  // the anchor, while a later rendered run creates its own anchor even when the
+  // two runs are minutes apart. This is what prevents one scan from consuming
+  // two attempts without merging genuine retries.
+  const inspectionAnchors = new Set<number>();
+  for (const observation of observations) {
+    const provenance = asRecord(observation.provenance) || {};
+    const telemetry = asRecord(provenance.crawlerTelemetry) || {};
+    const startedAt = Date.parse(String(telemetry.crawlStartedAt || ''));
+    if (Number.isFinite(startedAt)) inspectionAnchors.add(startedAt);
+    if (String(telemetry.mode || '').toUpperCase() === 'RENDERED') {
+      const observedAt = Date.parse(observation.observedAt);
+      if (Number.isFinite(observedAt)) inspectionAnchors.add(observedAt);
+    }
+  }
+  const anchors = [...inspectionAnchors].sort((a, b) => a - b);
+  const claimedAnchors = new Set<number>();
+  const staticClusters: number[] = [];
+  for (const observation of billable) {
+    if (observation.workLeaseToken) continue;
+    const at = Date.parse(observation.observedAt);
+    if (!Number.isFinite(at)) continue;
+    const provenance = asRecord(observation.provenance) || {};
+    const telemetry = asRecord(provenance.crawlerTelemetry) || {};
+    const rendered = String(telemetry.mode || '').toUpperCase() === 'RENDERED';
+    const ownAnchor = Date.parse(String(telemetry.crawlStartedAt || ''));
+    const anchor = Number.isFinite(ownAnchor)
+      ? ownAnchor
+      : rendered
+        ? at
+        : anchors.find(candidate => at >= candidate - 5_000 && at - candidate <= COMMUNITY_INSPECTION_WINDOW_MS);
+    if (anchor !== undefined) {
+      claimedAnchors.add(anchor);
+      continue;
+    }
+    // Static-only legacy scans have no rendered anchor. One static run emits
+    // one row per seed, so only same-inspection clock skew should collapse.
+    if (!staticClusters.some(candidate => Math.abs(at - candidate) <= 5_000)) {
+      staticClusters.push(at);
+    }
+  }
+  return Math.min(5, leaseClaims.size + claimedAnchors.size + staticClusters.length);
+}
+
 export function observationOwnsRetry(observation: CommunityWorkObservation): boolean {
   if (sharedEvidenceSource(observation)) return false;
   if (!isCommunityLedgerWorkObservation(observation)) return false;
@@ -351,6 +437,14 @@ export function normalizeCommunityWorkUrl(raw: string): string | null {
     || (parsed.protocol === 'https:' && parsed.port === '443')) {
     parsed.port = '';
   }
+  // Tracking parameters never identify independent work. Strip them for the
+  // durable ledger identity so a claimed URL and the inspector's normalized
+  // seed cannot diverge solely because one side retained utm_/fbclid/gclid.
+  for (const key of [...parsed.searchParams.keys()]) {
+    if (/^utm_/i.test(key) || /^(fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid)$/i.test(key)) {
+      parsed.searchParams.delete(key);
+    }
+  }
   let pathname = parsed.pathname || '/';
   if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.replace(/\/+$/, '');
   parsed.pathname = pathname;
@@ -367,7 +461,7 @@ export function communityAcquisitionWorkKey(
   surface: string,
 ): string {
   return createHash('sha256')
-    .update(`${channelId}\n${surface}\n${normalizedUrl}`)
+    .update(`${channelId}\n${canonicalCommunityWorkSurface(surface)}\n${normalizedUrl}`)
     .digest('hex');
 }
 
@@ -508,7 +602,12 @@ export function projectCommunityAcquisitionWork(
   options: ProjectCommunityWorkOptions = {},
 ): { rows: CommunityWorkProjectionRow[]; stats: CommunityWorkProjectionStats } {
   const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
-  const surfaces = options.surfaces ?? COMMUNITY_ACQUISITION_WORK_SURFACES;
+  // Callers may pass legacy aliases (LINKED_WEBSITES, SOCIAL_BIO, ...). Collapse
+  // both the filter set and the observation surface so membership cannot fail
+  // solely because one side still uses the old name.
+  const surfaces = new Set(
+    [...(options.surfaces ?? COMMUNITY_ACQUISITION_WORK_SURFACES)].map(canonicalCommunityWorkSurface),
+  );
   const grouped = new Map<string, {
     channelId: string;
     normalizedUrl: string;
@@ -531,7 +630,7 @@ export function projectCommunityAcquisitionWork(
   // admitted by required work or the static-gap exception. Optional evidence
   // for a different URL never creates a row.
   for (const observation of observations) {
-    const surface = surfaceFromObservation(observation);
+    const surface = canonicalCommunityWorkSurface(surfaceFromObservation(observation));
     if (!surfaces.has(surface)) {
       skippedRows++;
       continue;
@@ -595,10 +694,8 @@ export function projectCommunityAcquisitionWork(
     const latest = selectEffectiveInspectionObservation(inspectionCandidates);
     if (!latest) continue;
     let earliestAt = group.observations[0].observedAt;
-    let attempts = 0;
     let directProcessedExecutions = 0;
     let browserExecutions = 0;
-    let lastAttemptAt: string | null = null;
 
     for (const observation of group.observations) {
       if (Date.parse(observation.observedAt) < Date.parse(earliestAt)) {
@@ -606,13 +703,19 @@ export function projectCommunityAcquisitionWork(
       }
       if (hasDirectProcessedAcquisitionEvidence(observation)) directProcessedExecutions++;
       if (hasBrowserExecution(observation)) browserExecutions++;
-      if (countsTowardAttemptBudget(observation)) {
-        attempts++;
-        if (!lastAttemptAt || Date.parse(observation.observedAt) > Date.parse(lastAttemptAt)) {
-          lastAttemptAt = observation.observedAt;
-        }
-      }
     }
+    // One inspection can emit static and rendered observations for the same
+    // URL. Count inspection claims, never raw rows, or three partial scans fill
+    // a five-attempt budget and exhaust a URL that was actually tried three
+    // times. New observations carry the exact claim lease; legacy rows predate
+    // it and are clustered by the projection's inspection window.
+    const attempts = billableInspectionAttempts(group.observations);
+    const lastAttemptAt = group.observations
+      .filter(countsTowardAttemptBudget)
+      .reduce<string | null>((latest, observation) =>
+        !latest || Date.parse(observation.observedAt) > Date.parse(latest)
+          ? observation.observedAt
+          : latest, null);
 
     const { state, terminalReason } = resolveCommunityWorkState(latest, attempts, maxAttempts);
     const neverExecuted = directProcessedExecutions === 0;
@@ -636,6 +739,7 @@ export function projectCommunityAcquisitionWork(
       attempts,
       maxAttempts,
       firstObservedAt: earliestAt,
+      lastObservedAt: group.observations.reduce((latest, observation) => Date.parse(observation.observedAt) > Date.parse(latest) ? observation.observedAt : latest, group.observations[0].observedAt),
       lastAttemptAt,
       lastFailureClass: latest.failureClass ? String(latest.failureClass) : null,
       lastOutcome: latest.outcome,
@@ -651,6 +755,7 @@ export function projectCommunityAcquisitionWork(
         retryOwned,
       },
       retryOwned,
+      required: isRequiredCommunityWorkObservation(latest),
       observations: group.observations.length,
     });
   }

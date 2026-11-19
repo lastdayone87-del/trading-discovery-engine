@@ -17,7 +17,7 @@ function makeDb(row: Record<string, unknown>) {
     queries,
     async query(sql: string, values?: unknown[]) {
       queries.push({ sql, values });
-      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at FROM jobs')) {
+      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at,locked_by')) {
         return { rowCount: 1, rows: [row] };
       }
       if (sql.startsWith('SELECT id FROM job_attempts')) {
@@ -201,4 +201,36 @@ test('flag on does not let an expired provider hint retry a capacity wait immedi
   } finally {
     delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
   }
+});
+
+
+test('a stale ordinary failure cannot clear a replacement worker claim', async () => {
+  const queries: QueryRecord[] = [];
+  const db = {
+    async query(sql: string, values?: unknown[]) {
+      queries.push({ sql, values });
+      if (sql.startsWith('SELECT attempts,max_attempts,first_transient_failure_at,locked_by')) {
+        return {
+          rowCount: 1,
+          rows: [{ attempts: 1, max_attempts: 5, first_transient_failure_at: null, locked_by: 'worker-old' }],
+        };
+      }
+      if (sql.startsWith('SELECT id FROM job_attempts')) return { rowCount: 0, rows: [] };
+      if (sql.startsWith('UPDATE jobs SET status=')) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [] };
+    },
+  };
+  const disposition = await failJob('job-stale', new Error('temporary failure'), {
+    db,
+    now: Date.UTC(2026, 10, 6, 12, 0, 0),
+  });
+  assert.equal(disposition, null, 'a stale execution must not report a disposition');
+  const transition = queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
+  assert.ok(transition, 'failJob still attempts the guarded transition');
+  assert.match(transition!.sql, /status='PROCESSING'/);
+  assert.match(transition!.sql, /locked_by=\$4/);
+  assert.match(transition!.sql, /attempts=\$5/);
+  assert.deepEqual(transition!.values?.slice(3), ['worker-old', 1]);
+  assert.ok(!queries.some(query => query.sql.startsWith('UPDATE job_attempts')),
+    'a stale execution must not finalize a replacement attempt');
 });

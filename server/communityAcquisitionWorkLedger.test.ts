@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  billableInspectionAttempts,
   communityAcquisitionWorkKey,
+  isDirectDiscordInviteUrl,
   normalizeCommunityWorkUrl,
   percentDelta,
   projectCommunityAcquisitionWork,
@@ -40,6 +42,41 @@ test('work keys are stable and scoped to channel, surface, and normalized URL', 
   assert.notEqual(first, communityAcquisitionWorkKey('UC-a', 'https://example.com/y', 'CREATOR_WEBSITES'));
   assert.notEqual(first, communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_PROFILES'));
   assert.match(first, /^[0-9a-f]{64}$/);
+  // Legacy surface names are aliases, not independent work identities.
+  assert.equal(
+    communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'LINKED_WEBSITES'),
+    first,
+  );
+  assert.equal(
+    communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_BIO'),
+    communityAcquisitionWorkKey('UC-a', 'https://example.com/x', 'SOCIAL_PROFILES'),
+  );
+});
+
+test('the direct-invite predicate covers Discord invite hosts recognized by the candidate parser', () => {
+  for (const url of [
+    'https://discord.gg/code',
+    'https://discord.com/invite/code',
+    'https://discordapp.com/invite/code',
+    'https://discord.app/invite/code',
+    'https://dsc.gg/code',
+    'https://discord.me/code',
+    'https://discord.io/code',
+  ]) {
+    assert.equal(isDirectDiscordInviteUrl(url), true, url);
+  }
+  assert.equal(isDirectDiscordInviteUrl('https://discord.com/channels/1/2'), false);
+  assert.equal(isDirectDiscordInviteUrl('https://disboard.org/server/code'), false,
+    'directory pages are candidates, not direct invite URLs');
+});
+
+test('legacy alias filters still admit canonical observation surfaces', () => {
+  const { rows } = projectCommunityAcquisitionWork(
+    [observation()],
+    { surfaces: new Set(['LINKED_WEBSITES']) },
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].surface, 'CREATOR_WEBSITES');
 });
 
 test('URL normalization ignores host case, fragments, default ports, and trailing path slashes', () => {
@@ -58,6 +95,50 @@ test('URL normalization ignores host case, fragments, default ports, and trailin
   );
   assert.equal(normalizeCommunityWorkUrl('not a url'), null);
   assert.equal(normalizeCommunityWorkUrl('mailto:user@example.com'), null);
+  assert.equal(
+    normalizeCommunityWorkUrl('https://example.com/x?utm_source=a&fbclid=b&keep=1'),
+    'https://example.com/x?keep=1',
+    'tracking parameters are not durable work identity',
+  );
+});
+
+test('rendered inspection anchors fold static rows without merging separate retries', () => {
+  const base = observation();
+  const at = (time: string, telemetry: Record<string, unknown>) => ({
+    ...base,
+    observedAt: time,
+    provenance: { surface: 'CREATOR_WEBSITES', required: true, crawlerTelemetry: telemetry },
+  });
+  const observations = [
+    at('2026-11-01T00:00:01.000Z', { mode: 'STATIC', pagesInspected: 2 }),
+    at('2026-11-01T00:00:30.000Z', { mode: 'RENDERED', pagesInspected: 4, crawlStartedAt: '2026-11-01T00:00:00.000Z' }),
+    at('2026-11-01T00:01:30.000Z', { mode: 'STATIC', pagesInspected: 2 }),
+    at('2026-11-01T00:03:00.000Z', { mode: 'RENDERED', pagesInspected: 4, crawlStartedAt: '2026-11-01T00:02:50.000Z' }),
+  ];
+  assert.equal(billableInspectionAttempts(observations), 2,
+    'two rendered anchors are two claims; their static rows are not extra attempts');
+
+  const combined = [
+    ...observations,
+    { ...base, observedAt: '2026-11-01T00:02:50.000Z', workLeaseToken: '11111111-1111-4111-8111-111111111111' },
+  ];
+  assert.equal(billableInspectionAttempts(combined), 3,
+    'exact lease claims must not erase historical attempts');
+
+  const staticThenRendered = [
+    at('2026-11-01T00:00:40.000Z', { mode: 'STATIC', pagesInspected: 1 }),
+    at('2026-11-01T00:00:00.000Z', { mode: 'RENDERED', pagesInspected: 2 }),
+  ];
+  assert.equal(billableInspectionAttempts(staticThenRendered), 1,
+    'a static row that finishes after the rendered anchor belongs to that run');
+
+  const renderedThenStaticRetry = [
+    at('2026-11-01T00:00:00.000Z', { mode: 'RENDERED', pagesInspected: 2 }),
+    at('2026-11-01T00:01:00.000Z', { mode: 'STATIC', pagesInspected: 1 }),
+    at('2026-11-01T00:03:00.000Z', { mode: 'RENDERED', pagesInspected: 2 }),
+  ];
+  assert.equal(billableInspectionAttempts(renderedThenStaticRetry), 2,
+    'a static row before the next rendered anchor is a separate historical attempt');
 });
 
 test('a started request never clears never_executed', () => {

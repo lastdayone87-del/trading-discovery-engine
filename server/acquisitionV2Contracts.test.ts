@@ -1222,6 +1222,15 @@ test('v2 review e2e: FOUND+gap inspection creates the durable retry job', async 
       locked_at TEXT,
       last_error TEXT,
       completed_at TEXT,
+      terminal_failure_class TEXT,
+      capacity_deferrals INTEGER DEFAULT 0,
+      capacity_wait_started_at TEXT,
+      parked_reason TEXT,
+      parked_at TEXT,
+      last_progress_at TEXT,
+      last_enqueued_at TEXT,
+      last_reopened_at TEXT,
+      reopen_generation INTEGER DEFAULT 0,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );

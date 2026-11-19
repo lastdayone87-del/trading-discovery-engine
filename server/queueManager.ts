@@ -8,6 +8,7 @@ import {
   claimNextJob,
   type ClaimBudgetGuard,
   completeJob,
+  rescheduleJob,
   failJob,
   recoverStaleJobs,
   getChannelById,
@@ -186,6 +187,19 @@ import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerC
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
+import { normalizeCommunityWorkUrl } from './communityAcquisitionWorkLedger';
+import {
+  claimCommunityWorkSlice,
+  communityWorkSummary,
+  completeCommunityWorkSlice,
+  hasCommunityWorkRows,
+  materializeCommunityWorkForChannel,
+  promoteDueCommunityWork,
+  releaseCommunityWorkSlice,
+  resetStaleCommunityWork,
+  retireTerminalChannelCommunityWork,
+  retireUnusableCommunityWork,
+} from './communityAcquisitionWorkStore';
 
 const WORKER_ID = `worker_${process.pid}`;
 
@@ -1481,6 +1495,153 @@ export async function admitDiscoveredChannel(input: {
 /**
  * Worker loop that processes one durable search or enrichment job.
  */
+/**
+ * A ledger row can be resolved while its discovered invite still needs the
+ * legacy Discord validation pass. Closing the batch on URL completion alone
+ * would silently drop that invite, so both closure points ask the channel's
+ * durable validation state. `NOT_STARTED` with a stored locator is just as
+ * unfinished as `RETRY_PENDING`; the failed-scan flag means the last pass did
+ * not establish a verdict.
+ */
+function communityValidationStillPending(channel: ChannelRecord, job: DurableJob): boolean {
+  const locator = String(channel.discord_candidate_locator || '').trim();
+  const validationStatus = String(channel.discord_validation_status || '').toUpperCase();
+  // COMPLETED/SUCCEEDED is a durable verdict. A stale payload marker or a scan
+  // failure from an unrelated later pass must not keep re-entering validation.
+  const validationUnfinished = !['COMPLETED','SUCCEEDED','FAILED_OPERATIONAL'].includes(validationStatus);
+  return (job.payload?.ledgerValidationPending === true && validationUnfinished)
+    || (channel.scan_status === 'FAILED' && validationUnfinished)
+    || (!!locator && (validationStatus === 'RETRY_PENDING' || validationStatus === 'NOT_STARTED'));
+}
+
+/**
+ * Phase 1 retry slice. Returns false only when the URL ledger has no rows and
+ * the legacy whole-channel path should run. Throws a capacity-shaped error
+ * when the slice is complete but more URL work remains; failJob will refund
+ * the batch attempt because the per-URL ledger owns the real attempt budget.
+ */
+async function runCommunityLedgerRetrySlice(channel: ChannelRecord, job: DurableJob): Promise<boolean> {
+  const db = await getDb();
+  // A terminal channel cannot acquire anything. Retire its active ledger work
+  // before closing the batch owner so no PENDING/PARKED rows are left orphaned
+  // with no consumer, then close through the shared terminal predicate.
+  if (isTerminalState(channel)) {
+    await retireTerminalChannelCommunityWork(channel.channel_id, db);
+    await completeJob(job.id);
+    return true;
+  }
+  await resetStaleCommunityWork(db);
+  await materializeCommunityWorkForChannel(channel.channel_id, { db });
+  await retireUnusableCommunityWork(channel.channel_id, db);
+  await promoteDueCommunityWork(db, 200);
+  if (!(await hasCommunityWorkRows(channel.channel_id, db))) return false;
+
+  const slice = await claimCommunityWorkSlice(channel.channel_id, db, 8);
+  const deferred = (summary: Awaited<ReturnType<typeof communityWorkSummary>>) => Object.assign(
+    new Error('Community acquisition ledger slice is waiting for capacity'),
+    {
+      code: COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,
+      retryable: true,
+      retryAt: summary.minNextEligibleAt
+        ? Date.parse(summary.minNextEligibleAt)
+        : Date.now() + 5 * 60_000,
+    },
+  );
+
+  if (slice.length === 0) {
+    const summary = await communityWorkSummary(channel.channel_id, db);
+    // A prior slice can leave a Discord validation check pending after all URL
+    // work resolved. Do not close the batch without giving the legacy
+    // validation path its bounded retry.
+    const refreshed = await getChannelById(channel.channel_id);
+    const urlWorkTerminal = summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0;
+    // Validation may run only after URL work is terminal. A parked URL must keep
+    // its backoff; handing the channel to the unrestricted legacy crawler here
+    // would bypass the ledger's capacity parking.
+    if (refreshed && urlWorkTerminal && communityValidationStillPending(refreshed, job)) return false;
+    if (summary.total > 0 && urlWorkTerminal) {
+      await completeJob(job.id);
+      return true;
+    }
+    throw deferred(summary);
+  }
+
+  const allowedUrls = new Set(slice.map(row => row.normalizedUrl));
+  const seedUrls = slice.map(row => ({ url: row.url, surface: row.surface, leaseToken: row.leaseToken }));
+  let inspectionResult: Awaited<ReturnType<typeof inspectAndValidateChannel>>;
+  try {
+    inspectionResult = await inspectAndValidateChannel(
+      channel,
+      undefined,
+      false,
+      false,
+      false,
+      {
+        jobId: job.id,
+        attemptNumber: job.attempts,
+        generation: job.reopen_generation,
+        isRetryOwnedReacquire: true,
+        clickOffsets: resolveInspectionClickOffsets(job.payload.clickOffsets),
+      },
+      {
+        lane: 'RETRY',
+        jobType: job.type,
+        jobId: job.id,
+        slicePass: Math.max(1, job.attempts || 1),
+      },
+      { allowedUrls, seedUrls, slicePass: Math.max(1, job.attempts || 1) },
+    );
+  } catch (error) {
+    await releaseCommunityWorkSlice(slice, db, new Date(Date.now() + 60_000).toISOString());
+    throw error;
+  }
+
+  try {
+    await completeCommunityWorkSlice(channel.channel_id, slice, { db });
+  } catch (error) {
+    // Completion can fail after some rows were updated. Release only rows that
+    // are still RUNNING; the stale sweep remains the final backstop.
+    await releaseCommunityWorkSlice(slice, db, new Date(Date.now() + 60_000).toISOString());
+    throw error;
+  }
+  const summary = await communityWorkSummary(channel.channel_id, db);
+  if (summary.total > 0 && summary.active === 0 && summary.parkedInfra + summary.parkedExternal === 0) {
+    const refreshed = await getChannelById(channel.channel_id);
+    if ((inspectionResult && typeof inspectionResult === 'object' && inspectionResult.retryDirective)
+      || (refreshed && communityValidationStillPending(refreshed, job))) {
+      // Hand the unvalidated invite back to the legacy bounded validation
+      // path; it must not be silently closed as a clean URL-ledger completion.
+      await db.query(
+        `UPDATE jobs SET payload=jsonb_set(payload,'{ledgerValidationPending}','true'::jsonb),updated_at=now() WHERE id=$1`,
+        [job.id],
+      );
+      return false;
+    }
+    await completeJob(job.id);
+    return true;
+  }
+  if (summary.active > 0) {
+    // More URL work is pending. Reschedule the batch owner without consuming
+    // its channel-level attempt; the per-URL ledger already charged only the
+    // URLs that actually processed work.
+    const rescheduled = await rescheduleJob(
+      job.id,
+      summary.minNextEligibleAt || new Date(Date.now() + 1_000).toISOString(),
+      'Community acquisition ledger slice complete; rescheduled for remaining URL work',
+      {
+        workerId: job.locked_by || null,
+        attemptNumber: job.attempts,
+        generation: job.reopen_generation,
+      },
+    );
+    if (!rescheduled) {
+      console.warn('[CommunityAcquisition] ledger slice reschedule lost its claim; leaving recovery to the stale-claim sweep');
+    }
+    return true;
+  }
+  throw deferred(summary);
+}
+
 export async function processNextSearchJob(
   claimableOverride?: Array<ClaimableSearchJobType>,
   workerId = WORKER_ID
@@ -1619,6 +1780,10 @@ export async function processNextSearchJob(
     if(job.type==='RETRY_COMMUNITY_ACQUISITION'){
       const channel=await getChannelById(String(job.payload.channelId||''));
       if(!channel){await completeJob(job.id);return true;}
+      // Phase 1: once the URL ledger exists, the channel job is a batch owner
+      // and a bounded slice owns the actual crawl/attempt budget. A false
+      // return means no ledger rows are available, so legacy behavior runs.
+      if (await runCommunityLedgerRetrySlice(channel, job)) return true;
       // job.attempts is the post-claim number matching this attempt's
       // job_attempts row; the marker call throws on a stale/recovered claim so
       // inspection never starts unmarked.
@@ -1657,7 +1822,9 @@ export async function processNextSearchJob(
       // work through the generic unresolved-failure path below.
       // Browser-capacity attempt-free deferral throws above and is untouched.
       if(shouldCompleteSuppressedRetryJob(inspectionResult,refreshed?.scan_status)){await completeJob(job.id);return true;}
-      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'){
+      const outstandingRetryDirective=inspectionResult&&typeof inspectionResult==='object'&&Boolean(inspectionResult.retryDirective);
+      if(refreshed?.scan_status==='FAILED'||refreshed?.scan_status==='FAILED_PERMANENT'||outstandingRetryDirective
+        ||(refreshed&&communityValidationStillPending(refreshed,job))){
         throw Object.assign(
           new Error('Retryable community acquisition remains unresolved'),
           inspectionAcquisitionEvidence?{acquisitionEvidence:inspectionAcquisitionEvidence}:{},
@@ -3831,6 +3998,7 @@ export async function inspectAndValidateChannel(
   scheduleRetry: boolean = true,
   executionMarker?: { jobId: string; attemptNumber: number; generation?: number; isRetryOwnedReacquire?: boolean; clickOffsets?: Record<string, number> },
   attribution?: ChannelInspectionAttributionInput,
+  inspectionScope?: { allowedUrls?: ReadonlySet<string>; seedUrls?: Array<{url:string;surface:string;leaseToken?:string|null}>; slicePass?: number },
 ): Promise<{ debugLog?: any; inspection?: Awaited<ReturnType<typeof runChannelInspection>>; retryDirective?: CommunityRetryDirective } | void> {
   // Phase 0 lane attribution: explicit caller lane > execution marker > the
   // inspection shape. The attribution is observational only and never changes
@@ -3841,7 +4009,7 @@ export async function inspectAndValidateChannel(
     ...(attribution?.jobType ? { jobType: attribution.jobType } : {}),
     ...(attribution?.jobId || executionMarker?.jobId ? { jobId: attribution?.jobId || executionMarker?.jobId } : {}),
     channelId: channel.channel_id,
-    slicePass: Math.max(1, Math.floor(attribution?.slicePass || 1)),
+    slicePass: Math.max(1, Math.floor(inspectionScope?.slicePass || attribution?.slicePass || 1)),
     ...(attribution?.workRemaining !== undefined ? { workRemaining: attribution.workRemaining } : {}),
   };
   // Call sites deliberately use `void`: telemetry is observational and a slow
@@ -4030,7 +4198,14 @@ export async function inspectAndValidateChannel(
       clickOffsets: executionMarker?.isRetryOwnedReacquire ? resolveInspectionClickOffsets(executionMarker.clickOffsets) : undefined,
       bypassBorrowedCoverage: resolveBorrowBypassForInspectionMarker(executionMarker),
       renderedAdmissionLane: laneAttribution.lane,
-      renderedFallbackMaxWaitMs: attribution?.renderedFallbackMaxWaitMs
+      renderedFallbackMaxWaitMs: attribution?.renderedFallbackMaxWaitMs,
+      allowedCommunityUrl: inspectionScope?.allowedUrls
+        ? (url: string) => {
+            const normalized = normalizeCommunityWorkUrl(url);
+            return Boolean(normalized && inspectionScope.allowedUrls!.has(normalized));
+          }
+        : undefined,
+      ledgerSeedUrls: inspectionScope?.seedUrls
     });
     // Carry only controls this run actually examined into any retry directive.
     // A pre-click failure leaves the previous per-seed offsets unchanged, so
@@ -4044,6 +4219,32 @@ export async function inspectAndValidateChannel(
       });
     }
     if(inspection.acquisitionOutcomes?.length){
+      // A claimed ledger row carries the surface that owns its work key. The
+      // inspector may classify the same URL through a different surface path
+      // (for example a Discord widget discovered inside a website); restore the
+      // claimed surface on the durable observation so completion updates the
+      // row it actually claimed instead of creating a duplicate surface row.
+      if(inspectionScope?.seedUrls?.length){
+        const claimedByUrl=new Map<string,Array<{surface:string;leaseToken?:string|null}>>();
+        for(const seed of inspectionScope.seedUrls){
+          const normalized=normalizeCommunityWorkUrl(seed.url);
+          if(!normalized)continue;
+          const claims=claimedByUrl.get(normalized);
+          const claim={surface:seed.surface,leaseToken:seed.leaseToken};
+          if(claims)claims.push(claim);else claimedByUrl.set(normalized,[claim]);
+        }
+        for(const outcome of inspection.acquisitionOutcomes){
+          // The inspector binds claimed surfaces and leases itself; this block
+          // is only a fallback for an outcome it could not match by URL.
+          if((outcome as {workLeaseToken?:string}).workLeaseToken)continue;
+          const normalized=normalizeCommunityWorkUrl(outcome.requestedUrl);
+          const claims=normalized?claimedByUrl.get(normalized):undefined;
+          if(!claims?.length)continue;
+          const claimed=claims.find(entry=>entry.surface===String(outcome.surface||'').toUpperCase())||claims[0];
+          outcome.surface=claimed.surface as typeof outcome.surface;
+          if(claimed.leaseToken)(outcome as {workLeaseToken?:string}).workLeaseToken=claimed.leaseToken;
+        }
+      }
       // WorkRemaining is a per-pass snapshot, not a caller-supplied guess.
       // Compute it from the same classifier the lane event uses so persisted
       // observation telemetry and the event baseline cannot disagree.
@@ -4252,6 +4453,7 @@ export async function inspectAndValidateChannel(
       // earlier in this same scan.
       const currentCandidateRejected=currentCandidateNonTrading
         ||terminalInvalid.some(entry=>isSameSelectedDiscordCandidate(channel,entry.candidate));
+      const hadEstablishedSuccess=hasEstablishedValidatedDiscordSelection(channel);
       const shouldProjectValidation=canProjectDiscordValidation(channel,selected,selectedCandidate);
       if(shouldProjectValidation){
         // Project first, then select the candidate that the projection actually
@@ -4265,8 +4467,9 @@ export async function inspectAndValidateChannel(
         if(projectedDiscord.discord_candidate_id)await selectDiscordCandidate(channel.channel_id,projectedDiscord.discord_candidate_id);
       }
       attemptFree=attemptFreeDiscordValidation(selected.operationalOutcome,selected.retryable);
-      channel.scan_status=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?'COMPLETED':'FAILED';
-      channel.scan_attempts=selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID'?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
+      const preserveEstablishedInvite=hadEstablishedSuccess&&selected.operationalOutcome!=='CONFIRMED_INVALID'&&!currentCandidateRejected;
+      channel.scan_status=(preserveEstablishedInvite||selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID')?'COMPLETED':'FAILED';
+      channel.scan_attempts=(preserveEstablishedInvite||selected.operationalOutcome==='SUCCEEDED'||selected.operationalOutcome==='CONFIRMED_INVALID')?0:attemptFree?Math.max(0,channel.scan_attempts):nextChannelScanAttempts(channel.scan_attempts,false);
       channel.last_checked=now;
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:true});
       retryDirective=attemptFree?{attemptFree:true,code:COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE,reason:`Discord validation remained ${selected.operationalOutcome}`,retryAt:undefined,retryReason:'COMMUNITY_REQUIRED_ACQUISITION_FAILURE'}:undefined;
@@ -4302,8 +4505,12 @@ export async function inspectAndValidateChannel(
       reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
       retryDirective=inspection.retryDirective;
       attemptFree=Boolean(retryDirective?.attemptFree);
-      channel.scan_status='FAILED';
-      if(!retryDirective?.attemptFree)channel.scan_attempts++;
+      // A later slice must not turn a channel with an established validated
+      // invite back into FAILED. The invite remains authoritative while other
+      // relevant URLs continue through the recall lane. Explicit invalidation
+      // is handled by the validation branch, not here.
+      channel.scan_status=alreadyValidatedSuccess?'COMPLETED':'FAILED';
+      if(!alreadyValidatedSuccess&&!retryDirective?.attemptFree)channel.scan_attempts++;
       // An incomplete rescan cannot erase an earlier discovered locator. The
       // append-only checks remain authoritative until a new validation replaces
       // this compatibility projection.
@@ -4592,7 +4799,7 @@ export async function projectNotFoundAfterInspection(
           channel.discord_validation_status='RETRY_PENDING';
           channel.discord_discovery_status=channel.discord_candidate_locator?'DISCOVERED_VALIDATION_FAILED':(channel.discord_discovery_status||'NOT_DISCOVERED');
         }
-        channel.scan_status='FAILED';
+        channel.scan_status=alreadyValidatedSuccess?'COMPLETED':'FAILED';
         reconcileDiscordDiscoveryFromInspection(channel,admittedInspection,{validationProjected:false});
         // Pending work must always own a durable job. A locator/NOT_STARTED
         // or required-retryable observation may not have produced an

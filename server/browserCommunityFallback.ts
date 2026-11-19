@@ -3943,8 +3943,8 @@ export class RenderedFallbackGate {
       });
     }
     // Admission is timestamped here so callers can start budget clocks at the
-    // moment the gate slot was granted, even if they serialize internally
-    // afterwards (see withRenderedQueueLifecycleLock).
+    // moment the gate slot was granted, before any per-crawl lifecycle
+    // bookkeeping.
     try {
       const result = await operation(Date.now());
       // A proxy/browser startup failure can return a zero-work result. Refund
@@ -3978,10 +3978,10 @@ export class RenderedFallbackGate {
 }
 
 export const renderedFallbackGate = new RenderedFallbackGate(
-  // Stays at 1: withBrowserRuntimeLease serializes every crawler.run() onto
-  // one process-wide lease, and each crawl's total-budget clock starts at
-  // gate acquisition — admitting 2 would let the second burn its budget
-  // waiting for the lease. Env override still wins within the 1..2 bounds.
+  // Stays at 1 by default: the browser runtime lease defaults to one
+  // process-wide slot, and each crawl's total-budget clock starts at gate
+  // acquisition. A second slot is benchmark-gated; overlap is supported by
+  // the shared begin/end lifecycle accounting. Env override wins within 1..2.
   boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, 1, 1, 2),
   boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
 );
@@ -4087,9 +4087,9 @@ export function captureRenderedQueueLifecycleListeners(
  * public re-open; `drop()` closes the StorageManager registration), so the
  * smallest safe lifecycle change is to keep the fresh-queue-per-crawl
  * isolation semantics and reclaim the queue's process-wide registrations in
- * the crawl finally. `renderedFallbackGate` plus
- * `withRenderedQueueLifecycleLock` serialize each crawl end-to-end, so no
- * other live queue can own a listener added after the capture; a future
+ * the crawl finally. A shared active-crawl counter defers reclamation until the
+ * last live crawl ends, so overlapping crawls cannot cross-remove listeners;
+ * a future
  * Crawlee that stops registering or stops leaking degrades to a harmless
  * no-op.
  */
@@ -4113,16 +4113,10 @@ export function reclaimRenderedQueueLifecycleListeners(
 let renderedQueueLifecycleTail: Promise<void> = Promise.resolve();
 
 /**
- * Serializes a complete per-crawl queue lifecycle — emitter capture, isolated
- * queue open, crawler run, drop, and listener reclamation — on one
- * process-wide promise chain. The rendered fallback gate admits up to
- * RENDERED_FALLBACK_CONCURRENCY crawls (env-bound 1..2), but the
- * snapshot-based reclamation above can only attribute listeners correctly
- * while no other queue is being constructed on the shared emitter: without
- * serialization an earlier crawl's cleanup removes a later crawl's still-live
- * listeners. At the default gate width of 1 this adds no scheduling (the gate
- * already serializes, and crawler runs are further serialized onto the
- * process-wide browser runtime lease).
+ * Test-only serialization helper retained for lifecycle race fixtures.
+ * Production crawls use `beginRenderedQueueLifecycle`/`endRenderedQueueLifecycle`
+ * so the crawl itself is never serialized; only baseline capture and
+ * last-crawl reclamation are mutex-bound.
  */
 export async function withRenderedQueueLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
   const previous = renderedQueueLifecycleTail;
@@ -4134,6 +4128,82 @@ export async function withRenderedQueueLifecycleLock<T>(operation: () => Promise
   } finally {
     release();
   }
+}
+
+let renderedQueueLifecycleMutexTail: Promise<void> = Promise.resolve();
+
+async function withRenderedQueueLifecycleMutex<T>(operation: () => T | Promise<T>): Promise<T> {
+  const previous = renderedQueueLifecycleMutexTail;
+  let release!: () => void;
+  renderedQueueLifecycleMutexTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+export interface RenderedQueueLifecycleHandle<T> {
+  name: string;
+  queue: T;
+  /** Listeners added by this queue construction and owned by this crawl. */
+  ownedListeners: RenderedQueueListenerLedger;
+}
+
+/**
+ * Open one isolated rendered queue while serializing only the construction
+ * window. The before/after emitter diff is therefore exact for this queue, and
+ * the crawl can run concurrently with other crawls. Each crawl later removes
+ * exactly the listeners it owns, so a continuously replenished gate cannot
+ * retain finished queues just because the process never reaches zero active
+ * crawls.
+ */
+export async function beginRenderedQueueLifecycle<T extends { drop(): Promise<void> }>(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+  open: (name: string) => Promise<T>,
+): Promise<RenderedQueueLifecycleHandle<T>> {
+  return withRenderedQueueLifecycleMutex(async () => {
+    const before = captureRenderedQueueLifecycleListeners(emitter);
+    const opened = await openIsolatedRenderedRequestQueue(open);
+    const after = captureRenderedQueueLifecycleListeners(emitter);
+    return {
+      ...opened,
+      ownedListeners: {
+        migrating: new Set([...after.migrating].filter(listener => !before.migrating.has(listener))),
+        aborting: new Set([...after.aborting].filter(listener => !before.aborting.has(listener))),
+      },
+    };
+  });
+}
+
+export function reclaimOwnedRenderedQueueLifecycleListeners(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+  owned: RenderedQueueListenerLedger,
+): number {
+  if (!emitter) return 0;
+  let reclaimed = 0;
+  for (const event of RENDERED_QUEUE_LIFECYCLE_EVENTS) {
+    for (const listener of owned[event]) {
+      emitter.off(event, listener);
+      reclaimed++;
+    }
+  }
+  return reclaimed;
+}
+
+/**
+ * Drop this crawl's queue and remove exactly the listeners its construction
+ * added. Does not wait for, or remove, any other live crawl's listeners.
+ */
+export async function endRenderedQueueLifecycle(
+  emitter: RenderedQueueLifecycleEmitter | undefined,
+  owned: RenderedQueueListenerLedger,
+  queue?: { drop(): Promise<void> },
+  name?: string,
+): Promise<number> {
+  if (queue && name !== undefined) await dropIsolatedRenderedQueue(queue, name);
+  return withRenderedQueueLifecycleMutex(() => reclaimOwnedRenderedQueueLifecycleListeners(emitter, owned));
 }
 
 /**
@@ -4648,16 +4718,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
 
   try {
     const gateRequestedAtMs = Date.now();
-    return await renderedFallbackGate.run<BrowserFallbackResult>((gateAdmittedAtMs) => withRenderedQueueLifecycleLock(async () => {
-      // Admission wait is capacity evidence, measured before the lifecycle
-      // lock so serialized crawls correctly show gate pressure. It is never
-      // an acquisition failure or a reason to consume retry ownership.
+    return await renderedFallbackGate.run<BrowserFallbackResult>((gateAdmittedAtMs) => (async () => {
+      // Admission wait is capacity evidence, measured before lifecycle
+      // bookkeeping so gate pressure remains visible. It is never an
+      // acquisition failure or a reason to consume retry ownership.
       telemetry.gateWaitMs = Math.max(0, gateAdmittedAtMs - gateRequestedAtMs);
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
-      // Total-budget clock: starts at gate admission, before the lifecycle
-      // lock below, so a crawl admitted by a wider gate (env concurrency 2)
-      // consumes budget while waiting behind a serialized predecessor instead
-      // of occupying a gate slot with a fresh clock — the pre-lock semantics.
+      // Total-budget clock starts at gate admission. Lifecycle bookkeeping is
+      // short and never serializes the crawl itself, so a wider gate (env
+      // concurrency 2) can actually run both crawls concurrently.
       const startedAt = gateAdmittedAtMs;
       telemetry.crawlStartedAt = new Date(startedAt).toISOString();
       const { PlaywrightCrawler, RequestQueue, Configuration } = await import('crawlee');
@@ -4670,19 +4739,25 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       // rates (FATAL ERROR: Reached heap limit). Capture the emitter state
       // before opening and reclaim the new listeners in the finally below:
       // the fresh-queue-per-crawl isolation semantics stay unchanged while the
-      // dropped queue graph becomes collectable. The whole capture-through-
-      // reclamation window runs under withRenderedQueueLifecycleLock so
-      // overlapping crawls (env concurrency 2) cannot cross-remove listeners.
+      // dropped queue graph becomes collectable. Queue construction is
+      // serialized only long enough to diff exactly the listeners this queue
+      // added; each crawl reclaims its own set, so overlapping crawls (env
+      // concurrency 2) can run without retaining finished queue graphs.
       const queueEventEmitter = renderedQueueLifecycleEmitter(Configuration.getGlobalConfig().getEventManager());
-      const queueListenerLedger = captureRenderedQueueLifecycleListeners(queueEventEmitter);
       let isolated: { name: string; queue: InstanceType<typeof RequestQueue> } | undefined;
+      let ownedQueueListeners: RenderedQueueListenerLedger | undefined;
       let egressProxy: BrowserEgressProxy | undefined;
       const renderedRouteGuards = new Map<object, RenderedRouteGuard>();
       try {
         // Per-invocation isolated queue: never the process-default persisted
         // queue (see openIsolatedRenderedRequestQueue). Dropped in the finally
         // below on every path so named queues cannot accumulate.
-        isolated = await openIsolatedRenderedRequestQueue((name) => RequestQueue.open(name));
+        const lifecycleHandle = await beginRenderedQueueLifecycle(
+          queueEventEmitter,
+          (name) => RequestQueue.open(name),
+        );
+        isolated = { name: lifecycleHandle.name, queue: lifecycleHandle.queue };
+        ownedQueueListeners = lifecycleHandle.ownedListeners;
         // The route checks below are only a preflight. Chromium resolves again
         // when it connects, so all browser traffic goes through a loopback
         // proxy that resolves once, rejects mixed/private answers, and pins
@@ -6390,19 +6465,19 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // the context route already; this is the launch-failure/fallback path.
         await disposeRenderedRouteGuards(renderedRouteGuards.values());
         try {
-          await finalizeRenderedQueueLifecycle({
-            queue: isolated?.queue,
-            name: isolated?.name,
-            emitter: queueEventEmitter,
-            ledger: queueListenerLedger,
-          });
+          await endRenderedQueueLifecycle(
+            queueEventEmitter,
+            ownedQueueListeners || { migrating: new Set(), aborting: new Set() },
+            isolated?.queue,
+            isolated?.name,
+          );
         } finally {
           // The loopback proxy must not outlive the browser session; closing
           // is best-effort and never changes the crawl result.
           await egressProxy?.close().catch(() => undefined);
         }
       }
-    }), limits.admissionLane || 'UNKNOWN', { isWorkStarted: renderedCrawlStarted, maxWaitMs: limits.maxGateWaitMs });
+    })(), limits.admissionLane || 'UNKNOWN', { isWorkStarted: renderedCrawlStarted, maxWaitMs: limits.maxGateWaitMs });
   } catch (error:any) {
     if (!telemetry.crawlFinishedAt) telemetry.crawlFinishedAt = new Date().toISOString();
     const candidates=mergeDiscordCandidates(discovered);
