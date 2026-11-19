@@ -129,17 +129,38 @@ async function enqueueClassificationAfterAdmission(input: {
 }
 
 export function candidateFromAdmissionRow(row: AdmissionCandidateRow): DiscoveredChannelRaw {
+  const snapshot = row.evidence_snapshot;
+  const raw = row.raw_observation || {};
+  const snapshotVideos = Array.isArray(snapshot?.videos) ? snapshot.videos : [];
+  const videos = snapshotVideos
+    .filter(video => video && typeof video.title === 'string')
+    .map(video => ({
+      id: video.videoId,
+      title: video.title,
+      description: video.description || '',
+      published_at: video.publishedAt,
+    }));
+  const links = Array.isArray(snapshot?.links) ? snapshot.links.filter(link => typeof link === 'string' && link.trim()) : [];
   return {
     channelId: row.channel_id,
     channelName: row.channel_name,
     youtubeUrl: row.youtube_url,
-    description: String(row.raw_observation?.description || ''),
-    videoTitles: Array.isArray(row.raw_observation?.videoTitles) ? row.raw_observation.videoTitles : [],
-    videoDescriptions: Array.isArray(row.raw_observation?.videoDescriptions) ? row.raw_observation.videoDescriptions : [],
-    matchedDocument: row.matched_document as unknown as DiscoveredChannelRaw['matchedDocument'],
-    relationshipProvenance: row.raw_observation?.relationshipProvenance as DiscoveredChannelRaw['relationshipProvenance'],
-    locationTag: typeof row.raw_observation?.locationTag === 'string' ? row.raw_observation.locationTag : undefined,
-    quotaOrigin: row.raw_observation?.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
+    // The admission evidence snapshot contains the full creator-owned sample
+    // (bio, recent videos and descriptions) that the admission model saw. The
+    // classification job payload must carry that sample, not the sparse search
+    // match, or the full classifier would evaluate different evidence.
+    description: String(snapshot?.description ?? raw.description ?? ''),
+    videos: videos.length ? videos : undefined,
+    videoTitles: videos.length ? videos.map(video => video.title) : (Array.isArray(raw.videoTitles) ? raw.videoTitles : []),
+    videoDescriptions: videos.length ? videos.map(video => video.description) : (Array.isArray(raw.videoDescriptions) ? raw.videoDescriptions : []),
+    videoDescriptionsAuthoritative: snapshot?.evidenceCoverage === 'COMPLETE',
+    channelLinks: links.length ? links : undefined,
+    externalLinkDetails: links.length ? links.map(url => ({ url })) : undefined,
+    subscriberCount: snapshot?.subscriberCount ?? (typeof raw.subscriberCount === 'string' ? raw.subscriberCount : undefined),
+    matchedDocument: (snapshot?.matchedDocument || row.matched_document) as unknown as DiscoveredChannelRaw['matchedDocument'],
+    relationshipProvenance: (snapshot?.relationshipProvenance || raw.relationshipProvenance) as DiscoveredChannelRaw['relationshipProvenance'],
+    locationTag: typeof raw.locationTag === 'string' ? raw.locationTag : snapshot?.country,
+    quotaOrigin: raw.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
   };
 }
 
@@ -156,6 +177,31 @@ export function parseAdmissionReviewAction(flags: {
   if (flags.requeue) actions.push('REQUEUE');
   if (actions.length > 1) throw new Error('REVIEW_ACTION_CONFLICT');
   return actions[0] || null;
+}
+
+/**
+ * Build the classification candidate from the full admission evidence
+ * snapshot while preserving the admission provenance fields. The discovery
+ * candidate is often only a search-match envelope; the snapshot is the
+ * creator-owned bio/video sample the admission model actually evaluated.
+ */
+function classificationCandidateForAdmission(
+  base: DiscoveredChannelRaw,
+  row: AdmissionCandidateRow,
+): DiscoveredChannelRaw {
+  return {
+    ...candidateFromAdmissionRow(row),
+    admissionDecisionId: base.admissionDecisionId,
+    admissionStatus: base.admissionStatus,
+    admissionDecisionSource: base.admissionDecisionSource,
+    admissionConfirmedTrading: base.admissionConfirmedTrading,
+    admissionTradingConfidence: base.admissionTradingConfidence,
+    admissionCitations: base.admissionCitations,
+    admissionModel: base.admissionModel,
+    admissionProvider: base.admissionProvider,
+    admissionEvidenceHash: base.admissionEvidenceHash,
+    admissionCategory: base.admissionCategory,
+  };
 }
 
 /**
@@ -393,7 +439,7 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   input.candidate.admissionEvidenceHash = decision?.rows[0]?.evidence_hash || row.evidence_hash || undefined;
   input.candidate.admissionCategory = 'General Trading';
   const queued = await enqueueClassificationAfterAdmission({
-    candidate: input.candidate,
+    candidate: classificationCandidateForAdmission(input.candidate, row),
     targetCountry: input.targetCountry,
     source: input.source,
     query: input.query,
@@ -918,7 +964,7 @@ export async function verifyAdmissionCandidate(
       input.candidate.admissionEvidenceHash = hash;
       input.candidate.admissionCategory = effectiveJudgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
-        candidate: input.candidate,
+        candidate: classificationCandidateForAdmission(input.candidate, row),
         targetCountry: input.targetCountry,
         source: input.source,
         query: input.query,

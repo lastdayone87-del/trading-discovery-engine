@@ -259,6 +259,34 @@ test('clear unrelated with valid citations rejects; insufficient citations go to
   assert.equal(insufficient.admitted, false);
 });
 
+test('semantic trading with focus 1, 5 or 10 is routed to full classification, not first-class admission', () => {
+  const trader = evidence({
+    name: 'Low Focus Trader',
+    bio: 'Trading en vivo y analisis de mercados financieros.',
+    videos: [
+      { title: 'Analisis semanal del mercado', description: 'Escenarios operativos y niveles.' },
+      { title: 'Sesion de trading en directo', description: 'Ejecucion y gestion de riesgo.' },
+    ],
+  });
+  for (const focus of [1, 5, 10]) {
+    const result = decideAdmission({
+      evidence: trader,
+      judgment: judgment({
+        subject: 'TRADING',
+        focus,
+        citations: [
+          citation('bio', 'Trading en vivo y analisis de mercados', undefined, 'TRADING'),
+          citation('video_title', 'Analisis semanal del mercado', 0, 'TRADING'),
+        ],
+      }),
+    });
+    assert.equal(result.decision, 'ADMIT_AMBIGUOUS', String(focus));
+    assert.equal(result.status, 'ADMITTED_AMBIGUOUS', String(focus));
+    assert.equal(result.ambiguous, true, String(focus));
+    assert.ok(result.reasonCodes.includes('SEMANTIC_TRADING_LOW_CONFIDENCE'), String(focus));
+  }
+});
+
 test('a trailing ellipsis does not invalidate an otherwise exact citation', () => {
   const trader = evidence({
     name: 'Aker fixture',
@@ -279,8 +307,9 @@ test('a trailing ellipsis does not invalidate an otherwise exact citation', () =
       ],
     }),
   });
-  assert.equal(decision.decision, 'ADMIT');
+  assert.equal(decision.decision, 'ADMIT_AMBIGUOUS');
   assert.equal(decision.admitted, true);
+  assert.ok(decision.reasonCodes.includes('SEMANTIC_TRADING_LOW_CONFIDENCE'));
 });
 
 test('review and finance-adjacent outcomes report the effective second judgment', () => {
@@ -765,7 +794,8 @@ test('mid-quote ellipses are accepted only when every segment is exact and in or
       ],
     }),
   });
-  assert.equal(valid.decision, 'ADMIT');
+  assert.equal(valid.decision, 'ADMIT_AMBIGUOUS');
+  assert.ok(valid.reasonCodes.includes('SEMANTIC_TRADING_LOW_CONFIDENCE'));
 
   const fabricated = decideAdmission({
     evidence: trader,
@@ -1052,6 +1082,41 @@ test('review candidates rebuild the original discovery observation without provi
   assert.equal(candidate.locationTag, 'AE');
 });
 
+test('admission classification candidate carries the full evidence snapshot, not the sparse match', () => {
+  const candidate = candidateFromAdmissionRow({
+    channel_id: 'UC-full',
+    channel_name: 'Full Evidence Trader',
+    youtube_url: 'https://youtube.com/channel/UC-full',
+    raw_observation: {
+      description: '',
+      videoTitles: ['one sparse match'],
+      videoDescriptions: ['sparse'],
+    },
+    evidence_snapshot: {
+      channelId: 'UC-full',
+      channelName: 'Full Evidence Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-full',
+      description: 'Teaching options trading with real examples and risk management.',
+      links: ['https://example.test/community'],
+      subscriberCount: '1200',
+      evidenceCoverage: 'COMPLETE',
+      videos: [
+        { videoId: 'v1', title: 'The Bid-Ask Trap', description: 'How bid-ask spreads affect option trades.', publishedAt: '2026-10-30T00:00:00Z' },
+        { videoId: 'v2', title: 'Options Greeks', description: 'Delta, gamma and theta in practice.', publishedAt: '2026-09-01T00:00:00Z' },
+      ],
+      matchedDocument: { type: 'VIDEO', title: 'The Bid-Ask Trap' },
+    },
+    matched_document: { type: 'VIDEO', title: 'sparse' },
+  } as any);
+  assert.equal(candidate.description, 'Teaching options trading with real examples and risk management.');
+  assert.deepEqual(candidate.videoTitles, ['The Bid-Ask Trap', 'Options Greeks']);
+  assert.deepEqual(candidate.videoDescriptions, ['How bid-ask spreads affect option trades.', 'Delta, gamma and theta in practice.']);
+  assert.deepEqual(candidate.videos?.map(video => video.id), ['v1', 'v2']);
+  assert.deepEqual(candidate.channelLinks, ['https://example.test/community']);
+  assert.equal(candidate.subscriberCount, '1200');
+  assert.equal(candidate.videoDescriptionsAuthoritative, true);
+});
+
 
 test('finance-adjacent evidence is held back from deterministic fast-pass without active trading anchors', () => {
   const financeTexts = [
@@ -1088,7 +1153,8 @@ test('one valid trading citation is enough when the video evidence contains a tr
       citations: [citation('video_title', 'TRADING EN LIVE : GOLD, BITCOIN & NASDAQ !', 0, 'TRADING')],
     }),
   });
-  assert.equal(result.decision, 'ADMIT');
+  assert.equal(result.decision, 'ADMIT_AMBIGUOUS');
+  assert.ok(result.reasonCodes.includes('SEMANTIC_TRADING_LOW_CONFIDENCE'));
 });
 
 

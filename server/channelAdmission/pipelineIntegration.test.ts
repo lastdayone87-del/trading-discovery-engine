@@ -120,11 +120,14 @@ test('confirmed admission branch precedes the legacy classifier in the pipeline 
   const end = pipeline.indexOf('const classificationRouting = productionClassification.decision.deterministicRouting;', start);
   assert.ok(start > -1 && end > start, 'classification branch must exist');
   const slice = pipeline.slice(start, end);
-  const confirmed = slice.indexOf('candidate.admissionConfirmedTrading === true');
+  const confirmed = slice.indexOf('admissionShortcutEligible(candidate');
   const classifier = slice.indexOf('await classifyTradingRelevanceDetailed(classifierInput)');
-  assert.ok(confirmed > -1 && classifier > confirmed, 'confirmed admission must be selected before the legacy classifier');
+  assert.ok(confirmed > -1 && classifier > confirmed, 'confirmed admission must be selected before the full classifier');
   assert.match(slice, /buildAdmissionConfirmedClassification/);
-  assert.match(slice, /getAdmissionMode\(\)\) === 'ACTIVE'/);
+  assert.match(slice, /admissionShortcutEligible\(candidate, await getAdmissionMode\(\)\)/);
+  assert.match(pipeline, /admissionDecisionSource === 'DETERMINISTIC'/);
+  assert.match(pipeline, /admissionDecisionSource === 'HUMAN'/);
+  assert.match(pipeline, /ADMISSION_CONFIRMATION_MIN_CONFIDENCE/);
 });
 
 test('legacy dashboard predicate hides pre-admission rows', () => {

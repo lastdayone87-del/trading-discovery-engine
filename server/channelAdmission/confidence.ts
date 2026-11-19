@@ -1,4 +1,10 @@
 /**
+ * Minimum confidence for a first-class admission confirmation. Below this
+ * value admission remains a routing signal and the full classifier decides.
+ */
+export const ADMISSION_CONFIRMATION_MIN_CONFIDENCE = 80;
+
+/**
  * Semantic admission and downstream classification use a 0–100 percentage.
  * Some providers historically returned `trading_focus` as a 0–1 probability.
  * Normalize legacy fractions before policy thresholds and integer persistence,

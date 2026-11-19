@@ -305,6 +305,30 @@ Any classifier change must retain cases for:
 
 The classifier may consume an immutable classification-lane feature projection. Every feature retains concept and surface identity, concept version, publication version/checksum, and policy version. Governed features may add explainable candidate or corroboration evidence, but cannot bypass availability, sufficiency, independent corroboration, contradiction, or lifecycle stages. Missing or invalid knowledge abstains and uses the existing deterministic path; it is never negative evidence. Mutable graph, terminology, semantic, and discovery state are not classifier dependencies.
 
+## Semantic admission boundary
+
+Semantic admission is a routing gate, not a final trading classification. For
+new discoveries the deterministic admission stage runs first. Clear cases may
+be admitted or rejected without AI. Ambiguous cases use the semantic admission
+judge, whose output is stored with the full creator-owned evidence snapshot.
+
+An `ADMIT` or `ADMIT_AMBIGUOUS` from the semantic admission path never bypasses
+the full classifier. It enqueues `CLASSIFY_DISCOVERED_CHANNEL` with the
+admission evidence snapshot (bio, recent videos and descriptions), so the full
+classifier receives the same original evidence the admission model evaluated.
+Only a high-confidence deterministic or human admission may use the
+first-class confirmation shortcut; semantic admission confidence is not used as
+final classification confidence.
+
+The admission prompt defines `trading_focus` as an integer 0–100 percentage.
+Low-focus semantic trading judgments are recorded as `ADMITTED_AMBIGUOUS` and
+routed through the full classifier, not presented as confirmed relevance.
+
+Existing semantic-admission rows can be reprocessed with
+`scripts/reprocessSemanticAdmissions.ts`; completed-but-idle ENRICH rows can be
+recovered with `scripts/recoverEnrichBacklog.ts`. Both are dry-run by default,
+bounded, idempotent and never approve a channel.
+
 ## Precision-adjudicator deferral and recovery
 
 When a first-pass relevant channel is unresolved by the deterministic guard and
