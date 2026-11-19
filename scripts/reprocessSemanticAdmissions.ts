@@ -64,7 +64,7 @@ const rows = await db.query(
       and (c.admission_status = 'ADMITTED' or c.admission_status = 'ADMITTED_AMBIGUOUS')
       -- Semantic admission only. Deterministic and human admissions are
       -- legitimate first-class decisions and keep their fast path.
-      and coalesce(s.semantic_output->>'model', '') <> 'deterministic-first-v1'
+      and coalesce(s.semantic_output->>'model', '') not in ('', 'deterministic-first-v1')
       and coalesce(s.decision_key, '') not like '%:HUMAN:%'
       and ($2::boolean or c.trading_status in ('NEEDS_REVIEW', 'UNCERTAIN'))
       and not exists (

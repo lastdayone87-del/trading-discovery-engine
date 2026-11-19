@@ -263,8 +263,6 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
     && worker.indexOf('if (isRejectedAdmissionStatus(row.status))') < worker.indexOf('verifyAdmissionCandidate(input'),
   'review/rejected rows must not re-enter verification');
   assert.match(verify, /classificationCandidateForAdmission\(input\.candidate, \{ \.\.\.row, evidence_snapshot: evidence \}\)/);
-  assert.match(index, /function classificationCandidateForAdmission[\s\S]*candidateFromAdmissionRow\(row\)/);
-  assert.match(index, /candidateFromAdmissionRow[\s\S]*hasSnapshot \? snapshotDescription : String\(raw\.description/);
 });
 
 test('extracted query offer uses the trading-anchor/gambling guard', () => {

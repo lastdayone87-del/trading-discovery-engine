@@ -161,7 +161,9 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
     videos: videos.length ? videos : undefined,
     videoTitles: hasSnapshot ? videos.map(video => video.title) : rawTitles,
     videoDescriptions: hasSnapshot ? videos.map(video => video.description) : rawDescriptions,
-    videoDescriptionsAuthoritative: hasSnapshot && snapshot?.evidenceCoverage === 'COMPLETE',
+    // Only snapshot video descriptions may vote. A bio-only COMPLETE snapshot
+    // has no authoritative video sample, so the flag must stay false.
+    videoDescriptionsAuthoritative: hasSnapshot && videos.length > 0 && snapshot?.evidenceCoverage === 'COMPLETE',
     channelLinks: links.length ? links : undefined,
     externalLinkDetails: links.length ? links.map(url => ({ url })) : undefined,
     subscriberCount: snapshot?.subscriberCount ?? (typeof raw.subscriberCount === 'string' ? raw.subscriberCount : undefined),

@@ -1147,7 +1147,7 @@ test('a snapshot with no videos never falls back to sparse search-match fields',
   assert.deepEqual(candidate.videoDescriptions, []);
   assert.equal(candidate.channelLinks, undefined);
   assert.equal(candidate.locationTag, 'GB');
-  assert.equal(candidate.videoDescriptionsAuthoritative, true);
+  assert.equal(candidate.videoDescriptionsAuthoritative, false);
 });
 
 test('classification candidate preserves discovery accounting and replaces only creator evidence', () => {
