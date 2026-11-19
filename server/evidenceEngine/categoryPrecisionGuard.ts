@@ -437,7 +437,9 @@ export async function adjudicateCategoryDetailed(
   if (!clients.length) {
     return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_UNCONFIGURED' };
   }
-  if (!takeAdjudicatorBudget() || !takeAdjudicatorConcurrency()) {
+  // Concurrency is a bulkhead, not a provider call: never consume a
+  // per-minute request slot when the request cannot start.
+  if (!takeAdjudicatorConcurrency()) {
     return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_CAPACITY_DEFERRED' };
   }
   const prompt = buildCategoryAdjudicatorPrompt(input, firstLabel);
@@ -445,8 +447,12 @@ export async function adjudicateCategoryDetailed(
   try {
     // Try the serving provider first, then every other configured route. A
     // transient preferred-route failure must not defer an otherwise healthy
-    // adjudication.
+    // adjudication. Charge the minute budget per actual provider call so
+    // failover cannot multiply request volume under one admission token.
     for (const client of clients) {
+      if (!takeAdjudicatorBudget()) {
+        return { status: 'UNAVAILABLE', result: null, reasonCode: 'PRECISION_ADJUDICATOR_CAPACITY_DEFERRED' };
+      }
       try {
         const value = await client.classify(prompt, adjudicatorModelFor(client), {
           jobId: input.job_id,

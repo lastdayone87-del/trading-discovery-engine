@@ -185,10 +185,25 @@ export async function classifyTradingRelevanceDetailed(
   // evidence stages remain the record of how the first pass was reached; the
   // action is the final machine disposition used by routing and diagnostics.
   if (precisionApplied && decision.stagedClassification) {
-    if (decision.status === 'NON_TRADING') {
-      decision.stagedClassification = { ...decision.stagedClassification, lifecycleAction: 'REJECT' };
-    } else if (decision.status === 'UNCERTAIN') {
-      decision.stagedClassification = { ...decision.stagedClassification, lifecycleAction: 'ENRICH' };
+    const lifecycleAction = decision.status === 'NON_TRADING' ? 'REJECT' as const
+      : decision.status === 'UNCERTAIN' ? 'ENRICH' as const
+        : null;
+    if (lifecycleAction) {
+      decision.stagedClassification = {
+        ...decision.stagedClassification,
+        lifecycleAction,
+        stages: decision.stagedClassification.stages.map(stage => stage.stage === 'LIFECYCLE'
+          ? {
+            ...stage,
+            metrics: { ...stage.metrics, action: lifecycleAction },
+            reasonCodes: [
+              ...stage.reasonCodes.filter(code => !code.startsWith('ROUTE_')),
+              `ROUTE_${lifecycleAction}`,
+              'PRECISION_GUARD_FINAL_DISPOSITION',
+            ],
+          }
+          : stage),
+      };
     }
   }
   const corroboration = decision.stagedClassification?.stages.find(stage => stage.stage === 'CORROBORATION');
