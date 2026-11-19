@@ -183,10 +183,12 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     continue;
   }
   // Re-check before every insert so the batch stops at the configured cap even
-  // when normal workers or a concurrent operator run add pending jobs.
-  const capacity = await getClassificationBackpressureState('enrich-backlog-recovery');
-  if (capacity.globalPending >= capacity.maxPending) {
-    console.log(JSON.stringify({ stopped: true, reason: 'CLASSIFICATION_CAPACITY_FULL', globalPending: capacity.globalPending, maxPending: capacity.maxPending, ...summary }));
+  // when normal workers or a concurrent operator run add pending jobs. The cap
+  // is the same soft boundary used by search admission; the per-insert check
+  // bounds any concurrent overrun to one job per writer.
+  const capacity = await getClassificationBackpressureState(payload.queryScopeKey);
+  if (capacity.globalPending >= capacity.maxPending || capacity.scopedPending >= capacity.maxPerQuery) {
+    console.log(JSON.stringify({ stopped: true, reason: 'CLASSIFICATION_CAPACITY_FULL', globalPending: capacity.globalPending, maxPending: capacity.maxPending, scopedPending: capacity.scopedPending, maxPerQuery: capacity.maxPerQuery, ...summary }));
     break;
   }
   const job = await enqueueClassificationJobAtomic(channelId, payload, {
