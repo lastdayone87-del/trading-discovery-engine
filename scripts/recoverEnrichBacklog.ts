@@ -33,9 +33,12 @@ const rows = await db.query(
   `select c.channel_id, c.channel_name, c.youtube_url, c.country, c.country_status,
           c.discovery_source, c.subscriber_count, c.scan_status, c.trading_status,
           c.trading_confidence_score,
-          cand.id as admission_candidate_id
+          (select cand.id
+             from semantic_admission_candidates cand
+            where cand.channel_id = c.channel_id
+            order by cand.updated_at desc
+            limit 1) as admission_candidate_id
      from channels c
-     left join semantic_admission_candidates cand on cand.channel_id = c.channel_id
     where c.trading_status = 'UNCERTAIN'
       and c.scan_status in ('ENRICHING', 'ENRICHMENT_PENDING')
       and c.next_check is null
@@ -43,6 +46,13 @@ const rows = await db.query(
         select 1 from jobs j
          where j.payload->>'channelId' = c.channel_id
            and j.status in ('PENDING', 'PROCESSING')
+      )
+      -- Completed recovery work owns the channel. Failed recovery work is
+      -- reopened so a later bounded pass can retry it.
+      and not exists (
+        select 1 from jobs j
+         where left(j.idempotency_key, length('enrich-backlog-recovery:' || c.channel_id || ':')) = 'enrich-backlog-recovery:' || c.channel_id || ':'
+           and j.status = 'COMPLETED'
       )
     order by c.last_checked asc nulls first
     limit $1`,
@@ -155,6 +165,10 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     idempotencyKey,
     preventCompletedReopen: true,
   });
+  if (job.status !== 'PENDING' && job.status !== 'PROCESSING') {
+    console.log(JSON.stringify({ skipped: true, reason: 'JOB_ALREADY_TERMINAL', jobId: job.id, jobStatus: job.status, ...summary }));
+    continue;
+  }
   enqueued += 1;
   console.log(JSON.stringify({ enqueued: true, jobId: job.id, ...summary }));
 }

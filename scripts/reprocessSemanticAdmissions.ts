@@ -43,11 +43,22 @@ const rows = await db.query(
      join semantic_admission_candidates cand on cand.id = s.candidate_id
     where s.decision in ('ADMIT', 'ADMIT_AMBIGUOUS')
       and (c.admission_status = 'ADMITTED' or c.admission_status = 'ADMITTED_AMBIGUOUS')
+      -- Semantic admission only. Deterministic and human admissions are
+      -- legitimate first-class decisions and keep their fast path.
+      and coalesce(s.semantic_output->>'model', '') <> 'deterministic-first-v1'
+      and coalesce(s.decision_key, '') not like '%:HUMAN:%'
       and ($2::boolean or c.trading_status in ('NEEDS_REVIEW', 'UNCERTAIN'))
       and not exists (
         select 1 from jobs j
          where j.payload->>'channelId' = c.channel_id
            and j.status in ('PENDING', 'PROCESSING')
+      )
+      -- A completed reprocessing job owns this decision; only failed work is
+      -- retried. This keeps repeated bounded batches moving forward.
+      and not exists (
+        select 1 from jobs j
+         where j.idempotency_key = 'semantic-admission-reprocess:' || c.channel_id || ':' || c.admission_decision_id || ':v1'
+           and j.status = 'COMPLETED'
       )
     order by c.updated_at desc
     limit $1`,
@@ -113,6 +124,10 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     idempotencyKey,
     preventCompletedReopen: true,
   });
+  if (job.status !== 'PENDING' && job.status !== 'PROCESSING') {
+    console.log(JSON.stringify({ skipped: true, reason: 'JOB_ALREADY_TERMINAL', jobId: job.id, jobStatus: job.status, ...summary }));
+    continue;
+  }
   enqueued += 1;
   console.log(JSON.stringify({ enqueued: true, jobId: job.id, ...summary }));
 }

@@ -140,7 +140,10 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
       description: video.description || '',
       published_at: video.publishedAt,
     }));
-  const links = Array.isArray(snapshot?.links) ? snapshot.links.filter(link => typeof link === 'string' && link.trim()) : [];
+  const snapshotLinks = Array.isArray(snapshot?.links) ? snapshot.links.filter(link => typeof link === 'string' && link.trim()) : [];
+  const rawLinks = Array.isArray(raw.channelLinks) ? raw.channelLinks.filter((link): link is string => typeof link === 'string' && Boolean(link.trim())) : [];
+  const links = snapshotLinks.length ? snapshotLinks : rawLinks;
+  const snapshotDescription = typeof snapshot?.description === 'string' ? snapshot.description.trim() : '';
   return {
     channelId: row.channel_id,
     channelName: row.channel_name,
@@ -149,7 +152,7 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
     // (bio, recent videos and descriptions) that the admission model saw. The
     // classification job payload must carry that sample, not the sparse search
     // match, or the full classifier would evaluate different evidence.
-    description: String(snapshot?.description ?? raw.description ?? ''),
+    description: snapshotDescription || String(raw.description ?? ''),
     videos: videos.length ? videos : undefined,
     videoTitles: videos.length ? videos.map(video => video.title) : (Array.isArray(raw.videoTitles) ? raw.videoTitles : []),
     videoDescriptions: videos.length ? videos.map(video => video.description) : (Array.isArray(raw.videoDescriptions) ? raw.videoDescriptions : []),
@@ -964,7 +967,10 @@ export async function verifyAdmissionCandidate(
       input.candidate.admissionEvidenceHash = hash;
       input.candidate.admissionCategory = effectiveJudgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
-        candidate: classificationCandidateForAdmission(input.candidate, row),
+        // Use the evidence that was just evaluated, not the pre-verification
+        // row. On a first attempt the stored snapshot may still be null; the
+        // classifier must receive the same bio/video sample as the judge.
+        candidate: classificationCandidateForAdmission(input.candidate, { ...row, evidence_snapshot: evidence }),
         targetCountry: input.targetCountry,
         source: input.source,
         query: input.query,
