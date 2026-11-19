@@ -1,9 +1,8 @@
-import { getDb, enqueueJob } from '../server/db';
+import { getDb, enqueueClassificationJobAtomic, getClassificationBackpressureState } from '../server/db';
 import {
   buildClassificationJobPayload,
   classificationQueryScopeKey,
   resolveClassificationDecouplingConfig,
-  CLASSIFICATION_JOB_TYPE,
 } from '../server/classificationDecoupling';
 import { candidateFromAdmissionRow } from '../server/channelAdmission';
 import type { AdmissionCandidateRow } from '../server/channelAdmission/store';
@@ -22,13 +21,33 @@ import type { DiscoverySource } from '../src/types';
 const args = process.argv.slice(2);
 const apply = args.includes('--apply');
 const limitArg = args.find(arg => arg.startsWith('--limit='));
-const limit = Math.max(1, Math.min(500, Number(limitArg?.split('=')[1] || 25) || 25));
+let limit = Math.max(1, Math.min(500, Number(limitArg?.split('=')[1] || 25) || 25));
 
 function sourceOf(value: unknown): DiscoverySource {
   return value === 'manual_search' || value === 'recheck' ? value : 'automated_query';
 }
 
+const config = resolveClassificationDecouplingConfig();
 const db = await getDb();
+if (apply) {
+  const capacity = await getClassificationBackpressureState('enrich-backlog-recovery');
+  const remaining = Math.max(0, capacity.maxPending - capacity.globalPending);
+  if (remaining === 0) {
+    console.log(JSON.stringify({
+      apply,
+      capacityFull: true,
+      globalPending: capacity.globalPending,
+      maxPending: capacity.maxPending,
+      selected: 0,
+      enqueued: 0,
+    }));
+    process.exit(0);
+  }
+  if (remaining < limit) {
+    console.log(JSON.stringify({ apply, capacityLimited: true, requested: limit, effectiveLimit: remaining }));
+  }
+  limit = Math.min(limit, remaining);
+}
 const rows = await db.query(
   `select c.channel_id, c.channel_name, c.youtube_url, c.country, c.country_status,
           c.discovery_source, c.subscriber_count, c.scan_status, c.trading_status,
@@ -59,14 +78,16 @@ const rows = await db.query(
   [limit],
 );
 
-const config = resolveClassificationDecouplingConfig();
 let selected = 0;
 let enqueued = 0;
 for (const row of rows.rows as Array<Record<string, any>>) {
   selected += 1;
   const channelId = String(row.channel_id);
   let candidate: DiscoveredChannelRaw | null = null;
-  let targetCountry = String(row.country || 'UNKNOWN');
+  // channels.country is the detected creator country, not the discovery
+  // target. Never substitute it here: without a stored discovery target the
+  // safe value is UNKNOWN.
+  let targetCountry = 'UNKNOWN';
   let source = sourceOf(row.discovery_source);
   let queryRunId: string | undefined;
   let queryId: number | undefined;
@@ -143,10 +164,12 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     forceExtraction: false,
     forceClassification: true,
   });
-  const idempotencyKey = `enrich-backlog-recovery:${channelId}:${discoveryJobId || 'none'}:v1`;
+  // Stable per-channel key. Using the newest discovery job id would change the
+  // key after every attempt and could enqueue the same channel indefinitely.
+  const idempotencyKey = `enrich-backlog-recovery:${channelId}:v1`;
   const summary = {
     channelId,
-    channelName: row.channel_name,
+    channelName: candidate.channelName,
     confidence: Number(row.trading_confidence_score || 0),
     scanStatus: row.scan_status,
     evidenceVideos: candidate.videos?.length || 0,
@@ -159,12 +182,16 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     console.log(JSON.stringify({ dryRun: true, ...summary }));
     continue;
   }
-  const job = await enqueueJob(CLASSIFICATION_JOB_TYPE, payload, {
+  const job = await enqueueClassificationJobAtomic(channelId, payload, {
     priority: config.priority,
-    maxAttempts: 4,
+    maxAttempts: config.maxAttempts,
     idempotencyKey,
     preventCompletedReopen: true,
   });
+  if (!job) {
+    console.log(JSON.stringify({ skipped: true, reason: 'ACTIVE_CLASSIFICATION_OWNED', ...summary }));
+    continue;
+  }
   if (job.status !== 'PENDING' && job.status !== 'PROCESSING') {
     console.log(JSON.stringify({ skipped: true, reason: 'JOB_ALREADY_TERMINAL', jobId: job.id, jobStatus: job.status, ...summary }));
     continue;

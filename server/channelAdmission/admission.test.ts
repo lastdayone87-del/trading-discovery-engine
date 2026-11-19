@@ -9,7 +9,7 @@ import { ADMISSION_VERIFICATION_PRIORITY, admissionModeFromOverrides, admissionV
 import { CLASSIFICATION_JOB_PRIORITY_DEFAULT } from '../classificationDecoupling';
 import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from '../operationalEnrichmentRecovery';
 import { judgeRoutePoolHealthy } from './routeHealth';
-import { candidateFromAdmissionRow } from './index';
+import { candidateFromAdmissionRow, classificationCandidateForAdmission } from './index';
 import { admissionRediscoveryDisposition, isRejectedAdmissionStatus, isRetryableAdmissionStatus, isTerminalAdmissionStatus, isWaitingAdmissionStatus, providerDeferredCandidateFields } from './types';
 import { ambiguousAdmitRate, evaluateQueryAdmissionGuard } from './queryGuard';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
@@ -1115,6 +1115,89 @@ test('admission classification candidate carries the full evidence snapshot, not
   assert.deepEqual(candidate.channelLinks, ['https://example.test/community']);
   assert.equal(candidate.subscriberCount, '1200');
   assert.equal(candidate.videoDescriptionsAuthoritative, true);
+});
+
+test('a snapshot with no videos never falls back to sparse search-match fields', () => {
+  const candidate = candidateFromAdmissionRow({
+    channel_id: 'UC-bio-only',
+    channel_name: 'Search Display Name',
+    youtube_url: 'https://youtube.com/channel/UC-bio-only',
+    raw_observation: {
+      description: 'sparse search snippet',
+      videoTitles: ['search-only title'],
+      videoDescriptions: ['search-only description'],
+      channelLinks: ['https://search-only.example'],
+      locationTag: 'US',
+    },
+    evidence_snapshot: {
+      channelId: 'UC-bio-only',
+      channelName: 'Creator Display Name',
+      youtubeUrl: 'https://youtube.com/@creator',
+      description: 'Bio-only creator evidence.',
+      links: [],
+      country: 'GB',
+      videos: [],
+      evidenceCoverage: 'COMPLETE',
+    },
+  } as any);
+  assert.equal(candidate.channelName, 'Creator Display Name');
+  assert.equal(candidate.youtubeUrl, 'https://youtube.com/@creator');
+  assert.equal(candidate.description, 'Bio-only creator evidence.');
+  assert.deepEqual(candidate.videoTitles, []);
+  assert.deepEqual(candidate.videoDescriptions, []);
+  assert.equal(candidate.channelLinks, undefined);
+  assert.equal(candidate.locationTag, 'GB');
+  assert.equal(candidate.videoDescriptionsAuthoritative, true);
+});
+
+test('classification candidate preserves discovery accounting and replaces only creator evidence', () => {
+  const base = {
+    channelId: 'UC-merge',
+    channelName: 'Search Display Name',
+    youtubeUrl: 'https://youtube.com/channel/UC-merge',
+    description: 'sparse search snippet',
+    videoTitles: ['search-only title'],
+    videoDescriptions: ['search-only description'],
+    channelThumbnailUrl: 'https://thumb.example/creator.jpg',
+    countryMetadataStatus: 'AVAILABLE_DECLARED',
+    queryRunId: 'run-1',
+    nominationId: 'nom-1',
+    admissionDecisionId: 'decision-1',
+    admissionDecisionSource: 'SEMANTIC',
+    admissionConfirmedTrading: false,
+    admissionTradingConfidence: 5,
+    admissionNewlyCreated: true,
+  } as any;
+  const merged = classificationCandidateForAdmission(base, {
+    channel_id: 'UC-merge',
+    channel_name: 'Search Display Name',
+    youtube_url: 'https://youtube.com/channel/UC-merge',
+    raw_observation: {},
+    evidence_snapshot: {
+      channelId: 'UC-merge',
+      channelName: 'Creator Display Name',
+      youtubeUrl: 'https://youtube.com/@creator',
+      description: 'Full creator bio.',
+      links: ['https://creator.example'],
+      country: 'GB',
+      videos: [
+        { videoId: 'v1', title: 'Real creator video', description: 'Real description.' },
+      ],
+      evidenceCoverage: 'COMPLETE',
+    },
+  } as any);
+  assert.equal(merged.channelName, 'Creator Display Name');
+  assert.equal(merged.description, 'Full creator bio.');
+  assert.deepEqual(merged.videoTitles, ['Real creator video']);
+  assert.equal(merged.channelThumbnailUrl, 'https://thumb.example/creator.jpg');
+  assert.equal(merged.countryMetadataStatus, 'AVAILABLE_DECLARED');
+  assert.equal(merged.queryRunId, 'run-1');
+  assert.equal(merged.nominationId, 'nom-1');
+  assert.equal(merged.locationTag, 'GB');
+  assert.equal(merged.admissionNewlyCreated, true);
+  assert.equal(merged.admissionDecisionId, 'decision-1');
+  assert.equal(merged.admissionDecisionSource, 'SEMANTIC');
+  assert.equal(merged.admissionConfirmedTrading, false);
 });
 
 

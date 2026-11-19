@@ -17,6 +17,10 @@ test('semantic admission never uses the confirmation shortcut', () => {
 });
 
 test('only high-confidence deterministic or human admissions may shortcut', () => {
+  assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'DETERMINISTIC', admissionTradingConfidence: 80 }, 'ACTIVE'), true);
+  assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'DETERMINISTIC', admissionTradingConfidence: 79 }, 'ACTIVE'), false);
+  assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'HUMAN', admissionTradingConfidence: 80 }, 'ACTIVE'), true);
+  assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'HUMAN', admissionTradingConfidence: 79 }, 'ACTIVE'), false);
   assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'DETERMINISTIC', admissionTradingConfidence: 93 }, 'ACTIVE'), true);
   assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'DETERMINISTIC', admissionTradingConfidence: 40 }, 'ACTIVE'), false);
   assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'HUMAN', admissionTradingConfidence: 100 }, 'ACTIVE'), true);

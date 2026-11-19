@@ -9,7 +9,7 @@ import { resolveAdmissionPrimaryModel, resolveAdmissionSecondaryModel } from './
 import { independentCitationCount, normalizeSemanticJudgment } from './policy';
 import type { AdmissionEvidence, SemanticJudgment } from './types';
 
-export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v4';
+export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v5';
 const ADMISSION_FEATURE_VERSION = 'semantic-admission-v1';
 const ADMISSION_PROVIDER = 'admission-semantic';
 

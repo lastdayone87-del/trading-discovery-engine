@@ -131,6 +131,7 @@ async function enqueueClassificationAfterAdmission(input: {
 export function candidateFromAdmissionRow(row: AdmissionCandidateRow): DiscoveredChannelRaw {
   const snapshot = row.evidence_snapshot;
   const raw = row.raw_observation || {};
+  const hasSnapshot = snapshot != null;
   const snapshotVideos = Array.isArray(snapshot?.videos) ? snapshot.videos : [];
   const videos = snapshotVideos
     .filter(video => video && typeof video.title === 'string')
@@ -142,27 +143,31 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
     }));
   const snapshotLinks = Array.isArray(snapshot?.links) ? snapshot.links.filter(link => typeof link === 'string' && link.trim()) : [];
   const rawLinks = Array.isArray(raw.channelLinks) ? raw.channelLinks.filter((link): link is string => typeof link === 'string' && Boolean(link.trim())) : [];
-  const links = snapshotLinks.length ? snapshotLinks : rawLinks;
+  const links = hasSnapshot ? snapshotLinks : rawLinks;
+  const rawTitles = Array.isArray(raw.videoTitles) ? raw.videoTitles : [];
+  const rawDescriptions = Array.isArray(raw.videoDescriptions) ? raw.videoDescriptions : [];
   const snapshotDescription = typeof snapshot?.description === 'string' ? snapshot.description.trim() : '';
+  const snapshotName = typeof snapshot?.channelName === 'string' ? snapshot.channelName.trim() : '';
+  const snapshotUrl = typeof snapshot?.youtubeUrl === 'string' ? snapshot.youtubeUrl.trim() : '';
   return {
     channelId: row.channel_id,
-    channelName: row.channel_name,
-    youtubeUrl: row.youtube_url,
+    channelName: snapshotName || row.channel_name,
+    youtubeUrl: snapshotUrl || row.youtube_url,
     // The admission evidence snapshot contains the full creator-owned sample
-    // (bio, recent videos and descriptions) that the admission model saw. The
-    // classification job payload must carry that sample, not the sparse search
-    // match, or the full classifier would evaluate different evidence.
-    description: snapshotDescription || String(raw.description ?? ''),
+    // (bio, recent videos and descriptions) that the admission model saw. When
+    // a snapshot exists, never fall back to raw_observation: those fields are
+    // the sparse search match, not creator evidence the judge evaluated.
+    description: hasSnapshot ? snapshotDescription : String(raw.description ?? ''),
     videos: videos.length ? videos : undefined,
-    videoTitles: videos.length ? videos.map(video => video.title) : (Array.isArray(raw.videoTitles) ? raw.videoTitles : []),
-    videoDescriptions: videos.length ? videos.map(video => video.description) : (Array.isArray(raw.videoDescriptions) ? raw.videoDescriptions : []),
-    videoDescriptionsAuthoritative: snapshot?.evidenceCoverage === 'COMPLETE',
+    videoTitles: hasSnapshot ? videos.map(video => video.title) : rawTitles,
+    videoDescriptions: hasSnapshot ? videos.map(video => video.description) : rawDescriptions,
+    videoDescriptionsAuthoritative: hasSnapshot && snapshot?.evidenceCoverage === 'COMPLETE',
     channelLinks: links.length ? links : undefined,
     externalLinkDetails: links.length ? links.map(url => ({ url })) : undefined,
     subscriberCount: snapshot?.subscriberCount ?? (typeof raw.subscriberCount === 'string' ? raw.subscriberCount : undefined),
     matchedDocument: (snapshot?.matchedDocument || row.matched_document) as unknown as DiscoveredChannelRaw['matchedDocument'],
     relationshipProvenance: (snapshot?.relationshipProvenance || raw.relationshipProvenance) as DiscoveredChannelRaw['relationshipProvenance'],
-    locationTag: typeof raw.locationTag === 'string' ? raw.locationTag : snapshot?.country,
+    locationTag: snapshot?.country || (typeof raw.locationTag === 'string' ? raw.locationTag : undefined),
     quotaOrigin: raw.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
   };
 }
@@ -184,16 +189,36 @@ export function parseAdmissionReviewAction(flags: {
 
 /**
  * Build the classification candidate from the full admission evidence
- * snapshot while preserving the admission provenance fields. The discovery
- * candidate is often only a search-match envelope; the snapshot is the
- * creator-owned bio/video sample the admission model actually evaluated.
+ * snapshot while preserving the discovery envelope. The discovery candidate is
+ * often only a search-match payload; the snapshot is the creator-owned
+ * bio/video sample the admission model actually evaluated. Keep the base row
+ * so accounting flags (notably admissionNewlyCreated), thumbnail, activity,
+ * query and nomination provenance survive the rebuild. Only creator-evidence
+ * fields are replaced by the snapshot.
  */
-function classificationCandidateForAdmission(
+export function classificationCandidateForAdmission(
   base: DiscoveredChannelRaw,
   row: AdmissionCandidateRow,
 ): DiscoveredChannelRaw {
+  const evidence = candidateFromAdmissionRow(row);
   return {
-    ...candidateFromAdmissionRow(row),
+    ...base,
+    channelName: evidence.channelName,
+    youtubeUrl: evidence.youtubeUrl,
+    description: evidence.description,
+    videos: evidence.videos,
+    videoTitles: evidence.videoTitles,
+    videoDescriptions: evidence.videoDescriptions,
+    videoDescriptionsAuthoritative: evidence.videoDescriptionsAuthoritative,
+    channelLinks: evidence.channelLinks,
+    externalLinkDetails: evidence.externalLinkDetails,
+    subscriberCount: evidence.subscriberCount ?? base.subscriberCount,
+    matchedDocument: evidence.matchedDocument ?? base.matchedDocument,
+    relationshipProvenance: evidence.relationshipProvenance ?? base.relationshipProvenance,
+    locationTag: evidence.locationTag ?? base.locationTag,
+    // The caller writes admission provenance immediately before building this
+    // candidate; keep it explicit so a future field addition cannot silently
+    // reintroduce the semantic shortcut.
     admissionDecisionId: base.admissionDecisionId,
     admissionStatus: base.admissionStatus,
     admissionDecisionSource: base.admissionDecisionSource,
@@ -204,6 +229,7 @@ function classificationCandidateForAdmission(
     admissionProvider: base.admissionProvider,
     admissionEvidenceHash: base.admissionEvidenceHash,
     admissionCategory: base.admissionCategory,
+    admissionNewlyCreated: base.admissionNewlyCreated,
   };
 }
 
@@ -424,15 +450,21 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   // The decision ledger is authoritative. A stale candidate projection must
   // not change the confidence or citations used by resumed classification.
   const semanticOutput = (decision?.rows[0]?.semantic_output || row.semantic_output) as Record<string, any> | null;
+  // A human admission has no semantic judgment at all. Legacy semantic
+  // judgments may have lost their provider field; they must still be treated
+  // as semantic, never promoted to HUMAN and allowed to take the shortcut.
+  const decisionSource = semanticOutput?.model === 'deterministic-first-v1'
+    ? 'DETERMINISTIC'
+    : semanticOutput && (semanticOutput.provider || semanticOutput.model)
+      ? 'SEMANTIC'
+      : 'HUMAN';
   input.candidate.admissionDecisionId = decisionId;
   input.candidate.admissionStatus = admissionStatus;
-  input.candidate.admissionDecisionSource = semanticOutput?.model === 'deterministic-first-v1'
-    ? 'DETERMINISTIC'
-    : semanticOutput?.provider ? 'SEMANTIC' : 'HUMAN';
+  input.candidate.admissionDecisionSource = decisionSource;
   input.candidate.admissionConfirmedTrading = admissionStatus === 'ADMITTED';
   const savedConfidence = semanticOutput?.tradingFocus;
   input.candidate.admissionTradingConfidence = savedConfidence === undefined || savedConfidence === null
-    ? (admissionStatus === 'ADMITTED' ? 90 : 0)
+    ? (admissionStatus === 'ADMITTED' && decisionSource !== 'SEMANTIC' ? (decisionSource === 'HUMAN' ? 100 : 90) : 0)
     : Number(savedConfidence);
   input.candidate.admissionCitations = Array.isArray(semanticOutput?.citations) ? semanticOutput.citations : [];
   input.candidate.admissionModel = semanticOutput?.model || undefined;

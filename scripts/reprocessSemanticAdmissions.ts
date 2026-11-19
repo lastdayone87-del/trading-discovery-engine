@@ -1,9 +1,8 @@
-import { getDb, enqueueJob } from '../server/db';
+import { getDb, enqueueClassificationJobAtomic, getClassificationBackpressureState } from '../server/db';
 import {
   buildClassificationJobPayload,
   classificationQueryScopeKey,
   resolveClassificationDecouplingConfig,
-  CLASSIFICATION_JOB_TYPE,
 } from '../server/classificationDecoupling';
 import { candidateFromAdmissionRow } from '../server/channelAdmission';
 import type { AdmissionCandidateRow } from '../server/channelAdmission/store';
@@ -20,14 +19,34 @@ import type { DiscoverySource } from '../src/types';
 const args = process.argv.slice(2);
 const apply = args.includes('--apply');
 const limitArg = args.find(arg => arg.startsWith('--limit='));
-const limit = Math.max(1, Math.min(500, Number(limitArg?.split('=')[1] || 25) || 25));
+let limit = Math.max(1, Math.min(500, Number(limitArg?.split('=')[1] || 25) || 25));
 const includeConfirmed = args.includes('--include-confirmed');
 
 function sourceOf(value: unknown): DiscoverySource {
   return value === 'manual_search' || value === 'recheck' ? value : 'automated_query';
 }
 
+const config = resolveClassificationDecouplingConfig();
 const db = await getDb();
+if (apply) {
+  const capacity = await getClassificationBackpressureState('semantic-admission-reprocess');
+  const remaining = Math.max(0, capacity.maxPending - capacity.globalPending);
+  if (remaining === 0) {
+    console.log(JSON.stringify({
+      apply,
+      capacityFull: true,
+      globalPending: capacity.globalPending,
+      maxPending: capacity.maxPending,
+      selected: 0,
+      enqueued: 0,
+    }));
+    process.exit(0);
+  }
+  if (remaining < limit) {
+    console.log(JSON.stringify({ apply, capacityLimited: true, requested: limit, effectiveLimit: remaining }));
+  }
+  limit = Math.min(limit, remaining);
+}
 const rows = await db.query(
   `select cand.*,
           c.channel_id as channel_id,
@@ -65,7 +84,6 @@ const rows = await db.query(
   [limit, includeConfirmed],
 );
 
-const config = resolveClassificationDecouplingConfig();
 let selected = 0;
 let enqueued = 0;
 for (const row of rows.rows as Array<Record<string, any>>) {
@@ -118,12 +136,16 @@ for (const row of rows.rows as Array<Record<string, any>>) {
     console.log(JSON.stringify({ dryRun: true, ...summary }));
     continue;
   }
-  const job = await enqueueJob(CLASSIFICATION_JOB_TYPE, payload, {
+  const job = await enqueueClassificationJobAtomic(row.channel_id, payload, {
     priority: config.priority,
-    maxAttempts: 4,
+    maxAttempts: config.maxAttempts,
     idempotencyKey,
     preventCompletedReopen: true,
   });
+  if (!job) {
+    console.log(JSON.stringify({ skipped: true, reason: 'ACTIVE_CLASSIFICATION_OWNED', ...summary }));
+    continue;
+  }
   if (job.status !== 'PENDING' && job.status !== 'PROCESSING') {
     console.log(JSON.stringify({ skipped: true, reason: 'JOB_ALREADY_TERMINAL', jobId: job.id, jobStatus: job.status, ...summary }));
     continue;
