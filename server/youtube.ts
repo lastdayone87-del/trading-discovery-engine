@@ -191,6 +191,9 @@ export interface DiscoveredChannelRaw {
   visualEvidence?: Array<{source_ref:string;description:string;model_provenance:string}>;
   enrichmentStage?: number;
   investigationId?: string;
+  /** Retry bookkeeping for precision-adjudicator deferrals on ENRICH_CHANNEL jobs. */
+  adjudicatorDeferralAttempts?: number;
+  adjudicatorFirstDeferredAt?: string;
   /** The retrieval document nominated this channel; it is not channel About metadata. */
   matchedDocument?: {type:'VIDEO'|'CHANNEL'|'PLAYLIST'|'EXTERNAL'|'MANUAL'|'UNKNOWN';providerNativeId?:string;title?:string;description?:string;publishedAt?:string;locator?:string};
   /**

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ChannelRecord, CountryStatus, DiscoverySource, DiscordStatus } from '../src/types';
+import { ChannelRecord, CountryStatus, DiscoverySource, DiscordStatus, TradingClassificationResult } from '../src/types';
 import { DiscoveredChannelRaw, classifierLanguageInputs, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry, type ValidationResult } from './countryValidator';
 import { bumpGate1Evaluation } from './operationsTelemetry';
@@ -55,6 +55,7 @@ import {
   runWithOfficialYouTubeQuotaOrigin,
 } from './officialYouTubeQuotaFence';
 import { resolveClassificationRoutingMode } from './classificationRouting/deterministicFirst';
+import { ADJUDICATOR_DEFERRAL_REASON, nextAdjudicatorDeferralPayload, type AdjudicatorDeferralPayload } from './evidenceEngine/adjudicatorRetryPolicy';
 import { materializeExhaustedReview } from './reviewEligibility/exhaustedReview';
 import { resolvePipelineQuotaOrigin } from './quotaOrigin';
 import { isProbeQuotaControlError, YouTubeKeyCapUnavailableError } from './quotaKeyCapShadow';
@@ -439,6 +440,143 @@ export function buildDeferredTradingIntakeChannel(
   ];
   applyCandidateObservability(channel, candidate);
   return channel;
+}
+
+export function buildAdjudicatorDeferralJob(args: {
+  candidate: IngestionCandidate;
+  targetCountry: string;
+  source: DiscoverySource;
+  currentStage: number;
+  now: string;
+  priority: number;
+}): {
+  payload: Record<string, unknown>;
+  options: { priority: number; maxAttempts: number; runAfter: string; idempotencyKey: string };
+  retry: AdjudicatorDeferralPayload;
+} {
+  const { candidate, targetCountry, source, currentStage, now, priority } = args;
+  const retry = nextAdjudicatorDeferralPayload(
+    candidate.adjudicatorDeferralAttempts,
+    candidate.adjudicatorFirstDeferredAt ? Date.parse(candidate.adjudicatorFirstDeferredAt) : undefined,
+    Date.parse(now),
+  );
+  const firstDeferredAt = new Date(retry.firstDeferredAt).toISOString();
+  const nextRetryAt = new Date(retry.nextRetryAt).toISOString();
+  return {
+    retry,
+    payload: {
+      channelId: candidate.channelId,
+      targetCountry,
+      source,
+      candidate: {
+        ...candidate,
+        enrichmentStage: currentStage,
+        adjudicatorDeferralAttempts: retry.attempts,
+        adjudicatorFirstDeferredAt: firstDeferredAt,
+      },
+      enrichmentStage: currentStage,
+      quotaOrigin: currentOfficialYouTubeQuotaOrigin() === 'PROBE' ? 'PROBE' : 'NORMAL',
+      adjudicatorDeferralAttempts: retry.attempts,
+      adjudicatorFirstDeferredAt: firstDeferredAt,
+      adjudicatorDeferralReason: ADJUDICATOR_DEFERRAL_REASON,
+      adjudicatorNextRetryAt: nextRetryAt,
+    },
+    options: {
+      priority,
+      maxAttempts: 4,
+      runAfter: nextRetryAt,
+      idempotencyKey: `adjudicator-deferral:${candidate.channelId}:${retry.attempts}`,
+    },
+  };
+}
+
+/**
+ * A precision-adjudicator outage is a bounded retry, not evidence work. Keep
+ * the same enrichment stage (so ordinary stage exhaustion cannot turn it into
+ * review debt), persist the attempt/first-deferral/next-retry fields on the
+ * durable job row, and let the queue's run_after enforce the backoff.
+ */
+async function deferAdjudicatorUnavailableClassification(args: {
+  candidate: IngestionCandidate;
+  existing: ChannelRecord | null;
+  countryVal: { status: 'CONFIRMED' | 'LIKELY' | 'UNCERTAIN' | 'REJECTED'; score: number };
+  tradingVal: TradingClassificationResult;
+  creatorCountry: string;
+  source: DiscoverySource;
+  targetCountry: string;
+  now: string;
+  countryValidationStep: NonNullable<ChannelRecord['inspection_trail']>[number];
+  input: RawChannelInput;
+}): Promise<IngestionPipelineOutcome> {
+  const {
+    candidate, existing, countryVal, tradingVal, creatorCountry,
+    source, targetCountry, now, countryValidationStep, input,
+  } = args;
+  // The queue treats stage 0 as a retrieval-only probe; a deferred retry is a
+  // real enrichment pass, so never enqueue stage 0.
+  const currentStage = Math.max(1, candidate.enrichmentStage || 0);
+  const channel: ChannelRecord = existing || {
+    channel_id: candidate.channelId,
+    channel_name: candidate.channelName,
+    youtube_url: candidate.youtubeUrl,
+    country: creatorCountry,
+    country_status: countryVal.status,
+    confidence_score: countryVal.score,
+    discord_status: 'UNCERTAIN',
+    discord_invite: null,
+    scan_status: 'ENRICHMENT_PENDING',
+    scan_attempts: 0,
+    discovery_source: source,
+    first_seen: now,
+    last_checked: now,
+    inspection_trail: [countryValidationStep],
+    subscriber_count: candidate.subscriberCount,
+    channel_thumbnail_url: candidate.channelThumbnailUrl || `https://ui-avatars.com/api/?name=${encodeURIComponent(candidate.channelName)}&background=0f172a&color=38bdf8&bold=true`,
+    trading_status: 'UNCERTAIN',
+    trading_confidence_score: tradingVal.confidenceScore,
+    trading_category: tradingVal.category,
+    trading_relevance_breakdown: tradingVal.breakdown,
+  };
+  channel.country = creatorCountry;
+  channel.country_status = countryVal.status;
+  channel.confidence_score = countryVal.score;
+  channel.trading_status = 'UNCERTAIN';
+  channel.trading_confidence_score = tradingVal.confidenceScore;
+  channel.trading_category = tradingVal.category;
+  channel.trading_relevance_breakdown = tradingVal.breakdown;
+  channel.scan_status = 'ENRICHMENT_PENDING';
+  channel.last_checked = now;
+  applyCandidateObservability(channel, candidate);
+  await upsertChannel(channel, { preserveDiscordOnUpdate: true });
+
+  const vitality = deriveVitalityScheduling(input.activity_metadata, now);
+  const priority = 10 + vitality.jobPriorityDelta;
+  const { payload, options } = buildAdjudicatorDeferralJob({
+    candidate,
+    targetCountry,
+    source,
+    currentStage,
+    now,
+    priority,
+  });
+  const job = await enqueueJob('ENRICH_CHANNEL', payload, options);
+  // The job row is the durable deferral record. Keep the operational reason
+  // visible on the queue row without turning it into a failed attempt.
+  const db = await getDb();
+  await db.query(`UPDATE jobs SET last_error=$2,updated_at=now() WHERE id=$1 AND status='PENDING'`, [job.id, ADJUDICATOR_DEFERRAL_REASON])
+    .catch(error => console.warn(`[ClassificationResolution] Adjudicator deferral annotation failed for ${candidate.channelId}:`, error instanceof Error ? error.message : error));
+  return {
+    channelId: candidate.channelId,
+    channelName: candidate.channelName,
+    isNew: !existing,
+    wasKnown: !!existing,
+    persisted: true,
+    countryStatus: countryVal.status,
+    tradingStatus: 'UNCERTAIN',
+    discordStatus: channel.discord_status,
+    discordInvite: channel.discord_invite ?? null,
+    channelRecord: channel,
+  };
 }
 
 export async function processChannelThroughPipeline(
@@ -1297,6 +1435,23 @@ async function processChannelThroughPipelineInContext(
       `[Unified Ingestion Pipeline - Gate 2] Channel '${candidate.channelName}' classified as UNCERTAIN (${tradingVal.confidenceScore}/100). Evaluating the governed enrichment/review route.`
     );
 
+    const adjudicatorDeferred = (productionClassification.decision.decisionPolicy?.reasonCodes || [])
+      .includes(ADJUDICATOR_DEFERRAL_REASON);
+    if (adjudicatorDeferred) {
+      console.log(`[Unified Ingestion Pipeline - Gate 2] Deferring '${candidate.channelName}' for precision-adjudicator retry; no review row created.`);
+      return deferAdjudicatorUnavailableClassification({
+        candidate,
+        existing: existing || null,
+        countryVal,
+        tradingVal,
+        creatorCountry,
+        source,
+        targetCountry,
+        now,
+        countryValidationStep,
+        input: productionClassification.input,
+      });
+    }
     const currentStage=candidate.enrichmentStage||0;
     const independentHypothesis=hasIndependentTradingHypothesis(productionClassification.decision);
     // Trading classification is not Discord validation evidence. Capture any
