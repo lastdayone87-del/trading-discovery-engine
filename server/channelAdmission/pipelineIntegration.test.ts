@@ -120,11 +120,14 @@ test('confirmed admission branch precedes the legacy classifier in the pipeline 
   const end = pipeline.indexOf('const classificationRouting = productionClassification.decision.deterministicRouting;', start);
   assert.ok(start > -1 && end > start, 'classification branch must exist');
   const slice = pipeline.slice(start, end);
-  const confirmed = slice.indexOf('candidate.admissionConfirmedTrading === true');
+  const confirmed = slice.indexOf('admissionShortcutEligible(candidate');
   const classifier = slice.indexOf('await classifyTradingRelevanceDetailed(classifierInput)');
-  assert.ok(confirmed > -1 && classifier > confirmed, 'confirmed admission must be selected before the legacy classifier');
+  assert.ok(confirmed > -1 && classifier > confirmed, 'confirmed admission must be selected before the full classifier');
   assert.match(slice, /buildAdmissionConfirmedClassification/);
-  assert.match(slice, /getAdmissionMode\(\)\) === 'ACTIVE'/);
+  assert.match(slice, /admissionShortcutEligible\(candidate, await getAdmissionMode\(\)\)/);
+  assert.match(pipeline, /admissionDecisionSource === 'DETERMINISTIC'/);
+  assert.match(pipeline, /admissionDecisionSource === 'HUMAN'/);
+  assert.match(pipeline, /ADMISSION_CONFIRMATION_MIN_CONFIDENCE/);
 });
 
 test('legacy dashboard predicate hides pre-admission rows', () => {
@@ -259,6 +262,7 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
   assert.ok(worker.indexOf('if (isRejectedAdmissionStatus(row.status))') > -1
     && worker.indexOf('if (isRejectedAdmissionStatus(row.status))') < worker.indexOf('verifyAdmissionCandidate(input'),
   'review/rejected rows must not re-enter verification');
+  assert.match(verify, /classificationCandidateForAdmission\(input\.candidate, \{ \.\.\.row, evidence_snapshot: evidence \}\)/);
 });
 
 test('extracted query offer uses the trading-anchor/gambling guard', () => {

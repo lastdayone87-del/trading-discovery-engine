@@ -1,7 +1,7 @@
 import type { EvidenceItem, RawChannelInput, VerificationDecision } from '../evidenceEngine';
 import type { TradingClassificationResult } from '../../src/types';
 import type { DiscoveredChannelRaw } from '../youtube';
-import { normalizeTradingFocus } from './confidence';
+import { ADMISSION_CONFIRMATION_MIN_CONFIDENCE, normalizeTradingFocus } from './confidence';
 
 /**
  * Legacy admission rows can still carry a 0–1 semantic confidence. Confirmed
@@ -13,9 +13,12 @@ export function normalizeAdmissionTradingConfidence(value: unknown, mainSubject?
 }
 
 /**
- * A confident semantic admission is a first-class classification result. It
- * bypasses the deterministic trading-relevance re-decision but still flows
- * through country validation, Discord inspection and quality gates.
+ * A confident deterministic or human admission is a first-class classification
+ * result. Semantic admissions are deliberately excluded at the pipeline
+ * boundary: they are routing signals and must run the full classifier so the
+ * original creator evidence, content category and composition safeguards are
+ * evaluated. The shortcut still flows through country validation, Discord
+ * inspection and quality gates.
  */
 export function buildAdmissionConfirmedClassification(
   input: RawChannelInput,
@@ -68,7 +71,7 @@ export function buildAdmissionConfirmedClassification(
   })) : [];
   const providerMissing = !nonSemantic && citations.length > 0 && !provider;
   const evidenceSufficiency = nonSemantic || positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
-  const degraded = human ? false : confidence < 80 || (!nonSemantic && positiveEvidence.length === 0);
+  const degraded = human ? false : confidence < ADMISSION_CONFIRMATION_MIN_CONFIDENCE || (!nonSemantic && positiveEvidence.length === 0);
   const humanReview = degraded;
   const reasonCode = human ? 'HUMAN_REVIEW_ADMISSION_CONFIRMED' : deterministic ? 'DETERMINISTIC_ADMISSION_CONFIRMED' : 'SEMANTIC_ADMISSION_CONFIRMED';
   const provenanceLabel = human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_ADMISSION' : 'SEMANTIC_ADMISSION';
@@ -130,7 +133,7 @@ export function buildAdmissionConfirmedClassification(
         : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
     classificationMethod: human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_EVIDENCE' : 'SEMANTIC_ADMISSION',
-    recognitionState: human || (confidence >= 80 && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+    recognitionState: human || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
     semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
     providerCoverage: 1,
     evidenceCount: positiveEvidence.length,
@@ -144,7 +147,7 @@ export function buildAdmissionConfirmedClassification(
       enrich: false,
       confidence,
       evidenceSufficiency,
-      recognitionState: human || (confidence >= 80 && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+      recognitionState: human || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
       semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
       fallbackReason: evidenceSufficiency === 'SUFFICIENT'
         ? null

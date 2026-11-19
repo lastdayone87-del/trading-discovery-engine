@@ -129,18 +129,64 @@ async function enqueueClassificationAfterAdmission(input: {
 }
 
 export function candidateFromAdmissionRow(row: AdmissionCandidateRow): DiscoveredChannelRaw {
+  const snapshot = row.evidence_snapshot;
+  const raw = row.raw_observation || {};
+  const hasSnapshot = snapshot != null;
+  const snapshotVideos = Array.isArray(snapshot?.videos) ? snapshot.videos : [];
+  const videos = snapshotVideos
+    .filter(video => video && typeof video.title === 'string')
+    .map(video => ({
+      id: video.videoId,
+      title: video.title,
+      description: video.description || '',
+      published_at: video.publishedAt,
+    }));
+  const snapshotLinks = Array.isArray(snapshot?.links) ? snapshot.links.filter(link => typeof link === 'string' && link.trim()) : [];
+  const rawLinks = Array.isArray(raw.channelLinks) ? raw.channelLinks.filter((link): link is string => typeof link === 'string' && Boolean(link.trim())) : [];
+  const links = hasSnapshot ? snapshotLinks : rawLinks;
+  const rawTitles = Array.isArray(raw.videoTitles) ? raw.videoTitles : [];
+  const rawDescriptions = Array.isArray(raw.videoDescriptions) ? raw.videoDescriptions : [];
+  const snapshotDescription = typeof snapshot?.description === 'string' ? snapshot.description.trim() : '';
+  const snapshotName = typeof snapshot?.channelName === 'string' ? snapshot.channelName.trim() : '';
+  const snapshotUrl = typeof snapshot?.youtubeUrl === 'string' ? snapshot.youtubeUrl.trim() : '';
   return {
     channelId: row.channel_id,
-    channelName: row.channel_name,
-    youtubeUrl: row.youtube_url,
-    description: String(row.raw_observation?.description || ''),
-    videoTitles: Array.isArray(row.raw_observation?.videoTitles) ? row.raw_observation.videoTitles : [],
-    videoDescriptions: Array.isArray(row.raw_observation?.videoDescriptions) ? row.raw_observation.videoDescriptions : [],
-    matchedDocument: row.matched_document as unknown as DiscoveredChannelRaw['matchedDocument'],
-    relationshipProvenance: row.raw_observation?.relationshipProvenance as DiscoveredChannelRaw['relationshipProvenance'],
-    locationTag: typeof row.raw_observation?.locationTag === 'string' ? row.raw_observation.locationTag : undefined,
-    quotaOrigin: row.raw_observation?.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
+    channelName: snapshotName || row.channel_name,
+    youtubeUrl: snapshotUrl || row.youtube_url,
+    // The admission evidence snapshot contains the full creator-owned sample
+    // (bio, recent videos and descriptions) that the admission model saw. When
+    // a snapshot exists, never fall back to raw_observation: those fields are
+    // the sparse search match, not creator evidence the judge evaluated.
+    description: hasSnapshot ? snapshotDescription : String(raw.description ?? ''),
+    videos: videos.length ? videos : undefined,
+    videoTitles: hasSnapshot ? videos.map(video => video.title) : rawTitles,
+    videoDescriptions: hasSnapshot ? videos.map(video => video.description) : rawDescriptions,
+    // Only snapshot video descriptions may vote. A bio-only COMPLETE snapshot
+    // has no authoritative video sample, so the flag must stay false.
+    videoDescriptionsAuthoritative: hasSnapshot && videos.length > 0 && snapshot?.evidenceCoverage === 'COMPLETE',
+    channelLinks: links.length ? links : undefined,
+    externalLinkDetails: links.length ? links.map(url => ({ url })) : undefined,
+    subscriberCount: snapshot?.subscriberCount ?? (typeof raw.subscriberCount === 'string' ? raw.subscriberCount : undefined),
+    matchedDocument: (snapshot?.matchedDocument || row.matched_document) as unknown as DiscoveredChannelRaw['matchedDocument'],
+    relationshipProvenance: (snapshot?.relationshipProvenance || raw.relationshipProvenance) as DiscoveredChannelRaw['relationshipProvenance'],
+    locationTag: snapshot?.country || (typeof raw.locationTag === 'string' ? raw.locationTag : undefined),
+    quotaOrigin: raw.quotaOrigin === 'PROBE' ? 'PROBE' : undefined,
   };
+}
+
+/**
+ * Explicit review decisions carry a HUMAN key. Everything else is machine
+ * provenance: deterministic-first rows are deterministic, and missing or
+ * legacy semantic provenance stays semantic. Never infer HUMAN from absent
+ * fields; that would reopen the confirmation shortcut.
+ */
+export function resumeAdmissionDecisionSource(input: {
+  decisionKey?: string | null;
+  semanticOutput?: Record<string, any> | null;
+}): 'HUMAN' | 'DETERMINISTIC' | 'SEMANTIC' {
+  if (String(input.decisionKey || '').includes(':HUMAN:')) return 'HUMAN';
+  if (input.semanticOutput?.model === 'deterministic-first-v1') return 'DETERMINISTIC';
+  return 'SEMANTIC';
 }
 
 export type AdmissionReviewAction = 'ADMIT' | 'REJECT' | 'REQUEUE';
@@ -156,6 +202,52 @@ export function parseAdmissionReviewAction(flags: {
   if (flags.requeue) actions.push('REQUEUE');
   if (actions.length > 1) throw new Error('REVIEW_ACTION_CONFLICT');
   return actions[0] || null;
+}
+
+/**
+ * Build the classification candidate from the full admission evidence
+ * snapshot while preserving the discovery envelope. The discovery candidate is
+ * often only a search-match payload; the snapshot is the creator-owned
+ * bio/video sample the admission model actually evaluated. Keep the base row
+ * so accounting flags (notably admissionNewlyCreated), thumbnail, activity,
+ * query and nomination provenance survive the rebuild. Only creator-evidence
+ * fields are replaced by the snapshot.
+ */
+export function classificationCandidateForAdmission(
+  base: DiscoveredChannelRaw,
+  row: AdmissionCandidateRow,
+): DiscoveredChannelRaw {
+  const evidence = candidateFromAdmissionRow(row);
+  return {
+    ...base,
+    channelName: evidence.channelName,
+    youtubeUrl: evidence.youtubeUrl,
+    description: evidence.description,
+    videos: evidence.videos,
+    videoTitles: evidence.videoTitles,
+    videoDescriptions: evidence.videoDescriptions,
+    videoDescriptionsAuthoritative: evidence.videoDescriptionsAuthoritative,
+    channelLinks: evidence.channelLinks,
+    externalLinkDetails: evidence.externalLinkDetails,
+    subscriberCount: evidence.subscriberCount ?? base.subscriberCount,
+    matchedDocument: evidence.matchedDocument ?? base.matchedDocument,
+    relationshipProvenance: evidence.relationshipProvenance ?? base.relationshipProvenance,
+    locationTag: evidence.locationTag ?? base.locationTag,
+    // The caller writes admission provenance immediately before building this
+    // candidate; keep it explicit so a future field addition cannot silently
+    // reintroduce the semantic shortcut.
+    admissionDecisionId: base.admissionDecisionId,
+    admissionStatus: base.admissionStatus,
+    admissionDecisionSource: base.admissionDecisionSource,
+    admissionConfirmedTrading: base.admissionConfirmedTrading,
+    admissionTradingConfidence: base.admissionTradingConfidence,
+    admissionCitations: base.admissionCitations,
+    admissionModel: base.admissionModel,
+    admissionProvider: base.admissionProvider,
+    admissionEvidenceHash: base.admissionEvidenceHash,
+    admissionCategory: base.admissionCategory,
+    admissionNewlyCreated: base.admissionNewlyCreated,
+  };
 }
 
 /**
@@ -326,7 +418,7 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   await assertCountryAllowed(input.targetCountry, `admission_resume:${input.candidate.channelId}`);
   const db = await getDb();
   const decision = await db.query(
-    `SELECT id,decision,semantic_output,evidence_hash FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
+    `SELECT id,decision,decision_key,semantic_output,evidence_hash FROM semantic_admission_decisions WHERE candidate_id=$1 ORDER BY created_at DESC LIMIT 1`,
     [row.id],
   ).catch(() => null);
   let channel = await getChannelById(row.channel_id);
@@ -375,15 +467,21 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   // The decision ledger is authoritative. A stale candidate projection must
   // not change the confidence or citations used by resumed classification.
   const semanticOutput = (decision?.rows[0]?.semantic_output || row.semantic_output) as Record<string, any> | null;
+  // Only the review path's explicit HUMAN decision key may claim human
+  // provenance. Legacy semantic judgments may have lost both provider and
+  // model; defaulting them to HUMAN would let them take the shortcut. Default
+  // to SEMANTIC so the full classifier owns the decision.
+  const decisionSource = resumeAdmissionDecisionSource({
+    decisionKey: decision?.rows[0]?.decision_key,
+    semanticOutput,
+  });
   input.candidate.admissionDecisionId = decisionId;
   input.candidate.admissionStatus = admissionStatus;
-  input.candidate.admissionDecisionSource = semanticOutput?.model === 'deterministic-first-v1'
-    ? 'DETERMINISTIC'
-    : semanticOutput?.provider ? 'SEMANTIC' : 'HUMAN';
+  input.candidate.admissionDecisionSource = decisionSource;
   input.candidate.admissionConfirmedTrading = admissionStatus === 'ADMITTED';
   const savedConfidence = semanticOutput?.tradingFocus;
   input.candidate.admissionTradingConfidence = savedConfidence === undefined || savedConfidence === null
-    ? (admissionStatus === 'ADMITTED' ? 90 : 0)
+    ? (admissionStatus === 'ADMITTED' && decisionSource !== 'SEMANTIC' ? (decisionSource === 'HUMAN' ? 100 : 90) : 0)
     : Number(savedConfidence);
   input.candidate.admissionCitations = Array.isArray(semanticOutput?.citations) ? semanticOutput.citations : [];
   input.candidate.admissionModel = semanticOutput?.model || undefined;
@@ -393,7 +491,7 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   input.candidate.admissionEvidenceHash = decision?.rows[0]?.evidence_hash || row.evidence_hash || undefined;
   input.candidate.admissionCategory = 'General Trading';
   const queued = await enqueueClassificationAfterAdmission({
-    candidate: input.candidate,
+    candidate: classificationCandidateForAdmission(input.candidate, row),
     targetCountry: input.targetCountry,
     source: input.source,
     query: input.query,
@@ -918,7 +1016,10 @@ export async function verifyAdmissionCandidate(
       input.candidate.admissionEvidenceHash = hash;
       input.candidate.admissionCategory = effectiveJudgment.mainSubject === 'TRADING' ? 'General Trading' : 'General Trading';
       const queued = await enqueueClassificationAfterAdmission({
-        candidate: input.candidate,
+        // Use the evidence that was just evaluated, not the pre-verification
+        // row. On a first attempt the stored snapshot may still be null; the
+        // classifier must receive the same bio/video sample as the judge.
+        candidate: classificationCandidateForAdmission(input.candidate, { ...row, evidence_snapshot: evidence }),
         targetCountry: input.targetCountry,
         source: input.source,
         query: input.query,

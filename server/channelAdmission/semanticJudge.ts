@@ -9,7 +9,7 @@ import { resolveAdmissionPrimaryModel, resolveAdmissionSecondaryModel } from './
 import { independentCitationCount, normalizeSemanticJudgment } from './policy';
 import type { AdmissionEvidence, SemanticJudgment } from './types';
 
-export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v4';
+export const ADMISSION_PROMPT_VERSION = 'semantic-admission-prompt-v5';
 const ADMISSION_FEATURE_VERSION = 'semantic-admission-v1';
 const ADMISSION_PROVIDER = 'admission-semantic';
 
@@ -70,6 +70,7 @@ Critical rules:
 7. Do not infer from stereotypes, production quality, subscriber count, or country. Use only the evidence.
 8. General news, politics, sports, weather, entertainment, lifestyle, and consumer channels are UNRELATED. A business or financial-news channel whose main focus is companies, markets, investing, or the economy is FINANCE_ADJACENT, not UNRELATED. A single business segment on a general news channel does not make the channel finance-adjacent or a trading channel.
 9. If evidence is complete and still ambiguous, return MIXED when multiple genuine subjects are present, or UNKNOWN when the evidence is genuinely insufficient to determine the main subject (including sparse or contradictory evidence). UNKNOWN is retained for human review; MIXED may be admitted for downstream classification. Never return UNKNOWN just because the evidence block is marked untrusted.
+10. trading_focus is an integer percentage from 0 to 100, not a boolean and not a 0–1 probability. Use 0 when there is no trading focus, 50 when trading is a genuine but mixed/minority focus, and 100 when the channel is exclusively about trading. A TRADING main_subject with substantial trading evidence should normally be 70–100.
 
 Return JSON only:
 {

@@ -4,7 +4,7 @@ import type {
   SemanticCitation,
   SemanticJudgment,
 } from './types';
-import { normalizeTradingFocus } from './confidence';
+import { ADMISSION_CONFIRMATION_MIN_CONFIDENCE, normalizeTradingFocus } from './confidence';
 
 export const ADMISSION_POLICY_VERSION = 'semantic-admission-v1';
 
@@ -297,12 +297,17 @@ export function decideAdmission(input: {
     && (financeCitations >= 1 || hasTradingAnchor(evidenceText));
   if (clearlyTrading) {
     reasonCodes.push('SEMANTIC_TRADING_WITH_CITATIONS');
+    const confident = Number(effective.tradingFocus) >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE;
+    if (!confident) reasonCodes.push('SEMANTIC_TRADING_LOW_CONFIDENCE');
     return {
-      decision: 'ADMIT',
-      status: 'ADMITTED',
+      // A low numeric focus is not a confirmation. It is still admitted so the
+      // full classifier can inspect the original evidence, but it must not be
+      // presented as a first-class confirmed admission.
+      decision: confident ? 'ADMIT' : 'ADMIT_AMBIGUOUS',
+      status: confident ? 'ADMITTED' : 'ADMITTED_AMBIGUOUS',
       reasonCodes,
       effectiveRole,
-      rejected: false, admitted: true, hold: false, ambiguous: false,
+      rejected: false, admitted: true, hold: false, ambiguous: !confident,
       citationsValid: valid >= 2, independentUnrelatedCitations: unrelatedCitations, independentTradingCitations: tradingCitations,
     };
   }
