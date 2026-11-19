@@ -1,0 +1,47 @@
+name: Verify YouTube suspended-key quarantine
+
+on:
+  push:
+    branches:
+      - fix/youtube-suspended-key-quarantine
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply root-cause fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('server/youtube.ts')
+          s = p.read_text()
+          old = """            if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');\n            else if(runtimeRateLimited)youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');"""
+          new = """            const consumerSuspended=Array.isArray((error as any)?.providerReasons)&&((error as any).providerReasons as string[]).some(reason=>reason.toUpperCase()==='CONSUMER_SUSPENDED');\n            if(consumerSuspended)youtubeProviderCooldown.failed(dispatchedProviderKey,'CONSUMER_SUSPENDED');\n            else if(isQuotaExceeded(error))youtubeProviderCooldown.failed(dispatchedProviderKey,'DAILY_QUOTA_EXHAUSTED');\n            else if(runtimeRateLimited)youtubeProviderCooldown.failed(dispatchedProviderKey,'RATE_LIMITED');"""
+          if old not in s:
+              raise SystemExit('Expected YouTube failure-classification block not found; refusing blind edit.')
+          p.write_text(s.replace(old, new, 1))
+          PY
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
+      - name: Commit fix and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server/youtube.ts
+          git commit -m "fix: quarantine suspended YouTube providers" || true
+          git rm .github/workflows/verify-youtube-suspended-quarantine.yml
+          git commit -m "chore: remove temporary verification workflow"
+          git push
