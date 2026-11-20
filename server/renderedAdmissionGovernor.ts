@@ -1,19 +1,23 @@
 /**
  * Phase 2 Option C rendered-admission governor.
  *
- * The process-wide browser lease admits one crawl at a time. This governor
- * adds a rolling one-hour admission budget on top of that slot:
+ * The process-wide browser lease admits crawls into measured slots (one by
+ * default; a second slot under the memory-headroom guard). This governor adds
+ * a rolling one-hour admission budget on top of that slot count:
  *
- *   * 40 rendered crawls per rolling hour by default;
- *   * up to 48 when the nominal budget is full and other rendered requests are
+ *   * 64 rendered crawls per rolling hour by default (validated against the
+ *     measured two-slot lease capacity — see
+ *     docs/phase-2-rendered-capacity-experiment.md);
+ *   * up to 72 when the nominal budget is full and other rendered requests are
  *     already queued (the emergency allowance);
- *   * at least 35% DISCOVERY crawls whenever discovery work is queued.
- *
- * The floor is strict: non-DISCOVERY admissions are capped at the budget left
- * after reserving 35% of the selected limit for DISCOVERY, even when no
- * discovery request is currently queued. Unused reserve is not reassigned to
- * non-discovery work. When discovery work is waiting, the gate also selects a
- * discovery waiter before FIFO non-discovery waiters.
+ *   * a 35% DISCOVERY reserve that binds while discovery demand is pending:
+ *     when discovery work is queued and its projected window share is below
+ *     the floor, non-discovery admissions are capped at the budget left after
+ *     reserving the floor share, and the gate selects a discovery waiter
+ *     before FIFO non-discovery waiters. When no discovery request is
+ *     queued, the reserve is not confiscated — the full budget serves the
+ *     queued demand (demand-aware reserve; see the experiment doc's
+ *     DISCOVERY_FLOOR section for the waste evidence that motivated this).
  *
  * A denied admission is surfaced as the existing
  * `RENDERED_FALLBACK_SATURATED` capacity class, which the retry policy already
@@ -26,8 +30,14 @@
 
 import type { AcquisitionLane } from './acquisitionLaneKeys';
 
-export const RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT = 40;
-export const RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT = 48;
+// Validated by the Nov 2026 rendered-capacity production experiment
+// (docs/phase-2-rendered-capacity-experiment.md): with the browser lease at
+// two memory-guarded slots, the gate-serialized sustained rate measured
+// ~41 crawls/hour and the two-slot overlap is design-supported but its
+// sustained rate is pending post-merge measurement — 64/72 admits the
+// burst capacity both slots provide without overrunning the lease.
+export const RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT = 64;
+export const RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT = 72;
 export const RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT_DEFAULT = 35;
 export const RENDERED_ADMISSION_WINDOW_MS_DEFAULT = 60 * 60 * 1000;
 
@@ -274,10 +284,17 @@ export class RenderedAdmissionGovernor implements RenderedAdmissionGovernorLike 
       };
     }
 
-    // Strict discovery reserve: non-discovery admissions can never occupy the
-    // 35% of the selected limit reserved for DISCOVERY. Unused reserve is not
-    // reassigned to non-discovery work.
-    if (lane !== 'DISCOVERY') {
+    // Discovery reserve — demand-aware. The floor protects DISCOVERY capacity
+    // while discovery demand is actually pending, using the SAME predicate the
+    // gate uses for waiter selection (shouldReserveDiscoveryAt). An
+    // always-on strict reserve wasted real capacity in retry-heavy windows:
+    // during E2, 22 of 64 budget slots sat reserved-but-idle while retry work
+    // was denied (docs/phase-2-rendered-capacity-experiment.md, the
+    // DISCOVERY_FLOOR section). When discovery is queued and its projected
+    // share is below the floor, non-discovery admissions stay capped at the
+    // budget left after reserving the floor share; when nothing
+    // discovery-bearing is queued, the idle reserve serves the queued demand.
+    if (lane !== 'DISCOVERY' && this.shouldReserveDiscoveryAt(pendingLanes)) {
       const floorBasisPoints = Math.round(this.config.discoveryFloorPct * 100);
       const discoveryReserve = Math.ceil(limit * floorBasisPoints / 10000);
       const nonDiscoveryLimit = Math.max(0, limit - discoveryReserve);

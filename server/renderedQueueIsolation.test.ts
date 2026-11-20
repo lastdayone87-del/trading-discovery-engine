@@ -160,13 +160,17 @@ test('crawler uses a per-invocation named queue and shared lifecycle bookkeeping
     'the full crawl must not be serialized by the lifecycle lock');
 });
 
-test('total-budget clock starts at gate admission, not lifecycle bookkeeping', async () => {
-  // Regression guard: begin/end bookkeeping must not delay the crawl's
-  // total-budget clock — an admitted crawl has to consume budget from the
-  // gate's admission timestamp rather than from any later mutex acquisition.
+test('total-budget clock starts at the browser-lease grant, not gate admission or lifecycle bookkeeping', async () => {
+  // Regression guard: neither begin/end bookkeeping nor gate/lease capacity
+  // waits may consume the crawl's total budget. The clock starts when the
+  // browser slot is actually granted (inside withBrowserRuntimeLease), so a
+  // queued second crawl on a degraded host never launches with an expired
+  // budget that would skip page inspection.
   const source = await import('node:fs/promises').then(fs => fs.readFile(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8'));
   assert.match(source, /renderedFallbackGate\.run(?:<[^>]+>)?\(\(gateAdmittedAtMs\) => \(async \(\) => \{/);
-  assert.match(source, /const startedAt = gateAdmittedAtMs;/);
+  assert.match(source, /let startedAt = gateAdmittedAtMs;/);
+  assert.match(source, /await withBrowserRuntimeLease\(\(\) => \{/);
+  assert.match(source, /startedAt = Date\.now\(\);/);
   assert.match(source, /await operation\(Date\.now\(\)\);/);
 });
 

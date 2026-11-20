@@ -42,6 +42,9 @@ test('production manifest owns the measured model defaults and revert baseline',
   assert.equal(manifest.environment.SEARCH_WORKER_CONCURRENCY, '2');
   assert.equal(manifest.environment.COMMUNITY_RETRY_WORKER_CONCURRENCY, '3');
   assert.equal(manifest.environment.RENDERED_ADMISSION_GOVERNOR_ENABLED, 'true');
+  assert.equal(manifest.environment.RENDERED_ADMISSION_NOMINAL_PER_HOUR, '64');
+  assert.equal(manifest.environment.RENDERED_ADMISSION_EMERGENCY_PER_HOUR, '72');
+  assert.equal(manifest.environment.BROWSER_RUNTIME_CONCURRENCY, '2');
   assert.equal(manifest.environment.RENDERED_FALLBACK_MAX_WAIT_MS, '90000');
   assert.ok(manifest.secretGroups.some(group => group.kind === 'youtube' && group.minimum === 58));
 });
