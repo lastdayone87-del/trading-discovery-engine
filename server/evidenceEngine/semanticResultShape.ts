@@ -79,11 +79,8 @@ export function isSemanticVerdictIdentity(value: unknown): value is {
   languages: Array<{ language: string; script: string; confidence: number; field: string }>;
   citations: Array<{ field: string; index?: number; sourceId?: string }>;
 } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (!hasSemanticVerdictCore(value)) return false;
   const result = value as Record<string, unknown>;
-  if (typeof result.label !== 'string' || !LABELS.has(result.label)) return false;
-  if (!isBoundedConfidence(result.confidence)) return false;
-  if (typeof result.supportedLanguage !== 'boolean') return false;
   if (typeof result.explanation !== 'string' || !result.explanation.trim()) return false;
   if (!Array.isArray(result.reasonCodes) || !result.reasonCodes.every(code => typeof code === 'string')) return false;
   if (!Array.isArray(result.concepts) || !result.concepts.every(concept => typeof concept === 'string')) return false;
@@ -124,11 +121,8 @@ export function isSemanticResultShape(value: unknown): value is {
   languages: Array<{ language: string; script: string; confidence: number; field: string }>;
   citations: Array<{ field: string; index?: number; sourceId?: string }>;
 } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (!hasSemanticVerdictCore(value)) return false;
   const result = value as Record<string, unknown>;
-  if (typeof result.label !== 'string' || !LABELS.has(result.label)) return false;
-  if (!isBoundedConfidence(result.confidence)) return false;
-  if (typeof result.supportedLanguage !== 'boolean') return false;
   if (typeof result.explanation !== 'string') return false;
   if (!Array.isArray(result.reasonCodes) || !result.reasonCodes.every(code => typeof code === 'string')) return false;
   if (!Array.isArray(result.concepts) || !result.concepts.every(concept => typeof concept === 'string')) return false;
