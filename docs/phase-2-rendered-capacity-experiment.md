@@ -220,9 +220,11 @@ Production demand over the 7 days around the experiment (from
 
 | Lane | Rendered crawls | Share |
 |---|---|---|
-| RETRY | 4,574 | 73.4% |
-| DISCOVERY | 1,679 | 26.9% |
-| ENRICHMENT | 157 | 2.5% |
+| RETRY | 4,574 | 71.3% |
+| DISCOVERY | 1,679 | 26.2% |
+| ENRICHMENT | 157 | 2.4% |
+
+(Shares of the 6,410 total rendered crawls in the window.)
 
 Daily discovery share ran 23–31% (Nov 20: 15.2%) — consistently below
 the 35% floor target, because the total budget was the binding

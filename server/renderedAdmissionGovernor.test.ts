@@ -196,8 +196,9 @@ test('governor reserves the DISCOVERY floor only while discovery demand is pendi
   assert.equal(fresh.snapshot().discoverySharePct, 35);
 
   // With the floor met, queued non-discovery demand engages the emergency
-  // allowance: the limit rises to 72, of which 26 is the discovery reserve,
-  // so the retry lane can climb to 46 non-discovery admissions.
+  // allowance: the limit rises to the fixture's 48/hour emergency value, of
+  // which ceil(48 × 35%) = 17 is the discovery reserve, so the retry lane can
+  // climb to 31 non-discovery admissions and 48 total before the ceiling.
   const emergencyFirst = fresh.admit('RETRY', retryQueued);
   assert.equal(emergencyFirst.admitted, true);
   assert.equal(emergencyFirst.limit, 48, 'queued demand raises the limit to the emergency allowance');
