@@ -113,8 +113,12 @@ export function hasDecisionGradeEvidenceWithoutFailedProviders(decision: Verific
       ? decision.status === 'NON_TRADING'
       : false;
   if (!terminalStatusMatches) return false;
+  const aiLedConfirmation = staged.stages.some(stage =>
+    stage.stage === 'LIFECYCLE' && stage.reasonCodes.includes('AI_LED_CONFIRMATION'));
   const expectedStages = staged.lifecycleAction === 'CONFIRM'
-    ? [['CANDIDATE_DETECTION', 'PASS'], ['CORROBORATION', 'PASS']] as const
+    ? aiLedConfirmation
+      ? [['CANDIDATE_DETECTION', 'PASS'], ['CONTRADICTION', 'PASS']] as const
+      : [['CANDIDATE_DETECTION', 'PASS'], ['CORROBORATION', 'PASS']] as const
     : staged.lifecycleAction === 'REJECT'
       ? [['CONTRADICTION', 'FAIL']] as const
       : [];
@@ -124,7 +128,8 @@ export function hasDecisionGradeEvidenceWithoutFailedProviders(decision: Verific
   );
   return expectedStages.every(([stageName, disposition]) => {
     const stage = staged.stages.find(item => item.stage === stageName);
-    if (!stage || stage.disposition !== disposition || stage.evidenceIds.length === 0) return false;
+    if (!stage || stage.disposition !== disposition) return false;
+    if (stage.evidenceIds.length === 0 && !(aiLedConfirmation && stageName === 'CONTRADICTION')) return false;
     return stage.evidenceIds.every(id => {
       const evidence = evidenceById.get(id);
       return !!evidence && !failedProviders.has(evidence.source);

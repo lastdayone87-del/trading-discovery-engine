@@ -1516,7 +1516,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // still adjudicate low-confidence results.
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
-        cacheable = cacheable && isSemanticVerdictIdentity(adjudicatedValue);
+        cacheable = isSemanticVerdictIdentity(adjudicatedValue);
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }

@@ -32,13 +32,13 @@ verdict. Tier-A refers to the classifier's strongest creator-owned content famil
 
 | Metric | Before | After |
 |---|---:|---:|
-| Deterministic PASS | 593 | 446 |
+| Deterministic PASS | 593 | 439 |
 | Deterministic REJECT | 2 | 2 |
-| Deterministic abstain | 305 | 452 |
-| Decisive coverage | 66.1% | 49.8% |
-| Confirm precision | 98.65% | **99.55%** |
+| Deterministic abstain | 305 | 459 |
+| Decisive coverage | 66.1% | 49.0% |
+| Confirm precision | 98.65% | **99.54%** |
 | Hard UNRELATED confirmations | 5 | **0** |
-| Trading-relevant deterministic recall | 70.6% | 53.6% |
+| Trading-relevant deterministic recall | 70.6% | 52.7% |
 | Unrelated rejection recall | 6.9% | 6.9% |
 
 Blocked fast passes abstain and reach the one AI judge. No global threshold

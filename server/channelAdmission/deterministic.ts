@@ -264,7 +264,7 @@ export function hasDecisiveTradingShare(
   // consistency item are excluded: hashtags like #tjrtrades must not turn a
   // GTA clip feed into a trading channel.
   if (evidence.videos.length === 0) return creatorSignalsTrading(evidence);
-  const minimum = Math.max(2, Math.min(3, Math.ceil(evidence.videos.length * 0.4)));
+  const minimum = 3;
   const tradingVideoShare = indexes.size / evidence.videos.length;
   return indexes.size >= minimum && tradingVideoShare >= 0.4;
 }
