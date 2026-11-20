@@ -76,10 +76,10 @@ Existing affected records are reprocessed under the new path in bounded
 batches; no mass approval. The semantic reprocessor defaults to `--limit=25`;
 intake revalidation defaults to `--limit=50`. Both are dry-run by default, cap
 a single batch at 500, and stop before the classification queue reaches its
-configured pending capacity (the semantic reprocessor checks once per batch;
-intake revalidation checks before each admitted row). Run dry-run, inspect the
-selected rows, then apply one bounded batch at a time and recheck the queue
-before enlarging it.
+configured pending capacity (semantic reprocessing rechecks global and
+per-query limits before each enqueue; intake revalidation checks global
+capacity before each row). Run dry-run, inspect the selected rows, then apply
+one bounded batch at a time and recheck the queue before enlarging it.
 
 Post-deploy checks:
 
