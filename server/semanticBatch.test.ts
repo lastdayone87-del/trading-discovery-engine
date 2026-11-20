@@ -271,6 +271,24 @@ test('mixed attribution carries bounded member IDs on the single ledger row', as
   assert.equal(seen.requestMetadata.semanticBatchEvidenceChecksums, 'checksum-a,checksum-b');
 });
 
+test('a partially attributed batch never claims a single channel', async () => {
+  const clock = fakeClock();
+  let seen: any;
+  const client = clientWith(async (_prompt, _model, observability) => {
+    seen = observability;
+    return { results: [semanticResult('ACTIVE_TRADING'), semanticResult('UNRELATED')] };
+  });
+  const instance = scheduler(clock);
+  const first = instance.submit({ client, prompt: '{"channel_name":"A"}', model: 'm1', observability: { requestMetadata: { channelId: 'channel-a', evidenceChecksum: 'checksum-a' } } });
+  const second = instance.submit({ client, prompt: '{"channel_name":"B"}', model: 'm1' });
+  clock.runAll();
+  await Promise.all([first, second]);
+  assert.equal(seen.requestMetadata.channelId, undefined);
+  assert.equal(seen.requestMetadata.evidenceChecksum, undefined);
+  assert.equal(seen.requestMetadata.semanticBatchChannelIds, 'channel-a');
+  assert.equal(seen.requestMetadata.semanticBatchEvidenceChecksums, 'checksum-a');
+});
+
 test('disabled batching is a byte-for-byte direct provider call', async () => {
   const seen: string[] = [];
   const client = clientWith(async prompt => {

@@ -32,12 +32,12 @@ try {
         [hours],
       ),
       client.query(
-        `SELECT provider,
+        `SELECT provider,prompt_version,
                 COUNT(*)::int AS lifetime_rows,
                 COALESCE(SUM(hits),0)::int AS lifetime_hits,
                 COUNT(*) FILTER (WHERE created_at >= now() - ($1::int * interval '1 hour'))::int AS rows_created_in_window
            FROM semantic_classification_cache
-          GROUP BY provider
+          GROUP BY provider,prompt_version
           ORDER BY lifetime_rows DESC`,
         [hours],
       ),
@@ -49,14 +49,27 @@ try {
         [hours],
       ),
       client.query(
-        `SELECT COALESCE(request_metadata->>'channelId',
-                          NULLIF(request_metadata->>'semanticBatchChannelIds',''),
-                          '<unattributed>') AS channel_id,
-                COUNT(*)::int AS calls,
+        `WITH calls AS (
+           SELECT CASE
+                    WHEN request_metadata->>'channelId' IS NOT NULL THEN request_metadata->>'channelId'
+                    WHEN request_metadata->>'semanticBatchChannelIds' IS NOT NULL THEN NULL
+                    ELSE '<unattributed>'
+                  END AS single_channel,
+                  request_metadata->>'semanticBatchChannelIds' AS batch_channels,
+                  status
+             FROM provider_call_events
+            WHERE operation='multilingual-semantic-classification'
+              AND occurred_at >= now() - ($1::int * interval '1 hour')
+         )
+         SELECT channel_id,COUNT(*)::int AS calls,
                 COUNT(*) FILTER (WHERE status='SUCCESS')::int AS successes
-           FROM provider_call_events
-          WHERE operation='multilingual-semantic-classification'
-            AND occurred_at >= now() - ($1::int * interval '1 hour')
+           FROM (
+             SELECT single_channel AS channel_id,status FROM calls WHERE single_channel IS NOT NULL
+             UNION ALL
+             SELECT trim(channel) AS channel_id,status
+               FROM calls, LATERAL regexp_split_to_table(batch_channels, ',') channel
+              WHERE batch_channels IS NOT NULL
+           ) attributed
           GROUP BY 1
           ORDER BY calls DESC
           LIMIT 20`,

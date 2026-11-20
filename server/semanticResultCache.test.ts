@@ -231,8 +231,8 @@ test('disabled cache writes are a no-op and the backlog flushes', async () => {
 test('the scheduled writer uses a longer deadline than the caller cache read', () => {
   const source = readFileSync('server/evidenceEngine/semanticResultCache.ts', 'utf8');
   assert.match(source, /scheduleSemanticResultCacheWrite/, 'background writer must exist');
-  assert.match(source, /SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS = 5_000/);
+  assert.equal(SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS, 5_000);
   assert.match(source, /semanticResultCacheWriteTimeoutMs\(env\)/, 'background writer must honor the configured write timeout');
   assert.match(source, /pendingSemanticCacheWrites/, 'background writes must be tracked for flush');
-  assert.match(source, /SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY/, 'background writes must be bounded');
+  assert.equal(SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY, 4, 'background writes must be bounded');
 });

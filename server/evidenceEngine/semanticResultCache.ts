@@ -260,7 +260,7 @@ let backgroundWriteDropped = 0;
 let lastBackgroundWriteWarningAt = 0;
 
 function semanticResultCacheWriteTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const raw = env.SEMANTIC_RESULT_CACHE_WRITE_TIMEOUT_MS ?? env.SEMANTIC_RESULT_CACHE_TIMEOUT_MS;
+  const raw = env.SEMANTIC_RESULT_CACHE_WRITE_TIMEOUT_MS;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0
     ? Math.max(1_000, Math.floor(parsed))
