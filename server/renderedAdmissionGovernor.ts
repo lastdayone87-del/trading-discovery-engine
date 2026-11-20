@@ -1,11 +1,14 @@
 /**
  * Phase 2 Option C rendered-admission governor.
  *
- * The process-wide browser lease admits one crawl at a time. This governor
- * adds a rolling one-hour admission budget on top of that slot:
+ * The process-wide browser lease admits crawls into measured slots (one by
+ * default; a second slot under the memory-headroom guard). This governor adds
+ * a rolling one-hour admission budget on top of that slot count:
  *
- *   * 40 rendered crawls per rolling hour by default;
- *   * up to 48 when the nominal budget is full and other rendered requests are
+ *   * 64 rendered crawls per rolling hour by default (validated against the
+ *     measured two-slot lease capacity — see
+ *     docs/phase-2-rendered-capacity-experiment.md);
+ *   * up to 72 when the nominal budget is full and other rendered requests are
  *     already queued (the emergency allowance);
  *   * at least 35% DISCOVERY crawls whenever discovery work is queued.
  *
@@ -26,8 +29,13 @@
 
 import type { AcquisitionLane } from './acquisitionLaneKeys';
 
-export const RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT = 40;
-export const RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT = 48;
+// Validated by the Nov 2026 rendered-capacity production experiment
+// (docs/phase-2-rendered-capacity-experiment.md): with the browser lease at
+// two memory-guarded slots, the sustained two-slot run rate measured
+// ~60-80 crawls/hour, so 64/72 keeps the admission budget just under lease
+// capacity and makes the lease, not the governor, the first bottleneck.
+export const RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT = 64;
+export const RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT = 72;
 export const RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT_DEFAULT = 35;
 export const RENDERED_ADMISSION_WINDOW_MS_DEFAULT = 60 * 60 * 1000;
 

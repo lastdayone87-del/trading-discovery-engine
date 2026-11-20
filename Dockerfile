@@ -16,17 +16,24 @@ FROM mcr.microsoft.com/playwright:v1.62.1-noble
 # Phase 2 Option C: persist the append-only acquisition lane baseline so
 # crawls/hour, gate wait, and the discovery share are measurable. The writer
 # is observational only and can never change an acquisition result.
-# The rendered-admission governor enforces the single-slot budget: 40/h
-# nominal, 48/h emergency when queued demand exists, and a 35% DISCOVERY floor
-# whenever discovery work is waiting. Local/CI harnesses default it off.
+# The rendered-admission governor enforces the admission budget: 64/h
+# nominal, 72/h emergency when queued demand exists, and a 35% DISCOVERY
+# floor whenever discovery work is waiting. Local/CI harnesses default it
+# off. These defaults come from the Nov 2026 capacity experiment
+# (docs/phase-2-rendered-capacity-experiment.md): the browser lease runs
+# TWO Chromium slots under a memory-headroom guard, and the measured
+# sustained two-slot run rate sits at ~60-80 crawls/hour — 64/72 keeps
+# the governor just under the lease capacity so the lease, not the
+# queue, is the first bottleneck.
 ENV NODE_ENV=production \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_SKIP_BROWSER_GC=1 \
     COMMUNITY_RETRY_WORKER_CONCURRENCY=3 \
     ACQUISITION_LANE_TELEMETRY_ENABLED=true \
+    BROWSER_RUNTIME_CONCURRENCY=2 \
     RENDERED_ADMISSION_GOVERNOR_ENABLED=true \
-    RENDERED_ADMISSION_NOMINAL_PER_HOUR=40 \
-    RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48 \
+    RENDERED_ADMISSION_NOMINAL_PER_HOUR=64 \
+    RENDERED_ADMISSION_EMERGENCY_PER_HOUR=72 \
     RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35 \
     RENDERED_FALLBACK_MAX_WAIT_MS=90000 \
     SEARCH_WORKER_CONCURRENCY=2
