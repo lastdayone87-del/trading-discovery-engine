@@ -225,3 +225,14 @@ test('resource safety: BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB overrides the default 
     setHostMemAvailableReaderForTests(restoreReader);
   }
 });
+
+test('Dockerfile defaults match the validated browser-capacity configuration', () => {
+  const dockerfile = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.match(dockerfile, /BROWSER_RUNTIME_CONCURRENCY=2\b/,
+    'the validated experiment config runs two memory-guarded browser slots');
+  assert.match(dockerfile, /RENDERED_ADMISSION_NOMINAL_PER_HOUR=64\b/,
+    'nominal admission budget must track the measured two-slot lease capacity');
+  assert.match(dockerfile, /RENDERED_ADMISSION_EMERGENCY_PER_HOUR=72\b/,
+    'emergency allowance must stay above nominal and within lease capacity');
+  assert.match(dockerfile, /RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT=35\b/);
+});
