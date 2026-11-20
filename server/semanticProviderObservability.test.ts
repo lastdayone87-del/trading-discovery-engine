@@ -40,10 +40,15 @@ const unrelatedResult = {
 
 
 function assertSemanticAttribution(actual: any, label = 'semantic provider') {
-  assert.equal(actual?.jobId, 'job-observability-1', label);
-  assert.equal(actual?.runId, 'run-observability-1', label);
-  assert.equal(actual?.requestMetadata?.channelId, 'channel-1', label);
   assert.match(String(actual?.requestMetadata?.evidenceChecksum || ''), /^[a-f0-9]{64}$/, label);
+  assert.deepEqual(actual, {
+    jobId: 'job-observability-1',
+    runId: 'run-observability-1',
+    requestMetadata: {
+      channelId: 'channel-1',
+      evidenceChecksum: actual.requestMetadata.evidenceChecksum,
+    },
+  }, label);
 }
 
 test('every semantic provider forwards job and run attribution to its model client', async () => {
@@ -146,7 +151,7 @@ test('the ingestion pipeline maps the active job/run onto the classifier input a
   assert.match(queue, /processChannelThroughPipeline\(enriched[\s\S]{0,240}jobId:job\.id/);
   assert.match(queue, /processDiscoveredChannel\(candidate[\s\S]{0,240}jobId: job\.id/);
   assert.match(queue, /executeManualSearchPage\([^;]{0,240}job\.id\)/);
-  assert.match(queue, /processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{ jobId \}\)/);
+  assert.match(queue, /processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{[\s\S]{0,80}jobId,/);
 });
 
 test('404 model fallback forwards attribution on every retry for all providers', async () => {

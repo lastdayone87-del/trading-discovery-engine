@@ -5,6 +5,8 @@ import {
   isCacheableSemanticResult,
   isUsableCachedResult,
   SEMANTIC_RESULT_CACHE_VERSION,
+  SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY,
+  SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS,
   resetSemanticResultCacheCircuitForTests,
   semanticResultCacheEnabled,
   semanticResultCacheKey,
@@ -219,7 +221,7 @@ test('cache operations are fail-open and deadline-bounded', () => {
 });
 
 
-test('background cache writes are opt-in and flushable', async () => {
+test('disabled cache writes are a no-op and the backlog flushes', async () => {
   scheduleSemanticResultCacheWrite(identity, { result: complete as any, modelVersion: 'model-v1' }, { SEMANTIC_RESULT_CACHE_ENABLED: 'false' } as any);
   assert.equal(semanticResultCacheWriteBacklogForTests(), 0);
   await flushSemanticResultCacheWritesForTests();
@@ -229,6 +231,8 @@ test('background cache writes are opt-in and flushable', async () => {
 test('the scheduled writer uses a longer deadline than the caller cache read', () => {
   const source = readFileSync('server/evidenceEngine/semanticResultCache.ts', 'utf8');
   assert.match(source, /scheduleSemanticResultCacheWrite/, 'background writer must exist');
-  assert.match(source, /5_000/, 'background writer must not reuse the 500ms caller read deadline');
+  assert.match(source, /SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS = 5_000/);
+  assert.match(source, /semanticResultCacheWriteTimeoutMs\(env\)/, 'background writer must honor the configured write timeout');
   assert.match(source, /pendingSemanticCacheWrites/, 'background writes must be tracked for flush');
+  assert.match(source, /SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY/, 'background writes must be bounded');
 });

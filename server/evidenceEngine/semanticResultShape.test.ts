@@ -58,4 +58,8 @@ test('cache eligibility accepts a valid verdict identity while the parser normal
   assert.equal(isSemanticVerdictIdentity(result({ confidence: 101 })), false);
   assert.equal(isSemanticVerdictIdentity(result({ supportedLanguage: 'yes' })), false);
   assert.equal(isSemanticVerdictIdentity(result({ citations: [] })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ explanation: '' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ reasonCodes: 'none' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ concepts: 'none' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ languages: 'none' })), false);
 });

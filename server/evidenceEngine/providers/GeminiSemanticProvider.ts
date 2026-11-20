@@ -437,9 +437,9 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     } else {
       const candidatePrompt = prompt(input, 'CANDIDATE');
       const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-      // Only a complete model reply may be cached. parseSemanticResult turns
-      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
-      // placeholder would replay it for the same evidence indefinitely.
+      // Only a bounded verdict identity may be cached. parseSemanticResult
+      // normalizes nested fields, but a missing label/confidence/citation set is
+      // an abstention placeholder and must stay retryable.
       let cacheable = isSemanticVerdictIdentity(candidate.value);
       // A verdict produced inside a multi-channel batch saw sibling evidence
       // and a different completion allowance. It is not interchangeable with a

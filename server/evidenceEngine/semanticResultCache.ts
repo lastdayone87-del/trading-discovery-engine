@@ -248,14 +248,51 @@ export async function readSemanticResultCache(
   }
 }
 
-/**
- * Best-effort background write. The provider must return the judgment without
- * waiting for a cache round trip; a slow database can otherwise consume the
- * caller's classification deadline and silently lose the cache entry. Cache
- * writes are not part of the verdict and are safe to drop on shutdown.
- */
-const pendingSemanticCacheWrites = new Set<Promise<void>>();
+/** Background writes are best-effort and must not compete with cache reads. */
+export const SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY = 4;
+export const SEMANTIC_RESULT_CACHE_BACKGROUND_MAX_QUEUE = 1_000;
+export const SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS = 5_000;
 
+const pendingSemanticCacheWrites = new Set<Promise<void>>();
+const queuedSemanticCacheWrites: Array<() => Promise<void>> = [];
+let backgroundWriteFailures = 0;
+let backgroundWriteDropped = 0;
+let lastBackgroundWriteWarningAt = 0;
+
+function semanticResultCacheWriteTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.SEMANTIC_RESULT_CACHE_WRITE_TIMEOUT_MS ?? env.SEMANTIC_RESULT_CACHE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.max(1_000, Math.floor(parsed))
+    : SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS;
+}
+
+function drainSemanticCacheWrites(): void {
+  while (pendingSemanticCacheWrites.size < SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY
+    && queuedSemanticCacheWrites.length > 0) {
+    const run = queuedSemanticCacheWrites.shift()!;
+    const write = run()
+      .catch(error => {
+        backgroundWriteFailures += 1;
+        const now = Date.now();
+        if (now - lastBackgroundWriteWarningAt >= 60_000) {
+          lastBackgroundWriteWarningAt = now;
+          console.warn('[SemanticResultCache] background write failed:', error instanceof Error ? error.message : error);
+        }
+      })
+      .finally(() => {
+        pendingSemanticCacheWrites.delete(write);
+        drainSemanticCacheWrites();
+      });
+    pendingSemanticCacheWrites.add(write);
+  }
+}
+
+/**
+ * Queue a best-effort cache write. The provider returns the judgment without
+ * waiting for a cache round trip; the queue bounds concurrent DB work so a
+ * provider burst cannot exhaust the pool or accumulate timed-out inserts.
+ */
 export function scheduleSemanticResultCacheWrite(
   identity: SemanticResultCacheIdentity,
   value: CachedSemanticValue,
@@ -263,23 +300,39 @@ export function scheduleSemanticResultCacheWrite(
   options: SemanticResultCacheOptions = {},
 ): void {
   if (!semanticResultCacheEnabled(env)) return;
-  const write = writeSemanticResultCache(identity, value, env, {
-    timeoutMs: options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 5_000,
-  })
-    .catch(() => undefined)
-    .finally(() => { pendingSemanticCacheWrites.delete(write); });
-  pendingSemanticCacheWrites.add(write);
+  if (queuedSemanticCacheWrites.length >= SEMANTIC_RESULT_CACHE_BACKGROUND_MAX_QUEUE) {
+    backgroundWriteDropped += 1;
+    return;
+  }
+  queuedSemanticCacheWrites.push(async () => {
+    await writeSemanticResultCache(identity, value, env, {
+      timeoutMs: options.timeoutMs && options.timeoutMs > 0
+        ? Math.max(1_000, Math.floor(options.timeoutMs))
+        : semanticResultCacheWriteTimeoutMs(env),
+    });
+  });
+  drainSemanticCacheWrites();
 }
 
 /** Test/ops seam: wait for all background cache writes queued so far. */
 export async function flushSemanticResultCacheWritesForTests(): Promise<void> {
-  while (pendingSemanticCacheWrites.size > 0) {
+  while (queuedSemanticCacheWrites.length > 0 || pendingSemanticCacheWrites.size > 0) {
+    drainSemanticCacheWrites();
     await Promise.allSettled([...pendingSemanticCacheWrites]);
   }
 }
 
 export function semanticResultCacheWriteBacklogForTests(): number {
-  return pendingSemanticCacheWrites.size;
+  return pendingSemanticCacheWrites.size + queuedSemanticCacheWrites.length;
+}
+
+/** Production-visible backlog depth (not test-only). */
+export function semanticResultCacheWriteBacklog(): number {
+  return pendingSemanticCacheWrites.size + queuedSemanticCacheWrites.length;
+}
+
+export function semanticResultCacheWriteMetrics(): { failures: number; dropped: number; backlog: number } {
+  return { failures: backgroundWriteFailures, dropped: backgroundWriteDropped, backlog: semanticResultCacheWriteBacklog() };
 }
 
 export async function writeSemanticResultCache(

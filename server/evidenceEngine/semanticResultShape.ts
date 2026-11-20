@@ -53,6 +53,10 @@ export function isSemanticVerdictIdentity(value: unknown): value is {
   label: SemanticResultLabel;
   confidence: number;
   supportedLanguage: boolean;
+  explanation: string;
+  reasonCodes: string[];
+  concepts: string[];
+  languages: Array<{ language: string; script: string; confidence: number; field: string }>;
   citations: Array<{ field: string; index?: number; sourceId?: string }>;
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -60,6 +64,10 @@ export function isSemanticVerdictIdentity(value: unknown): value is {
   if (typeof result.label !== 'string' || !LABELS.has(result.label)) return false;
   if (!isBoundedConfidence(result.confidence)) return false;
   if (typeof result.supportedLanguage !== 'boolean') return false;
+  if (typeof result.explanation !== 'string' || !result.explanation.trim()) return false;
+  if (!Array.isArray(result.reasonCodes) || !result.reasonCodes.every(code => typeof code === 'string')) return false;
+  if (!Array.isArray(result.concepts) || !result.concepts.every(concept => typeof concept === 'string')) return false;
+  if (!Array.isArray(result.languages)) return false;
   if (!Array.isArray(result.citations) || result.citations.length === 0) return false;
   return true;
 }

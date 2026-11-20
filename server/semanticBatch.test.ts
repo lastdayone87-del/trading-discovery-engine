@@ -259,14 +259,16 @@ test('mixed attribution carries bounded member IDs on the single ledger row', as
     return { results: [semanticResult('ACTIVE_TRADING'), semanticResult('UNRELATED')] };
   });
   const instance = scheduler(clock);
-  const first = instance.submit({ client, prompt: '{"channel_name":"A"}', model: 'm1', observability: { jobId: 'job-a', runId: 'run-a' } });
-  const second = instance.submit({ client, prompt: '{"channel_name":"B"}', model: 'm1', observability: { jobId: 'job-b', runId: 'run-b' } });
+  const first = instance.submit({ client, prompt: '{"channel_name":"A"}', model: 'm1', observability: { jobId: 'job-a', runId: 'run-a', requestMetadata: { channelId: 'channel-a', evidenceChecksum: 'checksum-a' } } });
+  const second = instance.submit({ client, prompt: '{"channel_name":"B"}', model: 'm1', observability: { jobId: 'job-b', runId: 'run-b', requestMetadata: { channelId: 'channel-b', evidenceChecksum: 'checksum-b' } } });
   clock.runAll();
   await Promise.all([first, second]);
   assert.equal(seen.jobId, undefined);
   assert.equal(seen.requestMetadata.semanticBatchSize, '2');
   assert.equal(seen.requestMetadata.semanticBatchJobIds, 'job-a,job-b');
   assert.equal(seen.requestMetadata.semanticBatchRunIds, 'run-a,run-b');
+  assert.equal(seen.requestMetadata.semanticBatchChannelIds, 'channel-a,channel-b');
+  assert.equal(seen.requestMetadata.semanticBatchEvidenceChecksums, 'checksum-a,checksum-b');
 });
 
 test('disabled batching is a byte-for-byte direct provider call', async () => {

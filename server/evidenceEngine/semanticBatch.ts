@@ -205,6 +205,12 @@ function commonObservability(requests: PendingRequest[], batchSize: number): Sem
   const first = attribution[0];
   const shared = attribution.every(item => item.jobId === first.jobId && item.runId === first.runId);
   const requestMetadata: Record<string, string> = { semanticBatchSize: String(batchSize) };
+  const channelIds = [...new Set(requests.map(request => request.observability?.requestMetadata?.channelId).filter((value): value is string => Boolean(value)))];
+  const evidenceChecksums = [...new Set(requests.map(request => request.observability?.requestMetadata?.evidenceChecksum).filter((value): value is string => Boolean(value)))];
+  if (channelIds.length === 1) requestMetadata.channelId = channelIds[0];
+  else if (channelIds.length > 1) requestMetadata.semanticBatchChannelIds = channelIds.slice(0, 10).join(',');
+  if (evidenceChecksums.length === 1) requestMetadata.evidenceChecksum = evidenceChecksums[0];
+  else if (evidenceChecksums.length > 1) requestMetadata.semanticBatchEvidenceChecksums = evidenceChecksums.slice(0, 10).join(',');
   if (!shared) {
     // A mixed-attribution batch has one ledger row but served several jobs.
     // Carry bounded member IDs so an incident can still be joined back to
