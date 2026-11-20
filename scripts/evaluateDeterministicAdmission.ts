@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { evaluateDeterministicAdmission } from '../server/channelAdmission/deterministic';
 import { summarizeDeterministicCohort, type DeterministicCohortCase, type EvaluationTruth } from '../server/channelAdmission/deterministicEvaluation';
 import type { AdmissionEvidence } from '../server/channelAdmission/types';
@@ -18,8 +19,8 @@ function arg(name: string): string | undefined {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : undefined;
 }
-const casesPath = arg('cases') || new URL('../tests/fixtures/admission-v2/fresh_cases.jsonl', import.meta.url).pathname;
-const truthPath = arg('truth') || new URL('../tests/fixtures/admission-v2/fresh_truth.json', import.meta.url).pathname;
+const casesPath = arg('cases') || fileURLToPath(new URL('../tests/fixtures/admission-v2/fresh_cases.jsonl', import.meta.url));
+const truthPath = arg('truth') || fileURLToPath(new URL('../tests/fixtures/admission-v2/fresh_truth.json', import.meta.url));
 
 type Case = {
   index: string | number;
@@ -54,7 +55,7 @@ function toEvidence(item: Case): AdmissionEvidence {
     channelName: item.channel_name,
     youtubeUrl: `https://youtube.com/channel/${item.channel_id}`,
     description: item.description || '',
-    links: item.links || item.external_links || [],
+    links: item.links?.length ? item.links : item.external_links || [],
     country: item.country,
     declaredLanguage: item.language,
     videos,

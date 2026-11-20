@@ -26,7 +26,7 @@ The cohort files and checksums are in `tests/fixtures/admission-v2/README.md`.
 | Abstain (`AMBIGUOUS`) | 305 |
 | Decisive coverage | 66.1% |
 
-The acceptance denominator is the full resolved cohort (859 non-ambiguous
+The acceptance denominator is the full resolved cohort (893 non-ambiguous
 cases). The fast-path safety denominator is decisive cases (595), because a
 non-decision cannot be a false confirmation. Report both; do not use the larger
 denominator to make the fast path look safer than it is.
@@ -43,9 +43,9 @@ denominator to make the fast path look safer than it is.
 ### Gate metrics
 
 - Confirm precision: **98.65%** (585/593)
-- Hard unrelated confirmations: **5** (5/595 = **0.84% of decisive cases**; 5/859 = 0.58% of resolved cases)
+- Hard unrelated confirmations: **5** (5/595 = **0.84% of decisive cases**; 5/893 = 0.56% of resolved cases)
 - Reject precision: **100%** (2/2)
-- Unrelated rejection recall: **6.9%** (2/29); 23 unrelated cases abstain
+- Unrelated rejection recall: **6.9%** (2/29); 22 unrelated cases abstain
 - Trading-relevant deterministic recall: **70.6%** (585/829); 244 abstain
 - Finance-adjacent false rejects: **0**
 
@@ -53,7 +53,7 @@ denominator to make the fast path look safer than it is.
 
 ### The five hard false confirmations
 
-All four are channels whose bio/title says trading but whose recent uploads are
+All five are channels whose bio/title says trading but whose recent uploads are
 overwhelmingly unrelated:
 
 | Case | Channel | Why it passed | Recent uploads |
@@ -102,10 +102,10 @@ without needing a second independent surface.
 - 7 `DETERMINISTIC_TRADING_MINORITY`
 
 Reason-code counts are non-mutually-exclusive code occurrences, not a partition
-of the 300 cases.
+of the 244 cases.
 
-By content type: 103 trading education, 93 investing education, 63 active
-trading, 13 financial news, 10 hype, 10 market institution, 8 signal provider.
+By content type: 82 trading education, 92 investing education, 37 active
+trading, 12 financial news, 8 hype, 8 market institution, 5 signal provider.
 
 This shows two different gaps:
 
