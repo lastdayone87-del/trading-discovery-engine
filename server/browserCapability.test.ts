@@ -122,3 +122,106 @@ test('browser capability health is recoverable and never changes semantic provid
   assert.equal(snapshot.attestation, 'CHROMIUM_LAUNCH_CLOSE');
   assert.equal(snapshot.lastSuccessAt !== undefined, true);
 });
+
+test('resource safety: a second browser slot is granted only with host memory headroom', async () => {
+  const { setBrowserRuntimeLimitForTests, setHostMemAvailableReaderForTests, withBrowserRuntimeLease } = await import('./browserCapability');
+  const restoreLimit = setBrowserRuntimeLimitForTests(2);
+  const restoreReader = setHostMemAvailableReaderForTests(() => 4_000);
+  try {
+    const events: string[] = [];
+    const first = withBrowserRuntimeLease(async () => {
+      events.push('first:start');
+      await new Promise(resolve => setTimeout(resolve, 5));
+      events.push('first:end');
+    });
+    const second = withBrowserRuntimeLease(async () => {
+      events.push('second:start');
+      events.push('second:end');
+    });
+    await Promise.all([first, second]);
+    assert.deepEqual(events, ['first:start', 'second:start', 'second:end', 'first:end'],
+      'with headroom, the second slot runs concurrently with the first');
+  } finally {
+    setBrowserRuntimeLimitForTests(restoreLimit);
+    setHostMemAvailableReaderForTests(restoreReader);
+  }
+});
+
+test('resource safety: without host memory headroom the lease stays single-slot', async () => {
+  const { setBrowserRuntimeLimitForTests, setHostMemAvailableReaderForTests, withBrowserRuntimeLease } = await import('./browserCapability');
+  const restoreLimit = setBrowserRuntimeLimitForTests(2);
+  const restoreReader = setHostMemAvailableReaderForTests(() => 400);
+  try {
+    const events: string[] = [];
+    const first = withBrowserRuntimeLease(async () => {
+      events.push('first:start');
+      await new Promise(resolve => setTimeout(resolve, 5));
+      events.push('first:end');
+    });
+    const second = withBrowserRuntimeLease(async () => {
+      events.push('second:start');
+      events.push('second:end');
+    });
+    await Promise.all([first, second]);
+    assert.deepEqual(events, ['first:start', 'first:end', 'second:start', 'second:end'],
+      'a degraded host falls back to single-slot behavior for new launches');
+  } finally {
+    setBrowserRuntimeLimitForTests(restoreLimit);
+    setHostMemAvailableReaderForTests(restoreReader);
+  }
+});
+
+test('resource safety: slot one is always possible even on a degraded host', async () => {
+  const { setBrowserRuntimeLimitForTests, setHostMemAvailableReaderForTests, hostMemAvailableForExtraSlot } = await import('./browserCapability');
+  const restoreLimit = setBrowserRuntimeLimitForTests(2);
+  const restoreReader = setHostMemAvailableReaderForTests(() => 100);
+  try {
+    assert.equal(hostMemAvailableForExtraSlot(), null, 'below-threshold host denies the extra slot');
+    let completed = 0;
+    await withBrowserRuntimeLease(async () => { completed = 1; });
+    assert.equal(completed, 1, 'a single browser launch must remain possible regardless of headroom');
+  } finally {
+    setBrowserRuntimeLimitForTests(restoreLimit);
+    setHostMemAvailableReaderForTests(restoreReader);
+  }
+});
+
+test('resource safety: unreadable host memory telemetry fails open to the configured limit', async () => {
+  const { setBrowserRuntimeLimitForTests, setHostMemAvailableReaderForTests, withBrowserRuntimeLease } = await import('./browserCapability');
+  const restoreLimit = setBrowserRuntimeLimitForTests(2);
+  const restoreReader = setHostMemAvailableReaderForTests(() => null);
+  try {
+    const events: string[] = [];
+    const first = withBrowserRuntimeLease(async () => {
+      events.push('first:start');
+      await new Promise(resolve => setTimeout(resolve, 5));
+      events.push('first:end');
+    });
+    const second = withBrowserRuntimeLease(async () => {
+      events.push('second:start');
+      events.push('second:end');
+    });
+    await Promise.all([first, second]);
+    assert.deepEqual(events, ['first:start', 'second:start', 'second:end', 'first:end'],
+      'an unreadable /proc/meminfo must not brick an operator-configured second slot');
+  } finally {
+    setBrowserRuntimeLimitForTests(restoreLimit);
+    setHostMemAvailableReaderForTests(restoreReader);
+  }
+});
+
+test('resource safety: BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB overrides the default threshold', async () => {
+  const { setHostMemAvailableReaderForTests, hostMemAvailableForExtraSlot } = await import('./browserCapability');
+  const restoreReader = setHostMemAvailableReaderForTests(() => 1_600);
+  const previousEnv = process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB;
+  process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB = '2000';
+  try {
+    assert.equal(hostMemAvailableForExtraSlot(), null, '1600MB is below the raised 2000MB threshold');
+    process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB = '1000';
+    assert.equal(hostMemAvailableForExtraSlot(), 1_600, '1600MB clears the lowered 1000MB threshold');
+  } finally {
+    if (previousEnv === undefined) delete process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB;
+    else process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB = previousEnv;
+    setHostMemAvailableReaderForTests(restoreReader);
+  }
+});

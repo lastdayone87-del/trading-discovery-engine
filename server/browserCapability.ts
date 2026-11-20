@@ -1,4 +1,4 @@
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, readFileSync } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 
 export type BrowserCapabilityStatus = 'UNKNOWN' | 'READY' | 'UNAVAILABLE';
@@ -78,9 +78,67 @@ function browserRuntimeConcurrency(): number {
   return Math.min(MAX_BROWSER_RUNTIME_CONCURRENCY, Math.max(1, Math.floor(parsed)));
 }
 
-const browserRuntimeLimit = browserRuntimeConcurrency();
+let browserRuntimeLimit = browserRuntimeConcurrency();
 let browserRuntimeActive = 0;
 const browserRuntimeWaiters: Array<() => void> = [];
+
+/**
+ * Resource safety for the multi-slot browser lease (rendered-capacity Fix B).
+ * A second browser slot is only worth opening while the host actually has the
+ * spare memory to hold another Chromium. `/proc/meminfo` is not namespaced for
+ * containers, so `MemAvailable` reflects what the VPS really has left even
+ * though the crawler runs inside a container. The guard is re-evaluated on
+ * every acquire and release: a degraded host falls back to single-slot
+ * behavior for NEW launches, and the browser already running is never killed.
+ *
+ * The reader is injectable so capacity tests can simulate host memory without
+ * touching the real /proc filesystem.
+ */
+const DEFAULT_EXTRA_SLOT_MIN_HOST_MEM_MB = 1_500;
+export function readHostMemAvailableMb(): number | null {
+  try {
+    const meminfo = readFileSync('/proc/meminfo', 'utf8');
+    const match = meminfo.match(/^MemAvailable:\s+(\d+)\s*kB/m);
+    return match ? Math.floor(Number(match[1]) / 1024) : null;
+  } catch {
+    return null;
+  }
+}
+let hostMemAvailableReader: () => number | null = readHostMemAvailableMb;
+/** Test seam: replace the host-memory reader (pass it back to restore). */
+export function setHostMemAvailableReaderForTests(reader: () => number | null): () => number | null {
+  const previous = hostMemAvailableReader;
+  hostMemAvailableReader = reader;
+  return previous;
+}
+export function hostMemAvailableForExtraSlot(): number | null {
+  const availableMb = hostMemAvailableReader();
+  if (availableMb === null) return null;
+  const threshold = Number(process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB);
+  const minMb = Number.isFinite(threshold) && threshold > 0 ? threshold : DEFAULT_EXTRA_SLOT_MIN_HOST_MEM_MB;
+  return availableMb >= minMb ? availableMb : null;
+}
+
+/** Test seam: override the configured browser slot count (returns the previous value). */
+export function setBrowserRuntimeLimitForTests(limit: number): number {
+  const previous = browserRuntimeLimit;
+  browserRuntimeLimit = limit;
+  return previous;
+}
+
+/**
+ * Effective slot count for this acquire attempt. Slot one is always allowed —
+ * a single browser must remain possible even on a degraded host. Slots beyond
+ * one require host memory headroom; an unreadable /proc/meminfo fails open so
+ * an operator-configured limit is never bricked by a telemetry hiccup.
+ */
+function effectiveRuntimeLimit(): number {
+  if (browserRuntimeLimit <= 1) return 1;
+  // Unreadable telemetry fails open to the configured limit; only a readable
+  // below-threshold value closes the extra slots.
+  if (hostMemAvailableReader() === null) return browserRuntimeLimit;
+  return hostMemAvailableForExtraSlot() === null ? 1 : browserRuntimeLimit;
+}
 
 function acquireBrowserRuntimeLease(): Promise<() => void> {
   const grant = (): (() => void) => {
@@ -94,7 +152,7 @@ function acquireBrowserRuntimeLease(): Promise<() => void> {
       if (next) next();
     };
   };
-  if (browserRuntimeActive < browserRuntimeLimit) return Promise.resolve(grant());
+  if (browserRuntimeActive < effectiveRuntimeLimit()) return Promise.resolve(grant());
   return new Promise<() => void>(resolve => {
     browserRuntimeWaiters.push(() => resolve(grant()));
   });
@@ -103,8 +161,9 @@ function acquireBrowserRuntimeLease(): Promise<() => void> {
 /**
  * Bound attestation and real crawler browser launches to the measured number
  * of browser slots. The default remains one for existing deployments; an
- * operator can enable a second slot only after the production benchmark proves
- * CPU/DB headroom.
+ * operator can enable a second slot via BROWSER_RUNTIME_CONCURRENCY, and the
+ * resource-safety guard above keeps that slot closed whenever the host lacks
+ * the memory headroom to hold another Chromium.
  */
 export async function withBrowserRuntimeLease<T>(operation: () => Promise<T>): Promise<T> {
   const release = await acquireBrowserRuntimeLease();
