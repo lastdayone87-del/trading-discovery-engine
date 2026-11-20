@@ -20,8 +20,9 @@ unrelated:
 When an authoritative recent video sample exists:
 
 - A fast pass requires substantive video support, not only a trading name/bio.
-- `TERMINOLOGY` and whole-sample `MULTI_VIDEO_CONSISTENCY` fields are not counted
-  as substantive trading videos.
+- Whole-sample `MULTI_VIDEO_CONSISTENCY` references are not counted.
+  `TERMINOLOGY` counts only when the matched term appears outside hashtags/URLs,
+  preserving native-language video titles while rejecting `#tjrtrades`.
 - Minimum support is `min(3, ceil(videos * 0.4))` with at least 40% of the
   sample.
 - Channels with no video sample keep the existing creator-signal behavior.

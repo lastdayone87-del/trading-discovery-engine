@@ -274,15 +274,34 @@ export function hasDecisiveTradingShare(
  * citation list is shortened for persistence. Repeated trading instruments
  * can otherwise collapse to the first video and undercount the share.
  */
-export function decisionTradingVideoIndexes(decision: VerificationDecision): Set<number> {
+function withoutHashtagsAndUrls(value: string): string {
+  return value.replace(/#[^\s#]+/gu, ' ').replace(/https?:\/\/\S+/giu, ' ');
+}
+
+export function decisionTradingVideoIndexes(
+  decision: VerificationDecision,
+  evidence?: AdmissionEvidence,
+): Set<number> {
   const indexes = new Set<number>();
   for (const item of decision.positiveEvidence) {
     // The consistency item lists the whole sample, including videos without a
     // trading match. Counting it would report a false 100% trading share.
-    if (item.category === 'MULTI_VIDEO_CONSISTENCY' || item.category === 'TERMINOLOGY') continue;
+    if (item.category === 'MULTI_VIDEO_CONSISTENCY') continue;
     for (const fieldRef of item.provenance?.fields || []) {
       if ((fieldRef.field === 'video_title' || fieldRef.field === 'video_description')
         && typeof fieldRef.index === 'number') {
+        // Terminology is useful for native-language titles, but a hashtag such
+        // as #tjrtrades is not substantive trading content. Keep the index only
+        // when the matched term appears outside hashtags/URLs in that video.
+        if (item.category === 'TERMINOLOGY' && evidence) {
+          const video = evidence.videos[fieldRef.index];
+          const text = withoutHashtagsAndUrls(`${video?.title || ''} ${video?.description || ''}`).toLocaleLowerCase('und');
+          const substantive = item.rawMatches.some(match => {
+            const term = String(match || '').trim().toLocaleLowerCase('und');
+            return term.length >= 3 && text.includes(term);
+          });
+          if (!substantive) continue;
+        }
         indexes.add(fieldRef.index);
       }
     }
@@ -313,7 +332,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     // anchor in the creator-owned name/bio, or trading evidence spread across
     // a substantial share of recent videos. Three trading uploads on an
     // otherwise music/lifestyle channel are not decisive.
-    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations, decisionTradingVideoIndexes(decision));
+    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations, decisionTradingVideoIndexes(decision, evidence));
     if (citations.length > 0 && !financeAdjacentOnly && decisiveTradingShare) {
       const judgment: SemanticJudgment = {
         mainSubject: 'TRADING',
