@@ -15,6 +15,7 @@ import {
   semanticResultCacheWriteBacklogForTests,
   flushSemanticResultCacheWritesForTests,
   setSemanticResultCacheWriterForTests,
+  defaultSemanticResultCachePort,
   type SemanticCacheHit,
   type SemanticResultCachePort,
 } from './evidenceEngine/semanticResultCache';
@@ -275,6 +276,33 @@ test('every semantic provider skips the cache write for a malformed model verdic
     const provider = new Provider(client, harness.port);
     await provider.collectEvidence(providerInput, {} as any);
     assert.equal(harness.writes.length, 0, `${name} must not persist a malformed verdict`);
+  }
+});
+
+test('an injected client without a cache port never touches the production cache', async () => {
+  for (const [name, Provider] of providerCases) {
+    const originalRead = defaultSemanticResultCachePort.read;
+    const originalWrite = defaultSemanticResultCachePort.scheduleWrite;
+    let reads = 0;
+    let writes = 0;
+    let modelCalls = 0;
+    defaultSemanticResultCachePort.read = async () => {
+      reads += 1;
+      return undefined;
+    };
+    defaultSemanticResultCachePort.scheduleWrite = () => {
+      writes += 1;
+    };
+    try {
+      const provider = new Provider({ async classify() { modelCalls += 1; return providerVerdict; } });
+      await provider.collectEvidence(providerInput, {} as any);
+      assert.equal(modelCalls, 1, `${name} must still call its injected model`);
+      assert.equal(reads, 0, `${name} must not read the production cache for an injected client`);
+      assert.equal(writes, 0, `${name} must not write the production cache for an injected client`);
+    } finally {
+      defaultSemanticResultCachePort.read = originalRead;
+      defaultSemanticResultCachePort.scheduleWrite = originalWrite;
+    }
   }
 });
 

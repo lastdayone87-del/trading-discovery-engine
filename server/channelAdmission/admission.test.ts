@@ -774,14 +774,19 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
   assert.equal(hasDecisiveTradingShare(genericTrader, [], new Set([0, 1, 2, 3, 4, 5])), true);
 });
 
-test('a single trading upload cannot fast-pass a tiny channel without creator signals', async () => {
+test('a single trading upload is below the three-video deterministic minimum', async () => {
   const thin = evidence({
     name: 'Clip Feed',
     bio: 'Clips',
     videos: [{ title: 'NQ futures trade recap', description: 'Futures execution.' }],
   });
+  assert.equal(
+    hasDecisiveTradingShare(thin, [citation('video_title', 'NQ futures trade recap', 0, 'TRADING')]),
+    false,
+  );
   const result = await evaluateDeterministicAdmission(thin);
   assert.notEqual(result.outcome, 'PASS');
+  assert.ok(result.reasonCodes.includes('DETERMINISTIC_AMBIGUOUS'), `blocked thin sample must abstain: ${result.reasonCodes.join(',')}`);
 });
 
 test('a bio-only decisive creator still fast-passes without a video sample', async () => {

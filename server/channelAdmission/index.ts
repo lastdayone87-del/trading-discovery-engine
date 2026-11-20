@@ -306,10 +306,10 @@ async function enqueueEnrichmentAfterAmbiguousAdmission(input: {
   });
   if (job.status === 'COMPLETED') {
     // Stage-1 enrichment already finished before the admission side effect
-    // committed. Move directly to the one full classifier on the current
-    // admission snapshot. The completed job's stored payload is the input to
-    // that earlier pass, not the evidence this admission decision evaluated.
-    const enrichedCandidate = candidate;
+    // committed. The ENRICH_CHANNEL worker writes the fetched candidate back
+    // into the job payload, so this is the enriched evidence, not the original
+    // input. Reuse it and overlay this admission's provenance below.
+    const enrichedCandidate = (job.payload?.candidate || candidate) as DiscoveredChannelRaw;
     return enqueueClassificationAfterAdmission({
       candidate: {
         ...enrichedCandidate,

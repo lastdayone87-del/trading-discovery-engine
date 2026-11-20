@@ -13,7 +13,7 @@
  *     --include-classification-pending
  */
 import { randomUUID } from 'node:crypto';
-import { getChannelById, getDb } from '../server/db';
+import { getChannelById, getClassificationBackpressureState, getDb } from '../server/db';
 import type { DiscoveredChannelRaw } from '../server/youtube';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
 import { resumeAdmittedCandidate, verifyAdmissionCandidate } from '../server/channelAdmission';
@@ -142,6 +142,23 @@ async function main() {
   const rows = result.rows as DeferredRow[];
   const counts = { admitted: 0, ambiguous: 0, rejected: 0, held: 0, expired: 0, country: 0, failed: 0 };
   for (const row of rows) {
+    if (apply) {
+      // Admission can enqueue a classification job for every admitted row.
+      // Stop before the queue reaches its configured global ceiling; the
+      // remaining rows stay INTAKE_DEFERRED for a later bounded batch.
+      const capacity = await getClassificationBackpressureState('intake-deferred-revalidation');
+      if (capacity.globalPending >= capacity.maxPending) {
+        console.log(JSON.stringify({
+          event: 'intake_deferred_revalidation_capacity_full',
+          apply,
+          globalPending: capacity.globalPending,
+          maxPending: capacity.maxPending,
+          counts,
+          timestamp: new Date().toISOString(),
+        }));
+        break;
+      }
+    }
     const candidate = candidateFromRow(row);
     const targetCountry = String(explicitTarget || row.enrich_payload?.targetCountry || '');
     const source = String(row.discovery_source || 'automated_query') as DiscoverySource;

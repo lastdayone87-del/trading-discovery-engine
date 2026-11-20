@@ -6,7 +6,10 @@ import pg from 'pg';
  * Uses a dedicated read-only pool rather than getDb(), which runs migrations
  * and default seeding. The session is explicitly read-only for defense in
  * depth. Historical provider rows predate channel/checksum metadata; those
- * columns appear as null rather than being inferred.
+ * columns appear as null rather than being inferred. Capacity/scale-gate
+ * deferral rows are excluded from provider-call and channel-call counts but
+ * reported separately as `preCallDeferrals`, so omitted contention stays
+ * visible instead of looking like a clean provider picture.
  */
 const args = process.argv.slice(2);
 const hoursArg = args.find(arg => arg.startsWith('--hours='));
@@ -23,7 +26,7 @@ try {
   const client = await pool.connect();
   try {
     await client.query('BEGIN TRANSACTION READ ONLY');
-    const [calls, cache, hits, channels] = await Promise.all([
+    const [calls, deferrals, cache, hits, channels] = await Promise.all([
       client.query(
         `SELECT provider,status,COUNT(*)::int AS calls,
                 COALESCE(SUM(actual_cost),0)::float AS actual_cost
@@ -36,6 +39,19 @@ try {
             AND COALESCE(request_metadata->>'geminiScaleGateDeferral','') <> 'true'
           GROUP BY provider,status
           ORDER BY calls DESC`,
+        [hours],
+      ),
+      client.query(
+        `SELECT provider,status,COUNT(*)::int AS deferrals
+           FROM provider_call_events
+          WHERE operation='multilingual-semantic-classification'
+            AND occurred_at >= now() - ($1::int * interval '1 hour')
+            AND (
+              COALESCE(request_metadata->>'geminiCapacityDeferral','') = 'true'
+              OR COALESCE(request_metadata->>'geminiScaleGateDeferral','') = 'true'
+            )
+          GROUP BY provider,status
+          ORDER BY deferrals DESC`,
         [hours],
       ),
       client.query(
@@ -89,6 +105,7 @@ try {
     console.log(JSON.stringify({
       windowHours: hours,
       providerCalls: calls.rows,
+      preCallDeferrals: deferrals.rows,
       cache: cache.rows,
       diagnostics: hits.rows[0] || null,
       topChannels: channels.rows,
