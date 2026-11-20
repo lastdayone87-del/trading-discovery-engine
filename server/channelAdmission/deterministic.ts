@@ -290,11 +290,12 @@ export function decisionTradingVideoIndexes(
     for (const fieldRef of item.provenance?.fields || []) {
       if ((fieldRef.field === 'video_title' || fieldRef.field === 'video_description')
         && typeof fieldRef.index === 'number') {
-        // Terminology is useful for native-language titles, but a hashtag such
-        // as #tjrtrades is not substantive trading content. Keep the index only
-        // when the matched term appears outside hashtags/URLs in that video.
-        if (item.category === 'TERMINOLOGY') {
-          const video = evidence.videos[fieldRef.index];
+        // A hashtag such as #tjrtrades is not substantive trading content.
+        // Keep the index only when at least one matched term appears outside
+        // hashtags/URLs in that video's title or description. This applies to
+        // terminology and any other category that carries a video field.
+        const video = evidence.videos[fieldRef.index];
+        if (item.rawMatches.length > 0) {
           const text = withoutHashtagsAndUrls(`${video?.title || ''} ${video?.description || ''}`).toLocaleLowerCase('und');
           const substantive = item.rawMatches.some(match => {
             const term = String(match || '').trim().toLocaleLowerCase('und');

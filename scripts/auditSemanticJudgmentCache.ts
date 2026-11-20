@@ -10,7 +10,10 @@ import pg from 'pg';
  */
 const args = process.argv.slice(2);
 const hoursArg = args.find(arg => arg.startsWith('--hours='));
-const hours = Math.max(1, Math.min(24 * 14, Math.floor(Number(hoursArg?.split('=')[1] || 24) || 24)));
+const parsedHours = Number(hoursArg?.split('=')[1] || 24);
+const hours = Number.isFinite(parsedHours) ? Math.max(1, Math.min(24 * 14, Math.floor(parsedHours))) : 24;
+
+if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required for the semantic cache audit.');
 
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,

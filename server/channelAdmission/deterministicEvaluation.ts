@@ -24,6 +24,10 @@ const EMPTY_OUTCOME = (): Record<DeterministicOutcome, number> => ({ PASS: 0, RE
 const EMPTY_TRUTH = (): Record<EvaluationTruth, number> => ({ TRADING_RELEVANT: 0, FINANCE_ADJACENT: 0, UNRELATED: 0, AMBIGUOUS: 0 });
 
 export function summarizeDeterministicCohort(cases: DeterministicCohortCase[]): DeterministicCohortSummary {
+  for (const item of cases) {
+    if (!(item.truth in { TRADING_RELEVANT: 1, FINANCE_ADJACENT: 1, UNRELATED: 1, AMBIGUOUS: 1 })) throw new Error(`Unknown evaluation truth: ${String(item.truth)}`);
+    if (!(item.outcome in { PASS: 1, REJECT: 1, AMBIGUOUS: 1 })) throw new Error(`Unknown deterministic outcome: ${String(item.outcome)}`);
+  }
   const outcomes = EMPTY_OUTCOME();
   const truth = EMPTY_TRUTH();
   const confusion: Record<EvaluationTruth, Record<DeterministicOutcome, number>> = {

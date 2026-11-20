@@ -272,14 +272,7 @@ function drainSemanticCacheWrites(): void {
     && queuedSemanticCacheWrites.length > 0) {
     const run = queuedSemanticCacheWrites.shift()!;
     const write = run()
-      .catch(error => {
-        backgroundWriteFailures += 1;
-        const now = Date.now();
-        if (now - lastBackgroundWriteWarningAt >= 60_000) {
-          lastBackgroundWriteWarningAt = now;
-          console.warn('[SemanticResultCache] background write failed:', error instanceof Error ? error.message : error);
-        }
-      })
+      .catch(() => undefined)
       .finally(() => {
         pendingSemanticCacheWrites.delete(write);
         drainSemanticCacheWrites();
@@ -376,6 +369,14 @@ export async function writeSemanticResultCache(
     })(), options, env);
     noteCacheSuccess();
   } catch (error) {
-    if (!options.signal?.aborted) noteCacheFailure();
+    if (!options.signal?.aborted) {
+      noteCacheFailure();
+      backgroundWriteFailures += 1;
+      const now = Date.now();
+      if (now - lastBackgroundWriteWarningAt >= 60_000) {
+        lastBackgroundWriteWarningAt = now;
+        console.warn('[SemanticResultCache] background write failed:', error instanceof Error ? error.message : error);
+      }
+    }
   }
 }

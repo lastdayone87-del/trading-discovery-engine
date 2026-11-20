@@ -32,12 +32,13 @@ verdict.
 
 | Metric | Before | After |
 |---|---:|---:|
-| Deterministic PASS | 593 | 514 |
+| Deterministic PASS | 593 | 466 |
 | Deterministic REJECT | 2 | 2 |
-| Deterministic abstain | 305 | 384 |
-| Confirm precision | 98.65% | **99.61%** |
+| Deterministic abstain | 305 | 432 |
+| Decisive coverage | 66.1% | 52.0% |
+| Confirm precision | 98.65% | **99.57%** |
 | Hard UNRELATED confirmations | 5 | **0** |
-| Trading-relevant deterministic recall | 70.6% | 61.8% |
+| Trading-relevant deterministic recall | 70.6% | 56.0% |
 | Unrelated rejection recall | 6.9% | 6.9% |
 
 Blocked fast passes abstain and reach the one AI judge. No global threshold
@@ -45,13 +46,35 @@ was lowered.
 
 ## Existing full-classifier validation
 
-The frozen full-classifier cohort remains at **99.26% precision / 98.28%
-recall** with **0 confirmed UNRELATED** in the resolved set. The new policy
-cannot reduce semantic recall; its AI-led confirmation path only removes the
-Tier-A veto for verdicts with creator-owned citations and no contradiction.
+The frozen full-classifier cohort (890 resolved predictions, checked into
+`tests/fixtures/admission-v2`) measures **97.94% precision / 97.82% recall**,
+**4 hard `UNRELATED` predictions (0.45%)**, and **69.44% content-type exact**.
+Reproduce with:
 
-## Deployment
+```bash
+npx tsx scripts/evaluateFrozenClassifierCohort.ts
+```
+
+Those predictions predate the routing change. The AI-led path does not add a
+rejection rule; it removes the Tier-A confirmation veto only when a semantic
+trading verdict has a creator-owned citation, confidence >=70, a valid category,
+and no material contradiction. A post-deploy replay is required to measure the
+new routing on fresh production evidence.
+
+## Deployment and rollback
 
 The release is a single cutover. Production ran the old image until this PR
-merged. No shadow or canary path was deployed. Existing affected records are
-reprocessed under the new path in bounded batches; no mass approval.
+merged. No shadow or canary path was deployed. Image rollback is the previous
+production image (`75694245`); migrations are additive and do not require a
+destructive rollback. Existing affected records are reprocessed under the new
+path in bounded batches; no mass approval.
+
+Post-deploy checks:
+
+1. `/api/health` ready, restarts 0, new symbols present in the bundle.
+2. One ambiguous admission creates one stage-1 `ENRICH_CHANNEL` job and no
+   semantic admission judgement.
+3. One classifier AI judgement after enrichment; unchanged evidence hits cache.
+4. Confirmed/non-trading terminal rows are preserved on rediscovery.
+5. Monitor confirmation, rejection, review, ENRICH, AI calls, cache hits and
+   provider retries before enlarging reprocessing batches.

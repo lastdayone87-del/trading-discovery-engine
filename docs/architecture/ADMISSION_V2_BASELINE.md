@@ -122,7 +122,7 @@ The deterministic gate should be strengthened in this order:
 1. **Recent-content dominance guard for deterministic confirmation.** If
    creator-owned recent videos are available and the substantive majority is
    unrelated, do not fast-pass on bio/title alone. Abstain for the full AI
-   judge. This targets the 4 hard false confirmations and the 3 mixed cases
+   judge. This targets the 5 hard false confirmations and the 3 mixed cases
    without globally lowering thresholds.
 2. **Recent-content-based unrelated rejection.** Use independent creator-owned
    video evidence plus bio/title to reject clear unrelated channels; do not

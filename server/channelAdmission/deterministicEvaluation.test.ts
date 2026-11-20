@@ -27,9 +27,15 @@ test('deterministic cohort summary separates hard false confirmations from finan
   assert.equal(summary.abstain.tradingRelevant, 1);
   assert.equal(summary.abstain.financeAdjacent, 0);
   assert.equal(summary.abstain.ambiguous, 1);
+  assert.equal(summary.abstain.unrelated, 1);
   assert.equal(summary.reasonCodes.DETERMINISTIC_AMBIGUOUS, 2);
   assert.equal(summary.coverage.decisive, 5);
   assert.equal(summary.coverage.decisiveRate, 5 / 8);
+});
+
+test('unknown truth or outcome values fail closed', () => {
+  assert.throws(() => summarizeDeterministicCohort([{ truth: 'BROKEN' as any, outcome: 'PASS' }]), /Unknown evaluation truth/);
+  assert.throws(() => summarizeDeterministicCohort([{ truth: 'UNRELATED', outcome: 'BROKEN' as any }]), /Unknown deterministic outcome/);
 });
 
 test('an empty cohort reports null precision rather than a fabricated zero', () => {

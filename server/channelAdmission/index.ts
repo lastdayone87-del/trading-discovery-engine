@@ -276,7 +276,6 @@ async function enqueueEnrichmentAfterAmbiguousAdmission(input: {
   candidate.admissionDecisionSource = 'DETERMINISTIC';
   candidate.admissionConfirmedTrading = false;
   candidate.admissionTradingConfidence = 0;
-  candidate.enrichmentStage = 1;
   const payload = {
     channelId: candidate.channelId,
     targetCountry: input.targetCountry,
