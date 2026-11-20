@@ -258,8 +258,15 @@ export function hasDecisiveTradingShare(
     .filter(citation => citation.field === 'video_title' || citation.field === 'video_description')
     .map(citation => citation.index)
     .filter((index): index is number => typeof index === 'number'));
-  const tradingVideoShare = evidence.videos.length > 0 ? indexes.size / evidence.videos.length : 0;
-  return creatorSignalsTrading(evidence) || (indexes.size >= 3 && tradingVideoShare >= 0.4);
+  // A trading bio/title cannot confirm a channel whose recent uploads are
+  // unrelated. When a creator-owned video sample exists, the fast pass needs
+  // substantive video support. Keyword-only TERMINOLOGY and the whole-sample
+  // consistency item are excluded: hashtags like #tjrtrades must not turn a
+  // GTA clip feed into a trading channel.
+  if (evidence.videos.length === 0) return creatorSignalsTrading(evidence);
+  const minimum = Math.min(3, Math.ceil(evidence.videos.length * 0.4));
+  const tradingVideoShare = indexes.size / evidence.videos.length;
+  return indexes.size >= minimum && tradingVideoShare >= 0.4;
 }
 
 /**
@@ -272,7 +279,7 @@ export function decisionTradingVideoIndexes(decision: VerificationDecision): Set
   for (const item of decision.positiveEvidence) {
     // The consistency item lists the whole sample, including videos without a
     // trading match. Counting it would report a false 100% trading share.
-    if (item.category === 'MULTI_VIDEO_CONSISTENCY') continue;
+    if (item.category === 'MULTI_VIDEO_CONSISTENCY' || item.category === 'TERMINOLOGY') continue;
     for (const fieldRef of item.provenance?.fields || []) {
       if ((fieldRef.field === 'video_title' || fieldRef.field === 'video_description')
         && typeof fieldRef.index === 'number') {

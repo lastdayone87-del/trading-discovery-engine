@@ -757,7 +757,7 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
       description: 'Futures trading recap.',
     })),
   });
-  assert.equal(hasDecisiveTradingShare(namedTrader, citations), true);
+  assert.equal(hasDecisiveTradingShare(namedTrader, citations), false);
 
   const genericTrader = evidence({
     name: 'Channel X',
@@ -772,6 +772,9 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
   // The uncapped decision index set is authoritative even if only one audit
   // citation survives shortening.
   assert.equal(hasDecisiveTradingShare(genericTrader, [], new Set([0, 1, 2, 3, 4, 5])), true);
+
+  const bioOnly = evidence({ name: 'Nifty Trader', bio: 'Daily Nifty trading analysis and risk management.', videos: [] });
+  assert.equal(hasDecisiveTradingShare(bioOnly, citations), true);
 });
 
 test('mid-quote ellipses are accepted only when every segment is exact and in order', () => {
@@ -868,6 +871,10 @@ test('sample-wide consistency references are not counted as trading videos', () 
       {
         category: 'INSTRUMENT',
         provenance: { fields: [{ field: 'video_title', index: 1 }] },
+      },
+      {
+        category: 'TERMINOLOGY',
+        provenance: { fields: [{ field: 'video_title', index: 2 }] },
       },
     ],
   } as any);
