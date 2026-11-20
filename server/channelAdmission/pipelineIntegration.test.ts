@@ -266,7 +266,7 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
   assert.match(verify, /DETERMINISTIC_ADMISSION_ABSTAINED/);
   assert.match(verify, /enqueueEnrichmentAfterAmbiguousAdmission/);
   assert.doesNotMatch(verify, /ProviderAdmissionJudge|judge\.judge\(evidence/);
-  assert.match(index, /:DETERMINISTIC_AMBIGUOUS:/);
+  assert.match(verify, /:DETERMINISTIC_AMBIGUOUS:/);
   assert.match(index, /admissionStatus === 'ADMITTED_AMBIGUOUS' && decisionSource === 'DETERMINISTIC'/);
 });
 

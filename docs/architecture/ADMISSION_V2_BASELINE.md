@@ -11,7 +11,7 @@ It does not call AI, write production rows, or change behavior.
 npx tsx scripts/evaluateDeterministicAdmission.ts \
   --cases=tests/fixtures/admission-v2/fresh_cases.jsonl \
   --truth=tests/fixtures/admission-v2/fresh_truth.json \
-  --out=/tmp/opencode/deterministic-eval.jsonl
+  --out=/tmp/deterministic-eval.jsonl
 ```
 
 The cohort files and checksums are in `tests/fixtures/admission-v2/README.md`.
@@ -79,7 +79,7 @@ deterministically.
 
 ### The unrelated abstentions
 
-22 of 29 `UNRELATED` cases abstained. Reason codes:
+22 of 29 `UNRELATED` cases abstained. Reason-code counts are non-mutually-exclusive occurrences:
 
 - `INDEPENDENT_EVIDENCE_REQUIRED` — 11
 - `INSUFFICIENT_EVIDENCE_ENRICH` — 9

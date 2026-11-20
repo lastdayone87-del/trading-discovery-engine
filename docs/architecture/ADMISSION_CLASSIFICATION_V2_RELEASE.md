@@ -46,9 +46,10 @@ was lowered.
 
 ## Existing full-classifier validation
 
-The frozen full-classifier cohort (890 resolved predictions, checked into
-`tests/fixtures/admission-v2`) measures **97.94% precision / 97.82% recall**,
-**4 hard `UNRELATED` predictions (0.45%)**, and **69.44% content-type exact**.
+The frozen full-classifier cohort (893 non-ambiguous cases, checked into
+`tests/fixtures/admission-v2`) measures **97.94% precision / 97.47% recall**,
+**4 hard `UNRELATED` predictions (0.45%)**, and **70.66% content-type exact**.
+Three non-ambiguous cases have no stored prediction and are counted as misses.
 Reproduce with:
 
 ```bash

@@ -68,6 +68,9 @@ function toEvidence(item: Case): AdmissionEvidence {
 
 const cases = readFileSync(casesPath, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as Case);
 const truth = JSON.parse(readFileSync(truthPath, 'utf8')) as Record<string, Truth>;
+const validTruth = new Set<string>(['TRADING_RELEVANT', 'FINANCE_ADJACENT', 'UNRELATED', 'AMBIGUOUS']);
+const invalidTruth = Object.entries(truth).filter(([, value]) => !validTruth.has(String(value?.relevance))).map(([key]) => key);
+if (invalidTruth.length > 0) throw new Error(`Truth file has unknown relevance label for case(s): ${invalidTruth.slice(0, 20).join(', ')}`);
 const missingTruth = cases.filter(item => !truth[String(item.index)]).map(item => String(item.index));
 if (missingTruth.length > 0) {
   throw new Error(`Truth file is missing ${missingTruth.length} cohort case(s): ${missingTruth.slice(0, 20).join(', ')}`);
