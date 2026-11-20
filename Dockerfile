@@ -18,13 +18,15 @@ FROM mcr.microsoft.com/playwright:v1.62.1-noble
 # is observational only and can never change an acquisition result.
 # The rendered-admission governor enforces the admission budget: 64/h
 # nominal, 72/h emergency when queued demand exists, and a 35% DISCOVERY
-# floor whenever discovery work is waiting. Local/CI harnesses default it
-# off. These defaults come from the Nov 2026 capacity experiment
-# (docs/phase-2-rendered-capacity-experiment.md): the browser lease runs
-# TWO Chromium slots under a memory-headroom guard, and the measured
-# sustained two-slot run rate sits at ~60-80 crawls/hour — 64/72 keeps
-# the governor just under the lease capacity so the lease, not the
-# queue, is the first bottleneck.
+# floor that binds while discovery demand is pending. Local/CI harnesses
+# default it off. These defaults come from the Nov 2026 capacity
+# experiment (docs/phase-2-rendered-capacity-experiment.md): the browser
+# lease runs TWO Chromium slots under a memory-headroom guard, the
+# rendered-crawl gate derives its concurrency from the same slot budget,
+# and the sustained one-at-a-time rate measured ~41 crawls/hour — 64/72
+# admits the burst capacity the two slots provide while the experiment
+# doc tracks the two-slot sustained rate as pending post-merge
+# measurement.
 ENV NODE_ENV=production \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_SKIP_BROWSER_GC=1 \

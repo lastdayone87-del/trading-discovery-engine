@@ -72,7 +72,13 @@ let activeProbe: Promise<BrowserCapabilitySnapshot> | undefined;
 const DEFAULT_BROWSER_RUNTIME_CONCURRENCY = 1;
 const MAX_BROWSER_RUNTIME_CONCURRENCY = 2;
 
-function browserRuntimeConcurrency(): number {
+/**
+ * Configured browser slot count (1..2), read once at module load. Exported so
+ * downstream gates can default to the same slot budget instead of pinning a
+ * separate copy of the number — the rendered-crawl gate derives its
+ * concurrency from this so the lease and the gate can never disagree.
+ */
+export function browserRuntimeConcurrency(): number {
   const parsed = Number(process.env.BROWSER_RUNTIME_CONCURRENCY);
   if (!Number.isFinite(parsed)) return DEFAULT_BROWSER_RUNTIME_CONCURRENCY;
   return Math.min(MAX_BROWSER_RUNTIME_CONCURRENCY, Math.max(1, Math.floor(parsed)));
@@ -84,39 +90,77 @@ const browserRuntimeWaiters: Array<() => void> = [];
 
 /**
  * Resource safety for the multi-slot browser lease (rendered-capacity Fix B).
- * A second browser slot is only worth opening while the host actually has the
- * spare memory to hold another Chromium. `/proc/meminfo` is not namespaced for
- * containers, so `MemAvailable` reflects what the VPS really has left even
- * though the crawler runs inside a container. The guard is re-evaluated on
- * every acquire and release: a degraded host falls back to single-slot
- * behavior for NEW launches, and the browser already running is never killed.
+ * A second browser slot is only worth opening while the memory actually
+ * available to THIS container has room for another Chromium. Two ceilings
+ * apply: the host's `MemAvailable` (`/proc/meminfo` is not namespaced, so it
+ * reflects the VPS the container runs on) and, when a cgroup memory limit is
+ * configured, the container's own headroom (`memory.max` minus
+ * `memory.current`). The guard is re-evaluated on every acquire and release:
+ * a degraded host falls back to single-slot behavior for NEW launches, and
+ * the browser already running is never killed.
  *
  * The reader is injectable so capacity tests can simulate host memory without
- * touching the real /proc filesystem.
+ * touching the real /proc and cgroup filesystems.
  */
 const DEFAULT_EXTRA_SLOT_MIN_HOST_MEM_MB = 1_500;
-export function readHostMemAvailableMb(): number | null {
+function readMemoryFileMb(filePath: string): number | null {
   try {
-    const meminfo = readFileSync('/proc/meminfo', 'utf8');
-    const match = meminfo.match(/^MemAvailable:\s+(\d+)\s*kB/m);
-    return match ? Math.floor(Number(match[1]) / 1024) : null;
+    const content = readFileSync(filePath, 'utf8').trim();
+    // /proc/meminfo lines carry a kB suffix; cgroup v2 files carry plain bytes
+    // and the literal "max" for unbounded.
+    if (content.endsWith('kB')) return Math.floor(Number(content.replace(/kB$/, '').trim()) / 1024);
+    if (content === 'max' || content === '') return null;
+    const bytes = Number(content);
+    return Number.isFinite(bytes) ? Math.floor(bytes / (1024 * 1024)) : null;
   } catch {
     return null;
   }
 }
-let hostMemAvailableReader: () => number | null = readHostMemAvailableMb;
-/** Test seam: replace the host-memory reader (pass it back to restore). */
-export function setHostMemAvailableReaderForTests(reader: () => number | null): () => number | null {
-  const previous = hostMemAvailableReader;
-  hostMemAvailableReader = reader;
+interface MemoryHeadroomReader {
+  /** Host MemAvailable in MB, or null when unreadable. */
+  host: () => number | null;
+  /** Container cgroup memory.max in MB, or null when unbounded/unreadable. */
+  containerLimit: () => number | null;
+  /** Container cgroup memory.current in MB, or null when unreadable. */
+  containerUsage: () => number | null;
+}
+const productionMemoryHeadroomReader: MemoryHeadroomReader = {
+  host: () => {
+    try {
+      const match = readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+)\s*kB/m);
+      return match ? Math.floor(Number(match[1]) / 1024) : null;
+    } catch {
+      return null;
+    }
+  },
+  containerLimit: () => readMemoryFileMb('/sys/fs/cgroup/memory.max'),
+  containerUsage: () => readMemoryFileMb('/sys/fs/cgroup/memory.current'),
+};
+let headroomReader: MemoryHeadroomReader = productionMemoryHeadroomReader;
+/** Test seam: replace the memory readers (pass the previous value to restore). */
+export function setMemoryHeadroomReaderForTests(reader: Partial<MemoryHeadroomReader>): MemoryHeadroomReader {
+  const previous = headroomReader;
+  headroomReader = { ...previous, ...reader };
   return previous;
 }
+/**
+ * Memory available for one more browser, in MB, or null when the guard must
+ * not grant an extra slot (below threshold, or host telemetry unreadable).
+ * When a cgroup memory limit is configured, the container's own headroom
+ * (limit − usage) caps the effective value.
+ */
 export function hostMemAvailableForExtraSlot(): number | null {
-  const availableMb = hostMemAvailableReader();
-  if (availableMb === null) return null;
+  const hostAvailableMb = headroomReader.host();
+  if (hostAvailableMb === null) return null;
+  let effective = hostAvailableMb;
+  const containerLimitMb = headroomReader.containerLimit();
+  if (containerLimitMb !== null) {
+    const containerUsageMb = headroomReader.containerUsage() ?? 0;
+    effective = Math.min(effective, Math.max(0, containerLimitMb - containerUsageMb));
+  }
   const threshold = Number(process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB);
   const minMb = Number.isFinite(threshold) && threshold > 0 ? threshold : DEFAULT_EXTRA_SLOT_MIN_HOST_MEM_MB;
-  return availableMb >= minMb ? availableMb : null;
+  return effective >= minMb ? effective : null;
 }
 
 /** Test seam: override the configured browser slot count (returns the previous value). */
@@ -129,14 +173,16 @@ export function setBrowserRuntimeLimitForTests(limit: number): number {
 /**
  * Effective slot count for this acquire attempt. Slot one is always allowed —
  * a single browser must remain possible even on a degraded host. Slots beyond
- * one require host memory headroom; an unreadable /proc/meminfo fails open so
- * an operator-configured limit is never bricked by a telemetry hiccup.
+ * one require memory headroom (host and, when applicable, cgroup); unreadable
+ * host telemetry fails open so an operator-configured limit is never bricked
+ * by a telemetry hiccup. Reads the host value exactly once per call.
  */
 function effectiveRuntimeLimit(): number {
   if (browserRuntimeLimit <= 1) return 1;
+  const hostAvailableMb = headroomReader.host();
   // Unreadable telemetry fails open to the configured limit; only a readable
   // below-threshold value closes the extra slots.
-  if (hostMemAvailableReader() === null) return browserRuntimeLimit;
+  if (hostAvailableMb === null) return browserRuntimeLimit;
   return hostMemAvailableForExtraSlot() === null ? 1 : browserRuntimeLimit;
 }
 
@@ -148,8 +194,15 @@ function acquireBrowserRuntimeLease(): Promise<() => void> {
       if (released) return;
       released = true;
       browserRuntimeActive--;
-      const next = browserRuntimeWaiters.shift();
-      if (next) next();
+      // Recheck the resource guard before promoting a queued waiter: memory
+      // may have degraded while both slots ran. When the effective limit no
+      // longer admits a new launch, the waiter stays queued for a later
+      // release — slot one always becomes possible once active hits zero,
+      // so a queued waiter can never be stranded.
+      if (browserRuntimeActive < effectiveRuntimeLimit()) {
+        const next = browserRuntimeWaiters.shift();
+        if (next) next();
+      }
     };
   };
   if (browserRuntimeActive < effectiveRuntimeLimit()) return Promise.resolve(grant());

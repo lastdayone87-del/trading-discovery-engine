@@ -11,6 +11,7 @@ import {
   PHASE2_REPORT_MAX_WINDOW_HOURS,
   type CrawlThroughputEventRow,
 } from './crawlThroughputReport';
+import { RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT, RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT } from './renderedAdmissionGovernor';
 
 interface RowOptions {
   renderedCrawls?: number;
@@ -178,9 +179,9 @@ test('report flags the emergency ceiling and the discovery floor independently',
       { renderedCrawls: 1 },
     ));
   }
-  for (let index = 10; index < 50; index++) {
+  for (let index = 10; index < 80; index++) {
     rows.push(row(
-      `2026-11-10T12:${String(index).padStart(2, '0')}:00.000Z`,
+      `2026-11-10T12:${String(index % 60).padStart(2, '0')}:${String(Math.floor(index / 60) * 20).padStart(2, '0')}.000Z`,
       'RETRY',
       'ACQUIRED',
       { renderedCrawls: 1 },
@@ -192,10 +193,10 @@ test('report flags the emergency ceiling and the discovery floor independently',
     now: new Date('2026-11-10T12:59:00.000Z'),
   });
 
-  assert.equal(report.totals.browserCrawls, 50);
-  assert.equal(report.gates.peakBrowserCrawlsPerHour, 50);
+  assert.equal(report.totals.browserCrawls, 80);
+  assert.equal(report.gates.peakBrowserCrawlsPerHour, 80);
   assert.equal(report.gates.emergencyCeilingExceeded, true);
-  assert.equal(report.gates.discoverySharePct, 20);
+  assert.equal(report.gates.discoverySharePct, 12.5, '10 of 80 crawls are DISCOVERY');
   assert.equal(report.gates.discoveryFloorMet, false);
   assert.ok(report.failures.includes('peak_browser_crawls_per_hour_above_emergency_ceiling'));
   assert.ok(report.failures.includes('discovery_share_below_floor'));
@@ -350,9 +351,14 @@ test('an exact integer floor is not lost to binary percentage noise', () => {
   assert.ok(!report.failures.includes('discovery_share_below_floor'));
 });
 
-test('the report keeps the approved Option C thresholds', () => {
-  assert.equal(PHASE2_NOMINAL_CRAWLS_PER_HOUR, 40);
-  assert.equal(PHASE2_EMERGENCY_CRAWLS_PER_HOUR, 48);
+test('the report thresholds track the validated rendered-capacity governor', () => {
+  // The report must evaluate against the DEPLOYED admission budget, not a
+  // stale copy of it: the governor constants are the single source of truth
+  // (64/72 validated in docs/phase-2-rendered-capacity-experiment.md).
+  assert.equal(PHASE2_NOMINAL_CRAWLS_PER_HOUR, RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT);
+  assert.equal(PHASE2_EMERGENCY_CRAWLS_PER_HOUR, RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT);
+  assert.equal(PHASE2_NOMINAL_CRAWLS_PER_HOUR, 64);
+  assert.equal(PHASE2_EMERGENCY_CRAWLS_PER_HOUR, 72);
   assert.equal(PHASE2_DISCOVERY_FLOOR_PERCENT, 35);
 });
 

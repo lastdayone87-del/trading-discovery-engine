@@ -1,7 +1,11 @@
 # Rendered-Browser Capacity Experiment (Fix B)
 
-**Status: COMPLETE — validated config deployed and codified**
-Owner: muse audit session · Host: Coolify VPS `45.94.58.135` (4 cores / 8GB)
+**Status: COMPLETE — validated config deployed to production; the guarded
+two-slot image is in review (PR #673) and not yet the deployed artifact**
+
+Investigated on the Coolify production VPS (4 cores / 8GB RAM). Host-level
+details (IP, paths) live in the internal runbook; this document contains no
+infrastructure identifiers.
 
 ## Why
 
@@ -18,9 +22,11 @@ channels inspected/hour. The admission governor admits 40/h nominal
 
 Controlled production experiment on the live Coolify deployment. Each
 step changes ONE variable via Coolify env (runtime-only), verified
-inside the container, and is observed for ≥60 min through a fixed
-sampling monitor (`/root/fixb_monitor.sh` on the VPS, JSONL at
-`/root/fixb_monitor.jsonl`, 120s cadence):
+inside the container, and is observed for a fixed window through a
+sampling monitor (read-only `docker stats` + SELECT-only SQL, JSONL
+log, 120s cadence). The baseline window was shorter than the
+experiment windows (~24 min of samples plus a 24-hour hourly trail
+analysis) — noted so the baseline's confidence is not overstated.
 
 * container CPU% / mem usage (`docker stats`)
 * host load1 + MemAvailable (the resource-safety inputs)
@@ -69,19 +75,26 @@ search-phase warm-up).
 
 **E1 findings:**
 
-1. Two concurrent Chromiums are resource-safe on this VPS. CPU bursts
-   reach ~4–5 cores briefly; load stays ≤10 sustained; memory headroom is
-   massive. `BROWSER_RUNTIME_CONCURRENCY=2` is validated.
-2. **The governor became the binding bottleneck immediately.** With two
-   slots, the rendered tier consumed its entire rolling-window budget in
-   ~25 minutes (26 admissions) and then denied every retry-lane request
-   until the window freed (`retryAt` up to 60 min out). Non-discovery
-   lanes cap at 65% × 40 = 26/h — the DISCOVERY_FLOOR makes the nominal
-   40/h effectively 26/h for retries.
+1. Two concurrent Chromium slots fit the host's memory comfortably and
+   the load stayed workable (≤9.2 sustained), but CPU oversubscription
+   is real: bursts reached ~4–5 cores on a 4-core VPS with brief load
+   spikes to 15–17. The config is acceptable at the measured load; the
+   CPU risk is named here — more slots or heavier pages need CPU
+   evidence before raising further.
+2. **The governor's discovery floor was the binding constraint.** With
+   two slots, the retry lane's non-discovery cap (65% × 40 = 26/h —
+   a lane-level allocation, not the full budget) was hit within ~25
+   minutes (21 `DISCOVERY_FLOOR` denials) while discovery demand sat
+   near zero in that window. See the DISCOVERY_FLOOR section below for
+   the demand data and the policy adjustment this motivated.
 3. Per-run duration with two slots is roughly comparable to single-slot
-   (~90–115s incl. launch overhead), so the two-slot lease sustains
-   ~60–80 crawls/hour — the E2 governor raise (64/72) is sized to sit
-   just under lease capacity.
+   (~90–115s incl. launch overhead). **Important caveat discovered in
+   review:** the rendered-crawl gate (`renderedFallbackGate`) still
+   defaulted to ONE active crawl during E1/E2, so the two browser slots
+   were never actually exercised in overlap — the measured rates are
+   gate-serialized one-at-a-time rates. The gate now derives its
+   concurrency from the lease slot budget (this PR), and the sustained
+   two-slot rate is pending post-merge measurement.
 
 ## E2 — governor raise 64/72 with lease=2 — COMPLETE
 
@@ -102,13 +115,17 @@ Config verified in container `…20261120T212037`:
 **E2 findings:**
 
 1. The raised budget served more rendered work (44 completed crawls in
-   one window vs the old 40/h hard ceiling) with no resource distress:
-   container memory stayed under 0.9GiB, host headroom above 5.4GB.
-2. The remaining retry-lane constraint is the **DISCOVERY_FLOOR policy**
-   (non-discovery admissions capped at 65% of the budget, so 41/h at
-   nominal 64). That is a discovery-protection policy choice, not a
-   capacity knob — deliberately left unchanged in this PR and flagged
-   for a separate policy discussion if retry drain needs to be faster.
+   one window vs the old 40/h nominal budget — 48/h with the emergency
+   allowance) with no resource distress: container memory stayed under
+   0.9GiB (whole-container `docker stats` reading, not a per-browser
+   footprint measurement), host headroom above 5.4GB. The memory guard
+   was NOT deployed during E1/E2 (it ships in this PR), so the guard
+   threshold remains to be exercised in production.
+2. The remaining retry-lane constraint was the **DISCOVERY_FLOOR
+   policy** (non-discovery admissions capped at 65% of the budget even
+   with no discovery demand queued — 41/h at nominal 64). The demand
+   evidence and the demand-aware reserve adjustment are in the
+   DISCOVERY_FLOOR section below.
 3. Observability note: `RENDERED_FALLBACK_SATURATED` observations also
    cover the separate classification-rendered lane
    (`CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS=5000`), which has its
@@ -119,15 +136,21 @@ Config verified in container `…20261120T212037`:
 
 | Knob | Old | New | Evidence |
 |---|---|---|---|
-| `BROWSER_RUNTIME_CONCURRENCY` | 1 (unset) | **2** | E1: two slots resource-safe; bursts ≤4–5 cores; ≥5GB memory headroom |
-| `RENDERED_ADMISSION_NOMINAL_PER_HOUR` | 40 | **64** | E1: governor saturated in 25 min at 40; E2: 64/h budget served 44 crawls/window with headroom left |
-| `RENDERED_ADMISSION_EMERGENCY_PER_HOUR` | 48 | **72** | Stays above nominal, under measured lease ceiling (~60–80/h) |
-| `BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB` | — (new) | **1500** (code default) | Measured per-browser footprint ≤~900MiB; 1500MB reserve is conservative |
+| `BROWSER_RUNTIME_CONCURRENCY` | 1 (unset) | **2** | E1: two slots memory-safe; CPU bursts ≤4–5 cores with load spikes to 15–17 named as the open risk; ≥5GB memory headroom |
+| `RENDERED_ADMISSION_NOMINAL_PER_HOUR` | 40 | **64** | E1: retry lane hit its 26/h floor cap in 25 min at 40; E2: 64/h budget served 44 crawls/window with headroom left |
+| `RENDERED_ADMISSION_EMERGENCY_PER_HOUR` | 48 | **72** | Stays above nominal, within the two-slot design capacity (sustained two-slot rate pending post-merge measurement) |
+| `RENDERED_FALLBACK_CONCURRENCY` | 1 | **derived from the lease** (2) | Review finding: the gate serialized rendered crawls during E1/E2; the gate now follows the lease slot budget so the slots are actually usable |
+| `BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB` | — (new) | **1500** (code default) | Container memory ≤0.9GiB during E2 (not a per-browser measurement); 1500MB reserve is conservative and untested in production |
 | `MAX_BROWSER_RUNTIME_CONCURRENCY` (code cap) | 2 | 2 (unchanged) | 4-core VPS: CPU bursts already reach all cores; more slots need CPU evidence |
+| `RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT` | 35 (strict) | **35 (demand-aware)** | 7-day demand: RETRY 73% / DISCOVERY 27%; strict reserve idled 22 slots in E2's window while retries were denied — reserve now binds only while discovery demand is pending |
 
-The resource-safety guard (previous commit) keeps the second slot
-closed whenever host memory headroom drops below the threshold, so the
-raised defaults cannot overwhelm a smaller host.
+The resource-safety guard (earlier commit) keeps the second slot
+closed whenever memory headroom — host and, when configured, cgroup —
+drops below the threshold, so the raised defaults cannot overwhelm a
+smaller host. It is risk reduction, not a hard guarantee: unreadable
+host telemetry fails open to the configured limit. The experiments ran
+WITHOUT the guard deployed (it ships in this PR), so the guarded
+configuration is untested in production until post-merge monitoring.
 
 ## Backfill plan (post-capacity)
 
@@ -180,3 +203,58 @@ WHERE observed_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1;
   `BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB` (default 1500MB); degraded host
   falls back to single-slot; unreadable telemetry fails open.
 * Rollback: remove the Coolify env row (or set `=1`) and redeploy.
+
+## DISCOVERY_FLOOR: what the denials were and the policy adjustment
+
+During E2, 17 retry-lane rendered requests were denied with
+`reason=DISCOVERY_FLOOR` while capacity sat idle. The mechanism (verified
+in code): with the floor at 35%, non-discovery admissions were capped at
+`limit − ceil(limit × 0.35)` — 26/h at the old nominal 40, 41/h at 64 —
+**even when no discovery request was queued**, so the reserved share sat
+idle while retry work was denied until the rolling window freed.
+
+Production demand over the 7 days around the experiment (from
+`acquisition_lane_events`, per inspection pass):
+
+| Lane | Rendered crawls | Share |
+|---|---|---|
+| RETRY | 4,574 | 73.4% |
+| DISCOVERY | 1,679 | 26.9% |
+| ENRICHMENT | 157 | 2.5% |
+
+Daily discovery share ran 23–31% (Nov 20: 15.2%) — consistently below
+the 35% floor target, because the total budget was the binding
+constraint, not lane allocation. So the strict reserve both (a) wasted
+idle capacity in retry-heavy windows and (b) did not actually deliver a
+35% discovery share under the old budget.
+
+**Policy adjustment (this PR)**: the reserve is now demand-aware — the
+admit path reuses the same predicate the gate already used for waiter
+selection (`shouldReserveDiscoveryAt`): the strict cap binds only while
+discovery demand is pending and its projected share is below the floor.
+When nothing discovery-bearing is queued, the full budget serves the
+queued demand. When discovery arrives, it keeps queue priority and the
+cap returns, so a retry flood cannot starve it. Discovery's worst case
+under the new policy is "shares the rolling budget FIFO with retries
+when it arrives late", with the `crawlThroughputReport` discovery-share
+gate continuing to surface any sustained shortfall.
+
+## Rollback
+
+Rolling back is **not** "remove the Coolify env row": after this change
+the image itself bakes `BROWSER_RUNTIME_CONCURRENCY=2` and the 64/72
+governor defaults, so deleting the experiment rows restores the *image
+defaults*, which are the new configuration. To return to the old
+behavior, either deploy the previous image or set explicit overrides in
+Coolify env (encrypted values, runtime scope):
+
+```
+BROWSER_RUNTIME_CONCURRENCY=1
+RENDERED_ADMISSION_NOMINAL_PER_HOUR=40
+RENDERED_ADMISSION_EMERGENCY_PER_HOUR=48
+RENDERED_FALLBACK_CONCURRENCY=1   # only needed if the gate-coupling change is already deployed
+```
+
+The resource-safety guard cannot be env-disabled, but it only ever
+narrows the effective slot count, so `BROWSER_RUNTIME_CONCURRENCY=1`
+fully restores single-slot behavior.

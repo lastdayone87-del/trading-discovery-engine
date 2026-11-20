@@ -4,7 +4,7 @@ import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
-import { browserLaunchOptions, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
+import { browserLaunchOptions, browserRuntimeConcurrency, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
 import { startBrowserEgressProxy, type BrowserEgressProxy } from './browserEgressProxy';
 import type {
   RenderedLifecycleStage,
@@ -3978,11 +3978,14 @@ export class RenderedFallbackGate {
 }
 
 export const renderedFallbackGate = new RenderedFallbackGate(
-  // Stays at 1 by default: the browser runtime lease defaults to one
-  // process-wide slot, and each crawl's total-budget clock starts at gate
-  // acquisition. A second slot is benchmark-gated; overlap is supported by
-  // the shared begin/end lifecycle accounting. Env override wins within 1..2.
-  boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, 1, 1, 2),
+  // Defaults to the browser runtime lease's slot budget so the gate and the
+  // lease can never disagree: with BROWSER_RUNTIME_CONCURRENCY=2 (the
+  // validated rendered-capacity config) two rendered crawls may overlap, and
+  // the lease's memory-headroom guard still closes the second slot on a
+  // degraded host. Each crawl's total-budget clock starts at gate
+  // acquisition; overlap is supported by the shared begin/end lifecycle
+  // accounting. An explicit env override wins within 1..2.
+  boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, browserRuntimeConcurrency(), 1, 2),
   boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
 );
 

@@ -7,8 +7,8 @@
  * in that pass. Static HTTP observations are deliberately not browser crawls.
  *
  * Two gates are reported:
- *   * rendered browser crawls/hour against the 40/h nominal target and the
- *     48/h emergency ceiling; and
+ *   * rendered browser crawls/hour against the governor's nominal budget and
+ *     its emergency ceiling (single source of truth: the governor constants);
  *   * the DISCOVERY share of rendered browser crawls against the 35% floor.
  *
  * Every lane is included in the browser-crawl total, including MAINTENANCE
@@ -16,8 +16,10 @@
  * are separately counted so no browser work can hide from the ceiling.
  */
 
-export const PHASE2_NOMINAL_CRAWLS_PER_HOUR = 40;
-export const PHASE2_EMERGENCY_CRAWLS_PER_HOUR = 48;
+import { RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT, RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT } from './renderedAdmissionGovernor';
+
+export const PHASE2_NOMINAL_CRAWLS_PER_HOUR = RENDERED_ADMISSION_NOMINAL_PER_HOUR_DEFAULT;
+export const PHASE2_EMERGENCY_CRAWLS_PER_HOUR = RENDERED_ADMISSION_EMERGENCY_PER_HOUR_DEFAULT;
 export const PHASE2_DISCOVERY_FLOOR_PERCENT = 35;
 export const PHASE2_REPORT_DEFAULT_WINDOW_HOURS = 24;
 export const PHASE2_REPORT_MAX_WINDOW_HOURS = 168;

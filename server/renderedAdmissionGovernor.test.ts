@@ -159,33 +159,58 @@ test('rate-limit retry time uses the expiry that frees the selected limit', () =
   assert.equal(denied.retryAtMs, 68_000);
 });
 
-test('governor strictly reserves 35% of the window for DISCOVERY', () => {
+test('governor reserves the DISCOVERY floor only while discovery demand is pending', () => {
   const governor = makeGovernor();
   const none = new Set<never>();
-  const queued = new Set(['RETRY'] as const);
+  const discoveryQueued = new Set(['DISCOVERY'] as const);
+  const retryQueued = new Set(['RETRY'] as const);
 
-  // 26 of 40 is the non-discovery cap even when no discovery request is
-  // currently queued. The unused reserve is not reassigned.
-  for (let index = 0; index < 26; index++) {
-    assert.equal(governor.admit('RETRY', none).admitted, true, `retry ${index + 1}`);
+  // No discovery demand pending: the reserve is not confiscated — the full
+  // 40/hour budget serves non-discovery demand (the E2 waste case: idle
+  // reserve must never block retry work).
+  for (let index = 0; index < 40; index++) {
+    const decision = governor.admit('RETRY', none);
+    assert.equal(decision.admitted, true, `retry ${index + 1} should use the full budget`);
+    assert.notEqual(decision.reason, 'DISCOVERY_FLOOR');
   }
-  const blocked = governor.admit('RETRY', none);
+  const full = governor.admit('RETRY', none);
+  assert.equal(full.admitted, false);
+  assert.equal(full.reason, 'RATE_LIMIT', 'a full window denies by rate, not by the floor');
+
+  // Discovery demand pending while its projected share is below the floor:
+  // the strict cap returns and protects the reserve.
+  const fresh = makeGovernor();
+  for (let index = 0; index < 26; index++) {
+    assert.equal(fresh.admit('RETRY', discoveryQueued).admitted, true, `retry ${index + 1}`);
+  }
+  const blocked = fresh.admit('RETRY', discoveryQueued);
   assert.equal(blocked.admitted, false);
   assert.equal(blocked.reason, 'DISCOVERY_FLOOR');
   assert.equal(blocked.retryAtMs, 60_000, 'the oldest non-discovery reservation expiry');
 
+  // Discovery requests fill the reserve while it is protected.
   for (let index = 0; index < 14; index++) {
-    assert.equal(governor.admit('DISCOVERY', none).admitted, true, `discovery ${index + 1}`);
+    assert.equal(fresh.admit('DISCOVERY', discoveryQueued).admitted, true, `discovery ${index + 1}`);
   }
-  assert.equal(governor.snapshot().admissionsInWindow, 40);
-  assert.equal(governor.snapshot().discoverySharePct, 35);
+  assert.equal(fresh.snapshot().admissionsInWindow, 40);
+  assert.equal(fresh.snapshot().discoverySharePct, 35);
 
-  // The nominal window is full; emergency demand allows the five remaining
-  // non-discovery slots up to the 48/hour cap's 31 non-discovery limit.
-  const emergency = governor.admit('RETRY', queued);
-  assert.equal(emergency.admitted, true);
-  assert.equal(emergency.limit, 48);
-  assert.equal(emergency.emergency, true);
+  // With the floor met, queued non-discovery demand engages the emergency
+  // allowance: the limit rises to 72, of which 26 is the discovery reserve,
+  // so the retry lane can climb to 46 non-discovery admissions.
+  const emergencyFirst = fresh.admit('RETRY', retryQueued);
+  assert.equal(emergencyFirst.admitted, true);
+  assert.equal(emergencyFirst.limit, 48, 'queued demand raises the limit to the emergency allowance');
+  assert.equal(emergencyFirst.emergency, true);
+  for (let index = 0; index < 7; index++) {
+    const decision = fresh.admit('RETRY', retryQueued);
+    assert.equal(decision.admitted, true, `emergency retry ${index + 1}`);
+    assert.equal(decision.emergency, true);
+  }
+  const atEmergencyCeiling = fresh.admit('RETRY', retryQueued);
+  assert.equal(atEmergencyCeiling.admitted, false);
+  assert.equal(atEmergencyCeiling.reason, 'RATE_LIMIT', 'emergency ceiling reached at 48 total');
+  assert.equal(atEmergencyCeiling.limit, 48);
 });
 
 test('governor tracks window expiry and exposes a bounded snapshot', () => {
