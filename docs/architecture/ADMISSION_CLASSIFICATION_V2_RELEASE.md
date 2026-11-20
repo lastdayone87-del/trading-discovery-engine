@@ -26,19 +26,19 @@ discovery
 Semantic admission is no longer a decision judge. It remains ledger/audit
 provenance only. The full classifier's composition/recognition remains a
 coverage/contradiction signal; it cannot independently veto a valid AI trading
-verdict.
+verdict. Tier-A refers to the classifier's strongest creator-owned content families (for example an explicit trading bio or a substantive trading video), as defined in `server/evidenceEngine/contextualComposition.ts`.
 
 ## Frozen-900 deterministic result
 
 | Metric | Before | After |
 |---|---:|---:|
-| Deterministic PASS | 593 | 466 |
+| Deterministic PASS | 593 | 446 |
 | Deterministic REJECT | 2 | 2 |
-| Deterministic abstain | 305 | 432 |
-| Decisive coverage | 66.1% | 52.0% |
-| Confirm precision | 98.65% | **99.57%** |
+| Deterministic abstain | 305 | 452 |
+| Decisive coverage | 66.1% | 49.8% |
+| Confirm precision | 98.65% | **99.55%** |
 | Hard UNRELATED confirmations | 5 | **0** |
-| Trading-relevant deterministic recall | 70.6% | 56.0% |
+| Trading-relevant deterministic recall | 70.6% | 53.6% |
 | Unrelated rejection recall | 6.9% | 6.9% |
 
 Blocked fast passes abstain and reach the one AI judge. No global threshold

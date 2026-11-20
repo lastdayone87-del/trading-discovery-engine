@@ -108,7 +108,7 @@ function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], col
 }
 
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport, composition?: ContextualCompositionReport): StagedClassificationReport {
-  const positive = evidence.filter(item => item.polarity === 'POSITIVE' && item.rawMatches.length > 0);
+  const positive = evidence.filter(item => item.polarity === 'POSITIVE' && (item.rawMatches.length > 0 || isSemanticClassificationSource(item.source)));
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
   const semantic = positive.filter(item => isSemanticClassificationSource(item.source) || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
   const aiLedTrading = hasAiLedTradingConfirmation(positive);

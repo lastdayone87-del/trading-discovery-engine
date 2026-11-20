@@ -34,17 +34,17 @@ abstains and reaches the one full AI judge.
 
 | Metric | Before PR5 | After PR5 |
 |---|---:|---:|
-| Deterministic `PASS` | 593 | 466 |
+| Deterministic `PASS` | 593 | 446 |
 | Deterministic `REJECT` | 2 | 2 |
-| Deterministic abstain | 305 | 432 |
-| Decisive coverage | 66.1% | 52.0% |
-| Confirm precision | 98.65% | **99.57%** |
+| Deterministic abstain | 305 | 452 |
+| Decisive coverage | 66.1% | 49.8% |
+| Confirm precision | 98.65% | **99.55%** |
 | Hard `UNRELATED` confirmations | 5 | **0** |
 | Hard-FP rate, decisive | 0.84% | **0%** |
-| Trading-relevant deterministic recall | 70.6% | 56.0% |
+| Trading-relevant deterministic recall | 70.6% | 53.6% |
 | Unrelated rejection recall | 6.9% | 6.9% |
 
-The coverage reduction is deliberate: 127 channels that previously fast-passed
+The coverage reduction is deliberate: 147 channels that previously fast-passed
 without substantive recent-video support now go to the one AI judge. No hard
 `UNRELATED` channel is deterministically confirmed.
 

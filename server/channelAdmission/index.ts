@@ -860,6 +860,9 @@ export async function verifyAdmissionCandidate(
         || existing.trading_status === 'HUMAN_REJECTED'
         || existing.scan_status === 'COMPLETED'
         || existing.scan_status === 'SKIPPED_NON_TRADING'
+        || existing.scan_status === 'NEEDS_REVIEW'
+        || existing.scan_status === 'ENRICHING'
+        || existing.scan_status === 'ENRICHMENT_PENDING'
       ));
       if (!existing) {
         input.candidate.admissionNewlyCreated = true;
@@ -909,6 +912,9 @@ export async function verifyAdmissionCandidate(
             || refreshed.trading_status === 'HUMAN_REJECTED'
             || refreshed.scan_status === 'COMPLETED'
             || refreshed.scan_status === 'SKIPPED_NON_TRADING'
+            || refreshed.scan_status === 'NEEDS_REVIEW'
+            || refreshed.scan_status === 'ENRICHING'
+            || refreshed.scan_status === 'ENRICHMENT_PENDING'
           ));
         }
       }

@@ -5,6 +5,7 @@ import type { ContextualCompositionReport } from './contextualComposition';
 import { CREATOR_OWNED_EVIDENCE_FIELDS } from './canonicalEvidencePlane';
 import type { RecognitionAssessment } from './recognitionState';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
+import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
 export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=SEMANTIC_TOP_CALIBRATED_CONFIDENCE;
@@ -25,6 +26,7 @@ const AI_TRADING_LABELS = new Set([
  * remain the safeguards; composition is diagnostic, not an independent veto.
  */
 export function hasAiLedTradingConfirmation(items: EvidenceItem[], contentCategory?: string): boolean {
+  if (resolveClassificationRoutingMode() !== 'ACTIVE') return false;
   if (contentCategory !== undefined && !isTradingRelevantCategory(contentCategory)) return false;
   const semantic = items.find(item =>
     isSemanticClassificationSource(item.source)
