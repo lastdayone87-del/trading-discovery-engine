@@ -269,18 +269,18 @@ export function hasDecisiveTradingShare(
   return indexes.size >= minimum && tradingVideoShare >= 0.4;
 }
 
+function withoutHashtagsAndUrls(value: string): string {
+  return value.replace(/#[^\s#]+/gu, ' ').replace(/\b(?:(?:https?:)?\/\/|www\.)\S+/giu, ' ');
+}
+
 /**
  * Count every video the deterministic classifier cited, before the audit
  * citation list is shortened for persistence. Repeated trading instruments
  * can otherwise collapse to the first video and undercount the share.
  */
-function withoutHashtagsAndUrls(value: string): string {
-  return value.replace(/#[^\s#]+/gu, ' ').replace(/https?:\/\/\S+/giu, ' ');
-}
-
 export function decisionTradingVideoIndexes(
   decision: VerificationDecision,
-  evidence?: AdmissionEvidence,
+  evidence: AdmissionEvidence,
 ): Set<number> {
   const indexes = new Set<number>();
   for (const item of decision.positiveEvidence) {
@@ -293,7 +293,7 @@ export function decisionTradingVideoIndexes(
         // Terminology is useful for native-language titles, but a hashtag such
         // as #tjrtrades is not substantive trading content. Keep the index only
         // when the matched term appears outside hashtags/URLs in that video.
-        if (item.category === 'TERMINOLOGY' && evidence) {
+        if (item.category === 'TERMINOLOGY') {
           const video = evidence.videos[fieldRef.index];
           const text = withoutHashtagsAndUrls(`${video?.title || ''} ${video?.description || ''}`).toLocaleLowerCase('und');
           const substantive = item.rawMatches.some(match => {
@@ -375,6 +375,26 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     };
   }
 
+  if (routing.route === 'DETERMINISTIC_TRADING'
+    && decision.status === 'TRADING_CONFIRMED'
+    && decision.evidenceCollection.sufficiency === 'SUFFICIENT') {
+    // A confirmed trading classifier result blocked from the fast path by
+    // recent-content support must not fall through to terminal unrelated
+    // rejection. It is ambiguous, not unrelated; the full AI judge decides.
+    return {
+      outcome: 'AMBIGUOUS',
+      route: routing.route,
+      confidence: decision.confidenceScore,
+      reasonCodes: [
+        'DETERMINISTIC_FAST_PASS_BLOCKED',
+        ...(passWithoutCitations ? ['DETERMINISTIC_PASS_WITHOUT_CITATIONS'] : []),
+        ...(passBlockedByFinanceAdjacency ? ['FINANCE_ADJACENT_DEFERRED_TO_DOWNSTREAM'] : []),
+        ...(passBlockedByMinorityTrading ? ['DETERMINISTIC_TRADING_MINORITY'] : []),
+      ],
+      citations: [],
+      priority: 10,
+    };
+  }
   const rejection = evaluateStrictRejection(evidence);
   if (rejection) {
     const judgment: SemanticJudgment = {

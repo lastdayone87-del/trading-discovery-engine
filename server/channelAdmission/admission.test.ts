@@ -871,7 +871,7 @@ test('hashtag-only terminology and sample-wide references are not counted as tra
     bio: 'Clips',
     videos: [
       { title: 'NQ futures trade recap', description: 'Futures execution.' },
-      { title: '#tjrtrades GTA clip', description: 'GTA 6 streamer clip.' },
+      { title: '#trading GTA clip', description: 'GTA 6 streamer clip.' },
     ],
   });
   const indexes = decisionTradingVideoIndexes({

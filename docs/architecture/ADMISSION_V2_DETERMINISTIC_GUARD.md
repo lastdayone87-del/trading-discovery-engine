@@ -64,7 +64,7 @@ without substantive recent-video support now go to the one AI judge. No hard
 
 - `npx tsc --noEmit`
 - `npx tsx --test server/channelAdmission/admission.test.ts`
-- 51/51 pass.
+- 53/53 pass.
 - Updated fast-pass tests: 3/15 trading videos no longer pass; 6/15 still pass;
-  bio-only evidence retains the creator-signal path; terminology and
-  whole-sample references are not counted as substantive videos.
+  bio-only evidence retains the creator-signal path; whole-sample references
+  are excluded, and terminology counts only outside hashtags/URLs.
