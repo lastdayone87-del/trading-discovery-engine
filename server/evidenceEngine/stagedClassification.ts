@@ -255,14 +255,15 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     acquisitionEnrich = activeRouting;
     if (acquisitionEnrich) acquisitionReasonCodes.add('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION');
   }
-  if (aiLedTrading && contradiction.disposition !== 'FAIL' && availability.disposition === 'PASS') {
+  if (aiLedTrading && contradiction.disposition === 'PASS' && availability.disposition === 'PASS'
+    && !isThinRetrievalInputRequiringHydration(input)) {
     lifecycleAction = 'CONFIRM';
     acquisitionEnrich = false;
     acquisitionReasonCodes.clear();
   }
   const lifecycleReasonCodes = [...new Set([
     `ROUTE_${lifecycleAction}`,
-    ...(aiLedTrading ? ['AI_LED_CONFIRMATION'] : []),
+    ...(aiLedTrading && lifecycleAction === 'CONFIRM' ? ['AI_LED_CONFIRMATION'] : []),
     ...(acquisitionEnrich ? ['ACQUISITION_ENRICH', ...acquisitionReasonCodes] : []),
   ])];
   const lifecycle = result('LIFECYCLE', 'PASS', lifecycleReasonCodes, [], { action: lifecycleAction });

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ChannelRecord, DiscoverySource } from '../../src/types';
-import { enqueueJob, getDb, getChannelById, hasActiveClassificationJob, hasActiveEnrichmentJob, insertChannelIfAbsent, upsertChannel, upsertChannelWithResult } from '../db';
+import { enqueueJob, getDb, getChannelById, hasActiveClassificationJob, insertChannelIfAbsent, upsertChannel, upsertChannelWithResult } from '../db';
 import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQueryScopeKey, enrichmentJobIdempotencyKey, resolveClassificationDecouplingConfig } from '../classificationDecoupling';
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
@@ -289,7 +289,15 @@ async function enqueueEnrichmentAfterAmbiguousAdmission(input: {
     enrichmentStage: 1,
     quotaOrigin: candidate.quotaOrigin === 'PROBE' ? 'PROBE' : 'NORMAL',
   };
-  if (await hasActiveEnrichmentJob(candidate.channelId)) return true;
+  const db = await getDb();
+  const activeStageOne = await db.query(
+    `SELECT 1 FROM jobs
+      WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')
+        AND payload->>'channelId'=$1 AND COALESCE(payload->>'enrichmentStage','')='1'
+      LIMIT 1`,
+    [candidate.channelId],
+  );
+  if (activeStageOne.rowCount) return true;
   const key = enrichmentJobIdempotencyKey(candidate.channelId, 1);
   const job = await enqueueJob('ENRICH_CHANNEL', payload, {
     priority: 10,
@@ -297,6 +305,21 @@ async function enqueueEnrichmentAfterAmbiguousAdmission(input: {
     idempotencyKey: key,
     preventCompletedReopen: true,
   });
+  if (job.status === 'COMPLETED') {
+    // Stage-1 enrichment already finished before the admission side effect
+    // committed. Move directly to the one full classifier on the enriched
+    // candidate instead of reporting an enqueue failure forever.
+    return enqueueClassificationAfterAdmission({
+      candidate,
+      targetCountry: input.targetCountry,
+      source: input.source,
+      query: input.query,
+      queryId: input.queryId,
+      queryRunId: input.queryRunId,
+      discoveryJobId: input.discoveryJobId,
+      admissionDecisionId: input.decisionId,
+    });
+  }
   return job.status === 'PENDING' || job.status === 'PROCESSING';
 }
 
@@ -818,6 +841,13 @@ export async function verifyAdmissionCandidate(
       if (recordedDecisionId) decisionId = recordedDecisionId;
       const now = new Date().toISOString();
       const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
+      const preserveExistingDecision = Boolean(existing && (
+        existing.trading_status === 'TRADING_CONFIRMED'
+        || existing.trading_status === 'NON_TRADING'
+        || existing.trading_status === 'HUMAN_REJECTED'
+        || existing.scan_status === 'COMPLETED'
+        || existing.scan_status === 'SKIPPED_NON_TRADING'
+      ));
       if (!existing) {
         input.candidate.admissionNewlyCreated = true;
         const channel = admittedChannel({
@@ -836,7 +866,7 @@ export async function verifyAdmissionCandidate(
           timestamp: now,
         }];
         await insertChannelIfAbsent(channel);
-      } else {
+      } else if (!preserveExistingDecision) {
         existing.admission_status = 'ADMITTED_AMBIGUOUS';
         existing.admission_decision_id = decisionId;
         existing.scan_status = 'ENRICHMENT_PENDING';
@@ -853,6 +883,19 @@ export async function verifyAdmissionCandidate(
         await upsertChannel(existing, { preserveDiscordOnUpdate: true });
       }
       await markChannelAdmitted({ channelId: evidence.channelId, decisionId, status: 'ADMITTED_AMBIGUOUS' });
+      if (preserveExistingDecision) {
+        return {
+          channelId: evidence.channelId,
+          channelName: evidence.channelName,
+          decision: 'ADMIT_AMBIGUOUS',
+          status: 'ADMITTED_AMBIGUOUS',
+          reasonCodes: [...reasonCodes, 'EXISTING_TERMINAL_DECISION_PRESERVED'],
+          evidence,
+          deterministicRoute,
+          decisionSource: 'DETERMINISTIC',
+          priority: deterministic.priority,
+        };
+      }
       const queued = await enqueueEnrichmentAfterAmbiguousAdmission({
         candidate: input.candidate,
         row,

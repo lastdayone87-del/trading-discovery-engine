@@ -203,6 +203,7 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const reasons:string[]=[];let status:UnifiedDecisionPolicyResult['status']='UNCERTAIN';
   const independentCreatorField=hasIndependentCreatorOwnedPositiveField(positive);
   const aiLedTrading=hasAiLedTradingConfirmation(input.evidence,input.contentCategory);
+  const positiveBoundaryForDecision=aiLedTrading?true:boundary.satisfied;
   const compositionOk=aiLedTrading?true:input.composition?compositionConfirmsTrading(input.composition):true;
   const recognitionAllowsConfirmation=aiLedTrading?true:!input.recognition||input.recognition.state==='DECISIVE_TRADING';
   const contentCategoryAllowsConfirmation=isTradingRelevantCategory(input.contentCategory);
@@ -213,7 +214,7 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const terminalNegative=terminalNegativeItems(negative, input.collection.terminalNegativeSufficiency
     ? { terminalEligible: input.collection.terminalNegativeSufficiency.status === 'SUFFICIENT' }
     : {});
-  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation&&!materialContradiction){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY',...(aiLedTrading?['AI_LED_TRADING_CONFIRMATION']:[]));if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
+  if(input.lifecycleAction==='CONFIRM'&&positiveBoundaryForDecision&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation&&!materialContradiction){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY',...(aiLedTrading?['AI_LED_TRADING_CONFIRMATION']:[]));if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
     status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {

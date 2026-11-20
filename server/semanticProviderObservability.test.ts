@@ -216,3 +216,13 @@ test('groq citation repair forwards attribution on the repair call', async () =>
   assert.equal(seen.length, 2);
   assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' });
 });
+
+test('invalid model citations never reach evidence or the AI-led confirmation gate', async () => {
+  const invalid = { ...unrelatedResult, citations: [{ field: 'video_title', index: 999 }] };
+  for (const Provider of [GeminiSemanticProvider, GeminiFreeSemanticProvider, GroqSemanticProvider]) {
+    const provider = new Provider({ async classify() { return invalid; } } as any);
+    const evidence = await provider.collectEvidence(input, {} as any);
+    assert.equal(evidence[0]?.category, 'SEMANTIC_ABSTENTION', Provider.name);
+    assert.deepEqual(evidence[0]?.provenance?.fields || [], [], Provider.name);
+  }
+});

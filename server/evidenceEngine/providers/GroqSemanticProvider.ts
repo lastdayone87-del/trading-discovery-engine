@@ -1509,6 +1509,8 @@ export class GroqSemanticProvider implements EvidenceProvider {
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       cacheable = cacheable && !batchedOutput;
+      result = { ...result, citations: retainSuppliedCitations(result.citations, candidateDocumentRefs(input)) };
+      if (result.citations.length === 0) cacheable = false;
       // Cache the final verdict after repair/adjudication. Repair provenance
       // is stored explicitly so a cache hit reports the same reason codes.
       // Injected clients are a test/shadow seam and never touch the cache.

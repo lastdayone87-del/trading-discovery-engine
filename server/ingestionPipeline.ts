@@ -131,10 +131,9 @@ export interface IngestionCandidate extends DiscoveredChannelRaw {
 }
 
 /**
- * Only deterministic and human admissions with a real confidence may bypass
- * the full classifier. Semantic admission is a router: it must be classified
- * from the original creator evidence. Unknown sources and low confidence also
- * fall through to the classifier.
+ * A deterministic PASS or explicit human ADMIT is a final relevance decision
+ * and bypasses the classifier. Semantic admission is a router and must reach
+ * the one full AI judge. Unknown provenance never shortcuts.
  */
 export function admissionShortcutEligible(
   candidate: Pick<DiscoveredChannelRaw,
