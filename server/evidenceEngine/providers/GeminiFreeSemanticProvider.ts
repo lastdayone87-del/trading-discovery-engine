@@ -13,6 +13,7 @@ import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, scheduleSemanticResultCacheWrite, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
+import { citationsReferenceSuppliedDocuments } from '../semanticDocumentRefs';
 import { isSemanticResultShape, isSemanticVerdictIdentity } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
@@ -458,6 +459,8 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       cacheable = cacheable && !batchedOutput;
+      result = { ...result, citations: result.citations.filter(ref => citationsReferenceSuppliedDocuments([ref], input)) };
+      if (result.citations.length === 0) cacheable = false;
       if (!this.injectedClient && cacheable) scheduleSemanticResultCacheWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:

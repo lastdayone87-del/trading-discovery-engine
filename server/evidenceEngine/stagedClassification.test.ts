@@ -80,3 +80,37 @@ test('provider degradation remains observable without vetoing sufficient indepen
   assert.equal(stage(report, 'AVAILABILITY').metrics.degraded,true);
   assert.equal(report.lifecycleAction, 'CONFIRM');
 });
+
+test('one AI trading verdict reaches CONFIRM despite insufficient Tier-A composition', () => {
+  const semantic = evidence('semantic', {
+    source: 'gemini_semantic',
+    confidence: 84,
+    finalWeight: 13,
+    provenance: {
+      provider: 'gemini_semantic',
+      type: 'METHODOLOGY_CONCEPT',
+      matchedTerm: 'live trading',
+      sourceRef: 'semantic',
+      fields: [{ field: 'video_title', index: 0, sourceId: 'v1', sourceFamilyId: 'video:v1' }],
+      semantic: {
+        taxonomyLabel: 'ACTIVE_TRADING',
+        calibratedConfidence: 84,
+        rawConfidence: 95,
+        modelVersion: 'test',
+        promptVersion: 'test',
+        featureVersion: 'test',
+        calibrationVersion: 'test',
+        reasonCodes: ['PRIMARY_TRADER', 'CONTENT_LIVE'],
+        detectedLanguages: [],
+      },
+    } as any,
+  });
+  const report = evaluateClassificationStages(
+    { channel_name: 'Live Trader', description: 'Live execution', videos: [{ title: 'Live session', published_at: '2026-01-01' }] },
+    [semantic],
+    collection(),
+    { focus: 'INSUFFICIENT_COVERAGE' } as any,
+  );
+  assert.equal(report.lifecycleAction, 'CONFIRM');
+  assert.ok(stage(report, 'LIFECYCLE').reasonCodes.includes('AI_LED_CONFIRMATION'));
+});
