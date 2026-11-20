@@ -10,10 +10,11 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
-import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
+import { defaultSemanticResultCachePort, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
-import { isSemanticResultShape } from '../semanticResultShape';
+import { citationsReferenceSuppliedDocuments } from '../semanticDocumentRefs';
+import { isSemanticResultShape, isSemanticVerdictIdentity } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -382,8 +383,13 @@ async function classifyCandidateWith404Fallback(client: SemanticModelClient, can
 
 export class GeminiFreeSemanticProvider implements EvidenceProvider {
   name = 'gemini_free_semantic' as const;
-  constructor(private readonly injectedClient?: SemanticModelClient) {}
+  constructor(
+    private readonly injectedClient?: SemanticModelClient,
+    private readonly cachePort?: SemanticResultCachePort,
+  ) {}
   private client() { return this.injectedClient || defaultClient(); }
+  private cache() { return this.cachePort || defaultSemanticResultCachePort; }
+  private cacheAllowed() { return Boolean(this.cachePort) || !this.injectedClient; }
   availability(input: RawChannelInput) {
     if (!this.client()) return { availability: 'UNAVAILABLE' as const, reason: 'GEMINI_FREE_API_KEY is not configured.' };
     if (!hasCreatorLevelSemanticContext(input)) {
@@ -401,7 +407,6 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     if (!client) return [];
     const candidateModel = process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GEMINI_FREE_ADJUDICATOR_MODEL || DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL;
-    const observability = { jobId: input.job_id, runId: input.run_id };
     const adjudicationEnabled = process.env.GEMINI_FREE_ADJUDICATION_ENABLED === 'true';
     const cacheIdentity = {
       input,
@@ -413,7 +418,16 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       adjudicationEnabled,
       batchPromptVersion: semanticBatchConfig().enabled ? SEMANTIC_BATCH_PROMPT_VERSION : undefined,
     };
-    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
+    const cacheIdentityKeys = semanticResultCacheKey(cacheIdentity);
+    const observability = {
+      jobId: input.job_id,
+      runId: input.run_id,
+      requestMetadata: {
+        channelId: input.channel_id,
+        evidenceChecksum: cacheIdentityKeys.inputChecksum,
+      },
+    };
+    const cached = this.cacheAllowed() ? await this.cache().read(cacheIdentity, process.env, { signal }) : undefined;
     let result: ReturnType<typeof parseSemanticResult>;
     let model: string;
     let fallbackReasonCodes: string[];
@@ -427,10 +441,10 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     } else {
       const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
       const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-      // Only a complete model reply may be cached. parseSemanticResult turns
-      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
-      // placeholder would replay it for the same evidence indefinitely.
-      let cacheable = isSemanticResultShape(candidate.value);
+      // Only a bounded verdict identity may be cached. parseSemanticResult
+      // normalizes nested fields, but a missing label/confidence/citation set is
+      // an abstention placeholder and must stay retryable.
+      let cacheable = isSemanticVerdictIdentity(candidate.value);
       // A verdict produced inside a multi-channel batch saw sibling evidence
       // and a different completion allowance; keep it out of the cache.
       let batchedOutput = semanticResultWasBatched(candidate.value);
@@ -445,12 +459,14 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       // flag. Decisive results still cost exactly one call (first conditions).
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
-        cacheable = isSemanticResultShape(adjudicatedValue);
+        cacheable = isSemanticVerdictIdentity(adjudicatedValue);
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       cacheable = cacheable && !batchedOutput;
-      if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env, { signal });
+      result = { ...result, citations: result.citations.filter(ref => citationsReferenceSuppliedDocuments([ref], input)) };
+      if (result.citations.length === 0) cacheable = false;
+      if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:
     // it never changes the verdict, and enforce mode records nothing because

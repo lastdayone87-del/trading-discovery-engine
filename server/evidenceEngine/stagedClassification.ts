@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
-import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution, observedTradingFamilies } from './decisionPolicy';
+import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasAiLedTradingConfirmation, hasCreatorLevelUnrelatedAttribution, observedTradingFamilies } from './decisionPolicy';
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
@@ -108,9 +108,14 @@ function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], col
 }
 
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport, composition?: ContextualCompositionReport): StagedClassificationReport {
-  const positive = evidence.filter(item => item.polarity === 'POSITIVE' && item.rawMatches.length > 0);
+  // A semantic verdict can be decisive with an empty `concepts` list, but a
+  // semantic abstention is not affirmative candidate evidence. Exclude
+  // abstentions here while keeping cited non-abstention verdicts on a
+  // rawMatches-free path.
+  const positive = evidence.filter(item => item.polarity === 'POSITIVE' && (item.rawMatches.length > 0 || (isSemanticClassificationSource(item.source) && item.category !== 'SEMANTIC_ABSTENTION')));
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
   const semantic = positive.filter(item => isSemanticClassificationSource(item.source) || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
+  const aiLedTrading = hasAiLedTradingConfirmation(evidence);
   const strongPositive = positive.filter(item => item.reliability !== 'LOWER' && Math.abs(item.finalWeight) >= 6);
   const corroborating = strongPositive.filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY');
   const sources = new Set(corroborating.map(item => item.source));
@@ -254,8 +259,15 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     acquisitionEnrich = activeRouting;
     if (acquisitionEnrich) acquisitionReasonCodes.add('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION');
   }
+  if (aiLedTrading && contradiction.disposition === 'PASS' && availability.disposition === 'PASS'
+    && !isThinRetrievalInputRequiringHydration(input)) {
+    lifecycleAction = 'CONFIRM';
+    acquisitionEnrich = false;
+    acquisitionReasonCodes.clear();
+  }
   const lifecycleReasonCodes = [...new Set([
     `ROUTE_${lifecycleAction}`,
+    ...(aiLedTrading && lifecycleAction === 'CONFIRM' ? ['AI_LED_CONFIRMATION'] : []),
     ...(acquisitionEnrich ? ['ACQUISITION_ENRICH', ...acquisitionReasonCodes] : []),
   ])];
   const lifecycle = result('LIFECYCLE', 'PASS', lifecycleReasonCodes, [], { action: lifecycleAction });

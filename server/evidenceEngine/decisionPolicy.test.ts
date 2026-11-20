@@ -206,3 +206,122 @@ test('Cali Bourse shape still confirms as hype', () => {
   });
   assert.equal(decision.status, 'TRADING_CONFIRMED');
 });
+
+const semanticTrading = (fields = [{ field: 'video_title' as const, index: 0, sourceId: 'v1', sourceFamilyId: 'video:v1' }]): EvidenceItem => ({
+  ...positive('channel_bio'),
+  id: 'semantic-trading',
+  source: 'gemini_semantic',
+  confidence: 84,
+  provenance: {
+    ...positive('channel_bio').provenance,
+    provider: 'gemini_semantic',
+    fields,
+    semantic: {
+      taxonomyLabel: 'ACTIVE_TRADING',
+      calibratedConfidence: 84,
+      rawConfidence: 95,
+      modelVersion: 'test',
+      promptVersion: 'test',
+      featureVersion: 'test',
+      calibrationVersion: 'test',
+      reasonCodes: ['PRIMARY_TRADER', 'CONTENT_LIVE'],
+      detectedLanguages: [],
+    },
+  } as any,
+});
+
+test('one AI trading verdict confirms without a Tier-A composition veto', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [semanticTrading()],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 10,
+    minimumTradingScore: 1,
+    contentCategory: 'ACTIVE_TRADING',
+    composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+    recognition: { state: 'AMBIGUOUS_THIN' } as any,
+  });
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
+  assert.ok(decision.reasonCodes.includes('AI_LED_TRADING_CONFIRMATION'));
+});
+
+test('an AI verdict without a creator-owned citation still cannot confirm', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [semanticTrading([{ field: 'channel_title' } as any])],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 10,
+    minimumTradingScore: 1,
+    contentCategory: 'ACTIVE_TRADING',
+    composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+    recognition: { state: 'AMBIGUOUS_THIN' } as any,
+  });
+  assert.equal(decision.status, 'UNCERTAIN');
+});
+
+test('a dominant creator-owned contradiction still blocks an AI trading verdict', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [semanticTrading(), irrelevant()],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 10,
+    minimumTradingScore: 1,
+    contentCategory: 'ACTIVE_TRADING',
+    composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+    recognition: { state: 'AMBIGUOUS_THIN' } as any,
+  });
+  assert.notEqual(decision.status, 'TRADING_CONFIRMED');
+});
+
+test('an AI-led verdict confirms despite a raw score below the deterministic boundary', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [{ ...semanticTrading(), finalWeight: 5 }],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 10,
+    minimumTradingScore: 99,
+    contentCategory: 'ACTIVE_TRADING',
+    composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+    recognition: { state: 'AMBIGUOUS_THIN' } as any,
+  });
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
+  assert.ok(decision.reasonCodes.includes('AI_LED_TRADING_CONFIRMATION'));
+});
+
+test('a cited AI verdict with no concept matches still confirms', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [{ ...semanticTrading(), rawMatches: [] }],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    contentCategory: 'ACTIVE_TRADING',
+    composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+    recognition: { state: 'AMBIGUOUS_THIN' } as any,
+  });
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
+  assert.ok(decision.reasonCodes.includes('AI_LED_TRADING_CONFIRMATION'));
+});
+
+test('LEGACY routing restores the pre-v2 confirmation veto for the same verdict', () => {
+  const previous = process.env.DETERMINISTIC_CLASSIFICATION_ROUTING;
+  process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = 'LEGACY';
+  try {
+    const decision = evaluateUnifiedDecisionPolicy({
+      evidence: [{ ...semanticTrading(), finalWeight: 12 }],
+      collection: collection(),
+      lifecycleAction: 'CONFIRM',
+      minimumPositiveWeight: 1,
+      minimumTradingScore: 1,
+      contentCategory: 'ACTIVE_TRADING',
+      composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+      recognition: { state: 'AMBIGUOUS_THIN' } as any,
+    });
+    assert.notEqual(decision.status, 'TRADING_CONFIRMED');
+    assert.ok(!decision.reasonCodes.includes('AI_LED_TRADING_CONFIRMATION'));
+    assert.ok(decision.reasonCodes.includes('CONTEXTUAL_COMPOSITION_CONFIRMATION_REQUIRED'));
+  } finally {
+    if (previous === undefined) delete process.env.DETERMINISTIC_CLASSIFICATION_ROUTING;
+    else process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = previous;
+  }
+});

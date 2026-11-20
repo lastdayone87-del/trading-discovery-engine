@@ -258,8 +258,19 @@ export function hasDecisiveTradingShare(
     .filter(citation => citation.field === 'video_title' || citation.field === 'video_description')
     .map(citation => citation.index)
     .filter((index): index is number => typeof index === 'number'));
-  const tradingVideoShare = evidence.videos.length > 0 ? indexes.size / evidence.videos.length : 0;
-  return creatorSignalsTrading(evidence) || (indexes.size >= 3 && tradingVideoShare >= 0.4);
+  // A trading bio/title cannot confirm a channel whose recent uploads are
+  // unrelated. When a creator-owned video sample exists, the fast pass needs
+  // substantive video support. Keyword-only TERMINOLOGY and the whole-sample
+  // consistency item are excluded: hashtags like #tjrtrades must not turn a
+  // GTA clip feed into a trading channel.
+  if (evidence.videos.length === 0) return creatorSignalsTrading(evidence);
+  const minimum = 3;
+  const tradingVideoShare = indexes.size / evidence.videos.length;
+  return indexes.size >= minimum && tradingVideoShare >= 0.4;
+}
+
+function withoutHashtagsAndUrls(value: string): string {
+  return value.replace(/#[^\s#]+/gu, ' ').replace(/\b(?:(?:https?:)?\/\/|www\.)\S+/giu, ' ');
 }
 
 /**
@@ -267,7 +278,10 @@ export function hasDecisiveTradingShare(
  * citation list is shortened for persistence. Repeated trading instruments
  * can otherwise collapse to the first video and undercount the share.
  */
-export function decisionTradingVideoIndexes(decision: VerificationDecision): Set<number> {
+export function decisionTradingVideoIndexes(
+  decision: VerificationDecision,
+  evidence: AdmissionEvidence,
+): Set<number> {
   const indexes = new Set<number>();
   for (const item of decision.positiveEvidence) {
     // The consistency item lists the whole sample, including videos without a
@@ -276,6 +290,20 @@ export function decisionTradingVideoIndexes(decision: VerificationDecision): Set
     for (const fieldRef of item.provenance?.fields || []) {
       if ((fieldRef.field === 'video_title' || fieldRef.field === 'video_description')
         && typeof fieldRef.index === 'number') {
+        // A hashtag such as #tjrtrades is not substantive trading content.
+        // Keep the index only when at least one matched term appears outside
+        // hashtags/URLs in that video's title or description. This applies to
+        // terminology and any other category that carries a video field.
+        const video = evidence.videos[fieldRef.index];
+        const rawMatches = item.rawMatches || [];
+        if (rawMatches.length > 0) {
+          const text = withoutHashtagsAndUrls(`${video?.title || ''} ${video?.description || ''}`).toLocaleLowerCase('und');
+          const substantive = rawMatches.some(match => {
+            const term = String(match || '').trim().toLocaleLowerCase('und');
+            return term.length >= 3 && text.includes(term);
+          });
+          if (!substantive) continue;
+        }
         indexes.add(fieldRef.index);
       }
     }
@@ -306,7 +334,7 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     // anchor in the creator-owned name/bio, or trading evidence spread across
     // a substantial share of recent videos. Three trading uploads on an
     // otherwise music/lifestyle channel are not decisive.
-    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations, decisionTradingVideoIndexes(decision));
+    const decisiveTradingShare = hasDecisiveTradingShare(evidence, citations, decisionTradingVideoIndexes(decision, evidence));
     if (citations.length > 0 && !financeAdjacentOnly && decisiveTradingShare) {
       const judgment: SemanticJudgment = {
         mainSubject: 'TRADING',
@@ -349,6 +377,26 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     };
   }
 
+  if (routing.route === 'DETERMINISTIC_TRADING'
+    && decision.status === 'TRADING_CONFIRMED'
+    && decision.evidenceCollection.sufficiency === 'SUFFICIENT') {
+    // A confirmed trading classifier result blocked from the fast path by
+    // recent-content support must not fall through to terminal unrelated
+    // rejection. It is ambiguous, not unrelated; the full AI judge decides.
+    return {
+      outcome: 'AMBIGUOUS',
+      route: routing.route,
+      confidence: decision.confidenceScore,
+      reasonCodes: [
+        'DETERMINISTIC_FAST_PASS_BLOCKED',
+        ...(passWithoutCitations ? ['DETERMINISTIC_PASS_WITHOUT_CITATIONS'] : []),
+        ...(passBlockedByMinorityTrading ? ['DETERMINISTIC_TRADING_MINORITY'] : []),
+        ...routing.reasonCodes,
+      ],
+      citations: [],
+      priority: 10,
+    };
+  }
   const rejection = evaluateStrictRejection(evidence);
   if (rejection) {
     const judgment: SemanticJudgment = {

@@ -5,12 +5,25 @@ import {
   isCacheableSemanticResult,
   isUsableCachedResult,
   SEMANTIC_RESULT_CACHE_VERSION,
+  SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY,
+  SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS,
+  DEFAULT_SEMANTIC_RESULT_CACHE_TIMEOUT_MS,
   resetSemanticResultCacheCircuitForTests,
   semanticResultCacheEnabled,
   semanticResultCacheKey,
+  scheduleSemanticResultCacheWrite,
+  semanticResultCacheWriteBacklogForTests,
+  flushSemanticResultCacheWritesForTests,
+  setSemanticResultCacheWriterForTests,
+  defaultSemanticResultCachePort,
+  type SemanticCacheHit,
+  type SemanticResultCachePort,
 } from './evidenceEngine/semanticResultCache';
 import { canonicalJsonStringify } from './classificationInputChecksum';
 import type { RawChannelInput } from './evidenceEngine/types';
+import { GeminiSemanticProvider, type SemanticModelClient } from './evidenceEngine/providers/GeminiSemanticProvider';
+import { GeminiFreeSemanticProvider } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
+import { GroqSemanticProvider } from './evidenceEngine/providers/GroqSemanticProvider';
 
 const baseInput: RawChannelInput = {
   channel_name: '  Order Flow Lab  ',
@@ -163,23 +176,137 @@ test('degenerate and uncited results are never persisted', () => {
   assert.equal(isCacheableSemanticResult(null), false);
 });
 
-test('all production semantic providers wire the cache and keep injected clients isolated', () => {
-  for (const file of [
-    'server/evidenceEngine/providers/GeminiSemanticProvider.ts',
-    'server/evidenceEngine/providers/GroqSemanticProvider.ts',
-    'server/evidenceEngine/providers/GeminiFreeSemanticProvider.ts',
-  ]) {
-    const source = readFileSync(file, 'utf8');
-    assert.match(source, /readSemanticResultCache/, `${file} must read the cache`);
-    assert.match(source, /writeSemanticResultCache/, `${file} must write the cache`);
-    assert.match(source, /this\.injectedClient \? undefined : await readSemanticResultCache/, `${file} must not let test clients read production cache`);
-    assert.match(source, /if \(!this\.injectedClient && cacheable\) await writeSemanticResultCache/, `${file} must gate cache writes on a structurally valid result`);
-    assert.match(source, /isSemanticResultShape\(/, `${file} must validate the model result before caching`);
-    assert.match(source, /SEMANTIC_RESULT_CACHE_HIT_REASON/, `${file} must mark cache hits`);
-    assert.match(source, /fallbackReasonCodes = \[[\s\S]*SEMANTIC_RESULT_CACHE_HIT_REASON/, `${file} must append the cache-hit reason to the result`);
-    assert.match(source, /readSemanticResultCache\(cacheIdentity, process\.env, \{ signal \}\)/, `${file} must bound cache reads by the caller deadline`);
-    assert.match(source, /writeSemanticResultCache\(cacheIdentity,[\s\S]{0,400}process\.env, \{ signal \}\)/, `${file} must bound cache writes by the caller deadline`);
+const providerInput = {
+  channel_id: 'cache-channel',
+  channel_name: 'Order Flow Lab',
+  description: 'Futures trading education and risk management.',
+  video_titles: ['Liquidity sweeps', 'Risk management'],
+  video_descriptions: ['Futures execution.', 'Position sizing.'],
+  country: 'US',
+} as any;
+
+const providerVerdict = {
+  label: 'ACTIVE_TRADING',
+  confidence: 88,
+  supportedLanguage: true,
+  reasonCodes: ['REPEATED_EXECUTION_DISCUSSION'],
+  explanation: 'The creator teaches futures execution.',
+  concepts: ['risk'],
+  languages: [{ language: 'en', script: 'Latin', confidence: 95, field: 'channel_bio' }],
+  citations: [{ field: 'channel_bio' }],
+};
+
+function cacheHarness(hit?: SemanticCacheHit) {
+  const reads: Array<{ identity: any; env: any; options: any }> = [];
+  const writes: Array<{ identity: any; value: any; env: any; options: any }> = [];
+  const port: SemanticResultCachePort = {
+    async read(identity, env, options) {
+      reads.push({ identity, env, options });
+      return hit;
+    },
+    scheduleWrite(identity, value, env, options) {
+      writes.push({ identity, value, env, options });
+    },
+  };
+  return { port, reads, writes };
+}
+
+const providerCases = [
+  ['gemini_semantic', GeminiSemanticProvider],
+  ['gemini_free_semantic', GeminiFreeSemanticProvider],
+  ['groq_semantic', GroqSemanticProvider],
+] as const;
+
+test('every semantic provider reads and writes the cache through observable behavior', async () => {
+  for (const [name, Provider] of providerCases) {
+    const harness = cacheHarness();
+    let observability: any;
+    const client: SemanticModelClient = {
+      async classify(_prompt, _model, observed) {
+        observability = observed;
+        return providerVerdict;
+      },
+    };
+    const provider = new Provider(client, harness.port);
+    const [item] = await provider.collectEvidence(providerInput, {} as any);
+    assert.equal(harness.reads.length, 1, `${name} must read the cache before calling the model`);
+    assert.equal(harness.writes.length, 1, `${name} must schedule exactly one write for a cited verdict`);
+    assert.equal(harness.writes[0].identity.provider, name);
+    assert.equal(harness.writes[0].value.result.label, 'ACTIVE_TRADING');
+    assert.match(String(observability?.requestMetadata?.evidenceChecksum), /^[0-9a-f]{64}$/, `${name} must attach the evidence checksum`);
+    assert.equal(observability?.requestMetadata?.channelId, providerInput.channel_id);
+    assert.equal(item.category, 'METHODOLOGY_CONCEPT');
+    assert.ok(!item.provenance?.semantic?.reasonCodes.includes('SEMANTIC_RESULT_CACHE_HIT'));
   }
+});
+
+test('every semantic provider replays a cache hit without calling the model or rewriting it', async () => {
+  for (const [name, Provider] of providerCases) {
+    const hit: SemanticCacheHit = {
+      cacheKey: 'cached-key',
+      inputChecksum: 'cached-checksum',
+      hit: true,
+      result: providerVerdict as any,
+      modelVersion: 'cached-model',
+    };
+    const harness = cacheHarness(hit);
+    let modelCalls = 0;
+    const client: SemanticModelClient = {
+      async classify() {
+        modelCalls += 1;
+        throw new Error('MODEL_MUST_NOT_RUN_ON_CACHE_HIT');
+      },
+    };
+    const provider = new Provider(client, harness.port);
+    const [item] = await provider.collectEvidence(providerInput, {} as any);
+    assert.equal(modelCalls, 0, `${name} must not call the model on a cache hit`);
+    assert.equal(harness.writes.length, 0, `${name} must not rewrite an unchanged cache entry`);
+    assert.ok(item.provenance?.semantic?.reasonCodes.includes('SEMANTIC_RESULT_CACHE_HIT'), `${name} must mark the hit`);
+  }
+});
+
+test('every semantic provider skips the cache write for a malformed model verdict', async () => {
+  for (const [name, Provider] of providerCases) {
+    const harness = cacheHarness();
+    const client: SemanticModelClient = {
+      async classify() {
+        return { ...providerVerdict, confidence: 101 };
+      },
+    };
+    const provider = new Provider(client, harness.port);
+    await provider.collectEvidence(providerInput, {} as any);
+    assert.equal(harness.writes.length, 0, `${name} must not persist a malformed verdict`);
+  }
+});
+
+test('an injected client without a cache port never touches the production cache', async () => {
+  for (const [name, Provider] of providerCases) {
+    const originalRead = defaultSemanticResultCachePort.read;
+    const originalWrite = defaultSemanticResultCachePort.scheduleWrite;
+    let reads = 0;
+    let writes = 0;
+    let modelCalls = 0;
+    defaultSemanticResultCachePort.read = async () => {
+      reads += 1;
+      return undefined;
+    };
+    defaultSemanticResultCachePort.scheduleWrite = () => {
+      writes += 1;
+    };
+    try {
+      const provider = new Provider({ async classify() { modelCalls += 1; return providerVerdict; } });
+      await provider.collectEvidence(providerInput, {} as any);
+      assert.equal(modelCalls, 1, `${name} must still call its injected model`);
+      assert.equal(reads, 0, `${name} must not read the production cache for an injected client`);
+      assert.equal(writes, 0, `${name} must not write the production cache for an injected client`);
+    } finally {
+      defaultSemanticResultCachePort.read = originalRead;
+      defaultSemanticResultCachePort.scheduleWrite = originalWrite;
+    }
+  }
+});
+
+test('provider-specific cache identities include repair, request and batch versions', () => {
   const groq = readFileSync('server/evidenceEngine/providers/GroqSemanticProvider.ts', 'utf8');
   assert.match(groq, /repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION/, 'Groq cache identity must include the repair prompt version');
   assert.match(groq, /requestSettings: groqRequestSettingsKey\(\)/, 'Groq cache identity must include prompt/completion settings');
@@ -211,4 +338,43 @@ test('cache operations are fail-open and deadline-bounded', () => {
     const provider = readFileSync(file, 'utf8');
     assert.match(provider, /semanticResultWasBatched\(/, `${file} must keep multi-channel batch results out of the cache`);
   }
+});
+
+
+test('disabled cache writes are a no-op and the backlog flushes', async () => {
+  scheduleSemanticResultCacheWrite(identity, { result: complete as any, modelVersion: 'model-v1' }, { SEMANTIC_RESULT_CACHE_ENABLED: 'false' } as any);
+  assert.equal(semanticResultCacheWriteBacklogForTests(), 0);
+  await flushSemanticResultCacheWritesForTests();
+  assert.equal(semanticResultCacheWriteBacklogForTests(), 0);
+});
+
+test('an enabled scheduled write enters the backlog and drains on flush', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  setSemanticResultCacheWriterForTests(async () => { await gate; });
+  try {
+    scheduleSemanticResultCacheWrite(identity, { result: complete as any, modelVersion: 'model-v1' }, {} as any);
+    assert.ok(semanticResultCacheWriteBacklogForTests() > 0, 'scheduling an enabled write must queue observable work');
+    release();
+    await flushSemanticResultCacheWritesForTests();
+    assert.equal(semanticResultCacheWriteBacklogForTests(), 0);
+  } finally {
+    release();
+    setSemanticResultCacheWriterForTests(undefined);
+    await flushSemanticResultCacheWritesForTests();
+  }
+});
+
+test('the scheduled writer has a bounded timeout and concurrency contract', () => {
+  const source = readFileSync('server/evidenceEngine/semanticResultCache.ts', 'utf8');
+  assert.match(source, /scheduleSemanticResultCacheWrite/, 'background writer must exist');
+  assert.equal(SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS, 5_000);
+  assert.ok(
+    SEMANTIC_RESULT_CACHE_BACKGROUND_WRITE_TIMEOUT_MS > DEFAULT_SEMANTIC_RESULT_CACHE_TIMEOUT_MS,
+    'background writes may take longer than the caller read deadline but remain bounded',
+  );
+  assert.match(source, /semanticResultCacheWriteTimeoutMs\(env\)/, 'background writer must honor the configured write timeout');
+  assert.match(source, /pendingSemanticCacheWrites/, 'background writes must be tracked for flush');
+  assert.equal(SEMANTIC_RESULT_CACHE_BACKGROUND_CONCURRENCY, 4, 'background writes must be bounded');
+  assert.match(source, /holdUntilSettled/, 'queued writes must hold their concurrency slot until the DB operation settles');
 });

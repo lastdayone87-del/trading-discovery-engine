@@ -29,6 +29,7 @@ import {
 } from './server/db';
 import { buildQueryQualityDashboard, QUERY_QUALITY_DASHBOARD_MAX_ROWS } from './server/queryQuality/dashboard';
 import { getExecutionLineageMetrics } from './server/executionLineageMetrics';
+import { semanticResultCacheWriteMetrics } from './server/evidenceEngine/semanticResultCache';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
 import { inspectCoverageLifecycle, recordLifecycleEvent } from './server/coverageLifecycle';
@@ -140,7 +141,7 @@ async function startServer() {
   app.get('/api/candidate-admission/baseline',async(req,res)=>{try{res.json(await getCandidateAdmissionBaseline(String(req.query.cutoff||new Date().toISOString())));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/admission/decisions',async(req,res)=>{try{res.json(await inspectAdmission(Number(req.query.limit||100)));}catch(err:any){sendOperationError(res,err);}});
   app.get('/api/admission/channels/:channelId',async(req,res)=>{try{res.json(await getAdmissionForChannel(req.params.channelId));}catch(err:any){sendOperationError(res,err);}});
-  app.get('/api/admission/metrics',async(req,res)=>{try{const report=await inspectAdmission(1);res.json({mode:report.mode,canaryBasisPoints:report.canaryBasisPoints,servingAuthority:false,metrics:report.metrics});}catch(err:any){sendOperationError(res,err);}});
+  app.get('/api/admission/metrics',async(req,res)=>{try{const report=await inspectAdmission(1);res.json({mode:report.mode,canaryBasisPoints:report.canaryBasisPoints,servingAuthority:false,metrics:report.metrics,semanticCacheWrites:semanticResultCacheWriteMetrics()});}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/admission/replay',async(req,res)=>{try{const result=await loadAdmissionReplay(String(req.body?.cutoff||new Date().toISOString()));res.json({cutoff:result.cutoff,eventCount:result.events.length,states:[...result.states.entries()].map(([channelId,state])=>({channelId,...state})),networkAccess:false,materialized:false});}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/admission/projection/verify',async(req,res)=>{try{res.json(await verifyAdmissionProjection(String(req.body?.cutoff||new Date().toISOString())));}catch(err:any){sendOperationError(res,err);}});
   app.post('/api/admission/projection/repair',async(req,res)=>{try{res.json(await repairAdmissionProjection(req.operator!.actorId,String(req.body?.cutoff||new Date().toISOString())));}catch(err:any){sendOperationError(res,err);}});

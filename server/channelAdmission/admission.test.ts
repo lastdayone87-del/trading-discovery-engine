@@ -757,7 +757,7 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
       description: 'Futures trading recap.',
     })),
   });
-  assert.equal(hasDecisiveTradingShare(namedTrader, citations), true);
+  assert.equal(hasDecisiveTradingShare(namedTrader, citations), false);
 
   const genericTrader = evidence({
     name: 'Channel X',
@@ -772,6 +772,28 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
   // The uncapped decision index set is authoritative even if only one audit
   // citation survives shortening.
   assert.equal(hasDecisiveTradingShare(genericTrader, [], new Set([0, 1, 2, 3, 4, 5])), true);
+});
+
+test('a single trading upload is below the three-video deterministic minimum', async () => {
+  const thin = evidence({
+    name: 'Clip Feed',
+    bio: 'Clips',
+    videos: [{ title: 'NQ futures trade recap', description: 'Futures execution.' }],
+  });
+  assert.equal(
+    hasDecisiveTradingShare(thin, [citation('video_title', 'NQ futures trade recap', 0, 'TRADING')]),
+    false,
+  );
+  const result = await evaluateDeterministicAdmission(thin);
+  assert.notEqual(result.outcome, 'PASS');
+  assert.ok(result.reasonCodes.includes('DETERMINISTIC_AMBIGUOUS'), `blocked thin sample must abstain: ${result.reasonCodes.join(',')}`);
+});
+
+test('a bio-only decisive creator still fast-passes without a video sample', async () => {
+  const bioOnly = evidence({ name: 'Nifty Trader', bio: 'Daily Nifty trading analysis and risk management.', videos: [] });
+  const result = await evaluateDeterministicAdmission(bioOnly);
+  assert.equal(result.outcome, 'PASS');
+  assert.ok(result.reasonCodes.includes('DETERMINISTIC_FAST_PASS'));
 });
 
 test('mid-quote ellipses are accepted only when every segment is exact and in order', () => {
@@ -858,7 +880,15 @@ test('mid-quote ellipses are accepted only when every segment is exact and in or
   assert.notEqual(fabricatedPrefix.decision, 'ADMIT');
 });
 
-test('sample-wide consistency references are not counted as trading videos', () => {
+test('hashtag-only terminology and sample-wide references are not counted as trading videos', () => {
+  const sample = evidence({
+    name: 'Clip Feed',
+    bio: 'Clips',
+    videos: [
+      { title: 'NQ futures trade recap', description: 'Futures execution.' },
+      { title: '#trading GTA clip', description: 'GTA 6 streamer clip.' },
+    ],
+  });
   const indexes = decisionTradingVideoIndexes({
     positiveEvidence: [
       {
@@ -867,11 +897,32 @@ test('sample-wide consistency references are not counted as trading videos', () 
       },
       {
         category: 'INSTRUMENT',
+        provenance: { fields: [{ field: 'video_title', index: 0 }] },
+      },
+      {
+        category: 'TERMINOLOGY',
+        rawMatches: ['trading'],
         provenance: { fields: [{ field: 'video_title', index: 1 }] },
       },
     ],
-  } as any);
-  assert.deepEqual([...indexes], [1]);
+  } as any, sample);
+  assert.deepEqual([...indexes], [0]);
+});
+
+test('native-language terminology outside hashtags still counts as video evidence', () => {
+  const sample = evidence({
+    name: 'Analisis',
+    bio: 'Mercados',
+    videos: [{ title: 'Análisis de trading en vivo', description: 'Ejecución y gestión de riesgo.' }],
+  });
+  const indexes = decisionTradingVideoIndexes({
+    positiveEvidence: [{
+      category: 'TERMINOLOGY',
+      rawMatches: ['trading'],
+      provenance: { fields: [{ field: 'video_title', index: 0 }] },
+    }],
+  } as any, sample);
+  assert.deepEqual([...indexes], [0]);
 });
 
 test('deterministic strict rejection requires three matches across two independent sources', () => {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SEMANTIC_RESULT_FIELD_NAMES, isSemanticResultShape } from './semanticResultShape';
+import { SEMANTIC_RESULT_FIELD_NAMES, isSemanticResultShape, isSemanticVerdictIdentity } from './semanticResultShape';
 
 function result(overrides: Record<string, unknown> = {}) {
   return {
@@ -47,4 +47,19 @@ test('the closed taxonomy includes trading education and market institutions', (
     assert.equal(isSemanticResultShape(result({ label })), true, label);
   }
   assert.equal(isSemanticResultShape(result({ label: 'BROKER_PLATFORM' })), false);
+});
+
+
+test('cache eligibility accepts a complete verdict identity and rejects malformed nested fields', () => {
+  assert.equal(isSemanticVerdictIdentity(result()), true);
+  assert.equal(isSemanticVerdictIdentity(result({ languages: [{ language: 'en', script: 'Latn', confidence: 90, field: 'not_a_field' }] })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ citations: [{ field: 'not_a_field' }] })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ label: 'BROKER_PLATFORM' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ confidence: 101 })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ supportedLanguage: 'yes' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ citations: [] })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ explanation: '' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ reasonCodes: 'none' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ concepts: 'none' })), false);
+  assert.equal(isSemanticVerdictIdentity(result({ languages: 'none' })), false);
 });
