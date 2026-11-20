@@ -9,6 +9,34 @@ import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeE
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
 export const SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE=SEMANTIC_TOP_CALIBRATED_CONFIDENCE;
 
+
+const AI_TRADING_LABELS = new Set([
+  'ACTIVE_TRADING',
+  'TRADING_EDUCATION',
+  'INVESTING_EDUCATION',
+  'MARKET_INSTITUTION',
+  'HYPE',
+]);
+
+/**
+ * One-judge confirmation: a complete semantic trading verdict with a
+ * creator-owned citation is sufficient to bypass contextual Tier-A
+ * composition/recognition. Coverage, citation support and contradiction
+ * remain the safeguards; composition is diagnostic, not an independent veto.
+ */
+export function hasAiLedTradingConfirmation(items: EvidenceItem[], contentCategory?: string): boolean {
+  if (contentCategory !== undefined && !isTradingRelevantCategory(contentCategory)) return false;
+  const semantic = items.find(item =>
+    isSemanticClassificationSource(item.source)
+    && item.polarity === 'POSITIVE'
+    && item.category !== 'SEMANTIC_ABSTENTION'
+    && AI_TRADING_LABELS.has(String(item.provenance?.semantic?.taxonomyLabel || '')));
+  if (!semantic || semantic.confidence < 70) return false;
+  return (semantic.provenance?.fields || []).some(field =>
+    field.field !== 'channel_title'
+    && CREATOR_OWNED_EVIDENCE_FIELDS.has(field.field));
+}
+
 export interface UnifiedDecisionPolicyInput {evidence:EvidenceItem[];collection:EvidenceCollectionReport;lifecycleAction:LifecycleAction;minimumPositiveWeight:number;minimumTradingScore:number;composition?:ContextualCompositionReport;recognition?:RecognitionAssessment;contentCategory?:string}
 export interface UnifiedDecisionPolicyResult {status:'TRADING_CONFIRMED'|'NON_TRADING'|'UNCERTAIN';confidenceScore:number;tradingProbability:number;nonTradingProbability:number;coverageConfidence:number;reasonCodes:string[]}
 
@@ -174,16 +202,18 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const coverageConfidence=input.collection.sufficiency==='MISSING'?0:input.collection.sufficiency==='INSUFFICIENT'?30:Math.min(100,55+Math.min(20,substantiveProviders*5)+Math.min(25,documentFamilies*5));
   const reasons:string[]=[];let status:UnifiedDecisionPolicyResult['status']='UNCERTAIN';
   const independentCreatorField=hasIndependentCreatorOwnedPositiveField(positive);
-  const compositionOk=input.composition?compositionConfirmsTrading(input.composition):true;
-  const recognitionAllowsConfirmation=!input.recognition||input.recognition.state==='DECISIVE_TRADING';
+  const aiLedTrading=hasAiLedTradingConfirmation(input.evidence,input.contentCategory);
+  const compositionOk=aiLedTrading?true:input.composition?compositionConfirmsTrading(input.composition):true;
+  const recognitionAllowsConfirmation=aiLedTrading?true:!input.recognition||input.recognition.state==='DECISIVE_TRADING';
   const contentCategoryAllowsConfirmation=isTradingRelevantCategory(input.contentCategory);
   const positiveBoundary=boundary.satisfied;
   const semanticUnrelatedTerminal=qualifiesSemanticUnrelatedTerminalReject(input.evidence,input.collection);
   const dominantAttributedContradiction=qualifiesDominantAttributedContradiction(input.evidence,input.collection);
+  const materialContradiction=semanticUnrelatedTerminal||dominantAttributedContradiction;
   const terminalNegative=terminalNegativeItems(negative, input.collection.terminalNegativeSufficiency
     ? { terminalEligible: input.collection.terminalNegativeSufficiency.status === 'SUFFICIENT' }
     : {});
-  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY');if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
+  if(input.lifecycleAction==='CONFIRM'&&positiveBoundary&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation&&!materialContradiction){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY',...(aiLedTrading?['AI_LED_TRADING_CONFIRMATION']:[]));if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
     status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {

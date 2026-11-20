@@ -138,15 +138,17 @@ export interface IngestionCandidate extends DiscoveredChannelRaw {
  */
 export function admissionShortcutEligible(
   candidate: Pick<DiscoveredChannelRaw,
-    'admissionConfirmedTrading' | 'admissionDecisionId' | 'admissionDecisionSource' | 'admissionTradingConfidence'>,
+    'admissionConfirmedTrading' | 'admissionDecisionId' | 'admissionDecisionSource'>,
   admissionMode: 'ACTIVE' | 'OFF',
 ): boolean {
-  const confidence = Number(candidate.admissionTradingConfidence);
+  // A deterministic PASS or an explicit human ADMIT is already the final
+  // relevance decision. The semantic admission path is never eligible: it is
+  // a router and must reach the one full AI judge. Numeric admission focus is
+  // deliberately not a shortcut threshold for deterministic/human decisions;
+  // the deterministic gate's PASS is the decision.
   return candidate.admissionConfirmedTrading === true
     && Boolean(candidate.admissionDecisionId)
     && (candidate.admissionDecisionSource === 'DETERMINISTIC' || candidate.admissionDecisionSource === 'HUMAN')
-    && Number.isFinite(confidence)
-    && confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE
     && admissionMode === 'ACTIVE';
 }
 

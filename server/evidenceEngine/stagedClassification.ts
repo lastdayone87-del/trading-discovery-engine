@@ -4,7 +4,7 @@ import type {
 } from './types';
 import { isSemanticClassificationSource } from './types';
 import { collapseSourceIndependentObservations } from '../entityResolution';
-import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasCreatorLevelUnrelatedAttribution, observedTradingFamilies } from './decisionPolicy';
+import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasAiLedTradingConfirmation, hasCreatorLevelUnrelatedAttribution, observedTradingFamilies } from './decisionPolicy';
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
@@ -111,6 +111,7 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const positive = evidence.filter(item => item.polarity === 'POSITIVE' && item.rawMatches.length > 0);
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
   const semantic = positive.filter(item => isSemanticClassificationSource(item.source) || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
+  const aiLedTrading = hasAiLedTradingConfirmation(positive);
   const strongPositive = positive.filter(item => item.reliability !== 'LOWER' && Math.abs(item.finalWeight) >= 6);
   const corroborating = strongPositive.filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY');
   const sources = new Set(corroborating.map(item => item.source));
@@ -254,8 +255,14 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
     acquisitionEnrich = activeRouting;
     if (acquisitionEnrich) acquisitionReasonCodes.add('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION');
   }
+  if (aiLedTrading && contradiction.disposition !== 'FAIL' && availability.disposition === 'PASS') {
+    lifecycleAction = 'CONFIRM';
+    acquisitionEnrich = false;
+    acquisitionReasonCodes.clear();
+  }
   const lifecycleReasonCodes = [...new Set([
     `ROUTE_${lifecycleAction}`,
+    ...(aiLedTrading ? ['AI_LED_CONFIRMATION'] : []),
     ...(acquisitionEnrich ? ['ACQUISITION_ENRICH', ...acquisitionReasonCodes] : []),
   ])];
   const lifecycle = result('LIFECYCLE', 'PASS', lifecycleReasonCodes, [], { action: lifecycleAction });
