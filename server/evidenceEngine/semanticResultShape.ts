@@ -43,10 +43,31 @@ export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
 const LABELS: ReadonlySet<string> = new Set(SEMANTIC_RESULT_LABELS);
 
 /**
- * Cache-eligibility guard at the raw model boundary. It validates the verdict
- * identity and nested language/citation types before parsing, then the parsed
- * result is validated again by isCacheableSemanticResult against the supplied
- * evidence. This prevents incomplete replies from becoming durable cache rows.
+ * Required raw decision fields for cache eligibility. Optional nested fields
+ * (languages, concepts, reasonCodes, explanation) may be omitted and normalized
+ * by the parser, but a reply with a missing/misspelled label, non-numeric or
+ * out-of-range confidence, or non-boolean supportedLanguage is malformed and
+ * must stay retryable instead of becoming a durable abstention.
+ */
+export function hasSemanticVerdictCore(value: unknown): value is {
+  label: SemanticResultLabel;
+  confidence: number;
+  supportedLanguage: boolean;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  return typeof result.label === 'string'
+    && LABELS.has(result.label)
+    && isBoundedConfidence(result.confidence)
+    && typeof result.supportedLanguage === 'boolean';
+}
+
+/**
+ * Strict raw-verdict identity guard for callers that need to inspect a model
+ * reply before parsing. It is intentionally not the cache-eligibility gate:
+ * providers validate the raw core above, parse/normalize the reply, and then
+ * call isCacheableSemanticResult, so a valid verdict that omitted an optional
+ * raw field can still be cached.
  */
 export function isSemanticVerdictIdentity(value: unknown): value is {
   label: SemanticResultLabel;
@@ -58,11 +79,8 @@ export function isSemanticVerdictIdentity(value: unknown): value is {
   languages: Array<{ language: string; script: string; confidence: number; field: string }>;
   citations: Array<{ field: string; index?: number; sourceId?: string }>;
 } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (!hasSemanticVerdictCore(value)) return false;
   const result = value as Record<string, unknown>;
-  if (typeof result.label !== 'string' || !LABELS.has(result.label)) return false;
-  if (!isBoundedConfidence(result.confidence)) return false;
-  if (typeof result.supportedLanguage !== 'boolean') return false;
   if (typeof result.explanation !== 'string' || !result.explanation.trim()) return false;
   if (!Array.isArray(result.reasonCodes) || !result.reasonCodes.every(code => typeof code === 'string')) return false;
   if (!Array.isArray(result.concepts) || !result.concepts.every(concept => typeof concept === 'string')) return false;
@@ -103,11 +121,8 @@ export function isSemanticResultShape(value: unknown): value is {
   languages: Array<{ language: string; script: string; confidence: number; field: string }>;
   citations: Array<{ field: string; index?: number; sourceId?: string }>;
 } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (!hasSemanticVerdictCore(value)) return false;
   const result = value as Record<string, unknown>;
-  if (typeof result.label !== 'string' || !LABELS.has(result.label)) return false;
-  if (!isBoundedConfidence(result.confidence)) return false;
-  if (typeof result.supportedLanguage !== 'boolean') return false;
   if (typeof result.explanation !== 'string') return false;
   if (!Array.isArray(result.reasonCodes) || !result.reasonCodes.every(code => typeof code === 'string')) return false;
   if (!Array.isArray(result.concepts) || !result.concepts.every(concept => typeof concept === 'string')) return false;
