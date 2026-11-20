@@ -12,7 +12,7 @@ import { abortedByDeadline } from './abortReason';
 import { defaultSemanticResultCachePort, isCacheableSemanticResult, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
-import { isSemanticResultShape } from '../semanticResultShape';
+import { hasSemanticVerdictCore, isSemanticResultShape } from '../semanticResultShape';
 import { candidateDocumentRefs, citationsReferenceSuppliedDocuments } from '../semanticDocumentRefs';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
@@ -1464,6 +1464,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // and a different completion allowance. Keep it out of the cache: the
       // realized batch request is not part of this per-channel identity.
       let batchedOutput = semanticResultWasBatched(candidate.value);
+      let rawCoreValid = hasSemanticVerdictCore(candidate.value);
       result = parseSemanticResult(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -1513,6 +1514,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
+        rawCoreValid = hasSemanticVerdictCore(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       const retainedFinalCitations = result.citations.filter(citation => citationsReferenceSuppliedDocuments([citation], input));
@@ -1525,7 +1527,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // or structurally incomplete results still stay retryable. Repair
       // provenance is stored explicitly so a cache hit reports the same codes.
       // Injected clients are a test/shadow seam and never touch the cache.
-      const cacheable = !batchedOutput && isCacheableSemanticResult(result, input);
+      const cacheable = rawCoreValid && !batchedOutput && isCacheableSemanticResult(result, input);
       if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, {
         result,
         modelVersion: model,

@@ -14,7 +14,7 @@ import { defaultSemanticResultCachePort, isCacheableSemanticResult, semanticResu
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { citationsReferenceSuppliedDocuments } from '../semanticDocumentRefs';
-import { isSemanticResultShape } from '../semanticResultShape';
+import { hasSemanticVerdictCore, isSemanticResultShape } from '../semanticResultShape';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -444,6 +444,7 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       // A verdict produced inside a multi-channel batch saw sibling evidence
       // and a different completion allowance; keep it out of the cache.
       let batchedOutput = semanticResultWasBatched(candidate.value);
+      let rawCoreValid = hasSemanticVerdictCore(candidate.value);
       result = parseSemanticResult(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -456,6 +457,7 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
+        rawCoreValid = hasSemanticVerdictCore(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       // Cache only the parsed, normalized, citation-resolved result. This keeps
@@ -463,7 +465,7 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
       // nested field, while still rejecting uncited or structurally incomplete
       // results.
       result = { ...result, citations: result.citations.filter(ref => citationsReferenceSuppliedDocuments([ref], input)) };
-      const cacheable = !batchedOutput && isCacheableSemanticResult(result, input);
+      const cacheable = rawCoreValid && !batchedOutput && isCacheableSemanticResult(result, input);
       if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:

@@ -23,7 +23,7 @@ import { canonicalJsonStringify } from './classificationInputChecksum';
 import type { RawChannelInput } from './evidenceEngine/types';
 import { GeminiSemanticProvider, type SemanticModelClient } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { GeminiFreeSemanticProvider } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
-import { GroqSemanticProvider } from './evidenceEngine/providers/GroqSemanticProvider';
+import { GroqSemanticProvider, SEMANTIC_CITATION_REPAIR_PROMPT_VERSION } from './evidenceEngine/providers/GroqSemanticProvider';
 
 const baseInput: RawChannelInput = {
   channel_name: '  Order Flow Lab  ',
@@ -284,6 +284,47 @@ test('a parsed valid verdict is cached even when the raw reply omits optional fi
     assert.equal(harness.writes.length, 1, `${name} must cache the normalized parsed verdict`);
     assert.equal(harness.writes[0].value.result.label, 'ACTIVE_TRADING');
   }
+});
+
+test('every semantic provider refuses to cache a cited reply with invalid raw core fields', async () => {
+  const malformed = [
+    { ...providerVerdict, label: undefined },
+    { ...providerVerdict, confidence: 101 },
+    { ...providerVerdict, supportedLanguage: 'yes' },
+  ];
+  for (const [name, Provider] of providerCases) {
+    for (const raw of malformed) {
+      const harness = cacheHarness();
+      const client: SemanticModelClient = { async classify() { return raw; } };
+      const provider = new Provider(client, harness.port);
+      await provider.collectEvidence(providerInput, {} as any);
+      assert.equal(harness.writes.length, 0, `${name} must not cache malformed core fields: ${JSON.stringify(raw)}`);
+    }
+  }
+});
+
+test('Groq caches a valid candidate after citation repair', async () => {
+  const harness = cacheHarness();
+  const uncited = {
+    ...providerVerdict,
+    citations: [],
+  };
+  const repaired = {
+    ...uncited,
+    citations: [{ field: 'channel_bio' }],
+  };
+  let calls = 0;
+  const client: SemanticModelClient = {
+    async classify(prompt) {
+      calls += 1;
+      return prompt.includes(' Original request: ') ? repaired : uncited;
+    },
+  };
+  const provider = new GroqSemanticProvider(client, harness.port);
+  await provider.collectEvidence(providerInput, {} as any);
+  assert.equal(calls, 2, 'candidate plus one citation-repair call');
+  assert.equal(harness.writes.length, 1, 'a repaired cited verdict must be cacheable');
+  assert.equal(harness.writes[0].value.repairPromptVersion, SEMANTIC_CITATION_REPAIR_PROMPT_VERSION);
 });
 
 test('every semantic provider skips the cache write for an uncited or malformed verdict', async () => {

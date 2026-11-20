@@ -8,7 +8,7 @@ import { defaultSemanticResultCachePort, isCacheableSemanticResult, semanticResu
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { citationsReferenceSuppliedDocuments, semanticFieldDocuments } from '../semanticDocumentRefs';
-import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
+import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, hasSemanticVerdictCore, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-4';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
@@ -447,6 +447,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       // solo call for the same channel, so keeping it out of the cache avoids
       // replaying a result whose realized request cannot be keyed cheaply.
       let batchedOutput = semanticResultWasBatched(candidate.value);
+      let rawCoreValid = hasSemanticVerdictCore(candidate.value);
       result = parse(candidate.value);
       model = candidate.model;
       fallbackReasonCodes = candidate.fallbackUsed ? ['SEMANTIC_CANDIDATE_MODEL_404_FALLBACK'] : [];
@@ -457,6 +458,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: prompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
+        rawCoreValid = hasSemanticVerdictCore(adjudicatedValue);
         result = parse(adjudicatedValue); model = adjudicatorModel;
       }
       // Cache the parsed final (possibly adjudicated) verdict. A later recheck
@@ -467,7 +469,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       // is complete and cited. Uncited abstentions stay out so a later attempt
       // can recover.
       result = { ...result, citations: result.citations.filter(ref => citationsReferenceSuppliedDocuments([ref], input)) };
-      const cacheable = !batchedOutput && isCacheableSemanticResult(result, input);
+      const cacheable = rawCoreValid && !batchedOutput && isCacheableSemanticResult(result, input);
       if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:

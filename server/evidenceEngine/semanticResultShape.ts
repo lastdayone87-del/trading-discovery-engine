@@ -43,10 +43,31 @@ export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
 const LABELS: ReadonlySet<string> = new Set(SEMANTIC_RESULT_LABELS);
 
 /**
+ * Required raw decision fields for cache eligibility. Optional nested fields
+ * (languages, concepts, reasonCodes, explanation) may be omitted and normalized
+ * by the parser, but a reply with a missing/misspelled label, non-numeric or
+ * out-of-range confidence, or non-boolean supportedLanguage is malformed and
+ * must stay retryable instead of becoming a durable abstention.
+ */
+export function hasSemanticVerdictCore(value: unknown): value is {
+  label: SemanticResultLabel;
+  confidence: number;
+  supportedLanguage: boolean;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  return typeof result.label === 'string'
+    && LABELS.has(result.label)
+    && isBoundedConfidence(result.confidence)
+    && typeof result.supportedLanguage === 'boolean';
+}
+
+/**
  * Strict raw-verdict identity guard for callers that need to inspect a model
  * reply before parsing. It is intentionally not the cache-eligibility gate:
- * providers parse/normalize first and then call isCacheableSemanticResult, so a
- * valid verdict that omitted an optional raw field can still be cached.
+ * providers validate the raw core above, parse/normalize the reply, and then
+ * call isCacheableSemanticResult, so a valid verdict that omitted an optional
+ * raw field can still be cached.
  */
 export function isSemanticVerdictIdentity(value: unknown): value is {
   label: SemanticResultLabel;
