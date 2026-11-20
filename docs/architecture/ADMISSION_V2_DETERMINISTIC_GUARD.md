@@ -23,7 +23,7 @@ When an authoritative recent video sample exists:
 - Whole-sample `MULTI_VIDEO_CONSISTENCY` references are not counted.
   `TERMINOLOGY` counts only when the matched term appears outside hashtags/URLs,
   preserving native-language video titles while rejecting `#tjrtrades`.
-- Minimum support is `min(3, ceil(videos * 0.4))` with at least 40% of the
+- Minimum support is at least three substantive recent videos and at least 40% of the
   sample.
 - Channels with no video sample keep the existing creator-signal behavior.
 

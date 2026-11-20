@@ -306,9 +306,10 @@ async function enqueueEnrichmentAfterAmbiguousAdmission(input: {
   });
   if (job.status === 'COMPLETED') {
     // Stage-1 enrichment already finished before the admission side effect
-    // committed. Move directly to the one full classifier on the enriched
-    // candidate instead of reporting an enqueue failure forever.
-    const enrichedCandidate = (job.payload?.candidate || candidate) as DiscoveredChannelRaw;
+    // committed. Move directly to the one full classifier on the current
+    // admission snapshot. The completed job's stored payload is the input to
+    // that earlier pass, not the evidence this admission decision evaluated.
+    const enrichedCandidate = candidate;
     return enqueueClassificationAfterAdmission({
       candidate: {
         ...enrichedCandidate,
@@ -860,9 +861,6 @@ export async function verifyAdmissionCandidate(
         || existing.trading_status === 'HUMAN_REJECTED'
         || existing.scan_status === 'COMPLETED'
         || existing.scan_status === 'SKIPPED_NON_TRADING'
-        || existing.scan_status === 'NEEDS_REVIEW'
-        || existing.scan_status === 'ENRICHING'
-        || existing.scan_status === 'ENRICHMENT_PENDING'
       ));
       if (!existing) {
         input.candidate.admissionNewlyCreated = true;
@@ -912,9 +910,6 @@ export async function verifyAdmissionCandidate(
             || refreshed.trading_status === 'HUMAN_REJECTED'
             || refreshed.scan_status === 'COMPLETED'
             || refreshed.scan_status === 'SKIPPED_NON_TRADING'
-            || refreshed.scan_status === 'NEEDS_REVIEW'
-            || refreshed.scan_status === 'ENRICHING'
-            || refreshed.scan_status === 'ENRICHMENT_PENDING'
           ));
         }
       }

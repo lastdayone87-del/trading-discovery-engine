@@ -203,8 +203,11 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
   const documentFamilies=new Set(positive.flatMap(item=>item.provenance?.fields||[]).map(field=>field.sourceFamilyId||`${field.field}:${field.sourceId||field.index||''}`)).size;
   const coverageConfidence=input.collection.sufficiency==='MISSING'?0:input.collection.sufficiency==='INSUFFICIENT'?30:Math.min(100,55+Math.min(20,substantiveProviders*5)+Math.min(25,documentFamilies*5));
   const reasons:string[]=[];let status:UnifiedDecisionPolicyResult['status']='UNCERTAIN';
-  const independentCreatorField=hasIndependentCreatorOwnedPositiveField(positive);
   const aiLedTrading=hasAiLedTradingConfirmation(input.evidence,input.contentCategory);
+  // The AI-led helper already requires a non-title creator-owned citation, so
+  // it is an independent creator field even when the verdict's `concepts`
+  // list is empty and the rawMatches-filtered positive list omits it.
+  const independentCreatorField=aiLedTrading||hasIndependentCreatorOwnedPositiveField(positive);
   const positiveBoundaryForDecision=aiLedTrading?true:boundary.satisfied;
   const compositionOk=aiLedTrading?true:input.composition?compositionConfirmsTrading(input.composition):true;
   const recognitionAllowsConfirmation=aiLedTrading?true:!input.recognition||input.recognition.state==='DECISIVE_TRADING';

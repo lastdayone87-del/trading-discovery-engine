@@ -30,6 +30,10 @@ try {
            FROM provider_call_events
           WHERE operation='multilingual-semantic-classification'
             AND occurred_at >= now() - ($1::int * interval '1 hour')
+            -- Capacity/scale-gate deferrals are emitted before a provider
+            -- request starts; they are waits, not calls.
+            AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'
+            AND COALESCE(request_metadata->>'geminiScaleGateDeferral','') <> 'true'
           GROUP BY provider,status
           ORDER BY calls DESC`,
         [hours],
@@ -63,6 +67,8 @@ try {
              FROM provider_call_events
             WHERE operation='multilingual-semantic-classification'
               AND occurred_at >= now() - ($1::int * interval '1 hour')
+              AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'
+              AND COALESCE(request_metadata->>'geminiScaleGateDeferral','') <> 'true'
          )
          SELECT channel_id,COUNT(*)::int AS calls,
                 COUNT(*) FILTER (WHERE status='SUCCESS')::int AS successes

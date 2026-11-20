@@ -45,6 +45,12 @@ export interface SemanticResultCacheIdentity {
 export interface SemanticResultCacheOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /**
+   * Background writes keep their concurrency slot until the underlying DB
+   * operation settles. The caller deadline still fails the write open, but a
+   * timed-out INSERT must not let the queue start unbounded additional work.
+   */
+  holdUntilSettled?: boolean;
 }
 
 export interface CachedSemanticValue {
@@ -52,6 +58,25 @@ export interface CachedSemanticValue {
   modelVersion: string;
   fallbackUsed?: boolean;
   repairPromptVersion?: string;
+}
+
+/**
+ * Provider-facing cache boundary. Production uses the module functions
+ * directly; tests can inject this port alongside a fake model client to assert
+ * observable read/write behavior without touching PostgreSQL.
+ */
+export interface SemanticResultCachePort {
+  read(
+    identity: SemanticResultCacheIdentity,
+    env: NodeJS.ProcessEnv,
+    options?: SemanticResultCacheOptions,
+  ): Promise<SemanticCacheHit | undefined>;
+  scheduleWrite(
+    identity: SemanticResultCacheIdentity,
+    value: CachedSemanticValue,
+    env: NodeJS.ProcessEnv,
+    options?: SemanticResultCacheOptions,
+  ): void;
 }
 
 export interface SemanticCacheHit extends CachedSemanticValue {
@@ -258,6 +283,14 @@ const queuedSemanticCacheWrites: Array<() => Promise<void>> = [];
 let backgroundWriteFailures = 0;
 let backgroundWriteDropped = 0;
 let lastBackgroundWriteWarningAt = 0;
+let semanticCacheWriterForTests: typeof writeSemanticResultCache | undefined;
+
+/** Test/ops seam: exercise queue drain/backlog without a live database. */
+export function setSemanticResultCacheWriterForTests(
+  writer?: typeof writeSemanticResultCache,
+): void {
+  semanticCacheWriterForTests = writer;
+}
 
 function semanticResultCacheWriteTimeoutMs(env: NodeJS.ProcessEnv): number {
   const raw = env.SEMANTIC_RESULT_CACHE_WRITE_TIMEOUT_MS;
@@ -298,10 +331,12 @@ export function scheduleSemanticResultCacheWrite(
     return;
   }
   queuedSemanticCacheWrites.push(async () => {
-    await writeSemanticResultCache(identity, value, env, {
+    const writer = semanticCacheWriterForTests || writeSemanticResultCache;
+    await writer(identity, value, env, {
       timeoutMs: options.timeoutMs && options.timeoutMs > 0
         ? Math.max(1_000, Math.floor(options.timeoutMs))
         : semanticResultCacheWriteTimeoutMs(env),
+      holdUntilSettled: true,
     });
   });
   drainSemanticCacheWrites();
@@ -340,33 +375,34 @@ export async function writeSemanticResultCache(
   // anyway, and an uncited abstention must remain eligible for a later retry.
   if (!isCacheableSemanticResult(value.result, identity.input)) return;
   const { cacheKey, inputChecksum } = semanticResultCacheKey(identity);
+  const operation = (async () => {
+    const { getDb } = await import('../db');
+    const db = await getDb();
+    return db.query(
+      `INSERT INTO semantic_classification_cache(
+        cache_key,input_checksum,prompt_version,feature_version,model_version,
+        adjudicator_model_version,adjudication_enabled,provider,result,
+        fallback_used,repair_prompt_version,batch_prompt_version
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT(cache_key) DO NOTHING`,
+      [
+        cacheKey,
+        inputChecksum,
+        identity.promptVersion,
+        identity.featureVersion,
+        value.modelVersion,
+        identity.adjudicatorModelVersion || null,
+        identity.adjudicationEnabled === true,
+        identity.provider,
+        JSON.stringify(value.result),
+        value.fallbackUsed === true,
+        value.repairPromptVersion || null,
+        identity.batchPromptVersion || null,
+      ]
+    );
+  })();
   try {
-    await boundedCacheOperation((async () => {
-      const { getDb } = await import('../db');
-      const db = await getDb();
-      return db.query(
-        `INSERT INTO semantic_classification_cache(
-          cache_key,input_checksum,prompt_version,feature_version,model_version,
-          adjudicator_model_version,adjudication_enabled,provider,result,
-          fallback_used,repair_prompt_version,batch_prompt_version
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-        ON CONFLICT(cache_key) DO NOTHING`,
-        [
-          cacheKey,
-          inputChecksum,
-          identity.promptVersion,
-          identity.featureVersion,
-          value.modelVersion,
-          identity.adjudicatorModelVersion || null,
-          identity.adjudicationEnabled === true,
-          identity.provider,
-          JSON.stringify(value.result),
-          value.fallbackUsed === true,
-          value.repairPromptVersion || null,
-          identity.batchPromptVersion || null,
-        ]
-      );
-    })(), options, env);
+    await boundedCacheOperation(operation, options, env);
     noteCacheSuccess();
   } catch (error) {
     if (!options.signal?.aborted) {
@@ -378,5 +414,15 @@ export async function writeSemanticResultCache(
         console.warn('[SemanticResultCache] background write failed:', error instanceof Error ? error.message : error);
       }
     }
+  } finally {
+    // A timed-out write may still be running in the pool. Consume its eventual
+    // rejection and, for queued background writes, keep the caller's concurrency
+    // slot until it settles so a stalled DB cannot accumulate INSERTs.
+    if (options.holdUntilSettled) await operation.catch(() => undefined);
   }
 }
+
+export const defaultSemanticResultCachePort: SemanticResultCachePort = {
+  read: readSemanticResultCache,
+  scheduleWrite: scheduleSemanticResultCacheWrite,
+};

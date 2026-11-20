@@ -108,10 +108,14 @@ function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], col
 }
 
 export function evaluateClassificationStages(input: RawChannelInput, evidence: EvidenceItem[], collection: EvidenceCollectionReport, composition?: ContextualCompositionReport): StagedClassificationReport {
-  const positive = evidence.filter(item => item.polarity === 'POSITIVE' && (item.rawMatches.length > 0 || isSemanticClassificationSource(item.source)));
+  // A semantic verdict can be decisive with an empty `concepts` list, but a
+  // semantic abstention is not affirmative candidate evidence. Exclude
+  // abstentions here while keeping cited non-abstention verdicts on a
+  // rawMatches-free path.
+  const positive = evidence.filter(item => item.polarity === 'POSITIVE' && (item.rawMatches.length > 0 || (isSemanticClassificationSource(item.source) && item.category !== 'SEMANTIC_ABSTENTION')));
   const negative = evidence.filter(item => item.polarity === 'NEGATIVE');
   const semantic = positive.filter(item => isSemanticClassificationSource(item.source) || item.category === 'METHODOLOGY_CONCEPT' || item.category === 'TERMINOLOGY' || item.category === 'INSTRUMENT');
-  const aiLedTrading = hasAiLedTradingConfirmation(positive);
+  const aiLedTrading = hasAiLedTradingConfirmation(evidence);
   const strongPositive = positive.filter(item => item.reliability !== 'LOWER' && Math.abs(item.finalWeight) >= 6);
   const corroborating = strongPositive.filter(item => item.category !== 'MULTI_VIDEO_CONSISTENCY');
   const sources = new Set(corroborating.map(item => item.source));

@@ -774,6 +774,16 @@ test('a few trading uploads on an otherwise music channel do not fast-pass', asy
   assert.equal(hasDecisiveTradingShare(genericTrader, [], new Set([0, 1, 2, 3, 4, 5])), true);
 });
 
+test('a single trading upload cannot fast-pass a tiny channel without creator signals', async () => {
+  const thin = evidence({
+    name: 'Clip Feed',
+    bio: 'Clips',
+    videos: [{ title: 'NQ futures trade recap', description: 'Futures execution.' }],
+  });
+  const result = await evaluateDeterministicAdmission(thin);
+  assert.notEqual(result.outcome, 'PASS');
+});
+
 test('a bio-only decisive creator still fast-passes without a video sample', async () => {
   const bioOnly = evidence({ name: 'Nifty Trader', bio: 'Daily Nifty trading analysis and risk management.', videos: [] });
   const result = await evaluateDeterministicAdmission(bioOnly);

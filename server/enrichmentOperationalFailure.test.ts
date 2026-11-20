@@ -63,6 +63,23 @@ test('stage REJECT without a terminal non-trading decision still retries provide
   assert.ok(enrichmentOperationalFailure(d.evidenceCollection,true,ready));
 });
 
+test('AI-led confirmation with no contradiction evidence still retries an uncovered failed provider',()=>{
+  const d=decision({lifecycle:'CONFIRM',source:'gemini_semantic',degraded:false});
+  d.stagedClassification={pipelineVersion:'test',lifecycleAction:'CONFIRM',stages:[
+    {stage:'CANDIDATE_DETECTION',disposition:'PASS',reasonCodes:['SEMANTIC_CANDIDATE_FOUND'],evidenceIds:['p1'],fields:[],metrics:{}},
+    {stage:'CONTRADICTION',disposition:'PASS',reasonCodes:['NO_AFFIRMATIVE_CONTRADICTION'],evidenceIds:[],fields:[],metrics:{}},
+    {stage:'LIFECYCLE',disposition:'PASS',reasonCodes:['ROUTE_CONFIRM','AI_LED_CONFIRMATION'],evidenceIds:[],fields:[],metrics:{action:'CONFIRM'}},
+  ]};
+  d.evidenceCollection={...d.evidenceCollection,degraded:true,providers:[
+    {provider:'gemini_semantic',availability:'AVAILABLE',evidenceCount:1,outcome:'EXECUTED_WITH_EVIDENCE',reasonCodes:[]},
+    {provider:'discord_metadata',availability:'FAILED',evidenceCount:0,outcome:'FAILED_PROVIDER',reasonCodes:['PROVIDER_TIMEOUT']},
+  ]};
+  assert.equal(hasDecisionGradeEvidenceWithoutFailedProviders(d),false);
+  assert.ok(enrichmentOperationalFailure(d.evidenceCollection,true,false));
+  d.evidenceCollection={...d.evidenceCollection,degraded:false,providers:d.evidenceCollection.providers.filter(provider=>provider.provider!=='discord_metadata')};
+  assert.equal(hasDecisionGradeEvidenceWithoutFailedProviders(d),true);
+});
+
 test('failed-provider evidence never qualifies as independent decision-grade support',()=>{
   const d=decision({lifecycle:'CONFIRM',source:'gemini_semantic'});
   assert.equal(hasDecisionGradeEvidenceWithoutFailedProviders(d),false);

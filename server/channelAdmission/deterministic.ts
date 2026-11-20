@@ -295,9 +295,10 @@ export function decisionTradingVideoIndexes(
         // hashtags/URLs in that video's title or description. This applies to
         // terminology and any other category that carries a video field.
         const video = evidence.videos[fieldRef.index];
-        if (item.rawMatches.length > 0) {
+        const rawMatches = item.rawMatches || [];
+        if (rawMatches.length > 0) {
           const text = withoutHashtagsAndUrls(`${video?.title || ''} ${video?.description || ''}`).toLocaleLowerCase('und');
-          const substantive = item.rawMatches.some(match => {
+          const substantive = rawMatches.some(match => {
             const term = String(match || '').trim().toLocaleLowerCase('und');
             return term.length >= 3 && text.includes(term);
           });

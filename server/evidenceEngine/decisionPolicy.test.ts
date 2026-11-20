@@ -272,3 +272,40 @@ test('a dominant creator-owned contradiction still blocks an AI trading verdict'
   });
   assert.notEqual(decision.status, 'TRADING_CONFIRMED');
 });
+
+test('an AI-led verdict confirms despite a raw score below the deterministic boundary', () => {
+  const decision = evaluateUnifiedDecisionPolicy({
+    evidence: [{ ...semanticTrading(), finalWeight: 5 }],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 10,
+    minimumTradingScore: 99,
+    contentCategory: 'ACTIVE_TRADING',
+    composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+    recognition: { state: 'AMBIGUOUS_THIN' } as any,
+  });
+  assert.equal(decision.status, 'TRADING_CONFIRMED');
+  assert.ok(decision.reasonCodes.includes('AI_LED_TRADING_CONFIRMATION'));
+});
+
+test('LEGACY routing restores the pre-v2 confirmation veto for the same verdict', () => {
+  const previous = process.env.DETERMINISTIC_CLASSIFICATION_ROUTING;
+  process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = 'LEGACY';
+  try {
+    const decision = evaluateUnifiedDecisionPolicy({
+      evidence: [{ ...semanticTrading(), finalWeight: 5 }],
+      collection: collection(),
+      lifecycleAction: 'CONFIRM',
+      minimumPositiveWeight: 10,
+      minimumTradingScore: 99,
+      contentCategory: 'ACTIVE_TRADING',
+      composition: { focus: 'INSUFFICIENT_COVERAGE' } as any,
+      recognition: { state: 'AMBIGUOUS_THIN' } as any,
+    });
+    assert.notEqual(decision.status, 'TRADING_CONFIRMED');
+    assert.ok(!decision.reasonCodes.includes('AI_LED_TRADING_CONFIRMATION'));
+  } finally {
+    if (previous === undefined) delete process.env.DETERMINISTIC_CLASSIFICATION_ROUTING;
+    else process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = previous;
+  }
+});

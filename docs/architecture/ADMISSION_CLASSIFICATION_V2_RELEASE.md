@@ -41,8 +41,9 @@ verdict. Tier-A refers to the classifier's strongest creator-owned content famil
 | Trading-relevant deterministic recall | 70.6% | 52.7% |
 | Unrelated rejection recall | 6.9% | 6.9% |
 
-Blocked fast passes abstain and reach the one AI judge. No global threshold
-was lowered.
+The 154 channels removed from the deterministic fast path are a deliberate
+recall/coverage trade: they abstain and reach the one AI judge instead of being
+confirmed without AI review. No global threshold was lowered.
 
 ## Existing full-classifier validation
 
@@ -67,8 +68,16 @@ new routing on fresh production evidence.
 The release is a single cutover. Production ran the old image until this PR
 merged. No shadow or canary path was deployed. Image rollback is the previous
 production image (`75694245`); migrations are additive and do not require a
-destructive rollback. Existing affected records are reprocessed under the new
-path in bounded batches; no mass approval.
+destructive rollback. If the new image fails health or produces regressions,
+redeploy the previous image, leave the additive tables/columns in place, and
+keep admission mode OFF until the candidate fix is verified.
+
+Existing affected records are reprocessed under the new path in bounded
+batches; no mass approval. Both reprocessing scripts are dry-run by default,
+default to `--limit=25`, cap a single batch at 500, and stop when the
+classification queue reaches its configured pending capacity. Run dry-run,
+inspect the selected rows, then apply one bounded batch at a time and recheck
+the queue before enlarging it.
 
 Post-deploy checks:
 
@@ -77,5 +86,6 @@ Post-deploy checks:
    semantic admission judgement.
 3. One classifier AI judgement after enrichment; unchanged evidence hits cache.
 4. Confirmed/non-trading terminal rows are preserved on rediscovery.
-5. Monitor confirmation, rejection, review, ENRICH, AI calls, cache hits and
-   provider retries before enlarging reprocessing batches.
+5. Monitor confirmation, rejection, review, ENRICH, AI calls, cache hits,
+   cache-write failures/dropped/backlog (exposed as `semanticCacheWrites` on
+   `/api/health`) and provider retries before enlarging reprocessing batches.

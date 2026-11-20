@@ -4,7 +4,7 @@ import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallEr
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { abortedByDeadline } from './abortReason';
-import { readSemanticResultCache, scheduleSemanticResultCacheWrite, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON } from '../semanticResultCache';
+import { defaultSemanticResultCachePort, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { citationsReferenceSuppliedDocuments, semanticFieldDocuments } from '../semanticDocumentRefs';
@@ -384,8 +384,13 @@ async function classifyCandidateWith404Fallback(client: SemanticModelClient, can
 
 export class GeminiSemanticProvider implements EvidenceProvider {
   name = 'gemini_semantic' as const;
-  constructor(private readonly injectedClient?: SemanticModelClient) {}
+  constructor(
+    private readonly injectedClient?: SemanticModelClient,
+    private readonly cachePort?: SemanticResultCachePort,
+  ) {}
   private client() { return this.injectedClient || defaultClient(); }
+  private cache() { return this.cachePort || defaultSemanticResultCachePort; }
+  private cacheAllowed() { return Boolean(this.cachePort) || !this.injectedClient; }
   availability(input: RawChannelInput) {
     if (!this.client()) return { availability: 'UNAVAILABLE' as const, reason: 'GEMINI_API_KEY is not configured.' };
     if (!hasCreatorLevelSemanticContext(input)) {
@@ -423,7 +428,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
         evidenceChecksum: cacheIdentityKeys.inputChecksum,
       },
     };
-    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
+    const cached = this.cacheAllowed() ? await this.cache().read(cacheIdentity, process.env, { signal }) : undefined;
     let result: SemanticModelResult;
     let model: string;
     let fallbackReasonCodes: string[];
@@ -467,7 +472,7 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       // abstentions stay out of the cache so a later attempt can recover.
       result = { ...result, citations: result.citations.filter(ref => citationsReferenceSuppliedDocuments([ref], input)) };
       if (result.citations.length === 0) cacheable = false;
-      if (!this.injectedClient && cacheable) scheduleSemanticResultCacheWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
+      if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:
     // it never changes the verdict, and enforce mode records nothing because

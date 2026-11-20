@@ -9,7 +9,7 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
-import { readSemanticResultCache, scheduleSemanticResultCacheWrite, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON } from '../semanticResultCache';
+import { defaultSemanticResultCachePort, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { isSemanticResultShape, isSemanticVerdictIdentity } from '../semanticResultShape';
@@ -1394,8 +1394,13 @@ export function retainSuppliedCitations(
 
 export class GroqSemanticProvider implements EvidenceProvider {
   name = 'groq_semantic' as const;
-  constructor(private readonly injectedClient?: SemanticModelClient) {}
+  constructor(
+    private readonly injectedClient?: SemanticModelClient,
+    private readonly cachePort?: SemanticResultCachePort,
+  ) {}
   private client() { return this.injectedClient || defaultClient(); }
+  private cache() { return this.cachePort || defaultSemanticResultCachePort; }
+  private cacheAllowed() { return Boolean(this.cachePort) || !this.injectedClient; }
   availability(input: RawChannelInput) {
     if (!this.client()) return { availability: 'UNAVAILABLE' as const, reason: 'GROQ_API_KEY is not configured.' };
     if (!hasCreatorLevelSemanticContext(input)) {
@@ -1439,7 +1444,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
         evidenceChecksum: cacheIdentityKeys.inputChecksum,
       },
     };
-    const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
+    const cached = this.cacheAllowed() ? await this.cache().read(cacheIdentity, process.env, { signal }) : undefined;
     let result: SemanticModelResult;
     let model: string;
     let fallbackReasonCodes: string[];
@@ -1529,7 +1534,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // Cache the final verdict after repair/adjudication. Repair provenance
       // is stored explicitly so a cache hit reports the same reason codes.
       // Injected clients are a test/shadow seam and never touch the cache.
-      if (!this.injectedClient && cacheable) scheduleSemanticResultCacheWrite(cacheIdentity, {
+      if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, {
         result,
         modelVersion: model,
         fallbackUsed: candidate.fallbackUsed,

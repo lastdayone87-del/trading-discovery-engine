@@ -50,7 +50,7 @@ test('the closed taxonomy includes trading education and market institutions', (
 });
 
 
-test('cache eligibility accepts a valid verdict identity while the parser normalizes nested fields', () => {
+test('cache eligibility accepts a complete verdict identity and rejects malformed nested fields', () => {
   assert.equal(isSemanticVerdictIdentity(result()), true);
   assert.equal(isSemanticVerdictIdentity(result({ languages: [{ language: 'en', script: 'Latn', confidence: 90, field: 'not_a_field' }] })), false);
   assert.equal(isSemanticVerdictIdentity(result({ citations: [{ field: 'not_a_field' }] })), false);

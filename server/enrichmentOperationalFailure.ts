@@ -129,7 +129,13 @@ export function hasDecisionGradeEvidenceWithoutFailedProviders(decision: Verific
   return expectedStages.every(([stageName, disposition]) => {
     const stage = staged.stages.find(item => item.stage === stageName);
     if (!stage || stage.disposition !== disposition) return false;
-    if (stage.evidenceIds.length === 0 && !(aiLedConfirmation && stageName === 'CONTRADICTION')) return false;
+    if (stage.evidenceIds.length === 0) {
+      // An AI-led confirmation can legitimately have no contradiction evidence
+      // to cite, but `[].every(...)` must not make an uncovered provider
+      // failure look decision-grade.
+      if (!(aiLedConfirmation && stageName === 'CONTRADICTION')) return false;
+      return uncoveredFailedProviders(decision.evidenceCollection).length === 0;
+    }
     return stage.evidenceIds.every(id => {
       const evidence = evidenceById.get(id);
       return !!evidence && !failedProviders.has(evidence.source);

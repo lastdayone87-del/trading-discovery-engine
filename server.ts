@@ -29,6 +29,7 @@ import {
 } from './server/db';
 import { buildQueryQualityDashboard, QUERY_QUALITY_DASHBOARD_MAX_ROWS } from './server/queryQuality/dashboard';
 import { getExecutionLineageMetrics } from './server/executionLineageMetrics';
+import { semanticResultCacheWriteMetrics } from './server/evidenceEngine/semanticResultCache';
 import { inspectPassivePrograms } from './server/passiveExploration';
 import { inspectTopicPilot, updatePilotControl } from './server/topicPilot';
 import { inspectCoverageLifecycle, recordLifecycleEvent } from './server/coverageLifecycle';
@@ -291,7 +292,13 @@ async function startServer() {
   // Health check
   app.get('/api/health', (_req, res) => {
     const state = readiness.snapshot();
-    res.status(state.readiness === 'ready' ? 200 : 503).json(state);
+    // Process-local, read-only cache-write telemetry. These counters never
+    // affect readiness; they let operators see dropped or failed background
+    // cache writes without another database round trip.
+    res.status(state.readiness === 'ready' ? 200 : 503).json({
+      ...state,
+      semanticCacheWrites: semanticResultCacheWriteMetrics(),
+    });
   });
 
   // Country Discovery Loop deploy gate and operating metrics. The health route
