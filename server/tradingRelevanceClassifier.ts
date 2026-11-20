@@ -331,7 +331,15 @@ export async function classifyTradingRelevanceDetailed(
  * search result must not be promoted into the video-evidence providers.
  */
 export function normalizeFieldAwareInput(value: RawChannelInput): RawChannelInput {
-  const retrievalOnly = !!value.search_match_context && (value.enrichment_stage || 0) === 0;
+  // A search-match context marks retrieval provenance, but it does not prove
+  // that every video field is retrieval-selected. Admission snapshots and
+  // enrichment passes can supply an authoritative creator-owned video sample
+  // alongside the matched document. Those videos must reach composition and
+  // the semantic judge; dropping them makes the classifier evaluate less
+  // evidence than it actually holds.
+  const retrievalOnly = !!value.search_match_context
+    && (value.enrichment_stage || 0) === 0
+    && value.videoDescriptionsAuthoritative !== true;
   const videos = retrievalOnly
     ? []
     : value.videos?.map(video=>({...video})) || (value.video_titles||[]).map((title,index)=>({title,description:value.video_descriptions?.[index]}));
