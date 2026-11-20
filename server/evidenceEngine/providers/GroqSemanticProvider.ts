@@ -9,10 +9,10 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
-import { readSemanticResultCache, SEMANTIC_RESULT_CACHE_HIT_REASON, writeSemanticResultCache } from '../semanticResultCache';
+import { readSemanticResultCache, scheduleSemanticResultCacheWrite, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
-import { isSemanticResultShape } from '../semanticResultShape';
+import { isSemanticResultShape, isSemanticVerdictIdentity } from '../semanticResultShape';
 import { candidateDocumentRefs } from '../semanticDocumentRefs';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
@@ -1413,7 +1413,6 @@ export class GroqSemanticProvider implements EvidenceProvider {
     if (!client) return [];
     const candidateModel = process.env.GROQ_CANDIDATE_MODEL || DEFAULT_GROQ_CANDIDATE_MODEL;
     const adjudicatorModel = process.env.GROQ_ADJUDICATOR_MODEL || DEFAULT_GROQ_ADJUDICATOR_MODEL;
-    const observability = { jobId: input.job_id, runId: input.run_id };
     const adjudicationEnabled = process.env.MULTILINGUAL_ADJUDICATION_ENABLED === 'true';
     const cacheIdentity = {
       input,
@@ -1431,6 +1430,15 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // model-facing request; a cached result must not outlive them.
       requestSettings: groqRequestSettingsKey(),
     };
+    const cacheIdentityKeys = semanticResultCacheKey(cacheIdentity);
+    const observability = {
+      jobId: input.job_id,
+      runId: input.run_id,
+      requestMetadata: {
+        channelId: input.channel_id,
+        evidenceChecksum: cacheIdentityKeys.inputChecksum,
+      },
+    };
     const cached = this.injectedClient ? undefined : await readSemanticResultCache(cacheIdentity, process.env, { signal });
     let result: SemanticModelResult;
     let model: string;
@@ -1447,10 +1455,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
     } else {
       const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
       const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-      // Only a complete model reply may be cached. parseSemanticResult turns
-      // a missing/partial reply into an AMBIGUOUS abstention; persisting that
-      // placeholder would replay it for the same evidence indefinitely.
-      let cacheable = isSemanticResultShape(candidate.value);
+      // Only a bounded verdict identity may be cached. parseSemanticResult
+      // normalizes nested fields, but a missing label/confidence/citation set is
+      // an abstention placeholder and must stay retryable.
+      let cacheable = isSemanticVerdictIdentity(candidate.value);
       // A verdict produced inside a multi-channel batch saw sibling evidence
       // and a different completion allowance. Keep it out of the cache: the
       // realized batch request is not part of this per-channel identity.
@@ -1493,6 +1501,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
           // Keep the original result, which abstains.
         }
       }
+      // A repaired decisive verdict is cacheable when the repair supplied
+      // usable citations; the original uncited candidate was not. The final
+      // write still validates the parsed result against the supplied evidence.
+      if (repairUsed) cacheable = isSemanticVerdictIdentity({ ...(candidate.value as Record<string, unknown>), citations: repairedCitations });
       // The repair code marks only results that survive to evidence
       // construction with their repaired citations: a later adjudication that
       // replaces the result drops the code with it. Evaluated below, after
@@ -1504,7 +1516,7 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // still adjudicate low-confidence results.
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
-        cacheable = cacheable && isSemanticResultShape(adjudicatedValue);
+        cacheable = cacheable && isSemanticVerdictIdentity(adjudicatedValue);
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
@@ -1512,12 +1524,12 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // Cache the final verdict after repair/adjudication. Repair provenance
       // is stored explicitly so a cache hit reports the same reason codes.
       // Injected clients are a test/shadow seam and never touch the cache.
-      if (!this.injectedClient && cacheable) await writeSemanticResultCache(cacheIdentity, {
+      if (!this.injectedClient && cacheable) scheduleSemanticResultCacheWrite(cacheIdentity, {
         result,
         modelVersion: model,
         fallbackUsed: candidate.fallbackUsed,
         repairPromptVersion: repairSurvived() ? SEMANTIC_CITATION_REPAIR_PROMPT_VERSION : undefined,
-      }, process.env, { signal });
+      }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:
     // it never changes the verdict, and enforce mode records nothing because
