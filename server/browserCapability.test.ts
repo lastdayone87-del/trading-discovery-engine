@@ -242,6 +242,9 @@ test('resource safety: a tight cgroup limit caps the container headroom even wit
     setMemoryHeadroomReaderForTests({ containerLimit: () => null, containerUsage: () => 900 });
     assert.equal(hostMemAvailableForExtraSlot(), 5_000,
       'an unbounded cgroup falls back to the host reading alone');
+    setMemoryHeadroomReaderForTests({ containerLimit: () => 4_000, containerUsage: () => null });
+    assert.equal(hostMemAvailableForExtraSlot(), null,
+      'a configured limit with unreadable usage fails closed — no slot granted on a guess');
   } finally {
     setMemoryHeadroomReaderForTests(restoreReader);
   }

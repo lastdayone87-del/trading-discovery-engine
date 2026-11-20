@@ -155,7 +155,11 @@ export function hostMemAvailableForExtraSlot(): number | null {
   let effective = hostAvailableMb;
   const containerLimitMb = headroomReader.containerLimit();
   if (containerLimitMb !== null) {
-    const containerUsageMb = headroomReader.containerUsage() ?? 0;
+    const containerUsageMb = headroomReader.containerUsage();
+    // A configured limit with unreadable usage fails closed: the container
+    // could be sitting at its cap, so an extra slot must not be granted on a
+    // guess. (Only the HOST reading fails open — see effectiveRuntimeLimit.)
+    if (containerUsageMb === null) return null;
     effective = Math.min(effective, Math.max(0, containerLimitMb - containerUsageMb));
   }
   const threshold = Number(process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB);
