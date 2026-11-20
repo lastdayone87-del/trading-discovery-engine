@@ -87,26 +87,16 @@ const reviewEvidence = fixtureEvidence({
   videos: [{ title: 'One video' }],
 });
 
-const unknownJudgment: SemanticJudgment = {
-  mainSubject: 'UNKNOWN',
-  tradingFocus: 40,
-  unrelatedDomains: [],
-  incidentalTradingMentions: [],
-  citations: [],
-  explanation: 'Staging fixture: genuinely ambiguous.',
-  model: 'staging-fixture',
-  provider: 'gemini_semantic',
-};
+const humanAdmitEvidence = fixtureEvidence({
+  channelId: `${PREFIX}HUMAN_ADMIT`,
+  channelName: 'Human Admit Candidate',
+  description: 'Short bio',
+  videos: [{ title: 'One video' }],
+});
 
-const unknownJudge = {
+const forbiddenJudge = {
   async judge(): Promise<SemanticJudgment> {
-    return { ...unknownJudgment };
-  },
-};
-
-const providerFailureJudge = {
-  async judge(): Promise<SemanticJudgment> {
-    throw Object.assign(new Error('429 rate limit exceeded'), { status: 429, retryable: true });
+    throw new Error('SEMANTIC_ADMISSION_MUST_NOT_RUN');
   },
 };
 
@@ -123,6 +113,18 @@ function candidateInput(evidence: AdmissionEvidence): AdmissionCandidateInput {
     targetCountry: 'Sweden',
     source: 'automated_query',
   };
+}
+
+async function prepareNeedsReviewCandidate(db: any, evidence: AdmissionEvidence): Promise<{ input: AdmissionCandidateInput; row: any }> {
+  const input = candidateInput(evidence);
+  const row = await upsertAdmissionCandidate(input);
+  await db.query(
+    `UPDATE semantic_admission_candidates
+        SET status='NEEDS_REVIEW', decision='NEEDS_REVIEW', evidence_snapshot=$2, attempts=0, next_check_at=NULL, expires_at=NULL
+      WHERE id=$1`,
+    [row.id, JSON.stringify(evidence)],
+  );
+  return { input, row: await findAdmissionCandidate(evidence.channelId) };
 }
 
 async function cleanup(db: any): Promise<void> {
@@ -333,36 +335,43 @@ async function main(): Promise<void> {
     return { channel: channel?.admission_status, classificationJobs: jobs.rowCount };
   });
 
-  await check('semantic ambiguity persists terminal NEEDS_REVIEW without channel or enrichment', async () => {
+  await check('deterministic ambiguity enqueues stage-1 enrichment and never calls the semantic judge', async () => {
     const input = candidateInput(reviewEvidence);
     const row = await upsertAdmissionCandidate(input);
-    const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: reviewEvidence, judge: unknownJudge });
-    assert.equal(result.status, 'NEEDS_REVIEW');
+    const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: reviewEvidence, judge: forbiddenJudge });
+    assert.equal(result.status, 'ADMITTED_AMBIGUOUS');
     const candidate = await findAdmissionCandidate(reviewEvidence.channelId);
-    assert.equal(candidate?.status, 'NEEDS_REVIEW');
+    assert.equal(candidate?.status, 'ADMITTED_AMBIGUOUS');
     const ledger = await db.query(`SELECT decision FROM semantic_admission_decisions WHERE channel_id=$1 LIMIT 1`, [reviewEvidence.channelId]);
-    assert.equal(ledger.rows[0]?.decision, 'NEEDS_REVIEW');
-    assert.equal(await getChannelById(reviewEvidence.channelId), null);
-    const jobs = await db.query(`SELECT id FROM jobs WHERE payload->>'channelId'=$1`, [reviewEvidence.channelId]);
-    assert.equal(jobs.rowCount, 0);
-    return { candidateStatus: candidate?.status, jobs: 0 };
+    assert.equal(ledger.rows[0]?.decision, 'ADMIT_AMBIGUOUS');
+    const channel = await getChannelById(reviewEvidence.channelId);
+    assert.equal(channel?.admission_status, 'ADMITTED_AMBIGUOUS');
+    assert.equal(channel?.scan_status, 'ENRICHMENT_PENDING');
+    const jobs = await db.query(`SELECT type,payload FROM jobs WHERE payload->>'channelId'=$1`, [reviewEvidence.channelId]);
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0].type, 'ENRICH_CHANNEL');
+    assert.equal(Number(jobs.rows[0].payload.enrichmentStage), 1);
+    assert.equal(jobs.rows[0].payload.candidate?.admissionConfirmedTrading, false);
+    assert.equal(jobs.rows[0].payload.candidate?.admissionDecisionSource, 'DETERMINISTIC');
+    return { candidateStatus: candidate?.status, jobType: jobs.rows[0].type, stage: jobs.rows[0].payload.enrichmentStage };
   });
 
   await check('human review ADMIT creates a channel and one durable classification', async () => {
+    await prepareNeedsReviewCandidate(db, humanAdmitEvidence);
     const resolved = await resolveAdmissionReview({
-      channelId: reviewEvidence.channelId,
+      channelId: humanAdmitEvidence.channelId,
       action: 'ADMIT',
       reviewer: 'staging-e2e',
       reason: 'fixture confirms trading evidence',
     });
     assert.equal(resolved.status, 'ADMITTED');
-    const candidate = await findAdmissionCandidate(reviewEvidence.channelId);
+    const candidate = await findAdmissionCandidate(humanAdmitEvidence.channelId);
     assert.equal(candidate?.status, 'ADMITTED');
-    const channel = await getChannelById(reviewEvidence.channelId);
+    const channel = await getChannelById(humanAdmitEvidence.channelId);
     assert.equal(channel?.admission_status, 'ADMITTED');
-    const jobs = await db.query(`SELECT id FROM jobs WHERE payload->>'channelId'=$1 AND type='CLASSIFY_DISCOVERED_CHANNEL'`, [reviewEvidence.channelId]);
+    const jobs = await db.query(`SELECT id FROM jobs WHERE payload->>'channelId'=$1 AND type='CLASSIFY_DISCOVERED_CHANNEL'`, [humanAdmitEvidence.channelId]);
     assert.equal(jobs.rowCount, 1);
-    const ledger = await db.query(`SELECT decision FROM semantic_admission_decisions WHERE channel_id=$1 ORDER BY created_at DESC LIMIT 1`, [reviewEvidence.channelId]);
+    const ledger = await db.query(`SELECT decision FROM semantic_admission_decisions WHERE channel_id=$1 ORDER BY created_at DESC LIMIT 1`, [humanAdmitEvidence.channelId]);
     assert.equal(ledger.rows[0]?.decision, 'ADMIT');
     return { status: resolved.status, classificationJobs: jobs.rowCount };
   });
@@ -374,11 +383,8 @@ async function main(): Promise<void> {
       description: 'Short bio',
       videos: [{ title: 'One video' }],
     });
-    const input = candidateInput(evidence);
     await insertDeferredChannel(evidence.channelId);
-    const row = await upsertAdmissionCandidate(input);
-    const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: evidence, judge: unknownJudge });
-    assert.equal(result.status, 'NEEDS_REVIEW');
+    await prepareNeedsReviewCandidate(db, evidence);
     const resolved = await resolveAdmissionReview({
       channelId: evidence.channelId,
       action: 'REJECT',
@@ -399,10 +405,7 @@ async function main(): Promise<void> {
       description: 'Short bio',
       videos: [{ title: 'One video' }],
     });
-    const input = candidateInput(evidence);
-    const row = await upsertAdmissionCandidate(input);
-    const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: evidence, judge: unknownJudge });
-    assert.equal(result.status, 'NEEDS_REVIEW');
+    await prepareNeedsReviewCandidate(db, evidence);
     await db.query(`UPDATE semantic_admission_candidates SET attempts=3 WHERE channel_id=$1`, [evidence.channelId]);
     const resolved = await resolveAdmissionReview({
       channelId: evidence.channelId,
@@ -419,59 +422,6 @@ async function main(): Promise<void> {
     const requeued = await findAdmissionCandidate(evidence.channelId);
     assert.equal(Number(requeued?.attempts), 0);
     return { jobs: jobs.rowCount, key: jobs.rows[0].idempotency_key, attempts: requeued?.attempts };
-  });
-
-  await check('provider failure retains attempts/expiry and schedules provider-retry:2 then provider-retry:3', async () => {
-    const evidence = fixtureEvidence({
-      channelId: `${PREFIX}DEFERRED`,
-      channelName: 'Provider Deferred Candidate',
-      description: 'Short bio',
-      videos: [{ title: 'One video' }],
-    });
-    const input = candidateInput(evidence);
-    const row = await upsertAdmissionCandidate(input);
-    const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: evidence, judge: providerFailureJudge });
-    assert.equal(result.status, 'PROVIDER_DEFERRED');
-    const candidate = await findAdmissionCandidate(evidence.channelId);
-    assert.equal(candidate?.status, 'PROVIDER_DEFERRED');
-    assert.equal(Number(candidate?.attempts), 0);
-    assert.equal(candidate?.expires_at, null);
-    assert.ok(candidate?.next_check_at);
-    const ledger = await db.query(`SELECT id FROM semantic_admission_decisions WHERE channel_id=$1`, [evidence.channelId]);
-    assert.equal(ledger.rowCount, 0);
-    const attempt2 = nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 1, candidateAttempts: 0 });
-    await enqueueAdmissionVerification({ candidate: input, attempt: attempt2, runAfter: candidate!.next_check_at!, retryKind: 'provider' });
-    const attempt3 = nextAdmissionVerificationAttempt({ status: 'PROVIDER_DEFERRED', jobAttempt: 2, candidateAttempts: 0 });
-    await enqueueAdmissionVerification({ candidate: input, attempt: attempt3, runAfter: candidate!.next_check_at!, retryKind: 'provider' });
-    const keys = await db.query(`SELECT idempotency_key,status FROM jobs WHERE payload->>'channelId'=$1 AND type='VERIFY_CHANNEL_ADMISSION' ORDER BY idempotency_key`, [evidence.channelId]);
-    assert.equal(keys.rowCount, 2);
-    assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':provider-retry:2')));
-    assert.ok(keys.rows.some((job: any) => job.idempotency_key.endsWith(':provider-retry:3')));
-    return { attempts: candidate?.attempts, expiresAt: candidate?.expires_at, retryKeys: keys.rows.map((job: any) => job.idempotency_key) };
-  });
-
-  await check('worker schedules the next provider-deferred successor from the real job payload', async () => {
-    const evidence = fixtureEvidence({
-      channelId: `${PREFIX}WORKER_DEFER`,
-      channelName: 'Worker Deferred Candidate',
-      description: 'Short bio',
-      videos: [{ title: 'One video' }],
-    });
-    const input = candidateInput(evidence);
-    const row = await upsertAdmissionCandidate(input);
-    const job = await enqueueAdmissionVerification({ candidate: input, attempt: 2, retryKind: 'provider' });
-    await processAdmissionVerificationJob(
-      { ...job, payload: { ...job.payload, attempt: 2 } } as any,
-      { evidenceOverride: evidence, judge: providerFailureJudge },
-    );
-    const candidate = await findAdmissionCandidate(evidence.channelId);
-    assert.equal(candidate?.status, 'PROVIDER_DEFERRED');
-    assert.equal(Number(candidate?.attempts), 0);
-    assert.equal(candidate?.expires_at, null);
-    const keys = await db.query(`SELECT idempotency_key FROM jobs WHERE payload->>'channelId'=$1 AND type='VERIFY_CHANNEL_ADMISSION' ORDER BY idempotency_key`, [evidence.channelId]);
-    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':provider-retry:2')));
-    assert.ok(keys.rows.some((item: any) => item.idempotency_key.endsWith(':provider-retry:3')));
-    return { attempts: candidate?.attempts, retryKeys: keys.rows.map((item: any) => item.idempotency_key) };
   });
 
   await check('duplicate admission enqueue is idempotent and active-job detection works', async () => {

@@ -71,7 +71,7 @@ export function buildAdmissionConfirmedClassification(
   })) : [];
   const providerMissing = !nonSemantic && citations.length > 0 && !provider;
   const evidenceSufficiency = nonSemantic || positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
-  const degraded = human ? false : confidence < ADMISSION_CONFIRMATION_MIN_CONFIDENCE || (!nonSemantic && positiveEvidence.length === 0);
+  const degraded = human || deterministic ? false : confidence < ADMISSION_CONFIRMATION_MIN_CONFIDENCE || (!nonSemantic && positiveEvidence.length === 0);
   const humanReview = degraded;
   const reasonCode = human ? 'HUMAN_REVIEW_ADMISSION_CONFIRMED' : deterministic ? 'DETERMINISTIC_ADMISSION_CONFIRMED' : 'SEMANTIC_ADMISSION_CONFIRMED';
   const provenanceLabel = human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_ADMISSION' : 'SEMANTIC_ADMISSION';
@@ -133,7 +133,7 @@ export function buildAdmissionConfirmedClassification(
         : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
     classificationMethod: human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_EVIDENCE' : 'SEMANTIC_ADMISSION',
-    recognitionState: human || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+    recognitionState: human || deterministic || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
     semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
     providerCoverage: 1,
     evidenceCount: positiveEvidence.length,
@@ -147,7 +147,7 @@ export function buildAdmissionConfirmedClassification(
       enrich: false,
       confidence,
       evidenceSufficiency,
-      recognitionState: human || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
+      recognitionState: human || deterministic || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
       semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
       fallbackReason: evidenceSufficiency === 'SUFFICIENT'
         ? null

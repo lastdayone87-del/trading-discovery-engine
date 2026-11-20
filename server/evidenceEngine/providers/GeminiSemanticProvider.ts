@@ -7,7 +7,7 @@ import { abortedByDeadline } from './abortReason';
 import { readSemanticResultCache, scheduleSemanticResultCacheWrite, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
-import { semanticFieldDocuments } from '../semanticDocumentRefs';
+import { citationsReferenceSuppliedDocuments, semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, isSemanticResultShape, isSemanticVerdictIdentity, type SemanticResultLabel } from '../semanticResultShape';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-4';
@@ -465,6 +465,8 @@ export class GeminiSemanticProvider implements EvidenceProvider {
       // without spending provider quota. Injected clients are a test/shadow
       // seam and must never read or write the production cache. Uncited
       // abstentions stay out of the cache so a later attempt can recover.
+      result = { ...result, citations: result.citations.filter(ref => citationsReferenceSuppliedDocuments([ref], input)) };
+      if (result.citations.length === 0) cacheable = false;
       if (!this.injectedClient && cacheable) scheduleSemanticResultCacheWrite(cacheIdentity, { result, modelVersion: model, fallbackUsed: candidate.fallbackUsed }, process.env);
     }
     // Shadow validation for the Phase 4 prefilter gate. Observability only:
