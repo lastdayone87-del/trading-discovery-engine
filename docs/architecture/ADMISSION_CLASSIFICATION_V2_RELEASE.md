@@ -26,7 +26,9 @@ discovery
 Semantic admission is no longer a decision judge. It remains ledger/audit
 provenance only. The full classifier's composition/recognition remains a
 coverage/contradiction signal; it cannot independently veto a valid AI trading
-verdict. Tier-A refers to the classifier's strongest creator-owned content families (for example an explicit trading bio or a substantive trading video), as defined in `server/evidenceEngine/contextualComposition.ts`.
+verdict. Cache eligibility is decided on the parsed, citation-resolved verdict,
+so a valid AI judgment is replayed on unchanged evidence even if the raw model
+reply omitted an optional field. Tier-A refers to the classifier's strongest creator-owned content families (for example an explicit trading bio or a substantive trading video), as defined in `server/evidenceEngine/contextualComposition.ts`.
 
 ## Frozen-900 deterministic result
 

@@ -9,10 +9,10 @@ import {
 } from '../../providerResilience';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
-import { defaultSemanticResultCachePort, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
+import { defaultSemanticResultCachePort, isCacheableSemanticResult, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
-import { isSemanticResultShape, isSemanticVerdictIdentity } from '../semanticResultShape';
+import { isSemanticResultShape } from '../semanticResultShape';
 import { candidateDocumentRefs, citationsReferenceSuppliedDocuments } from '../semanticDocumentRefs';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
@@ -1460,10 +1460,6 @@ export class GroqSemanticProvider implements EvidenceProvider {
     } else {
       const candidatePrompt = buildSemanticPrompt(input, 'CANDIDATE');
       const candidate = await classifyCandidateWith404Fallback(client, candidatePrompt, candidateModel, adjudicatorModel, observability, signal);
-      // Only a bounded verdict identity may be cached. parseSemanticResult
-      // normalizes nested fields, but a missing label/confidence/citation set is
-      // an abstention placeholder and must stay retryable.
-      let cacheable = isSemanticVerdictIdentity(candidate.value);
       // A verdict produced inside a multi-channel batch saw sibling evidence
       // and a different completion allowance. Keep it out of the cache: the
       // realized batch request is not part of this per-channel identity.
@@ -1496,7 +1492,6 @@ export class GroqSemanticProvider implements EvidenceProvider {
           } else {
             // A malformed repair is not a usable attribution source; keep the
             // original abstention and let a later attempt retry.
-            cacheable = false;
           }
         } catch (error) {
           // Repair is best-effort, but cancellation is not a repair failure:
@@ -1506,10 +1501,6 @@ export class GroqSemanticProvider implements EvidenceProvider {
           // Keep the original result, which abstains.
         }
       }
-      // A repaired decisive verdict is cacheable when the repair supplied
-      // usable citations; the original uncited candidate was not. The final
-      // write still validates the parsed result against the supplied evidence.
-      if (repairUsed) cacheable = isSemanticVerdictIdentity({ ...(candidate.value as Record<string, unknown>), citations: repairedCitations });
       // The repair code marks only results that survive to evidence
       // construction with their repaired citations: a later adjudication that
       // replaces the result drops the code with it. Evaluated below, after
@@ -1521,19 +1512,20 @@ export class GroqSemanticProvider implements EvidenceProvider {
       // still adjudicate low-confidence results.
       if (result.supportedLanguage && (result.label === 'AMBIGUOUS' || result.confidence < 70) && adjudicationEnabled && !candidate.fallbackUsed) {
         const adjudicatedValue = await classifySemanticPrompt({ client, prompt: buildSemanticPrompt(input, 'ADJUDICATION'), model: adjudicatorModel, observability, signal });
-        cacheable = isSemanticVerdictIdentity(adjudicatedValue);
         batchedOutput = batchedOutput || semanticResultWasBatched(adjudicatedValue);
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
-      cacheable = cacheable && !batchedOutput;
       const retainedFinalCitations = result.citations.filter(citation => citationsReferenceSuppliedDocuments([citation], input));
       if (retainedFinalCitations.length !== result.citations.length) {
         result = { ...result, citations: retainedFinalCitations };
       }
-      if (result.citations.length === 0) cacheable = false;
-      // Cache the final verdict after repair/adjudication. Repair provenance
-      // is stored explicitly so a cache hit reports the same reason codes.
+      // Cache the parsed final verdict after repair/adjudication. The parsed
+      // result is normalized and re-validated against the supplied citations,
+      // so an omitted optional raw field does not defeat caching while uncited
+      // or structurally incomplete results still stay retryable. Repair
+      // provenance is stored explicitly so a cache hit reports the same codes.
       // Injected clients are a test/shadow seam and never touch the cache.
+      const cacheable = !batchedOutput && isCacheableSemanticResult(result, input);
       if (this.cacheAllowed() && cacheable) this.cache().scheduleWrite(cacheIdentity, {
         result,
         modelVersion: model,

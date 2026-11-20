@@ -265,17 +265,38 @@ test('every semantic provider replays a cache hit without calling the model or r
   }
 });
 
-test('every semantic provider skips the cache write for a malformed model verdict', async () => {
+test('a parsed valid verdict is cached even when the raw reply omits optional fields', async () => {
   for (const [name, Provider] of providerCases) {
     const harness = cacheHarness();
     const client: SemanticModelClient = {
       async classify() {
-        return { ...providerVerdict, confidence: 101 };
+        return {
+          label: 'ACTIVE_TRADING',
+          confidence: 88,
+          supportedLanguage: true,
+          explanation: 'The creator teaches futures execution.',
+          citations: [{ field: 'channel_bio' }],
+        };
       },
     };
     const provider = new Provider(client, harness.port);
     await provider.collectEvidence(providerInput, {} as any);
-    assert.equal(harness.writes.length, 0, `${name} must not persist a malformed verdict`);
+    assert.equal(harness.writes.length, 1, `${name} must cache the normalized parsed verdict`);
+    assert.equal(harness.writes[0].value.result.label, 'ACTIVE_TRADING');
+  }
+});
+
+test('every semantic provider skips the cache write for an uncited or malformed verdict', async () => {
+  for (const [name, Provider] of providerCases) {
+    const harness = cacheHarness();
+    const client: SemanticModelClient = {
+      async classify() {
+        return { ...providerVerdict, citations: [{ field: 'not_a_field' }] };
+      },
+    };
+    const provider = new Provider(client, harness.port);
+    await provider.collectEvidence(providerInput, {} as any);
+    assert.equal(harness.writes.length, 0, `${name} must not persist an uncited/malformed verdict`);
   }
 });
 
