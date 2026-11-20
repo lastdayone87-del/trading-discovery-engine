@@ -901,9 +901,16 @@ export async function verifyAdmissionCandidate(
         });
         if (!applied) {
           // Another worker changed the channel between our read and write.
-          // Never demote its committed decision; leave the admission ledger
-          // ambiguous and let a later recheck decide.
-          preserveExistingDecision = true;
+          // Preserve only a terminal decision; a nonterminal transition still
+          // needs the enrichment handoff, otherwise the candidate is stranded.
+          const refreshed = await getChannelById(evidence.channelId);
+          preserveExistingDecision = Boolean(refreshed && (
+            refreshed.trading_status === 'TRADING_CONFIRMED'
+            || refreshed.trading_status === 'NON_TRADING'
+            || refreshed.trading_status === 'HUMAN_REJECTED'
+            || refreshed.scan_status === 'COMPLETED'
+            || refreshed.scan_status === 'SKIPPED_NON_TRADING'
+          ));
         }
       }
       if (!preserveExistingDecision) {
