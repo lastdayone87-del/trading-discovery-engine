@@ -42,6 +42,28 @@ export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
 
 const LABELS: ReadonlySet<string> = new Set(SEMANTIC_RESULT_LABELS);
 
+/**
+ * Cache-eligibility guard at the raw model boundary. The full structural guard
+ * is deliberately strict about every nested field, but the parser normalizes
+ * bounded language/citation fields before they reach evidence construction.
+ * A valid verdict identity with a usable citation is sufficient to consider a
+ * cache write; the parsed result is validated again by isCacheableSemanticResult.
+ */
+export function isSemanticVerdictIdentity(value: unknown): value is {
+  label: SemanticResultLabel;
+  confidence: number;
+  supportedLanguage: boolean;
+  citations: Array<{ field: string; index?: number; sourceId?: string }>;
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  if (typeof result.label !== 'string' || !LABELS.has(result.label)) return false;
+  if (!isBoundedConfidence(result.confidence)) return false;
+  if (typeof result.supportedLanguage !== 'boolean') return false;
+  if (!Array.isArray(result.citations) || result.citations.length === 0) return false;
+  return true;
+}
+
 function isBoundedConfidence(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100;
 }

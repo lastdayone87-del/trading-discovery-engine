@@ -8,6 +8,9 @@ import {
   resetSemanticResultCacheCircuitForTests,
   semanticResultCacheEnabled,
   semanticResultCacheKey,
+  scheduleSemanticResultCacheWrite,
+  semanticResultCacheWriteBacklogForTests,
+  flushSemanticResultCacheWritesForTests,
 } from './evidenceEngine/semanticResultCache';
 import { canonicalJsonStringify } from './classificationInputChecksum';
 import type { RawChannelInput } from './evidenceEngine/types';
@@ -171,14 +174,16 @@ test('all production semantic providers wire the cache and keep injected clients
   ]) {
     const source = readFileSync(file, 'utf8');
     assert.match(source, /readSemanticResultCache/, `${file} must read the cache`);
-    assert.match(source, /writeSemanticResultCache/, `${file} must write the cache`);
+    assert.match(source, /scheduleSemanticResultCacheWrite/, `${file} must schedule the cache write`);
+    assert.doesNotMatch(source, /await writeSemanticResultCache/, `${file} must not block the provider result on the cache write`);
     assert.match(source, /this\.injectedClient \? undefined : await readSemanticResultCache/, `${file} must not let test clients read production cache`);
-    assert.match(source, /if \(!this\.injectedClient && cacheable\) await writeSemanticResultCache/, `${file} must gate cache writes on a structurally valid result`);
-    assert.match(source, /isSemanticResultShape\(/, `${file} must validate the model result before caching`);
+    assert.match(source, /if \(!this\.injectedClient && cacheable\) scheduleSemanticResultCacheWrite/, `${file} must gate cache writes on a structurally valid result`);
+    assert.match(source, /isSemanticVerdictIdentity\(/, `${file} must validate the model verdict before caching`);
     assert.match(source, /SEMANTIC_RESULT_CACHE_HIT_REASON/, `${file} must mark cache hits`);
     assert.match(source, /fallbackReasonCodes = \[[\s\S]*SEMANTIC_RESULT_CACHE_HIT_REASON/, `${file} must append the cache-hit reason to the result`);
     assert.match(source, /readSemanticResultCache\(cacheIdentity, process\.env, \{ signal \}\)/, `${file} must bound cache reads by the caller deadline`);
-    assert.match(source, /writeSemanticResultCache\(cacheIdentity,[\s\S]{0,400}process\.env, \{ signal \}\)/, `${file} must bound cache writes by the caller deadline`);
+    assert.match(source, /channelId: input\.channel_id/, `${file} must attach the channel to provider call accounting`);
+    assert.match(source, /evidenceChecksum: cacheIdentityKeys\.inputChecksum/, `${file} must attach the evidence checksum to provider call accounting`);
   }
   const groq = readFileSync('server/evidenceEngine/providers/GroqSemanticProvider.ts', 'utf8');
   assert.match(groq, /repairPromptVersion: SEMANTIC_CITATION_REPAIR_PROMPT_VERSION/, 'Groq cache identity must include the repair prompt version');
@@ -211,4 +216,19 @@ test('cache operations are fail-open and deadline-bounded', () => {
     const provider = readFileSync(file, 'utf8');
     assert.match(provider, /semanticResultWasBatched\(/, `${file} must keep multi-channel batch results out of the cache`);
   }
+});
+
+
+test('background cache writes are opt-in and flushable', async () => {
+  scheduleSemanticResultCacheWrite(identity, { result: complete as any, modelVersion: 'model-v1' }, { SEMANTIC_RESULT_CACHE_ENABLED: 'false' } as any);
+  assert.equal(semanticResultCacheWriteBacklogForTests(), 0);
+  await flushSemanticResultCacheWritesForTests();
+  assert.equal(semanticResultCacheWriteBacklogForTests(), 0);
+});
+
+test('the scheduled writer uses a longer deadline than the caller cache read', () => {
+  const source = readFileSync('server/evidenceEngine/semanticResultCache.ts', 'utf8');
+  assert.match(source, /scheduleSemanticResultCacheWrite/, 'background writer must exist');
+  assert.match(source, /5_000/, 'background writer must not reuse the 500ms caller read deadline');
+  assert.match(source, /pendingSemanticCacheWrites/, 'background writes must be tracked for flush');
 });

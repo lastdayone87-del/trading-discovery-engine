@@ -248,6 +248,40 @@ export async function readSemanticResultCache(
   }
 }
 
+/**
+ * Best-effort background write. The provider must return the judgment without
+ * waiting for a cache round trip; a slow database can otherwise consume the
+ * caller's classification deadline and silently lose the cache entry. Cache
+ * writes are not part of the verdict and are safe to drop on shutdown.
+ */
+const pendingSemanticCacheWrites = new Set<Promise<void>>();
+
+export function scheduleSemanticResultCacheWrite(
+  identity: SemanticResultCacheIdentity,
+  value: CachedSemanticValue,
+  env: NodeJS.ProcessEnv = process.env,
+  options: SemanticResultCacheOptions = {},
+): void {
+  if (!semanticResultCacheEnabled(env)) return;
+  const write = writeSemanticResultCache(identity, value, env, {
+    timeoutMs: options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 5_000,
+  })
+    .catch(() => undefined)
+    .finally(() => { pendingSemanticCacheWrites.delete(write); });
+  pendingSemanticCacheWrites.add(write);
+}
+
+/** Test/ops seam: wait for all background cache writes queued so far. */
+export async function flushSemanticResultCacheWritesForTests(): Promise<void> {
+  while (pendingSemanticCacheWrites.size > 0) {
+    await Promise.allSettled([...pendingSemanticCacheWrites]);
+  }
+}
+
+export function semanticResultCacheWriteBacklogForTests(): number {
+  return pendingSemanticCacheWrites.size;
+}
+
 export async function writeSemanticResultCache(
   identity: SemanticResultCacheIdentity,
   value: CachedSemanticValue,

@@ -38,6 +38,14 @@ const unrelatedResult = {
   citations: [{ field: 'channel_bio' }],
 };
 
+
+function assertSemanticAttribution(actual: any, label = 'semantic provider') {
+  assert.equal(actual?.jobId, 'job-observability-1', label);
+  assert.equal(actual?.runId, 'run-observability-1', label);
+  assert.equal(actual?.requestMetadata?.channelId, 'channel-1', label);
+  assert.match(String(actual?.requestMetadata?.evidenceChecksum || ''), /^[a-f0-9]{64}$/, label);
+}
+
 test('every semantic provider forwards job and run attribution to its model client', async () => {
   for (const Provider of [GeminiSemanticProvider, GeminiFreeSemanticProvider, GroqSemanticProvider]) {
     const seen: unknown[] = [];
@@ -49,7 +57,7 @@ test('every semantic provider forwards job and run attribution to its model clie
     };
     const provider = new Provider(client as any);
     await provider.collectEvidence(input, {} as any);
-    assert.deepEqual(seen[0], { jobId: 'job-observability-1', runId: 'run-observability-1' }, Provider.name);
+    assertSemanticAttribution(seen[0], Provider.name);
   }
 });
 
@@ -170,7 +178,7 @@ test('404 model fallback forwards attribution on every retry for all providers',
       };
       await new Provider(client as any).collectEvidence(input, {} as any);
       assert.equal(seen.length, 2, Provider.name);
-      assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' }, Provider.name);
+      assertSemanticAttribution(seen[1], Provider.name);
     }
   } finally {
     for (const [key, value] of Object.entries(saved)) {
@@ -195,7 +203,7 @@ test('adjudication forwards attribution on the second semantic call', async () =
     };
     await new GeminiSemanticProvider(client as any).collectEvidence(input, {} as any);
     assert.equal(seen.length, 2);
-    assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' });
+    assertSemanticAttribution(seen[1]);
   } finally {
     if (saved === undefined) delete process.env.MULTILINGUAL_ADJUDICATION_ENABLED;
     else process.env.MULTILINGUAL_ADJUDICATION_ENABLED = saved;
@@ -214,5 +222,5 @@ test('groq citation repair forwards attribution on the repair call', async () =>
   };
   await new GroqSemanticProvider(client as any).collectEvidence(input, {} as any);
   assert.equal(seen.length, 2);
-  assert.deepEqual(seen[1], { jobId: 'job-observability-1', runId: 'run-observability-1' });
+  assertSemanticAttribution(seen[1]);
 });
