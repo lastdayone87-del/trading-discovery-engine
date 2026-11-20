@@ -1,6 +1,6 @@
 # Rendered-Browser Capacity Experiment (Fix B)
 
-**Status: IN PROGRESS (E1 running)**
+**Status: COMPLETE — validated config deployed and codified**
 Owner: muse audit session · Host: Coolify VPS `45.94.58.135` (4 cores / 8GB)
 
 ## Why
@@ -83,16 +83,51 @@ search-phase warm-up).
    ~60–80 crawls/hour — the E2 governor raise (64/72) is sized to sit
    just under lease capacity.
 
-## E2 — governor raise 64/72 with lease=2 — RUNNING
+## E2 — governor raise 64/72 with lease=2 — COMPLETE
 
 Config verified in container `…20261120T212037`:
 `BROWSER_RUNTIME_CONCURRENCY=2`,
 `RENDERED_ADMISSION_NOMINAL_PER_HOUR=64`,
 `RENDERED_ADMISSION_EMERGENCY_PER_HOUR=72`. Window 21:26–22:30Z.
 
-Purpose: prove the raised budget drains the retry queue faster without
-resource distress, and observe whether the lease (not the governor) is
-now the first bottleneck. Results: (pending)
+| Metric | E2 observed |
+|---|---|
+| Completed rendered crawls | 44 in ~64 min (~41–62/h across phases; E1 burst measured 62/h) |
+| Governor denials | 17 (all RETRY lane, `reason=DISCOVERY_FLOOR`) |
+| Container CPU | 25% – 447% bursts |
+| Host load1 | 0.8 – 15.7 (post-deploy spikes; ≤10 sustained) |
+| Container memory | 0.6 – 0.9 GiB |
+| Host MemAvailable | 5.4 – 5.7 GB |
+
+**E2 findings:**
+
+1. The raised budget served more rendered work (44 completed crawls in
+   one window vs the old 40/h hard ceiling) with no resource distress:
+   container memory stayed under 0.9GiB, host headroom above 5.4GB.
+2. The remaining retry-lane constraint is the **DISCOVERY_FLOOR policy**
+   (non-discovery admissions capped at 65% of the budget, so 41/h at
+   nominal 64). That is a discovery-protection policy choice, not a
+   capacity knob — deliberately left unchanged in this PR and flagged
+   for a separate policy discussion if retry drain needs to be faster.
+3. Observability note: `RENDERED_FALLBACK_SATURATED` observations also
+   cover the separate classification-rendered lane
+   (`CLASSIFICATION_RENDERED_FALLBACK_MAX_WAIT_MS=5000`), which has its
+   own 5s gate outside the governor. Its saturation is out of scope for
+   this experiment's knobs and is flagged for future measurement.
+
+## Validated permanent configuration
+
+| Knob | Old | New | Evidence |
+|---|---|---|---|
+| `BROWSER_RUNTIME_CONCURRENCY` | 1 (unset) | **2** | E1: two slots resource-safe; bursts ≤4–5 cores; ≥5GB memory headroom |
+| `RENDERED_ADMISSION_NOMINAL_PER_HOUR` | 40 | **64** | E1: governor saturated in 25 min at 40; E2: 64/h budget served 44 crawls/window with headroom left |
+| `RENDERED_ADMISSION_EMERGENCY_PER_HOUR` | 48 | **72** | Stays above nominal, under measured lease ceiling (~60–80/h) |
+| `BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB` | — (new) | **1500** (code default) | Measured per-browser footprint ≤~900MiB; 1500MB reserve is conservative |
+| `MAX_BROWSER_RUNTIME_CONCURRENCY` (code cap) | 2 | 2 (unchanged) | 4-core VPS: CPU bursts already reach all cores; more slots need CPU evidence |
+
+The resource-safety guard (previous commit) keeps the second slot
+closed whenever host memory headroom drops below the threshold, so the
+raised defaults cannot overwhelm a smaller host.
 
 ## Backfill plan (post-capacity)
 
