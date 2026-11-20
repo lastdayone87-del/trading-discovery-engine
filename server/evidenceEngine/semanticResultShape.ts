@@ -68,7 +68,21 @@ export function isSemanticVerdictIdentity(value: unknown): value is {
   if (!Array.isArray(result.reasonCodes) || !result.reasonCodes.every(code => typeof code === 'string')) return false;
   if (!Array.isArray(result.concepts) || !result.concepts.every(concept => typeof concept === 'string')) return false;
   if (!Array.isArray(result.languages)) return false;
+  for (const language of result.languages) {
+    if (!language || typeof language !== 'object' || Array.isArray(language)) return false;
+    const entry = language as Record<string, unknown>;
+    if (typeof entry.field !== 'string' || !SEMANTIC_RESULT_FIELD_NAMES.has(entry.field)) return false;
+    if (typeof entry.language !== 'string' || typeof entry.script !== 'string') return false;
+    if (!isBoundedConfidence(entry.confidence)) return false;
+  }
   if (!Array.isArray(result.citations) || result.citations.length === 0) return false;
+  for (const citation of result.citations) {
+    if (!citation || typeof citation !== 'object' || Array.isArray(citation)) return false;
+    const entry = citation as Record<string, unknown>;
+    if (typeof entry.field !== 'string' || !SEMANTIC_RESULT_FIELD_NAMES.has(entry.field)) return false;
+    if (entry.index !== undefined && (!Number.isInteger(entry.index) || (entry.index as number) < 0)) return false;
+    if (entry.sourceId !== undefined && typeof entry.sourceId !== 'string') return false;
+  }
   return true;
 }
 

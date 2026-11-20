@@ -1501,6 +1501,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
           // Keep the original result, which abstains.
         }
       }
+      // A repaired decisive verdict is cacheable when the repair supplied
+      // usable citations; the original uncited candidate was not. The final
+      // write still validates the parsed result against the supplied evidence.
+      if (repairUsed) cacheable = true;
       // The repair code marks only results that survive to evidence
       // construction with their repaired citations: a later adjudication that
       // replaces the result drops the code with it. Evaluated below, after
