@@ -43,11 +43,10 @@ export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
 const LABELS: ReadonlySet<string> = new Set(SEMANTIC_RESULT_LABELS);
 
 /**
- * Cache-eligibility guard at the raw model boundary. The full structural guard
- * is deliberately strict about every nested field, but the parser normalizes
- * bounded language/citation fields before they reach evidence construction.
- * A valid verdict identity with a usable citation is sufficient to consider a
- * cache write; the parsed result is validated again by isCacheableSemanticResult.
+ * Cache-eligibility guard at the raw model boundary. It validates the verdict
+ * identity and nested language/citation types before parsing, then the parsed
+ * result is validated again by isCacheableSemanticResult against the supplied
+ * evidence. This prevents incomplete replies from becoming durable cache rows.
  */
 export function isSemanticVerdictIdentity(value: unknown): value is {
   label: SemanticResultLabel;
