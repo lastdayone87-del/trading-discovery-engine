@@ -11,11 +11,12 @@ test('deterministic cohort summary separates hard false confirmations from finan
     { truth: 'UNRELATED', outcome: 'PASS', reasonCodes: ['HARD_FALSE_CONFIRM'] },
     { truth: 'UNRELATED', outcome: 'REJECT', reasonCodes: ['STRICT_REJECT'] },
     { truth: 'UNRELATED', outcome: 'AMBIGUOUS', reasonCodes: ['DETERMINISTIC_AMBIGUOUS'] },
+    { truth: 'AMBIGUOUS', outcome: 'AMBIGUOUS', reasonCodes: ['MIXED_CONTENT'] },
   ]);
-  assert.equal(summary.total, 7);
+  assert.equal(summary.total, 8);
   assert.equal(summary.outcomes.PASS, 3);
   assert.equal(summary.outcomes.REJECT, 2);
-  assert.equal(summary.outcomes.AMBIGUOUS, 2);
+  assert.equal(summary.outcomes.AMBIGUOUS, 3);
   assert.equal(summary.confirm.trueRelevant, 1);
   assert.equal(summary.confirm.falseRelevant, 2);
   assert.equal(summary.confirm.hardUnrelated, 1);
@@ -25,9 +26,10 @@ test('deterministic cohort summary separates hard false confirmations from finan
   assert.equal(summary.reject.precision, 1 / 2);
   assert.equal(summary.abstain.tradingRelevant, 1);
   assert.equal(summary.abstain.financeAdjacent, 0);
+  assert.equal(summary.abstain.ambiguous, 1);
   assert.equal(summary.reasonCodes.DETERMINISTIC_AMBIGUOUS, 2);
   assert.equal(summary.coverage.decisive, 5);
-  assert.equal(summary.coverage.decisiveRate, 5 / 7);
+  assert.equal(summary.coverage.decisiveRate, 5 / 8);
 });
 
 test('an empty cohort reports null precision rather than a fabricated zero', () => {

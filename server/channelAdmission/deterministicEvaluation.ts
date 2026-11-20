@@ -15,7 +15,7 @@ export interface DeterministicCohortSummary {
   confusion: Record<EvaluationTruth, Record<DeterministicOutcome, number>>;
   confirm: { count: number; trueRelevant: number; falseRelevant: number; hardUnrelated: number; precision: number | null };
   reject: { count: number; trueUnrelated: number; falseUnrelated: number; falseTradingRelevant: number; falseFinanceAdjacent: number; precision: number | null };
-  abstain: { count: number; tradingRelevant: number; financeAdjacent: number; unrelated: number };
+  abstain: { count: number; tradingRelevant: number; financeAdjacent: number; unrelated: number; ambiguous: number };
   reasonCodes: Record<string, number>;
   coverage: { confirmed: number; rejected: number; abstained: number; decisive: number; decisiveRate: number | null };
 }
@@ -71,6 +71,7 @@ export function summarizeDeterministicCohort(cases: DeterministicCohortCase[]): 
       tradingRelevant: confusion.TRADING_RELEVANT.AMBIGUOUS,
       financeAdjacent: confusion.FINANCE_ADJACENT.AMBIGUOUS,
       unrelated: confusion.UNRELATED.AMBIGUOUS,
+      ambiguous: confusion.AMBIGUOUS.AMBIGUOUS,
     },
     reasonCodes: Object.fromEntries(Object.entries(reasonCodes).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))),
     coverage: {

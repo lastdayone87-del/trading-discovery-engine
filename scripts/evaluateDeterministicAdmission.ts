@@ -4,39 +4,46 @@ import { summarizeDeterministicCohort, type DeterministicCohortCase, type Evalua
 import type { AdmissionEvidence } from '../server/channelAdmission/types';
 
 /**
- * Offline deterministic-admission evaluation. The cases are the frozen
- * 900-channel cohort; evidence is the same field set the admission gate gets
- * (title, bio, videos). No semantic provider is called.
+ * Offline deterministic-admission evaluation. The default inputs are the
+ * frozen 900-channel cohort checked into tests/fixtures/admission-v2.
  *
  * Usage:
- *   npx tsx scripts/evaluateDeterministicAdmission.ts \
- *     --cases=/tmp/opencode/fresh_cases.jsonl \
- *     --truth=/tmp/opencode/fresh_truth.json \
- *     [--out=/tmp/opencode/deterministic-eval.jsonl]
+ *   npx tsx scripts/evaluateDeterministicAdmission.ts
+ *   npx tsx scripts/evaluateDeterministicAdmission.ts --cases=<jsonl> --truth=<json> [--out=<jsonl>]
  */
 const args = process.argv.slice(2);
 function arg(name: string): string | undefined {
-  const index = args.indexOf(name);
+  const equals = args.find(value => value.startsWith(`--${name}=`));
+  if (equals) return equals.slice(name.length + 3);
+  const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : undefined;
 }
-const casesPath = arg('--cases');
-const truthPath = arg('--truth');
-if (!casesPath || !truthPath) {
-  throw new Error('Usage: evaluateDeterministicAdmission --cases=<jsonl> --truth=<json> [--out=<jsonl>]');
-}
+const casesPath = arg('cases') || new URL('../tests/fixtures/admission-v2/fresh_cases.jsonl', import.meta.url).pathname;
+const truthPath = arg('truth') || new URL('../tests/fixtures/admission-v2/fresh_truth.json', import.meta.url).pathname;
 
 type Case = {
   index: string | number;
   channel_id: string;
   channel_name: string;
   description?: string;
+  country?: string;
+  language?: string;
+  links?: string[];
+  external_links?: string[];
   video_titles?: string[];
+  video_descriptions?: string[];
   videos?: Array<{ id?: string; title?: string; description?: string; published_at?: string }>;
 };
 type Truth = { relevance: EvaluationTruth; content_type?: string; operator_type?: string };
 
 function toEvidence(item: Case): AdmissionEvidence {
-  const videos = (item.videos || []).map((video, index) => ({
+  const structured = item.videos && item.videos.length > 0
+    ? item.videos
+    : (item.video_titles || []).map((title, index) => ({
+        title,
+        description: item.video_descriptions?.[index] || '',
+      }));
+  const videos = structured.map((video, index) => ({
     videoId: video.id || String(index),
     title: video.title || '',
     description: video.description || '',
@@ -47,7 +54,9 @@ function toEvidence(item: Case): AdmissionEvidence {
     channelName: item.channel_name,
     youtubeUrl: `https://youtube.com/channel/${item.channel_id}`,
     description: item.description || '',
-    links: [],
+    links: item.links || item.external_links || [],
+    country: item.country,
+    declaredLanguage: item.language,
     videos,
     source: 'automated_query',
     targetCountry: 'UNKNOWN',
@@ -58,13 +67,16 @@ function toEvidence(item: Case): AdmissionEvidence {
 
 const cases = readFileSync(casesPath, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as Case);
 const truth = JSON.parse(readFileSync(truthPath, 'utf8')) as Record<string, Truth>;
-const outPath = arg('--out');
+const missingTruth = cases.filter(item => !truth[String(item.index)]).map(item => String(item.index));
+if (missingTruth.length > 0) {
+  throw new Error(`Truth file is missing ${missingTruth.length} cohort case(s): ${missingTruth.slice(0, 20).join(', ')}`);
+}
+const outPath = arg('out');
 const rows: Array<Record<string, unknown>> = [];
 const summaryInput: DeterministicCohortCase[] = [];
 
 for (const item of cases) {
   const expected = truth[String(item.index)];
-  if (!expected) continue;
   const result = await evaluateDeterministicAdmission(toEvidence(item));
   const row = {
     index: String(item.index),
@@ -83,4 +95,4 @@ for (const item of cases) {
 
 const summary = summarizeDeterministicCohort(summaryInput);
 if (outPath) writeFileSync(outPath, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
-console.log(JSON.stringify({ cases: cases.length, evaluated: rows.length, summary }, null, 2));
+console.log(JSON.stringify({ inputCases: cases.length, evaluated: rows.length, casesPath, truthPath, summary }, null, 2));
