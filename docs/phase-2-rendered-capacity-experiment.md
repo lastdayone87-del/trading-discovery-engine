@@ -202,7 +202,9 @@ WHERE observed_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1;
   deployed): slot >1 requires host MemAvailable ≥
   `BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB` (default 1500MB); degraded host
   falls back to single-slot; unreadable telemetry fails open.
-* Rollback: remove the Coolify env row (or set `=1`) and redeploy.
+* Rollback: removing the Coolify env rows does NOT restore the old
+  behavior — the image bakes the new defaults. Use the explicit
+  overrides or previous image described in the Rollback section below.
 
 ## DISCOVERY_FLOOR: what the denials were and the policy adjustment
 

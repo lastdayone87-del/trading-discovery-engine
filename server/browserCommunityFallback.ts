@@ -3982,9 +3982,10 @@ export const renderedFallbackGate = new RenderedFallbackGate(
   // lease can never disagree: with BROWSER_RUNTIME_CONCURRENCY=2 (the
   // validated rendered-capacity config) two rendered crawls may overlap, and
   // the lease's memory-headroom guard still closes the second slot on a
-  // degraded host. Each crawl's total-budget clock starts at gate
-  // acquisition; overlap is supported by the shared begin/end lifecycle
-  // accounting. An explicit env override wins within 1..2.
+  // degraded host — a queued second crawl waits for the lease with its page
+  // budget unstarted (the clock starts at lease grant, below in the crawl
+  // body). Each crawl's total-budget clock therefore measures browser work,
+  // not capacity waits. An explicit env override wins within 1..2.
   boundedEnvInt(process.env.RENDERED_FALLBACK_CONCURRENCY, browserRuntimeConcurrency(), 1, 2),
   boundedEnvInt(process.env.RENDERED_FALLBACK_MAX_PENDING, 8, 0, 32),
 );
@@ -4727,10 +4728,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
       // acquisition failure or a reason to consume retry ownership.
       telemetry.gateWaitMs = Math.max(0, gateAdmittedAtMs - gateRequestedAtMs);
       telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'GATE_ACQUIRED');
-      // Total-budget clock starts at gate admission. Lifecycle bookkeeping is
-      // short and never serializes the crawl itself, so a wider gate (env
-      // concurrency 2) can actually run both crawls concurrently.
-      const startedAt = gateAdmittedAtMs;
+      // Provisional budget anchor; corrected when the browser lease is
+      // actually granted (below). Gate admission and crawler setup must not
+      // consume the crawl's page budget, and on a degraded host the lease may
+      // serialize a second crawl behind the first (memory guard) — that wait
+      // must never expire the budget before the first page opens.
+      let startedAt = gateAdmittedAtMs;
       telemetry.crawlStartedAt = new Date(startedAt).toISOString();
       const { PlaywrightCrawler, RequestQueue, Configuration } = await import('crawlee');
       // Crawlee 3.18 registers anonymous process-wide `migrating`/`aborting`
@@ -6256,7 +6259,14 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // A throw below (e.g. browser launch failure) keeps CRAWLER_RUNNING,
         // and the browser flag — not the stage — carries that classification.
         telemetry.lastLifecycleStage = advanceRenderedLifecycleStage(telemetry.lastLifecycleStage, 'CRAWLER_RUNNING');
-        await withBrowserRuntimeLease(() => crawler.run([seedUrl]));
+        await withBrowserRuntimeLease(() => {
+          // Budget clock starts when the browser slot is granted, not at gate
+          // admission: gate wait, crawlee setup, and lease serialization on a
+          // degraded host are capacity waits, never page-budget spend.
+          startedAt = Date.now();
+          telemetry.crawlStartedAt = new Date(startedAt).toISOString();
+          return crawler.run([seedUrl]);
+        });
         markBrowserCapabilityReady();
         // Request-budget cutoff is measured from the supported queue-info API:
         // after the run, pendingRequestCount reports eligible requests that

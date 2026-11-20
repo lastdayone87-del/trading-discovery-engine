@@ -126,7 +126,7 @@ test('browser capability health is recoverable and never changes semantic provid
 test('resource safety: a second browser slot is granted only with memory headroom', async () => {
   const { setBrowserRuntimeLimitForTests, setMemoryHeadroomReaderForTests, withBrowserRuntimeLease } = await import('./browserCapability');
   const restoreLimit = setBrowserRuntimeLimitForTests(2);
-  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 4_000 });
+  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 4_000, containerLimit: () => null, containerUsage: () => null });
   try {
     const events: string[] = [];
     const first = withBrowserRuntimeLease(async () => {
@@ -150,7 +150,7 @@ test('resource safety: a second browser slot is granted only with memory headroo
 test('resource safety: without memory headroom the lease stays single-slot', async () => {
   const { setBrowserRuntimeLimitForTests, setMemoryHeadroomReaderForTests, withBrowserRuntimeLease } = await import('./browserCapability');
   const restoreLimit = setBrowserRuntimeLimitForTests(2);
-  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 400 });
+  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 400, containerLimit: () => null, containerUsage: () => null });
   try {
     const events: string[] = [];
     const first = withBrowserRuntimeLease(async () => {
@@ -174,7 +174,7 @@ test('resource safety: without memory headroom the lease stays single-slot', asy
 test('resource safety: slot one is always possible even on a degraded host', async () => {
   const { setBrowserRuntimeLimitForTests, setMemoryHeadroomReaderForTests, hostMemAvailableForExtraSlot } = await import('./browserCapability');
   const restoreLimit = setBrowserRuntimeLimitForTests(2);
-  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 100 });
+  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 100, containerLimit: () => null, containerUsage: () => null });
   try {
     assert.equal(hostMemAvailableForExtraSlot(), null, 'below-threshold host denies the extra slot');
     let completed = 0;
@@ -189,7 +189,7 @@ test('resource safety: slot one is always possible even on a degraded host', asy
 test('resource safety: unreadable host memory telemetry fails open to the configured limit', async () => {
   const { setBrowserRuntimeLimitForTests, setMemoryHeadroomReaderForTests, withBrowserRuntimeLease } = await import('./browserCapability');
   const restoreLimit = setBrowserRuntimeLimitForTests(2);
-  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => null });
+  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => null, containerLimit: () => null, containerUsage: () => null });
   try {
     const events: string[] = [];
     const first = withBrowserRuntimeLease(async () => {
@@ -212,7 +212,7 @@ test('resource safety: unreadable host memory telemetry fails open to the config
 
 test('resource safety: BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB overrides the default threshold', async () => {
   const { setMemoryHeadroomReaderForTests, hostMemAvailableForExtraSlot } = await import('./browserCapability');
-  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 1_600 });
+  const restoreReader = setMemoryHeadroomReaderForTests({ host: () => 1_600, containerLimit: () => null, containerUsage: () => null });
   const previousEnv = process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB;
   process.env.BROWSER_EXTRA_SLOT_MIN_HOST_MEM_MB = '2000';
   try {
