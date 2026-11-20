@@ -309,8 +309,22 @@ async function enqueueEnrichmentAfterAmbiguousAdmission(input: {
     // Stage-1 enrichment already finished before the admission side effect
     // committed. Move directly to the one full classifier on the enriched
     // candidate instead of reporting an enqueue failure forever.
+    const enrichedCandidate = (job.payload?.candidate || candidate) as DiscoveredChannelRaw;
     return enqueueClassificationAfterAdmission({
-      candidate,
+      candidate: {
+        ...enrichedCandidate,
+        admissionDecisionId: candidate.admissionDecisionId,
+        admissionStatus: candidate.admissionStatus,
+        admissionDecisionSource: candidate.admissionDecisionSource,
+        admissionConfirmedTrading: candidate.admissionConfirmedTrading,
+        admissionTradingConfidence: candidate.admissionTradingConfidence,
+        admissionCitations: candidate.admissionCitations,
+        admissionModel: candidate.admissionModel,
+        admissionProvider: candidate.admissionProvider,
+        admissionEvidenceHash: candidate.admissionEvidenceHash,
+        admissionCategory: candidate.admissionCategory,
+        admissionNewlyCreated: candidate.admissionNewlyCreated,
+      },
       targetCountry: input.targetCountry,
       source: input.source,
       query: input.query,
@@ -841,7 +855,7 @@ export async function verifyAdmissionCandidate(
       if (recordedDecisionId) decisionId = recordedDecisionId;
       const now = new Date().toISOString();
       const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
-      const preserveExistingDecision = Boolean(existing && (
+      let preserveExistingDecision = Boolean(existing && (
         existing.trading_status === 'TRADING_CONFIRMED'
         || existing.trading_status === 'NON_TRADING'
         || existing.trading_status === 'HUMAN_REJECTED'
@@ -867,6 +881,7 @@ export async function verifyAdmissionCandidate(
         }];
         await insertChannelIfAbsent(channel);
       } else if (!preserveExistingDecision) {
+        const expectedSnapshot = { scan_status: existing.scan_status, trading_status: existing.trading_status };
         existing.admission_status = 'ADMITTED_AMBIGUOUS';
         existing.admission_decision_id = decisionId;
         existing.scan_status = 'ENRICHMENT_PENDING';
@@ -880,9 +895,20 @@ export async function verifyAdmissionCandidate(
           details: `${reasonCodes.join(', ')}; evidence acquisition precedes the full classifier.`,
           timestamp: now,
         }];
-        await upsertChannel(existing, { preserveDiscordOnUpdate: true });
+        const applied = await upsertChannelWithResult(existing, {
+          preserveDiscordOnUpdate: true,
+          requireStatusSnapshot: expectedSnapshot,
+        });
+        if (!applied) {
+          // Another worker changed the channel between our read and write.
+          // Never demote its committed decision; leave the admission ledger
+          // ambiguous and let a later recheck decide.
+          preserveExistingDecision = true;
+        }
       }
-      await markChannelAdmitted({ channelId: evidence.channelId, decisionId, status: 'ADMITTED_AMBIGUOUS' });
+      if (!preserveExistingDecision) {
+        await markChannelAdmitted({ channelId: evidence.channelId, decisionId, status: 'ADMITTED_AMBIGUOUS' });
+      }
       if (preserveExistingDecision) {
         return {
           channelId: evidence.channelId,

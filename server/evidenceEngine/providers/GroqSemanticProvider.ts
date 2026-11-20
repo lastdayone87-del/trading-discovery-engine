@@ -13,7 +13,7 @@ import { readSemanticResultCache, scheduleSemanticResultCacheWrite, semanticResu
 import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../semanticPrefilter';
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, SEMANTIC_REPAIR_REQUEST_MARKER, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { isSemanticResultShape, isSemanticVerdictIdentity } from '../semanticResultShape';
-import { candidateDocumentRefs } from '../semanticDocumentRefs';
+import { candidateDocumentRefs, citationsReferenceSuppliedDocuments } from '../semanticDocumentRefs';
 import type { EvidenceCategory, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import {
   buildSemanticPrompt,
@@ -1521,7 +1521,10 @@ export class GroqSemanticProvider implements EvidenceProvider {
         result = parseSemanticResult(adjudicatedValue); model = adjudicatorModel;
       }
       cacheable = cacheable && !batchedOutput;
-      result = { ...result, citations: retainSuppliedCitations(result.citations, candidateDocumentRefs(input)) };
+      const retainedFinalCitations = result.citations.filter(citation => citationsReferenceSuppliedDocuments([citation], input));
+      if (retainedFinalCitations.length !== result.citations.length) {
+        result = { ...result, citations: retainedFinalCitations };
+      }
       if (result.citations.length === 0) cacheable = false;
       // Cache the final verdict after repair/adjudication. Repair provenance
       // is stored explicitly so a cache hit reports the same reason codes.
