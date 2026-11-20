@@ -388,8 +388,8 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
       reasonCodes: [
         'DETERMINISTIC_FAST_PASS_BLOCKED',
         ...(passWithoutCitations ? ['DETERMINISTIC_PASS_WITHOUT_CITATIONS'] : []),
-        ...(passBlockedByFinanceAdjacency ? ['FINANCE_ADJACENT_DEFERRED_TO_DOWNSTREAM'] : []),
         ...(passBlockedByMinorityTrading ? ['DETERMINISTIC_TRADING_MINORITY'] : []),
+        ...routing.reasonCodes,
       ],
       citations: [],
       priority: 10,
