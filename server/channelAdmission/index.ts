@@ -99,13 +99,12 @@ async function enqueueClassificationAfterAdmission(input: {
   pageNumber?: number;
   admissionDecisionId?: string;
 }): Promise<boolean> {
-  // Admission has already completed its evidence-acquisition side effect. A
-  // classification job built from that decision must not replay the stage-0
-  // retrieval-only probe: the semantic judge needs to see the creator-owned
-  // bio/title as stage-1 evidence, not be withheld by the thin-retrieval gate.
+  // Admission has already completed its evidence-acquisition side effect. Mark
+  // the classification handoff without mutating hydration state: stage-based
+  // evidence planning and paid metadata fetches still use `enrichmentStage`.
   const candidate: DiscoveredChannelRaw = {
     ...input.candidate,
-    enrichmentStage: Math.max(1, Number(input.candidate.enrichmentStage || 0)),
+    admissionClassified: true,
   };
   const payload = buildClassificationJobPayload({
     candidate,
