@@ -156,16 +156,21 @@ const BANK_STANDALONE = /\b(?:bank|banking|banco|banque)\b/iu;
 // Compound brands are not proof of a bank: SoftBank, Fairbanks, Burbank and
 // similar names must not be downgraded. Only the explicit Maybank2u-style
 // numeric brand suffix is treated as a compound bank identity.
-const BANK_COMPOUND = /\b[a-z]{2,}bank2[a-z0-9]*\b/iu;
+const BANK_COMPOUND = /\b(?:[a-z]{2,}bank2[a-z0-9]*|citibank|commerzbank|maybank|bankmandiri|bankcentralasia|banknegara)\b/iu;
 const BANK_BRAND_EXCEPTION = /\b(?:bank\s*nifty|banknifty|bankless|bankroll)\b/iu;
 const ASSET_MANAGER_OR_INSURER = /\b(?:insurer|insurance|payment provider|consumer finance|wealth management|asset management|investment management|asset manager|fund manager|mutual fund|building society)\b/iu;
 function hasBankInstitutionIdentity(text: string): boolean {
-  if (BANK_BRAND_EXCEPTION.test(text)) return ASSET_MANAGER_OR_INSURER.test(text);
-  return BANK_STANDALONE.test(text) || BANK_COMPOUND.test(text) || ASSET_MANAGER_OR_INSURER.test(text);
+  // Remove instrument phrases before looking for a genuine bank identity, so
+  // "Maybank2usg covers Bank Nifty" still resolves to Maybank while an
+  // independent "Bank Nifty" trader does not become a bank.
+  const withoutInstruments = text.replace(new RegExp(BANK_BRAND_EXCEPTION.source, 'giu'), ' ');
+  return BANK_STANDALONE.test(withoutInstruments)
+    || BANK_COMPOUND.test(withoutInstruments)
+    || ASSET_MANAGER_OR_INSURER.test(withoutInstruments);
 }
 function hasPrimaryTradingSample(videoTexts: string[]): boolean {
   if (videoTexts.length === 0) return false;
-  const analysisVideos = videoTexts.filter(text => TRADING_ANALYSIS_TERMS.test(text)).length;
+  const analysisVideos = videoTexts.filter(text => TRADING_ANALYSIS_TERMS.test(text) || TRADING_ANALYSIS_CJK.test(text)).length;
   return analysisVideos >= 3 && analysisVideos >= Math.ceil(videoTexts.length / 2);
 }
 

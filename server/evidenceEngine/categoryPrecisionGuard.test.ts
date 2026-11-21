@@ -377,8 +377,8 @@ test('a bank brand with one market-analysis upload stays bank, but a primary tra
   assert.equal(bank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
 
   const tradingBank = deterministicCategoryGuard({
-    channel_name: 'Maybank Official Channel',
-    description: 'Official channel of Maybank. Trading education and market analysis.',
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking and trading education. Market analysis and technical analysis.',
     video_titles: ['Technical analysis of futures', 'Price action setup', 'Market structure lesson', 'Risk management'],
   });
   assert.equal(tradingBank, null);
@@ -391,4 +391,15 @@ test('ordinary asset managers and mutual-fund marketers are non-trading institut
     video_titles: ['Mutual fund overview', 'Retirement planning', 'Market outlook'],
   });
   assert.equal(assetManager?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+});
+
+test('known compound bank brands remain banks while SoftBank/Fairbanks do not', () => {
+  for (const name of ['Citibank', 'Commerzbank', 'Maybank']) {
+    const result = deterministicCategoryGuard({
+      channel_name: `${name} Official Channel`,
+      description: `Official channel of ${name}. Banking services and market insight.`,
+      video_titles: ['Banking services', 'Market outlook', 'Savings products'],
+    });
+    assert.equal(result?.category, 'BANK_OR_NON_TRADING_INSTITUTION', name);
+  }
 });
