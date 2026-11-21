@@ -54,6 +54,7 @@ export function candidateDocumentRefs(input: RawChannelInput): EvidenceFieldRef[
 export function semanticPromptInputProjection(input: RawChannelInput): {
   country: string | null;
   detected_languages: NonNullable<RawChannelInput['detected_languages']>;
+  platformTopics: string[];
   documents: Array<{ ref: EvidenceFieldRef; text: string }>;
 } {
   // The production classifier trims the channel name before the engine sees
@@ -67,6 +68,7 @@ export function semanticPromptInputProjection(input: RawChannelInput): {
   return {
     country: normalized.country || null,
     detected_languages: normalized.detected_languages || [],
+    platformTopics: normalized.topic_details || [],
     documents: semanticFieldDocuments(normalized),
   };
 }

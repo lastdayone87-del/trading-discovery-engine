@@ -7,12 +7,29 @@ import type {
 } from './types';
 import { isSemanticClassificationSource } from './types';
 import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
+import { hasMeaningfulCreatorText } from './creatorText';
 
 const CREATOR_LEVEL_FIELDS: ReadonlySet<EvidenceFieldType> = new Set<EvidenceFieldType>([
   'channel_bio',
   'transcript_excerpt',
   'pinned_comment',
 ]);
+
+/**
+ * Semantic labels that may become terminal negatives. A bank or other
+ * non-trading institution is a non-relevant creator focus in the same sense
+ * as UNRELATED; both still require creator-level attribution, top calibrated
+ * confidence, asserted (not quoted/disclaimer) claims, and no substantive
+ * positive evidence.
+ */
+export const NON_RELEVANT_SEMANTIC_LABELS: ReadonlySet<string> = new Set([
+  'UNRELATED',
+  'BANK_OR_NON_TRADING_INSTITUTION',
+]);
+
+export function isNonRelevantSemanticLabel(label: unknown): boolean {
+  return NON_RELEVANT_SEMANTIC_LABELS.has(String(label || ''));
+}
 
 /**
  * Terminal unrelated-domain evidence needs creator-level attribution. A single
@@ -93,15 +110,22 @@ export function hasCreatorLevelSemanticUnrelatedNegative(
   items: EvidenceItem[],
   input: Pick<RawChannelInput, 'description'>,
 ): boolean {
-  const bio = String(input.description || '').trim();
-  if (!bio) return false;
-  return items.some(item =>
-    classifyNegativeEvidenceRole(item, { terminalEligible: true }) === 'TERMINAL'
-    && isSemanticClassificationSource(item.source)
-    && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED'
-    && Number(item.provenance?.semantic?.calibratedConfidence) >= SEMANTIC_TOP_CALIBRATED_CONFIDENCE
-    && (item.provenance?.fields || []).some(field => field.field === 'channel_bio'),
-  );
+  return items.some(item => {
+    if (classifyNegativeEvidenceRole(item, { terminalEligible: true }) !== 'TERMINAL') return false;
+    if (!isSemanticClassificationSource(item.source)) return false;
+    if (!isNonRelevantSemanticLabel(item.provenance?.semantic?.taxonomyLabel)) return false;
+    if (Number(item.provenance?.semantic?.calibratedConfidence) < SEMANTIC_TOP_CALIBRATED_CONFIDENCE) return false;
+    const fields = item.provenance?.fields || [];
+    // Creator bio/transcript/pinned text is creator-level on its own. Two
+    // independent video families are the alternative; a single title is not.
+    if (fields.some(field => field.field === 'channel_bio')) return hasMeaningfulCreatorText(input.description);
+    if (fields.some(field => CREATOR_LEVEL_FIELDS.has(field.field))) return true;
+    const families = new Set(fields
+      .filter(field => field.field === 'video_title' || field.field === 'video_description')
+      .map(field => field.sourceFamilyId || field.sourceId)
+      .filter((value): value is string => Boolean(value)));
+    return families.size >= 2;
+  });
 }
 
 /** Resolve the policy role of one negative evidence item. */

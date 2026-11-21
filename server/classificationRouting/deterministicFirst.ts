@@ -287,8 +287,10 @@ export function resolveClassificationRouting(
     const categoryOwnsDecision = options.contentCategory === 'ACTIVE_TRADING'
       || options.contentCategory === 'TRADING_EDUCATION'
       || options.contentCategory === 'INVESTING_EDUCATION'
-      // Commercial, broker/platform, signal and promotional channels are
-      // still trading-relevant when their actual content is trading.
+      // Commercial broker/platform, signal and promotional channels are
+      // still trading-relevant when their actual content is trading. A bank
+      // or non-trading institution is deliberately excluded.
+      || options.contentCategory === 'TRADING_PLATFORM_OR_FIRM'
       || options.contentCategory === 'MARKET_INSTITUTION'
       || options.contentCategory === 'HYPE';
     if (!categoryOwnsDecision && videoTexts.length >= 3) {

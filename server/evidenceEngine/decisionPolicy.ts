@@ -4,7 +4,7 @@ import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { CREATOR_OWNED_EVIDENCE_FIELDS } from './canonicalEvidencePlane';
 import type { RecognitionAssessment } from './recognitionState';
-import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
+import { isNonRelevantSemanticLabel, negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
@@ -15,6 +15,9 @@ const AI_TRADING_LABELS = new Set([
   'ACTIVE_TRADING',
   'TRADING_EDUCATION',
   'INVESTING_EDUCATION',
+  // Legacy cached verdict accepted for compatibility; new verdicts use the
+  // split platform/bank taxonomy.
+  'TRADING_PLATFORM_OR_FIRM',
   'MARKET_INSTITUTION',
   'HYPE',
 ]);
@@ -89,7 +92,7 @@ export function observedTradingFamilies(
  * Unknown/future labels keep legacy behavior.
  */
 const NON_RELEVANT_CONTENT_CATEGORIES = new Set([
-  'FINANCIAL_NEWS','PERSONAL_FINANCE','UNRELATED','AMBIGUOUS',
+  'FINANCIAL_NEWS','PERSONAL_FINANCE','UNRELATED','AMBIGUOUS','BANK_OR_NON_TRADING_INSTITUTION',
 ]);
 
 export function isTradingRelevantCategory(category?:string):boolean{
@@ -131,7 +134,7 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   if(substantivePositiveWeight>0) return false;
-  const semanticUnrelated=terminalNegativeItems(evidence, { terminalEligible: true }).filter(item=>isSemanticClassificationSource(item.source)&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
+  const semanticUnrelated=terminalNegativeItems(evidence, { terminalEligible: true }).filter(item=>isSemanticClassificationSource(item.source)&&item.category==='IRRELEVANT_DOMAIN'&&isNonRelevantSemanticLabel(item.provenance?.semantic?.taxonomyLabel)&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 

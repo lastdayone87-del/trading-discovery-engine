@@ -6,7 +6,7 @@ import type {
 } from './types';
 import { ADMISSION_CONFIRMATION_MIN_CONFIDENCE, normalizeTradingFocus } from './confidence';
 
-export const ADMISSION_POLICY_VERSION = 'semantic-admission-v1';
+export const ADMISSION_POLICY_VERSION = 'pre-catalog-evidence-v2';
 
 export const DEFAULT_REJECT_TRADING_FOCUS = 25;
 export const DEFAULT_AMBIGUOUS_RATE_CAP = 0.35;

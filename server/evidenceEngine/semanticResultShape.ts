@@ -13,13 +13,21 @@ export const SEMANTIC_RESULT_LABELS = [
   'INVESTING_EDUCATION',
   'FINANCIAL_NEWS',
   'PERSONAL_FINANCE',
-  'MARKET_INSTITUTION',
+  'TRADING_PLATFORM_OR_FIRM',
+  'BANK_OR_NON_TRADING_INSTITUTION',
   'HYPE',
   'UNRELATED',
   'AMBIGUOUS',
 ] as const;
 
-export type SemanticResultLabel = typeof SEMANTIC_RESULT_LABELS[number];
+/**
+ * The legacy broad institution label is still accepted from historical
+ * fixtures/cache rows, but it is never advertised to the model and never
+ * re-used as a terminal category. New verdicts use one of the split labels.
+ */
+export const LEGACY_SEMANTIC_RESULT_LABELS = ['MARKET_INSTITUTION'] as const;
+
+export type SemanticResultLabel = typeof SEMANTIC_RESULT_LABELS[number] | typeof LEGACY_SEMANTIC_RESULT_LABELS[number];
 
 export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
   'channel_title',
@@ -40,7 +48,7 @@ export const SEMANTIC_RESULT_FIELD_NAMES: ReadonlySet<string> = new Set([
   'location',
 ]);
 
-const LABELS: ReadonlySet<string> = new Set(SEMANTIC_RESULT_LABELS);
+const LABELS: ReadonlySet<string> = new Set<string>([...SEMANTIC_RESULT_LABELS, ...LEGACY_SEMANTIC_RESULT_LABELS]);
 
 /**
  * Required raw decision fields for cache eligibility. Optional nested fields

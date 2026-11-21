@@ -6,7 +6,7 @@ import {
 import { defaultClient as defaultGroqClient, DEFAULT_GROQ_ADJUDICATOR_MODEL } from './providers/GroqSemanticProvider';
 import { defaultClient as defaultGeminiFreeClient, DEFAULT_GEMINI_FREE_ADJUDICATOR_MODEL } from './providers/GeminiFreeSemanticProvider';
 
-export type PrecisionCategory = 'MARKET_INSTITUTION' | 'HYPE' | 'FINANCIAL_NEWS' | 'UNRELATED';
+export type PrecisionCategory = 'TRADING_PLATFORM_OR_FIRM' | 'BANK_OR_NON_TRADING_INSTITUTION' | 'MARKET_INSTITUTION' | 'HYPE' | 'FINANCIAL_NEWS' | 'UNRELATED';
 
 export interface PrecisionGuardResult {
   category: PrecisionCategory;
@@ -33,6 +33,7 @@ export interface PrecisionGuardEvaluation {
 }
 
 const PRECISION_CATEGORIES: ReadonlySet<string> = new Set([
+  'TRADING_PLATFORM_OR_FIRM', 'BANK_OR_NON_TRADING_INSTITUTION',
   'MARKET_INSTITUTION', 'HYPE', 'FINANCIAL_NEWS', 'UNRELATED',
 ]);
 
@@ -145,7 +146,11 @@ const NEGATED_SIGNALS = /\b(?:no|not|never)\s+(?:paid|vip|free)?\s*signals?\b/iu
 const OFFICIAL_CHANNEL = /\b(?:official (?:youtube )?(?:channel|page)|canal oficial|chaîne officielle|offizieller (?:youtube )?kanal|canale ufficiale)\b/iu;
 // Arabic script has no ASCII word boundaries; match it without \b.
 const OFFICIAL_CHANNEL_ARABIC = /القناة الرسمية/u;
-const FINANCIAL_INSTITUTION = /\b(?:broker|brokerage|exchange|bank|banco|banque|prop firm|funded|asset management|investment management|securities|cfd|forex broker|trading platform|trading software|scanner|terminal)\b/iu;
+const FINANCIAL_INSTITUTION = /\b(?:broker|brokerage|exchange|bank(?:ing)?|banco|banque|prop firm|funded|asset management|investment management|securities|cfd|forex broker|trading platform|trading software|scanner|terminal|insurer|insurance|wealth management|mutual fund|fund manager|asset manager)\b/iu;
+// Banks, insurers, ordinary fund/wealth managers and payment/consumer-finance
+// companies are non-trading institutions even when their channel publishes
+// market commentary or educational videos.
+const BANK_OR_ASSET_MANAGER = /(?:bank(?:ing)?|banco|banque|insurer|insurance|payment provider|consumer finance|wealth management|asset management|investment management|asset manager|fund manager|mutual fund|building society)/iu;
 
 function decodeEntities(value: unknown): string {
   return String(value || '')
@@ -227,17 +232,17 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
 
   // MARKET_INSTITUTION: commercial financial product/service/venue.
   if (/\b(?:stock pick service|daily stock pick)\b/iu.test(nameAndBio)) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_STOCK_PICK_SERVICE'] };
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_STOCK_PICK_SERVICE'] };
   }
   if (/\b(?:prop firm|prop trading|proprietary trading firm)\b/iu.test(nameAndBio)
     && /\b(?:official|we are|we're|our (?:prop firm|funded))\b/iu.test(nameAndBio)
     && /\b(?:sign up|apply|join|challenge|coupon|discount|payout|funded account)\b/iu.test(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_PROP_FIRM'] };
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_PROP_FIRM'] };
   }
   if (/\bcuentas? (?:son )?simuladas?\b/iu.test(nameAndBio)
     && /\b(?:programas?|recompensas?)\b/iu.test(nameAndBio)) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_SIMULATED_PROGRAMS'] };
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_SIMULATED_PROGRAMS'] };
   }
   if (/\b(?:automated trading software|autotrader|trading software|trading platform)\b/iu.test(nameAndBio)
     // A product mention is not ownership. Require an explicit vendor cue so a
@@ -245,23 +250,40 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
     && VENDOR_SELF.test(nameAndBio)
     && /\b(?:software|platform|system|service|vendor)\b/iu.test(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_TRADING_SOFTWARE'] };
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_TRADING_SOFTWARE'] };
   }
   if (/\b(?:events?|masterclasses?|conferences?|congres|beleggersfair|tickets?|register now)\b/iu.test(nameAndBio)
     && /\b(?:congres|conference|fair|tickets?|register|platform|masterclasses?)\b/iu.test(nameAndBio)
     && (/\b(?:live en online events|online events|investor events|event platform)\b/iu.test(nameAndBio) || VENDOR_SELF.test(nameAndBio))) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_EVENTS_PLATFORM'] };
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_EVENTS_PLATFORM'] };
   }
   if (/\b(?:ai narrates|panel completo|quantiva\.live)\b/iu.test(nameAndBio)) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_DATA_PLATFORM'] };
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_DATA_PLATFORM'] };
+  }
+
+  // A bank/insurer/wealth-manager brand is a non-trading institution even
+  // when it does not say "official channel". Trading analysis or explicit
+  // education in the actual sample keeps an independent educator safe.
+  if (BANK_OR_ASSET_MANAGER.test(nameAndBio)
+    && !FIRST_PERSON_TRADER.test(nameAndBio)
+    && !TRADING_ANALYSIS_TERMS.test(all)
+    && !EXPLICIT_EDUCATION_TERMS.test(all)
+    && !/\b(?:my|our)\s+(?:trades?|trading|journey|account|strategy)\b/iu.test(nameAndBio)) {
+    return { category: 'BANK_OR_NON_TRADING_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_BANK_BRAND'] };
   }
 
   // Official financial-company channels are institutions even when they
-  // publish educational or analytical videos.
+  // publish educational or analytical videos. Split the legacy institution
+  // bucket: banks, insurers, asset/wealth managers and funds are not trading
+  // platforms, while brokers, exchanges, prop firms and trading-data vendors
+  // remain trading-relevant.
   if ((OFFICIAL_CHANNEL.test(nameAndBio) || OFFICIAL_CHANNEL_ARABIC.test(nameAndBio))
     && FINANCIAL_INSTITUTION.test(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)) {
-    return { category: 'MARKET_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_OFFICIAL_CHANNEL'] };
+    if (BANK_OR_ASSET_MANAGER.test(nameAndBio)) {
+      return { category: 'BANK_OR_NON_TRADING_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_BANK_OR_ASSET_MANAGER'] };
+    }
+    return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_OFFICIAL_CHANNEL'] };
   }
 
   // FINANCIAL_NEWS: explicit news product, not an educator that publishes updates.
@@ -306,11 +328,11 @@ const ADJUDICATOR_EXAMPLES: Array<[string, string]> = [
   ['Golden Waves — live trading signals, free gifts and broker promotions', 'HYPE'],
   ['Price Action Signals — price action signals only', 'HYPE'],
   ['shashwat01 — trading reels and motivation, no structured education', 'HYPE'],
-  ['Tradespoon — daily stock pick service and proprietary quant system', 'MARKET_INSTITUTION'],
-  ['Emerge Profit — prop firm with simulated accounts and reward programs', 'MARKET_INSTITUTION'],
-  ['12TradePro Com — automated trading software and NinjaTrader systems', 'MARKET_INSTITUTION'],
-  ['Quantiva — AI market narration platform and live data product', 'MARKET_INSTITUTION'],
-  ['BeursInside — investor events, masterclasses, conferences and platform', 'MARKET_INSTITUTION'],
+  ['Tradespoon — daily stock pick service and proprietary quant system', 'TRADING_PLATFORM_OR_FIRM'],
+  ['Emerge Profit — prop firm with simulated accounts and reward programs', 'TRADING_PLATFORM_OR_FIRM'],
+  ['12TradePro Com — automated trading software and NinjaTrader systems', 'TRADING_PLATFORM_OR_FIRM'],
+  ['Quantiva — AI market narration platform and live data product', 'TRADING_PLATFORM_OR_FIRM'],
+  ['BeursInside — investor events, masterclasses, conferences and platform', 'TRADING_PLATFORM_OR_FIRM'],
   ['CryptoDexWorld — crypto promo agency, 100x memecoin reviews and presales', 'HYPE'],
   ['Vanski Trades — art, candles, shop relaunch; one day-trading video', 'UNRELATED'],
   ['Emilio Gallardo — sales career training; one trading strategy video', 'UNRELATED'],
@@ -338,8 +360,10 @@ const ADJUDICATOR_EXAMPLES: Array<[string, string]> = [
   ['Market event reporting: CPI/FOMC headlines and company announcements without trade analysis', 'FINANCIAL_NEWS'],
   ['Active NQ trader with a free Discord community and broker affiliate links', 'KEEP_RELEVANT'],
   ['ICT teacher with a free signals recap in Discord and structured lessons', 'KEEP_RELEVANT'],
-  ['Official YouTube channel of a CFD broker that also publishes educational videos', 'MARKET_INSTITUTION'],
-  ['Official channel of a trading-software platform that publishes market analysis', 'MARKET_INSTITUTION'],
+  ['Official YouTube channel of a CFD broker that also publishes educational videos', 'TRADING_PLATFORM_OR_FIRM'],
+  ['Official channel of a trading-software platform that publishes market analysis', 'TRADING_PLATFORM_OR_FIRM'],
+  ['Official channel of a retail bank publishing wealth products and market insight', 'BANK_OR_NON_TRADING_INSTITUTION'],
+  ['Official channel of an asset manager advertising mutual funds and retirement products', 'BANK_OR_NON_TRADING_INSTITUTION'],
 ];
 
 export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabel: string): string {
@@ -351,15 +375,16 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
     'If the channel is a genuine trading educator, investing educator, or active trading creator, return KEEP_RELEVANT.',
     'When uncertain, return KEEP_RELEVANT. Do not downgrade a genuine educator.',
     'Return JSON only with keys label, confidence (0-100), explanation.',
-    'Allowed labels: MARKET_INSTITUTION, HYPE, FINANCIAL_NEWS, UNRELATED, KEEP_RELEVANT',
+    'Allowed labels: TRADING_PLATFORM_OR_FIRM, BANK_OR_NON_TRADING_INSTITUTION, HYPE, FINANCIAL_NEWS, UNRELATED, KEEP_RELEVANT',
     '',
     'Downgrade only when the PRIMARY product is clearly one of:',
-    '- MARKET_INSTITUTION: broker, exchange, bank, prop firm, fund, asset manager, data/software platform, trading-robot vendor, stock-pick service, or events/conference platform.',
+    '- TRADING_PLATFORM_OR_FIRM: broker, exchange, prop firm, trading data/software platform, scanner/terminal, trading-robot vendor, stock-pick service, or trading-education/events business whose primary content is trading/investing.',
+    '- BANK_OR_NON_TRADING_INSTITUTION: retail/corporate bank, insurer, payment provider, consumer finance, ordinary wealth manager, mutual-fund marketer, or financial institution without primary trading/investing analysis.',
     '- HYPE: VIP/free signals, guaranteed returns, 100x/memecoin/presale promotion, affiliate-first promotion, or trading motivation/reels without structured education.',
     '- FINANCIAL_NEWS: reporting market events, company announcements, economic developments, or financial headlines as the primary product, without original trading/investment analysis or actionable trade ideas. News clips and broker-comparison media also qualify.',
     '- UNRELATED: primary content is non-financial (art, cars, comedy, drama, religion, sports, fitness, tech tutorials, travel, beauty, etc.).',
     'Keep relevant when the creator teaches or produces trading method, market or technical analysis, psychology, platform use, risk management, stock portfolios, ETFs, dividends, valuation, company analysis, or long-term investing. Analysis-only and forecast-style trading channels qualify even without step-by-step lessons. This holds even if the videos discuss brokers, review software, or sell a course, watchlist, alerts, or a paid community.',
-    'Teaching algorithmic trading, backtesting, or how to use a trading platform is trading education; only a vendor selling the software/platform is MARKET_INSTITUTION.',
+    'Teaching algorithmic trading, backtesting, or how to use a trading platform is trading education; only a vendor selling the software/platform is TRADING_PLATFORM_OR_FIRM.',
     'Free educational content is not HYPE. HYPE requires VIP/free signals, guaranteed returns, 100x/memecoin/presale promotion, or affiliate-first promotion.',
     'Recurring live trading sessions, trade recaps, or a public trading journey are active trading, not HYPE or UNRELATED, even when the channel also posts motivation or comedy shorts.',
     'Live execution and market analysis without selling signals is active trading; HYPE requires signals or promotional returns to be the primary product.',
@@ -369,9 +394,9 @@ export function buildCategoryAdjudicatorPrompt(input: RawChannelInput, firstLabe
     'Market or technical analysis intended to inform trading decisions is trading content, even when it is analysis-only, forecast-style, or does not provide step-by-step lessons: charts, price action, market structure, support/resistance, trends, scenarios, setups, and trade ideas all qualify.',
     'FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading decisions.',
     'A broker comparison, review, or research site is FINANCIAL_NEWS, not education.',
-    'An independent trader who uses affiliate links or promotes a tool, or who offers account management or mentorship, remains active trading or education when the videos are trade recaps, backtests, or lessons. Only the official institution channel, or a channel whose primary product is the tool or managed account, is MARKET_INSTITUTION.',
+    'An independent trader who uses affiliate links or promotes a tool, or who offers account management or mentorship, remains active trading or education when the videos are trade recaps, backtests, or lessons. Only the official institution channel, or a channel whose primary product is the tool or managed account, is TRADING_PLATFORM_OR_FIRM.',
     'An active trader who publishes live sessions, trade recaps, or a documented trading journey is ACTIVE_TRADING even when the bio mentions free signals, a Discord/Telegram community, or broker affiliate links. HYPE requires the signal or promotional-returns product to be the primary offer, not a side community.',
-    'An official channel of a broker, exchange, bank, fund, data/software platform, or trading-robot vendor is MARKET_INSTITUTION even when it publishes educational videos or market analysis.',
+    'An official channel of a broker, exchange, prop firm, trading data/software platform, or trading-robot vendor is TRADING_PLATFORM_OR_FIRM even when it publishes educational videos or market analysis. A bank, insurer, wealth manager, or ordinary fund is BANK_OR_NON_TRADING_INSTITUTION unless its primary content is trading/investing analysis.',
     'A free Telegram or Discord community is not HYPE by itself; HYPE requires a signals or promotional-returns product to be the primary offer.',
     '',
     'Examples:',
@@ -495,7 +520,7 @@ export async function evaluateCategoryPrecisionGuard(
   options: PrecisionGuardOptions = {},
 ): Promise<PrecisionGuardEvaluation> {
   if (!firstLabel) return { status: 'KEEP', result: null };
-  if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'MARKET_INSTITUTION', 'HYPE'].includes(firstLabel)) {
+  if (!['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'TRADING_PLATFORM_OR_FIRM', 'MARKET_INSTITUTION', 'HYPE'].includes(firstLabel)) {
     return { status: 'KEEP', result: null };
   }
   const enabled = options.enabled ?? process.env.CONTENT_CATEGORY_PRECISION_GUARD_ENABLED !== 'false';

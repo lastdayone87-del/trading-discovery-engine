@@ -58,8 +58,8 @@ test('deterministic guard never downgrades a genuine education channel', () => {
 test('hybrid guard catches every false positive and keeps every genuine educator', async () => {
   const fallback: Record<string, PrecisionGuardResult['category']> = {
     BasedClips: 'FINANCIAL_NEWS',
-    '12TradePro Com': 'MARKET_INSTITUTION',
-    'Fx Crack Robo House': 'MARKET_INSTITUTION',
+    '12TradePro Com': 'TRADING_PLATFORM_OR_FIRM',
+    'Fx Crack Robo House': 'TRADING_PLATFORM_OR_FIRM',
     'Forex & Crypto Live': 'HYPE',
     'Golden Waves': 'HYPE',
     'Price Action Signals': 'HYPE',
@@ -172,8 +172,8 @@ test('adjudicator may downgrade only to the approved precision categories', asyn
       return value;
     },
   });
-  const market = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'MARKET_INSTITUTION', confidence: 91 }) });
-  assert.equal(market?.category, 'MARKET_INSTITUTION');
+  const market = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'TRADING_PLATFORM_OR_FIRM', confidence: 91 }) });
+  assert.equal(market?.category, 'TRADING_PLATFORM_OR_FIRM');
   // Providers may return a probability instead of a percentage.
   const probability = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'UNRELATED', confidence: 0.95 }) });
   assert.equal(probability?.category, 'UNRELATED');
@@ -245,7 +245,7 @@ test('Arabic official channels and Chinese analysis survive Unicode boundaries',
     channel_name: 'القناة الرسمية',
     description: 'The official broker channel for our clients.',
     video_titles: ['Gold analysis'],
-  })?.category, 'MARKET_INSTITUTION');
+  })?.category, 'TRADING_PLATFORM_OR_FIRM');
   assert.equal(deterministicCategoryGuard({
     channel_name: '财经新闻',
     description: 'Daily financial news updates with 技术分析 and 支撑阻力.',
@@ -312,7 +312,7 @@ test('channel metadata is delimited as untrusted data in the adjudicator prompt'
 test('adjudicator prompt explicitly forbids relevant-to-relevant relabeling', () => {
   const c = FALSE_POSITIVE_CASES.find(value => value.name === 'CryptoDexWorld')!;
   const prompt = buildCategoryAdjudicatorPrompt(input(c), 'INVESTING_EDUCATION');
-  assert.match(prompt, /Allowed labels: MARKET_INSTITUTION, HYPE, FINANCIAL_NEWS, UNRELATED, KEEP_RELEVANT/);
+  assert.match(prompt, /Allowed labels: TRADING_PLATFORM_OR_FIRM, BANK_OR_NON_TRADING_INSTITUTION, HYPE, FINANCIAL_NEWS, UNRELATED, KEEP_RELEVANT/);
   assert.match(prompt, /When uncertain, return KEEP_RELEVANT/);
   assert.match(prompt, /Do not downgrade a genuine educator/);
   assert.match(prompt, /confidence \(0-100\)/);
@@ -320,4 +320,27 @@ test('adjudicator prompt explicitly forbids relevant-to-relevant relabeling', ()
   assert.match(prompt, /signal-first brand|named for signals/);
   assert.match(prompt, /analysis-only, forecast-style/);
   assert.match(prompt, /FINANCIAL_NEWS only when the primary product is reporting market events/);
+});
+
+test('official banks and asset managers split away from trading platforms', () => {
+  const bank = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank wealth products, market insight and banking services.',
+    video_titles: ['Market outlook', 'Wealth solutions', 'Banking made simple'],
+  });
+  assert.equal(bank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const officialBank = deterministicCategoryGuard({
+    channel_name: 'Maybank Official Channel',
+    description: 'Official YouTube channel of Maybank. Wealth products, market insight and banking services.',
+    video_titles: ['Market outlook', 'Wealth solutions', 'Banking made simple'],
+  });
+  assert.equal(officialBank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const platform = deterministicCategoryGuard({
+    channel_name: 'Apex Broker Official Channel',
+    description: 'Official channel of Apex Broker. Trading platform, execution and market analysis.',
+    video_titles: ['Platform walkthrough', 'Futures execution', 'Risk management'],
+  });
+  assert.equal(platform?.category, 'TRADING_PLATFORM_OR_FIRM');
 });

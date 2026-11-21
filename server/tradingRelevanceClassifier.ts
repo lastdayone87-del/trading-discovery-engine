@@ -107,11 +107,14 @@ export async function classifyTradingRelevanceDetailed(
   };
   if (precision.status === 'DOWNGRADE' && precision.result) {
     const guard = precision.result;
-    // Commercial institutions, broker/platform channels, signal sellers and
-    // promotional channels are still trading/investing content. The guard may
-    // refine their category, but must not turn them into a non-trading result.
-    const relevantRefinement = guard.category === 'MARKET_INSTITUTION' || guard.category === 'HYPE';
-    const financeAdjacent = guard.category === 'FINANCIAL_NEWS';
+    // Broker/trading-platform, signal and promotional channels are still
+    // trading/investing content when their primary material is trading. A
+    // bank, insurer, wealth manager or ordinary fund is non-trading and must
+    // not inherit a first-pass confirmation from the legacy broad category.
+    const relevantRefinement = guard.category === 'TRADING_PLATFORM_OR_FIRM'
+      || guard.category === 'MARKET_INSTITUTION'
+      || guard.category === 'HYPE';
+    const financeAdjacent = guard.category === 'FINANCIAL_NEWS' || guard.category === 'BANK_OR_NON_TRADING_INSTITUTION';
     decision.category = guard.category;
     decision.geminiSemanticSummary = {
       ...(decision.geminiSemanticSummary || { concepts: [], instruments: [], reason: '', modelUsed: undefined }),

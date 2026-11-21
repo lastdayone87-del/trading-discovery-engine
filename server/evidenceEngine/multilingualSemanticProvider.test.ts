@@ -41,7 +41,7 @@ test('ambiguous first-tier results can be escalated to the versioned adjudicator
   delete process.env.MULTILINGUAL_ADJUDICATOR_MODEL;
   try {
     const ambiguous = { ...trading, label: 'AMBIGUOUS', confidence: 52 };
-    const [item] = await new GeminiSemanticProvider(client(ambiguous, trading)).collectEvidence({ channel_name: 'Code Switch', description: 'Opero live with risk controls' }, knowledge);
+    const [item] = await new GeminiSemanticProvider(client(ambiguous, trading)).collectEvidence({ channel_name: 'Code Switch', description: 'Opero live with risk controls', videos: [{ title: 'Entradas y salidas en vivo' }] }, knowledge);
     assert.equal(item.provenance?.semantic?.modelVersion, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL);
     assert.equal(item.category, 'METHODOLOGY_CONCEPT');
   } finally {
