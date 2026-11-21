@@ -1080,10 +1080,11 @@ test('only transient provider evidence failures defer without consuming attempts
     'read ECONNRESET',
     'Service unavailable (503)',
     'unexpected provider payload shape',
+    'FULL_DESCRIPTIONS_UNAVAILABLE:quota exhausted',
   ]) {
     assert.equal(isProviderEvidenceFailure(reason), true, reason);
   }
-  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'FULL_DESCRIPTIONS_UNAVAILABLE:no description', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
+  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
     assert.equal(isProviderEvidenceFailure(reason), false, String(reason));
   }
 });
