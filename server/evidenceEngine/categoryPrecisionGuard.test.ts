@@ -344,3 +344,51 @@ test('official banks and asset managers split away from trading platforms', () =
   });
   assert.equal(platform?.category, 'TRADING_PLATFORM_OR_FIRM');
 });
+
+test('Bank Nifty, SoftBank and Fairbanks are not bank institutions', () => {
+  const bankNifty = deterministicCategoryGuard({
+    channel_name: 'BankNifty Options Trader',
+    description: 'Daily Bank Nifty options scalping, live execution and risk management.',
+    video_titles: ['Bank Nifty live trading', 'Nifty options setup', 'Risk management recap'],
+  });
+  assert.notEqual(bankNifty?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const softbank = deterministicCategoryGuard({
+    channel_name: 'SoftBank Official Channel',
+    description: 'Official channel of SoftBank. Telecommunications, technology and investment.',
+    video_titles: ['Technology vision', 'Investment update', 'Telecom network'],
+  });
+  assert.notEqual(softbank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const fairbanks = deterministicCategoryGuard({
+    channel_name: 'Fairbanks Alaska',
+    description: 'Life in Fairbanks, Alaska. Travel, weather and local events.',
+    video_titles: ['Winter in Fairbanks', 'Northern lights', 'Local travel guide'],
+  });
+  assert.notEqual(fairbanks?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+});
+
+test('a bank brand with one market-analysis upload stays bank, but a primary trading sample does not', () => {
+  const bank = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank wealth products, market insight and banking services.',
+    video_titles: ['Market analysis', 'Wealth products', 'Savings accounts'],
+  });
+  assert.equal(bank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const tradingBank = deterministicCategoryGuard({
+    channel_name: 'Maybank Official Channel',
+    description: 'Official channel of Maybank. Trading education and market analysis.',
+    video_titles: ['Technical analysis of futures', 'Price action setup', 'Market structure lesson', 'Risk management'],
+  });
+  assert.equal(tradingBank, null);
+});
+
+test('ordinary asset managers and mutual-fund marketers are non-trading institutions', () => {
+  const assetManager = deterministicCategoryGuard({
+    channel_name: 'Northstar Asset Management Official Channel',
+    description: 'Official channel of Northstar Asset Management. Mutual funds, retirement products and wealth management.',
+    video_titles: ['Mutual fund overview', 'Retirement planning', 'Market outlook'],
+  });
+  assert.equal(assetManager?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+});

@@ -251,6 +251,7 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   const creatorBioTierA = Boolean(composition?.familyClassifications?.some(family =>
     family.field === 'channel_bio' && family.tierA && family.focus === 'TRADING_CORE'));
   const strongCreatorComposition = resolveClassificationRoutingMode() === 'ACTIVE'
+    && input.channelBioAuthoritative !== false
     && hasMeaningfulCreatorText(input.description)
     && creatorBioTierA
     && Boolean(composition && compositionConfirmsTrading(composition));

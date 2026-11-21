@@ -362,6 +362,7 @@ test('bank/non-trading institution is a terminal negative while a trading platfo
     contentCategory: 'BANK_OR_NON_TRADING_INSTITUTION',
   });
   assert.equal(bank.status, 'NON_TRADING');
+  assert.ok(bank.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION'));
 
   const platform = evaluateUnifiedDecisionPolicy({
     evidence: [semanticLabel('TRADING_PLATFORM_OR_FIRM', 'POSITIVE')],

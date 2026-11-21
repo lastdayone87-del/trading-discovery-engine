@@ -12,7 +12,12 @@
  */
 import { getChannelById, getDb } from '../server/db';
 import { candidateFromAdmissionRow, verifyAdmissionCandidate } from '../server/channelAdmission';
-import { findAdmissionCandidate, type AdmissionCandidateRow } from '../server/channelAdmission/store';
+import {
+  enqueueAdmissionVerification,
+  findAdmissionCandidate,
+  getAdmissionMode,
+  type AdmissionCandidateRow,
+} from '../server/channelAdmission/store';
 import type { AdmissionCandidateInput, AdmissionEvidence } from '../server/channelAdmission/types';
 import type { DiscoverySource } from '../src/types';
 
@@ -27,6 +32,10 @@ function sourceOf(value: unknown): DiscoverySource {
   return value === 'manual_search' || value === 'recheck' ? value : 'automated_query';
 }
 
+if (apply) {
+  const mode = await getAdmissionMode();
+  if (mode !== 'ACTIVE') throw new Error(`ADMISSION_MODE_NOT_ACTIVE:${mode}`);
+}
 const db = await getDb();
 const statuses = includeConfirmed
   ? ['ADMITTED', 'ADMITTED_AMBIGUOUS', 'WAITING_EVIDENCE', 'PROVIDER_DEFERRED', 'NEEDS_REVIEW']
@@ -34,16 +43,20 @@ const statuses = includeConfirmed
 const selected = await db.query(
   `SELECT cand.*
      FROM semantic_admission_candidates cand
-     JOIN channels c ON c.channel_id = cand.channel_id
     WHERE cand.status = ANY($1::text[])
       AND ($2::text IS NULL OR cand.channel_id = $2)
+      AND (
+        cand.status NOT IN ('WAITING_EVIDENCE','PROVIDER_DEFERRED')
+        OR cand.next_check_at IS NULL
+        OR cand.next_check_at <= now()
+      )
       AND NOT EXISTS (
         SELECT 1 FROM jobs j
          WHERE j.status IN ('PENDING','PROCESSING')
            AND j.type IN ('VERIFY_CHANNEL_ADMISSION','ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL')
            AND j.payload->>'channelId' = cand.channel_id
       )
-    ORDER BY cand.first_seen ASC
+    ORDER BY cand.created_at ASC
     LIMIT $3`,
   [statuses, channelArg || null, limit],
 );
@@ -77,6 +90,18 @@ for (const raw of selected.rows as Array<Record<string, any>>) {
       dryRun: !apply,
       archiveRejectedExistingChannel: true,
     });
+    if (apply && (result.status === 'WAITING_EVIDENCE' || result.status === 'PROVIDER_DEFERRED')) {
+      const refreshed = await findAdmissionCandidate(row.channel_id);
+      if (refreshed?.next_check_at) {
+        await enqueueAdmissionVerification({
+          candidate: input,
+          runAfter: refreshed.next_check_at,
+          attempt: Math.max(2, Number(refreshed.attempts || 0) + 1),
+          retryKind: result.status === 'PROVIDER_DEFERRED' ? 'provider' : 'evidence',
+          priority: result.priority,
+        });
+      }
+    }
     results.push({
       channelId: row.channel_id,
       priorStatus: row.status,
@@ -93,6 +118,9 @@ for (const raw of selected.rows as Array<Record<string, any>>) {
       applied: false,
     });
   }
+}
+if (results.some(result => typeof result.error === 'string')) {
+  process.exitCode = 1;
 }
 
 console.log(JSON.stringify({

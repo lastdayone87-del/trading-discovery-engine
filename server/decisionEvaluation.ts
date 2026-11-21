@@ -5,6 +5,8 @@ export const DECISION_EVALUATION_SCHEMA_VERSION = 'decision-evaluation-v1';
 export const DEFAULT_LABEL_POLICY_VERSION = 'evaluation-ground-truth-v1';
 export const CREATOR_TYPES=['ACTIVE_TRADING_CREATOR','TRADING_EDUCATOR','INVESTING_EDUCATOR','FINANCIAL_NEWS','PERSONAL_FINANCE','TRADING_PLATFORM_OR_FIRM','BANK_OR_NON_TRADING_INSTITUTION','MARKET_INSTITUTION','CORPORATE_BRAND','GAMING_CREATOR','ENTERTAINMENT_CREATOR','TRADING_ADJACENT','INCIDENTAL_TRADING_CONTENT','HYPE_OR_PROMOTION','UNRELATED_OTHER','INSUFFICIENT_EVIDENCE','IDENTITY_DISPUTED'] as const;
 export type CreatorType=typeof CREATOR_TYPES[number];
+/** New adjudications must use the split taxonomy; legacy rows stay readable. */
+export const CONFIRMABLE_CREATOR_TYPES: readonly CreatorType[] = CREATOR_TYPES.filter(type => type !== 'MARKET_INSTITUTION');
 
 const stable = (value:unknown):string => JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)
   ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))) : item);

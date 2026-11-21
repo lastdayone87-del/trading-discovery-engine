@@ -149,8 +149,25 @@ const OFFICIAL_CHANNEL_ARABIC = /القناة الرسمية/u;
 const FINANCIAL_INSTITUTION = /\b(?:broker|brokerage|exchange|bank(?:ing)?|banco|banque|prop firm|funded|asset management|investment management|securities|cfd|forex broker|trading platform|trading software|scanner|terminal|insurer|insurance|wealth management|mutual fund|fund manager|asset manager)\b/iu;
 // Banks, insurers, ordinary fund/wealth managers and payment/consumer-finance
 // companies are non-trading institutions even when their channel publishes
-// market commentary or educational videos.
-const BANK_OR_ASSET_MANAGER = /(?:bank(?:ing)?|banco|banque|insurer|insurance|payment provider|consumer finance|wealth management|asset management|investment management|asset manager|fund manager|mutual fund|building society)/iu;
+// market commentary or educational videos. The brand check uses word/compound
+// boundaries so Bank Nifty, BankNifty, Bankless, and bankroll creators are not
+// mistaken for banks.
+const BANK_STANDALONE = /\b(?:bank|banking|banco|banque)\b/iu;
+// Compound brands are not proof of a bank: SoftBank, Fairbanks, Burbank and
+// similar names must not be downgraded. Only the explicit Maybank2u-style
+// numeric brand suffix is treated as a compound bank identity.
+const BANK_COMPOUND = /\b[a-z]{2,}bank2[a-z0-9]*\b/iu;
+const BANK_BRAND_EXCEPTION = /\b(?:bank\s*nifty|banknifty|bankless|bankroll)\b/iu;
+const ASSET_MANAGER_OR_INSURER = /\b(?:insurer|insurance|payment provider|consumer finance|wealth management|asset management|investment management|asset manager|fund manager|mutual fund|building society)\b/iu;
+function hasBankInstitutionIdentity(text: string): boolean {
+  if (BANK_BRAND_EXCEPTION.test(text)) return ASSET_MANAGER_OR_INSURER.test(text);
+  return BANK_STANDALONE.test(text) || BANK_COMPOUND.test(text) || ASSET_MANAGER_OR_INSURER.test(text);
+}
+function hasPrimaryTradingSample(videoTexts: string[]): boolean {
+  if (videoTexts.length === 0) return false;
+  const analysisVideos = videoTexts.filter(text => TRADING_ANALYSIS_TERMS.test(text)).length;
+  return analysisVideos >= 3 && analysisVideos >= Math.ceil(videoTexts.length / 2);
+}
 
 function decodeEntities(value: unknown): string {
   return String(value || '')
@@ -264,10 +281,9 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
   // A bank/insurer/wealth-manager brand is a non-trading institution even
   // when it does not say "official channel". Trading analysis or explicit
   // education in the actual sample keeps an independent educator safe.
-  if (BANK_OR_ASSET_MANAGER.test(nameAndBio)
+  if (hasBankInstitutionIdentity(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)
-    && !TRADING_ANALYSIS_TERMS.test(all)
-    && !EXPLICIT_EDUCATION_TERMS.test(all)
+    && !hasPrimaryTradingSample(videoTexts)
     && !/\b(?:my|our)\s+(?:trades?|trading|journey|account|strategy)\b/iu.test(nameAndBio)) {
     return { category: 'BANK_OR_NON_TRADING_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_BANK_BRAND'] };
   }
@@ -280,7 +296,7 @@ export function deterministicCategoryGuard(input: RawChannelInput): PrecisionGua
   if ((OFFICIAL_CHANNEL.test(nameAndBio) || OFFICIAL_CHANNEL_ARABIC.test(nameAndBio))
     && FINANCIAL_INSTITUTION.test(nameAndBio)
     && !FIRST_PERSON_TRADER.test(nameAndBio)) {
-    if (BANK_OR_ASSET_MANAGER.test(nameAndBio)) {
+    if (hasBankInstitutionIdentity(nameAndBio) && !hasPrimaryTradingSample(videoTexts)) {
       return { category: 'BANK_OR_NON_TRADING_INSTITUTION', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_BANK_OR_ASSET_MANAGER'] };
     }
     return { category: 'TRADING_PLATFORM_OR_FIRM', source: 'DETERMINISTIC', reasonCodes: ['PRECISION_INSTITUTION_OFFICIAL_CHANNEL'] };

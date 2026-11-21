@@ -287,10 +287,9 @@ export function resolveClassificationRouting(
     const categoryOwnsDecision = options.contentCategory === 'ACTIVE_TRADING'
       || options.contentCategory === 'TRADING_EDUCATION'
       || options.contentCategory === 'INVESTING_EDUCATION'
-      // Commercial broker/platform, signal and promotional channels are
-      // still trading-relevant when their actual content is trading. A bank
-      // or non-trading institution is deliberately excluded.
-      || options.contentCategory === 'TRADING_PLATFORM_OR_FIRM'
+      // Legacy market-institution and promotional labels keep their historical
+      // behavior. A split platform/firm label must still pass the video-focus
+      // guard because platform identity alone does not prove trading content.
       || options.contentCategory === 'MARKET_INSTITUTION'
       || options.contentCategory === 'HYPE';
     if (!categoryOwnsDecision && videoTexts.length >= 3) {

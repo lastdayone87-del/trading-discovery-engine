@@ -47,6 +47,8 @@ test('the closed taxonomy includes trading education and split financial institu
     assert.equal(isSemanticResultShape(result({ label })), true, label);
   }
   assert.equal(isSemanticResultShape(result({ label: 'BROKER_PLATFORM' })), false);
+  // Legacy cache/fixture rows must remain structurally valid.
+  assert.equal(isSemanticResultShape(result({ label: 'MARKET_INSTITUTION' })), true);
 });
 
 

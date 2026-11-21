@@ -114,12 +114,14 @@ export function hasCreatorLevelSemanticUnrelatedNegative(
     if (classifyNegativeEvidenceRole(item, { terminalEligible: true }) !== 'TERMINAL') return false;
     if (!isSemanticClassificationSource(item.source)) return false;
     if (!isNonRelevantSemanticLabel(item.provenance?.semantic?.taxonomyLabel)) return false;
-    if (Number(item.provenance?.semantic?.calibratedConfidence) < SEMANTIC_TOP_CALIBRATED_CONFIDENCE) return false;
+    const calibratedConfidence = Number(item.provenance?.semantic?.calibratedConfidence);
+    if (!Number.isFinite(calibratedConfidence) || calibratedConfidence < SEMANTIC_TOP_CALIBRATED_CONFIDENCE) return false;
     const fields = item.provenance?.fields || [];
-    // Creator bio/transcript/pinned text is creator-level on its own. Two
+    // A meaningful creator bio is creator-level on its own. A boilerplate bio
+    // must not suppress a qualifying transcript/pinned citation. Two
     // independent video families are the alternative; a single title is not.
-    if (fields.some(field => field.field === 'channel_bio')) return hasMeaningfulCreatorText(input.description);
-    if (fields.some(field => CREATOR_LEVEL_FIELDS.has(field.field))) return true;
+    if (fields.some(field => field.field === 'channel_bio') && hasMeaningfulCreatorText(input.description)) return true;
+    if (fields.some(field => CREATOR_LEVEL_FIELDS.has(field.field) && field.field !== 'channel_bio')) return true;
     const families = new Set(fields
       .filter(field => field.field === 'video_title' || field.field === 'video_description')
       .map(field => field.sourceFamilyId || field.sourceId)

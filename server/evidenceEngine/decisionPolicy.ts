@@ -125,7 +125,7 @@ export function evaluateDecisionScoreBoundary(evidence:EvidenceItem[],minimumPos
 
 export function hasCreatorLevelUnrelatedAttribution(items:EvidenceItem[]):boolean{
   const fields=items.flatMap(item=>item.provenance?.fields||[]);
-  if(fields.some(field=>field.field==='channel_bio')) return true;
+  if(fields.some(field=>field.field==='channel_bio'||field.field==='transcript_excerpt'||field.field==='pinned_comment')) return true;
   const videoFamilies=new Set(fields.filter(field=>field.field==='video_title'||field.field==='video_description').map(field=>field.sourceFamilyId||field.sourceId).filter((value):value is string=>Boolean(value)));
   return videoFamilies.size>=2;
 }
@@ -224,7 +224,10 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
     : {});
   if(input.lifecycleAction==='CONFIRM'&&positiveBoundaryForDecision&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation&&!materialContradiction){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY',...(aiLedTrading?['AI_LED_TRADING_CONFIRMATION']:[]));if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
-    status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
+    status='NON_TRADING';
+    const terminalLabels=new Set(terminalNegative.map(item=>String(item.provenance?.semantic?.taxonomyLabel||'')));
+    if(terminalLabels.has('BANK_OR_NON_TRADING_INSTITUTION'))reasons.push('HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION');
+    else reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {
     if(input.lifecycleAction==='CONFIRM'&&!contentCategoryAllowsConfirmation)reasons.push('CONTENT_CATEGORY_NOT_TRADING_RELEVANT');
     if(input.lifecycleAction==='CONFIRM'&&!independentCreatorField)reasons.push('INDEPENDENT_CREATOR_OWNED_FIELD_REQUIRED');

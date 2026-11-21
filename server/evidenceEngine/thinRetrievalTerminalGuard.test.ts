@@ -399,3 +399,16 @@ test('thin retrieval input without a strong creator-owned composition routes to 
   assert.equal(stages.lifecycleAction, 'ENRICH');
   assert.ok(stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'));
 });
+
+test('an unhydrated search snippet cannot use the short-bio exception', () => {
+  const evidence = [
+    positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
+  ];
+  const { stages } = decide(
+    { ...thinRetrievalInput, description: 'Forex trading signals', channelBioAuthoritative: false },
+    evidence,
+    sufficientCollection(),
+    strongCreatorComposition,
+  );
+  assert.equal(stages.lifecycleAction, 'ENRICH');
+});
