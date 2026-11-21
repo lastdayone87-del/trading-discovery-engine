@@ -106,6 +106,25 @@ export function isYouTubePermanentInputError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * A channel's uploads playlist can legitimately be absent even when the
+ * channel itself is readable (no uploads, terminated channel, or a playlist
+ * the API refuses to expose). That is a missing video sample, not a provider
+ * outage: enrichment should keep the creator metadata it already fetched and
+ * let admission use the bio, rather than failing the whole evidence snapshot.
+ */
+export function isYouTubeUploadsPlaylistUnavailable(error: unknown): boolean {
+  let current: any = error;
+  let sawNotFound = false;
+  let sawPlaylistNotFound = false;
+  for (let depth = 0; current && depth < 6; depth++, current = current.cause) {
+    if (Number(current.status) === 404) sawNotFound = true;
+    const reasons = Array.isArray(current.providerReasons) ? current.providerReasons.map(String) : [];
+    if (reasons.includes('playlistNotFound')) sawPlaylistNotFound = true;
+  }
+  return sawNotFound && sawPlaylistNotFound;
+}
+
 /** Serializes durable suspension writes (persist + clear) in process
  * arrival order. The pool runs several clients, so without this a gated
  * clear issued before a concurrent re-suspension's upsert can still execute

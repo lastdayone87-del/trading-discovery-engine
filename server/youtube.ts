@@ -43,6 +43,7 @@ import {
   isYouTubeInputFailure,
   isYouTubePageTokenFailure,
   isYouTubePermanentInputError,
+  isYouTubeUploadsPlaylistUnavailable,
   isYouTubeQuotaAccountingError,
   normalizeYouTubeQuarantineInput,
   retryYouTubeQuotaAccounting,
@@ -1707,9 +1708,24 @@ export async function fetchYouTubeChannelEnrichment(
         }
         const uploadsPlaylistId = channelCheckpoint.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
         if (uploadsPlaylistId) {
-          const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet,contentDetails',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
-          await accountYouTubeQuotaResponse(recentResponse, 1);
-          uploadsCheckpoint = adaptPlaylistItemsToSearchShape(await readYouTubeJsonObject(recentResponse, 'channel-uploads'));
+          try {
+            const recentResponse = await youtubeFetch(buildYouTubeApiUrl('playlistItems',apiKey,{part:'snippet,contentDetails',playlistId:String(uploadsPlaylistId),maxResults:10}),'channel-uploads',1,attempt+1,acquisition,priority,apiKey);
+            await accountYouTubeQuotaResponse(recentResponse, 1);
+            uploadsCheckpoint = adaptPlaylistItemsToSearchShape(await readYouTubeJsonObject(recentResponse, 'channel-uploads'));
+          } catch (error) {
+            // A playlist the API reports as absent is a missing video sample,
+            // not a provider outage. Keep the channel metadata already fetched
+            // and let admission evaluate the bio instead of deferring forever.
+            if (!isYouTubeUploadsPlaylistUnavailable(error)) throw error;
+            uploadsCheckpoint = { items: [] };
+            console.warn(JSON.stringify({
+              event: 'youtube_uploads_playlist_unavailable',
+              channelId,
+              operation: 'channel-uploads',
+              reason: 'playlistNotFound',
+              timestamp: new Date().toISOString(),
+            }));
+          }
         } else {
           uploadsCheckpoint = { items: [] };
         }
