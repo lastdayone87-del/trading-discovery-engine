@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assessExtractedQueryAdmission, decideAdmission } from './policy';
+import { assessExtractedQueryAdmission, decideAdmission, validCitations } from './policy';
 import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
@@ -1310,4 +1310,18 @@ test('admission semantic route health treats unconfigured providers as unavailab
   assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: true }), false);
   assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: false }), true);
   assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: true }), false);
+});
+
+test('playlist citations are validated as creator-owned admission evidence', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
+    playlists: [{ name: 'NQ futures trade recaps', description: 'Weekly execution reviews' }],
+  };
+  const validated = validCitations(fixture, judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('playlist_name', 'NQ futures trade recaps', 0, 'TRADING')],
+  }));
+  assert.equal(validated.length, 1);
+  assert.equal(validated[0].field, 'playlist_name');
 });

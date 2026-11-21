@@ -82,7 +82,7 @@ Return JSON only:
   "trading_focus": 0,
   "unrelated_domains": [{"domain":"AI_RESEARCH","confidence":0.0}],
   "incidental_trading_mentions": [{"field":"video_title","index":0,"quote":"..."}],
-  "evidence_citations": [{"field":"bio|channel_name|video_title|video_description|link","index":0,"quote":"...","supports":"TRADING|UNRELATED|FINANCE_ADJACENT"}],
+  "evidence_citations": [{"field":"bio|channel_name|video_title|video_description|playlist_name|playlist_description|link","index":0,"quote":"...","supports":"TRADING|UNRELATED|FINANCE_ADJACENT"}],
   "language": "en",
   "reasoning": "Short, evidence-based explanation."
 }

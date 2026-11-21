@@ -140,7 +140,7 @@ export interface AdmissionEvidence {
 }
 
 export interface SemanticCitation {
-  field: 'channel_name' | 'bio' | 'video_title' | 'video_description' | 'link';
+  field: 'channel_name' | 'bio' | 'video_title' | 'video_description' | 'playlist_name' | 'playlist_description' | 'link';
   index?: number;
   quote: string;
   supports: 'TRADING' | 'UNRELATED' | 'FINANCE_ADJACENT';
