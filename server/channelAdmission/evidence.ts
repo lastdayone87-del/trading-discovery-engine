@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { fetchVideoSnippetsByIds, fetchYouTubeChannelEnrichment, type DiscoveredChannelRaw } from '../youtube';
 import type { AdmissionEvidence } from './types';
+import { hasMeaningfulCreatorText } from '../evidenceEngine/creatorText';
 
 /** Stable evidence fingerprint for decisions and the one semantic cache. */
 export function admissionEvidenceChecksum(evidence: AdmissionEvidence): string {
@@ -37,12 +38,78 @@ export function isProviderEvidenceFailure(reason?: string): boolean {
   // failure returned by the evidence fetcher is a provider, transport or
   // local collection failure and must not consume attempts or expire a
   // valid candidate.
-  if (/^(?:NO_CREATOR_TEXT_AVAILABLE|FULL_DESCRIPTIONS_UNAVAILABLE\b)/i.test(value)) return false;
+  if (/^NO_CREATOR_TEXT_AVAILABLE\b/i.test(value)) return false;
   // Deleted, private or invalid channels are permanent input failures, not
   // provider outages. Let the normal bounded missing-evidence path settle
   // them instead of deferring forever.
   if (/\b(?:404|410)\b|not[ _-]?found|does not exist|invalid channel|permanent input|videoNotFound|channelNotFound/i.test(value)) return false;
   return true;
+}
+
+
+/**
+ * Select only evidence actually recovered by the keyless fallbacks. Discovery
+ * snippets and candidate links are deliberately not inputs: an official
+ * provider outage must stay a retryable provider failure unless a fallback
+ * surface produced real creator text or a link.
+ */
+export function selectKeylessFallbackEvidence(input: {
+  aboutBio?: string;
+  innertubeBio?: string;
+  aboutLinks?: string[];
+  innertubeLinks?: string[];
+}): { description: string; addedLinks: string[]; usable: boolean } {
+  const description = [input.aboutBio, input.innertubeBio]
+    .map(value => String(value || '').trim())
+    .find(value => hasMeaningfulCreatorText(value)) || '';
+  const addedLinks = uniqueLinks([...(input.aboutLinks || []), ...(input.innertubeLinks || [])]);
+  return { description, addedLinks, usable: hasMeaningfulCreatorText(description) || addedLinks.length > 0 };
+}
+
+export interface AdmissionCoverageAssessment {
+  coverage: AdmissionEvidence['evidenceCoverage'];
+  evidenceSample: NonNullable<AdmissionEvidence['evidenceSample']>;
+  failureReason?: string;
+}
+
+/**
+ * Pure coverage assessment shared by the acquisition path and tests.
+ * A provider failure is only retryable when no meaningful creator evidence
+ * was acquired; a boilerplate bio or discovery snippet never makes an empty
+ * video sample authoritative.
+ */
+export function assessAdmissionEvidenceCoverage(input: {
+  description?: string;
+  videos: Array<{ title?: string; description?: string }>;
+  playlists?: Array<{ name?: string; description?: string }>;
+  detailFailure?: string;
+  acquisitionFailure?: string;
+}): AdmissionCoverageAssessment {
+  const description = String(input.description || '').trim();
+  const meaningfulDescription = hasMeaningfulCreatorText(description);
+  const meaningfulPlaylists = (input.playlists || []).some(playlist =>
+    hasMeaningfulCreatorText(playlist.name) || hasMeaningfulCreatorText(playlist.description));
+  const missingVideoDescriptions = input.videos.some(video => !String(video.description || '').trim());
+  const completeVideoSample = input.videos.length > 0 && (!input.detailFailure || !missingVideoDescriptions);
+  const coverage: AdmissionEvidence['evidenceCoverage'] =
+    completeVideoSample || (!input.detailFailure && (meaningfulDescription || meaningfulPlaylists))
+      ? 'COMPLETE'
+      : 'PARTIAL';
+  const failureReason = coverage === 'COMPLETE'
+    ? undefined
+    : input.detailFailure
+      ? `FULL_DESCRIPTIONS_UNAVAILABLE:${input.detailFailure}`
+      : input.acquisitionFailure
+        ? `PROVIDER_EVIDENCE_UNAVAILABLE:${input.acquisitionFailure}`
+        : 'NO_CREATOR_TEXT_AVAILABLE';
+  const evidenceSample: NonNullable<AdmissionEvidence['evidenceSample']> = input.videos.length > 0
+    ? 'VIDEO_SAMPLE'
+    : meaningfulPlaylists
+      ? 'PLAYLIST_SAMPLE'
+      : meaningfulDescription
+        ? 'METADATA_ONLY'
+        : 'NONE';
+  return { coverage, evidenceSample, failureReason };
 }
 
 /**
@@ -109,16 +176,17 @@ export async function fetchAdmissionEvidence(input: {
           publishedAt: full?.publishedAt || video.published_at,
         };
       })
-      .filter(video => video.title.trim().length > 0)
+      .filter(video => video.title.trim().length > 0 || video.description.trim().length > 0)
       .slice(0, 10);
-    const description = String(enriched.description || base.description || '').trim();
-    const missingVideoDescriptions = videos.some(video => !String(video.description || '').trim());
-    // A failed videos.list enrichment must not erase a usable sample that was
-    // already acquired through the keyless InnerTube fallback.
-    const coverage: AdmissionEvidence['evidenceCoverage'] =
-      (videos.length > 0 && (!detailFailure || !missingVideoDescriptions)) || description.length > 0
-        ? 'COMPLETE'
-        : 'PARTIAL';
+    const description = String(enriched.description || '').trim();
+    const playlists = enriched.playlists || base.playlists || [];
+    const assessment = assessAdmissionEvidenceCoverage({
+      description,
+      videos,
+      playlists,
+      detailFailure,
+      acquisitionFailure: enriched.evidenceAcquisitionFailure,
+    });
     return {
       ...base,
       channelName: enriched.channelName || base.channelName,
@@ -128,13 +196,11 @@ export async function fetchAdmissionEvidence(input: {
       declaredLanguage: enriched.detectedLanguages?.[0]?.language || base.declaredLanguage,
       subscriberCount: enriched.subscriberCount || base.subscriberCount,
       videos,
-      playlists: enriched.playlists || base.playlists,
+      playlists,
       topics: enriched.channelTopics || base.topics,
-      evidenceSample: videos.length > 0 ? 'VIDEO_SAMPLE' : description.length > 0 || uniqueLinks([...base.links, ...(enriched.channelLinks || [])]).length > 0 ? 'METADATA_ONLY' : 'NONE',
-      evidenceCoverage: coverage,
-      failureReason: coverage === 'PARTIAL'
-        ? (detailFailure || 'NO_CREATOR_TEXT_AVAILABLE')
-        : detailFailure ? `FULL_DESCRIPTIONS_UNAVAILABLE:${detailFailure}` : undefined,
+      evidenceSample: assessment.evidenceSample,
+      evidenceCoverage: assessment.coverage,
+      failureReason: assessment.failureReason,
     };
   } catch (error) {
     const failureReason = error instanceof Error ? error.message : String(error);
@@ -147,22 +213,19 @@ export async function fetchAdmissionEvidence(input: {
         fetchPublicAboutEvidence(`https://www.youtube.com/channel/${input.candidate.channelId}`).catch(() => null),
         fetchChannelAboutViaInnertube(input.candidate.channelId).catch(() => null),
       ]);
-      const aboutBio = about?.status === 'AVAILABLE' ? about.about?.bio?.trim() : undefined;
-      const innertubeBio = innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.description?.trim() : undefined;
-      const description = aboutBio || innertubeBio || base.description;
-      const links = uniqueLinks([
-        ...base.links,
-        ...(about?.status === 'AVAILABLE' ? about.about?.channelLinks || [] : []),
-        ...(innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.links || [] : []),
-      ]);
-      if (description.trim() || links.length) {
+      const fallback = selectKeylessFallbackEvidence({
+        aboutBio: about?.status === 'AVAILABLE' ? about.about?.bio : undefined,
+        innertubeBio: innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.description : undefined,
+        aboutLinks: about?.status === 'AVAILABLE' ? about.about?.channelLinks : undefined,
+        innertubeLinks: innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.links : undefined,
+      });
+      if (fallback.usable) {
         return {
           ...base,
-          description,
-          links,
+          description: fallback.description,
+          links: uniqueLinks([...base.links, ...fallback.addedLinks]),
           evidenceCoverage: 'COMPLETE',
           evidenceSample: 'METADATA_ONLY',
-          failureReason,
         };
       }
     } catch {

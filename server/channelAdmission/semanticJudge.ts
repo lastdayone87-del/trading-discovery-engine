@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { getDb } from '../db';
 import type { SemanticModelClient } from '../evidenceEngine/providers/GeminiSemanticProvider';
 import {
@@ -88,21 +87,10 @@ ${JSON.stringify(pack).replace(/</g, '\\u003c')}
 ${UNTRUSTED_END}`;
 }
 
-export function admissionEvidenceChecksum(evidence: AdmissionEvidence): string {
-  // Discovery provenance and fetch timestamps must not break the semantic
-  // cache: the same creator found through another query has the same subject.
-  const stable = {
-    channelId: evidence.channelId,
-    channelName: evidence.channelName,
-    description: evidence.description,
-    links: evidence.links,
-    declaredLanguage: evidence.declaredLanguage,
-    country: evidence.country,
-    subscriberCount: evidence.subscriberCount,
-    videos: evidence.videos,
-  };
-  return createHash('sha256').update(JSON.stringify(stable)).digest('hex');
-}
+// One checksum implementation lives with the evidence snapshot. Admission
+// decisions and the semantic cache must fingerprint identical fields.
+import { admissionEvidenceChecksum } from './evidence';
+export { admissionEvidenceChecksum } from './evidence';
 
 function admissionCacheKey(role: 'PRIMARY' | 'SECOND', model: string, checksum: string): string {
   return `admission:${role}:${model}:${ADMISSION_PROMPT_VERSION}:${checksum}`;

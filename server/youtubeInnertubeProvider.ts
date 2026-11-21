@@ -732,9 +732,6 @@ export async function fetchChannelAboutViaInnertube(
   opts: { jobId?: string } = {},
 ): Promise<InnertubeChannelAbout> {
   if (!channelId?.trim()) return { status: 'NOT_FOUND', reason: 'CHANNEL_ID_REQUIRED' };
-  const remainingMs = innertubeCooldownRemainingMs();
-  if (remainingMs > 0) return { status: 'RATE_LIMITED', reason: `COOLDOWN_${remainingMs}MS` };
-  const deadlineAtMs = Date.now() + innertubeTimeoutMs();
   const started = Date.now();
   const base = {
     id: randomUUID(),
@@ -748,6 +745,19 @@ export async function fetchChannelAboutViaInnertube(
     reservedCost: 0,
     policyVersion: 'provider-resilience-v1',
   };
+  const remainingMs = innertubeCooldownRemainingMs();
+  if (remainingMs > 0) {
+    await emit({
+      ...base,
+      status: 'RATE_LIMITED',
+      latencyMs: Date.now() - started,
+      actualCost: 0,
+      occurredAt: new Date().toISOString(),
+      requestMetadata: { ...base.requestMetadata, errorClass: 'COOLDOWN' },
+    }).catch(() => undefined);
+    return { status: 'RATE_LIMITED', reason: `COOLDOWN_${remainingMs}MS` };
+  }
+  const deadlineAtMs = Date.now() + innertubeTimeoutMs();
   const pacedCall = async <T>(work: () => Promise<T>): Promise<T> => {
     await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
     return withInnertubeRemaining(work(), deadlineAtMs);
@@ -763,6 +773,11 @@ export async function fetchChannelAboutViaInnertube(
     }
     const getChannel = session.getChannel;
     if (typeof getChannel !== 'function') {
+      await emit({
+        ...base, status: 'TRANSIENT_ERROR' as const, latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+        requestMetadata: { ...base.requestMetadata, errorClass: 'CHANNEL_UNAVAILABLE' },
+      }).catch(() => undefined);
       return { status: 'TEMPORARY_FAILURE', reason: 'INNERTUBE_CHANNEL_UNAVAILABLE' };
     }
     const channel = await pacedCall<any>(() => getChannel.call(session, channelId) as Promise<any>);
@@ -782,12 +797,16 @@ export async function fetchChannelAboutViaInnertube(
     const rawLinks = Array.isArray(metadata?.links) || typeof metadata?.links?.map === 'function'
       ? metadata.links
       : [];
-    const links = Array.from(rawLinks as Array<{ link?: unknown }>)
-      .map((link: any) => String(link?.link || '').trim())
+    const links = Array.from(rawLinks as Array<unknown>)
+      .map((link: any) => typeof link === 'string'
+        ? link.trim()
+        : String(link?.link || link?.url || link?.target || link?.canonical_url || '').trim())
       .filter(Boolean);
     const country = String(metadata?.country || '').trim() || undefined;
     const subscriberCount = String(metadata?.subscriber_count || '').trim() || undefined;
-    const status: InnertubeAcquisitionStatus = description || links.length ? 'AVAILABLE' : 'AUTHORITATIVE_EMPTY';
+    const status: InnertubeAcquisitionStatus = description || links.length || subscriberCount || country
+      ? 'AVAILABLE'
+      : 'AUTHORITATIVE_EMPTY';
     await emit({
       ...base,
       status: 'SUCCESS',
@@ -801,9 +820,19 @@ export async function fetchChannelAboutViaInnertube(
     const typed = classifyInnertubeError(error);
     if (typed.code === INNERTUBE_RATE_LIMITED_CODE) {
       innertubeCooldownUntilMs = Date.now() + innertubeCooldownMs();
+      await emit({
+        ...base, status: 'RATE_LIMITED', latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+        requestMetadata: { ...base.requestMetadata, errorClass: 'RATE_LIMIT' },
+      }).catch(() => undefined);
       return { status: 'RATE_LIMITED', reason: typed.message };
     }
     if (typed.code === INNERTUBE_TIMEOUT_CODE) {
+      await emit({
+        ...base, status: 'TRANSIENT_ERROR' as const, latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+        requestMetadata: { ...base.requestMetadata, errorClass: 'TIMEOUT' },
+      }).catch(() => undefined);
       return { status: 'TEMPORARY_FAILURE', reason: typed.message };
     }
     await emit({

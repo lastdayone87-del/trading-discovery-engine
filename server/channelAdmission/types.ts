@@ -132,7 +132,7 @@ export interface AdmissionEvidence {
   targetCountry: string;
   evidenceCoverage: 'COMPLETE' | 'PARTIAL';
   /** Whether the evidence contains an authoritative video sample. */
-  evidenceSample?: 'VIDEO_SAMPLE' | 'METADATA_ONLY' | 'NONE';
+  evidenceSample?: 'VIDEO_SAMPLE' | 'PLAYLIST_SAMPLE' | 'METADATA_ONLY' | 'NONE';
   /** Acquisition stage that produced this snapshot. */
   evidenceStage?: 1 | 2 | 3;
   fetchedAt: string;
