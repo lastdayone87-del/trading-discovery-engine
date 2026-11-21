@@ -8,6 +8,7 @@ import { parseAdmissionReviewAction } from './index';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
 const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
+const index = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
 const dbCore = readFileSync(new URL('../dbCore.ts', import.meta.url), 'utf8');
 const queryIntelligence = readFileSync(new URL('../queryIntelligence.ts', import.meta.url), 'utf8');
 
@@ -268,6 +269,14 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
   assert.doesNotMatch(verify, /ProviderAdmissionJudge|judge\.judge\(evidence/);
   assert.match(verify, /:DETERMINISTIC_AMBIGUOUS:/);
   assert.match(index, /admissionStatus === 'ADMITTED_AMBIGUOUS' && decisionSource === 'DETERMINISTIC'/);
+});
+
+test('admission classification never replays the stage-0 retrieval-only probe', () => {
+  const start = index.indexOf('async function enqueueClassificationAfterAdmission(');
+  assert.ok(start >= 0, 'classification handoff must exist');
+  const end = index.indexOf('\nexport ', start + 10);
+  const enqueue = index.slice(start, end < 0 ? undefined : end);
+  assert.match(enqueue, /enrichmentStage: Math\.max\(1, Number\(input\.candidate\.enrichmentStage \|\| 0\)\)/);
 });
 
 test('extracted query offer uses the trading-anchor/gambling guard', () => {

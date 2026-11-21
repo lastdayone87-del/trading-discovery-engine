@@ -99,8 +99,16 @@ async function enqueueClassificationAfterAdmission(input: {
   pageNumber?: number;
   admissionDecisionId?: string;
 }): Promise<boolean> {
+  // Admission has already completed its evidence-acquisition side effect. A
+  // classification job built from that decision must not replay the stage-0
+  // retrieval-only probe: the semantic judge needs to see the creator-owned
+  // bio/title as stage-1 evidence, not be withheld by the thin-retrieval gate.
+  const candidate: DiscoveredChannelRaw = {
+    ...input.candidate,
+    enrichmentStage: Math.max(1, Number(input.candidate.enrichmentStage || 0)),
+  };
   const payload = buildClassificationJobPayload({
-    candidate: input.candidate,
+    candidate,
     targetCountry: input.targetCountry,
     source: input.source,
     queryRunId: input.queryRunId,
@@ -108,20 +116,20 @@ async function enqueueClassificationAfterAdmission(input: {
     queryScopeKey: classificationQueryScopeKey({
       queryRunId: input.queryRunId,
       queryId: input.queryId,
-      query: input.query || input.candidate.channelName,
+      query: input.query || candidate.channelName,
       country: input.targetCountry,
     }),
-    discoveryJobId: input.discoveryJobId || `admission:${input.candidate.channelId}`,
-    quotaOrigin: input.candidate.quotaOrigin === 'PROBE' ? 'PROBE' : 'NORMAL',
+    discoveryJobId: input.discoveryJobId || `admission:${candidate.channelId}`,
+    quotaOrigin: candidate.quotaOrigin === 'PROBE' ? 'PROBE' : 'NORMAL',
     forceExtraction: false,
   });
-  const job = await enqueueClassificationJobAtomic(input.candidate.channelId, payload, {
+  const job = await enqueueClassificationJobAtomic(candidate.channelId, payload, {
     priority: resolveClassificationDecouplingConfig().priority,
     maxAttempts: 4,
-    idempotencyKey: `admission-classify:${input.candidate.channelId}:${input.admissionDecisionId || 'v1'}`,
+    idempotencyKey: `admission-classify:${candidate.channelId}:${input.admissionDecisionId || 'v1'}`,
     preventCompletedReopen: true,
   });
-  if (job == null) return await hasActiveClassificationJob(input.candidate.channelId);
+  if (job == null) return await hasActiveClassificationJob(candidate.channelId);
   // A completed job already owns this decision; a blocked reopen is still a
   // completed classification attempt and must not put the worker in a retry loop.
   return job.status === 'PENDING' || job.status === 'PROCESSING' || job.status === 'COMPLETED';
