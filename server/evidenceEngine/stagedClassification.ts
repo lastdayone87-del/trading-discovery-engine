@@ -8,6 +8,7 @@ import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasAiLedTradingCo
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
+import { hasMeaningfulCreatorText } from './creatorText';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.3.0';
 
@@ -246,11 +247,10 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   // (explicit creator statement, non-title Tier A family, no dominant
   // alternative) is already affirmative evidence and may confirm even when
   // the hydrated video sample is absent. Everything else stays in review.
-  const substantialCreatorBio = String(input.description || '').trim().length >= 80;
   const creatorBioTierA = Boolean(composition?.familyClassifications?.some(family =>
     family.field === 'channel_bio' && family.tierA && family.focus === 'TRADING_CORE'));
   const strongCreatorComposition = resolveClassificationRoutingMode() === 'ACTIVE'
-    && substantialCreatorBio
+    && hasMeaningfulCreatorText(input.description)
     && creatorBioTierA
     && Boolean(composition && compositionConfirmsTrading(composition));
   if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input) && !strongCreatorComposition) {

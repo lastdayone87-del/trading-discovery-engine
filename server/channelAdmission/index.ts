@@ -843,6 +843,7 @@ export async function verifyAdmissionCandidate(
       videos: evidence.videos,
       video_titles: evidence.videos.map(video => video.title),
       external_links: evidence.links,
+      playlists: evidence.playlists,
     })) {
       const attempts = Number(row.attempts || 0) + 1;
       const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);

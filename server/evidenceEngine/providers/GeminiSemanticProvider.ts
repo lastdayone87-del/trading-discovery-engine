@@ -9,6 +9,7 @@ import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../se
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { citationsReferenceSuppliedDocuments, semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, hasSemanticVerdictCore, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
+import { hasMeaningfulCreatorFields } from '../creatorText';
 
 export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-4';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
@@ -314,13 +315,13 @@ export function defaultClient(): SemanticModelClient | undefined {
 
 /** Shared creator-context gate (see buildSemanticPrompt). */
 export function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
-  const retrievalOnly = !!input.search_match_context && (input.enrichment_stage || 0) === 0;
-  if (!retrievalOnly) return true;
-  return (input.description?.trim().length || 0) >= 20 ||
-    (input.external_links?.length || 0) > 0 ||
-    (input.playlists?.length || 0) > 0 ||
-    (input.transcript_excerpts?.length || 0) > 0 ||
-    (input.videos?.length || 0) > 0;
+  // search_match_context is retrieval provenance, never creator context. At
+  // stage zero, retrieval-selected titles/descriptions are not creator-owned
+  // evidence. No arbitrary character threshold: a short real bio counts.
+  const retrievalOnly = Boolean(input.search_match_context) && (input.enrichment_stage || 0) === 0;
+  return hasMeaningfulCreatorFields(retrievalOnly
+    ? { ...input, video_titles: [], video_descriptions: [] }
+    : input);
 }
 
 function prompt(input: RawChannelInput, tier: 'CANDIDATE' | 'ADJUDICATION') {
