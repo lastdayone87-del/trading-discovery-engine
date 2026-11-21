@@ -95,6 +95,7 @@ export type AdmissionDecision =
   | 'ADMIT'
   | 'ADMIT_AMBIGUOUS'
   | 'REJECT_UNRELATED'
+  | 'REJECT_NON_TRADING'
   | 'REJECT_COUNTRY'
   | 'HOLD_MISSING_EVIDENCE'
   | 'PROVIDER_DEFERRED'

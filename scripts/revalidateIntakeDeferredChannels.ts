@@ -213,7 +213,7 @@ async function main() {
       }
       if (outcome.decision === 'ADMIT') counts.admitted += 1;
       else if (outcome.decision === 'ADMIT_AMBIGUOUS') counts.ambiguous += 1;
-      else if (outcome.decision === 'REJECT_UNRELATED') counts.rejected += 1;
+      else if (outcome.decision === 'REJECT_UNRELATED' || outcome.decision === 'REJECT_NON_TRADING') counts.rejected += 1;
       else if (outcome.decision === 'REJECT_COUNTRY') counts.country += 1;
       else if (outcome.status === 'EXPIRED_MISSING_EVIDENCE') counts.expired += 1;
       else counts.held += 1;

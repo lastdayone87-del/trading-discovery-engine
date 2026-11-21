@@ -346,6 +346,8 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
   deferred: number;
   review: number;
   pending: number;
+  evidencePending: number;
+  evidenceUnavailable: number;
   total: number;
 }> {
   const db = await getDb();
@@ -364,6 +366,8 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
        COUNT(*) FILTER (WHERE status='PROVIDER_DEFERRED')::int deferred,
        COUNT(*) FILTER (WHERE status='NEEDS_REVIEW')::int review,
        COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
+       COUNT(*) FILTER (WHERE status='WAITING_EVIDENCE')::int evidence_pending,
+       COUNT(*) FILTER (WHERE status='EXPIRED_MISSING_EVIDENCE')::int evidence_unavailable,
        COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE','PROVIDER_DEFERRED','NEEDS_REVIEW'))::int total
      FROM scoped`,
     [queryRunId],
@@ -377,6 +381,8 @@ export async function getAdmissionRunOutcomes(queryRunId: string): Promise<{
     deferred: Number(row.deferred || 0),
     review: Number(row.review || 0),
     pending: Number(row.pending || 0),
+    evidencePending: Number(row.evidence_pending || 0),
+    evidenceUnavailable: Number(row.evidence_unavailable || 0),
     total: Number(row.total || 0),
   };
 }
@@ -389,6 +395,8 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
   deferred: number;
   review: number;
   pending: number;
+  evidencePending: number;
+  evidenceUnavailable: number;
   total: number;
 }> {
   const db = await getDb();
@@ -407,6 +415,8 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
        COUNT(*) FILTER (WHERE status='PROVIDER_DEFERRED')::int deferred,
        COUNT(*) FILTER (WHERE status='NEEDS_REVIEW')::int review,
        COUNT(*) FILTER (WHERE status IN ('PENDING','VERIFYING'))::int pending,
+       COUNT(*) FILTER (WHERE status='WAITING_EVIDENCE')::int evidence_pending,
+       COUNT(*) FILTER (WHERE status='EXPIRED_MISSING_EVIDENCE')::int evidence_unavailable,
        COUNT(*) FILTER (WHERE status IN ('ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_UNRELATED','REJECTED_COUNTRY','WAITING_EVIDENCE','EXPIRED_MISSING_EVIDENCE','PROVIDER_DEFERRED','NEEDS_REVIEW'))::int total
      FROM scoped`,
     [queryRunId, pageNumber],
@@ -420,6 +430,8 @@ export async function getAdmissionPageOutcomes(queryRunId: string, pageNumber: n
     deferred: Number(row.deferred || 0),
     review: Number(row.review || 0),
     pending: Number(row.pending || 0),
+    evidencePending: Number(row.evidence_pending || 0),
+    evidenceUnavailable: Number(row.evidence_unavailable || 0),
     total: Number(row.total || 0),
   };
 }

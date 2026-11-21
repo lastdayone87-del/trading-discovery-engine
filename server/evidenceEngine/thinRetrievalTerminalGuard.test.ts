@@ -364,14 +364,14 @@ test('strong creator-owned composition confirms even when a retrieval-only input
   assert.equal(decision.status, 'TRADING_CONFIRMED');
 });
 
-test('a short keyword bio is not enough for the thin-retrieval exception', () => {
+test('a short meaningful bio with Tier-A composition can use the thin-retrieval exception', () => {
   const evidence = [
     positiveItem('pos-bio', 'PLATFORM_BROKER_PROPFIRM', 'channel_bio', 'fam-bio', 24),
     positiveItem('pos-link', 'EXTERNAL_RESOURCE', 'external_link_domain', 'fam-link', 18),
   ];
   const { stages } = decide({ ...thinRetrievalInput, description: 'Forex trading signals' }, evidence, sufficientCollection(), strongCreatorComposition);
-  assert.equal(stages.lifecycleAction, 'ENRICH');
-  assert.ok(stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'));
+  assert.equal(stages.lifecycleAction, 'CONFIRM');
+  assert.ok(!stages.stages.find(stage => stage.stage === 'LIFECYCLE')?.reasonCodes.includes('THIN_RETRIEVAL_INPUT_REQUIRES_HYDRATION'));
 });
 
 test('LEGACY restores the thin-retrieval review guard', () => {

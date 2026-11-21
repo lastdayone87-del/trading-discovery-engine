@@ -5,10 +5,13 @@ import { CLASSIFICATION_JOB_TYPE, buildClassificationJobPayload, classificationQ
 import { enqueueClassificationJobAtomic } from '../dbCore';
 import { validateChannelCountry } from '../countryValidator';
 import { assertCountryAllowed } from '../countryExclusion';
-import { fetchAdmissionEvidence, isProviderEvidenceFailure } from './evidence';
-import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP, decideAdmission } from './policy';
-import { admissionEvidenceChecksum, type AdmissionJudge } from './semanticJudge';
-import { evaluateDeterministicAdmission } from './deterministic';
+import { admissionEvidenceChecksum, fetchAdmissionEvidence, isProviderEvidenceFailure } from './evidence';
+import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP } from './policy';
+import { classifyTradingRelevanceDetailed } from '../tradingRelevanceClassifier';
+import { hasMeaningfulCreatorFields } from '../evidenceEngine/creatorText';
+import { recordProductionClassification } from '../classificationDiagnostics';
+import type { VerificationDecision } from '../evidenceEngine/types';
+import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations, categoryFallbackCitations } from './deterministic';
 import {
   enqueueAdmissionVerification,
   findAdmissionCandidate,
@@ -65,7 +68,7 @@ function admittedChannel(input: {
       step: 'BIO',
       title: 'Semantic admission',
       status: 'FOUND',
-      details: `Admitted by ${ADMISSION_POLICY_VERSION} (${input.status}); downstream classification owns trading status.`,
+      details: `Admitted by ${ADMISSION_POLICY_VERSION} (${input.status}); post-catalog classification rechecks the decision.`,
       timestamp: input.now,
     }],
     subscriber_count: candidate.subscriberCount,
@@ -172,7 +175,9 @@ export function candidateFromAdmissionRow(row: AdmissionCandidateRow): Discovere
     videoDescriptionsAuthoritative: hasSnapshot && videos.length > 0 && snapshot?.evidenceCoverage === 'COMPLETE',
     channelLinks: links.length ? links : undefined,
     externalLinkDetails: links.length ? links.map(url => ({ url })) : undefined,
+    playlists: Array.isArray(snapshot?.playlists) ? snapshot.playlists : undefined,
     subscriberCount: snapshot?.subscriberCount ?? (typeof raw.subscriberCount === 'string' ? raw.subscriberCount : undefined),
+    channelTopics: Array.isArray(snapshot?.topics) ? snapshot.topics : undefined,
     matchedDocument: (snapshot?.matchedDocument || row.matched_document) as unknown as DiscoveredChannelRaw['matchedDocument'],
     relationshipProvenance: (snapshot?.relationshipProvenance || raw.relationshipProvenance) as DiscoveredChannelRaw['relationshipProvenance'],
     locationTag: snapshot?.country || (typeof raw.locationTag === 'string' ? raw.locationTag : undefined),
@@ -234,6 +239,7 @@ export function classificationCandidateForAdmission(
     videoTitles: evidence.videoTitles,
     videoDescriptions: evidence.videoDescriptions,
     videoDescriptionsAuthoritative: evidence.videoDescriptionsAuthoritative,
+    playlists: evidence.playlists,
     channelLinks: evidence.channelLinks,
     externalLinkDetails: evidence.externalLinkDetails,
     subscriberCount: evidence.subscriberCount ?? base.subscriberCount,
@@ -617,8 +623,24 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   return true;
 }
 
+
+/** Provider outages returned as UNCERTAIN must stay retryable. */
+export function isPreCatalogProviderDeferredDecision(decision: VerificationDecision): boolean {
+  const reports = decision.evidenceCollection?.providers || [];
+  const semanticReports = reports.filter(provider => /semantic/.test(String(provider.provider)));
+  const semanticServed = semanticReports.some(provider => provider.outcome === 'EXECUTED_WITH_EVIDENCE');
+  const semanticAttempted = semanticReports.filter(provider =>
+    !['SUPPRESSED_BY_POLICY', 'NOT_APPLICABLE'].includes(String(provider.outcome)));
+  const semanticUnavailable = semanticAttempted.length > 0 && semanticAttempted.every(provider =>
+    provider.availability === 'FAILED'
+    || /^FAILED_/.test(String(provider.outcome))
+    || provider.outcome === 'UNAVAILABLE_CONFIGURATION');
+  const precisionDeferred = (decision.decisionPolicy?.reasonCodes || []).some(code =>
+    /PRECISION_ADJUDICATOR_(UNAVAILABLE|OUTAGE|CAPACITY_DEFERRED)|PRECISION_DEFERRAL/.test(code));
+  return (semanticUnavailable && !semanticServed) || precisionDeferred;
+}
+
 export interface VerifyAdmissionOptions {
-  judge?: AdmissionJudge;
   row?: AdmissionCandidateRow;
   existingChannel?: ChannelRecord | null;
   dryRun?: boolean;
@@ -830,140 +852,252 @@ export async function verifyAdmissionCandidate(
   }
 
   if (!policy) {
-    // Deterministic admission abstained. Do not call a second (semantic)
-    // admission judge and do not enqueue a classification pass that would run
-    // AI on the same pre-enrichment evidence. Acquire creator-owned evidence
-    // first; the one full classifier judge runs after enrichment.
-    const reasonCodes = ['DETERMINISTIC_ADMISSION_ABSTAINED', ...deterministic.reasonCodes];
-    let recordedDecisionId: string | null = null;
-    let decisionId: string = randomUUID();
-    if (!options.dryRun) {
-      const recorded = await recordAdmissionOutcome({
-        decision: {
-          candidateId: row.id,
-          decisionKey: `${row.id}:DETERMINISTIC_AMBIGUOUS:${hash}`,
-          channelId: evidence.channelId,
-          decision: 'ADMIT_AMBIGUOUS',
-          reasonCodes,
-          evidenceHash: hash,
-        },
-        candidate: {
+    // Deterministic admission abstained. The one full classifier judge now
+    // decides before any catalog row exists. No second admission taxonomy,
+    // no ADMIT_AMBIGUOUS catalog insertion, and no AI call on an empty
+    // channel: unresolved candidates stay in the admission ledger.
+    if (!hasMeaningfulCreatorFields({
+      description: evidence.description,
+      videos: evidence.videos,
+      video_titles: evidence.videos.map(video => video.title),
+      external_links: evidence.links,
+      playlists: evidence.playlists,
+    })) {
+      const attempts = Number(row.attempts || 0) + 1;
+      const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+      const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
+      const reasonCodes = [
+        expired ? 'EVIDENCE_ACQUISITION_EXHAUSTED'
+          : attempts >= 2 ? 'EVIDENCE_ACQUISITION_IN_PROGRESS' : 'EVIDENCE_ACQUISITION_REQUIRED',
+        'NO_CREATOR_CONTENT_CONTEXT',
+        ...deterministic.reasonCodes,
+      ];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
           id: row.id,
-          status: 'ADMITTED_AMBIGUOUS',
-          decision: 'ADMIT_AMBIGUOUS',
+          status,
+          decision: null,
           reasonCodes,
           evidence,
           evidenceHash: hash,
-          attempts: Number(row.attempts || 0) + 1,
-          nextCheckAt: null,
-          expiresAt: null,
+          attempts,
+          nextCheckAt: expired ? null : new Date(Date.now() + retryDelayMs(attempts)).toISOString(),
+          expiresAt: row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
           expectedStatus: row.status,
           expectedAttempts: row.attempts,
-        },
-      });
-      recordedDecisionId = recorded.decisionId;
-      if (recordedDecisionId) decisionId = recordedDecisionId;
-      const now = new Date().toISOString();
-      const existing = options.existingChannel === undefined ? await getChannelById(evidence.channelId) : options.existingChannel;
-      let preserveExistingDecision = Boolean(existing && (
-        existing.trading_status === 'TRADING_CONFIRMED'
-        || existing.trading_status === 'NON_TRADING'
-        || existing.trading_status === 'HUMAN_REJECTED'
-        || existing.scan_status === 'COMPLETED'
-        || existing.scan_status === 'SKIPPED_NON_TRADING'
-      ));
-      if (!existing) {
-        input.candidate.admissionNewlyCreated = true;
-        const channel = admittedChannel({
-          evidence,
-          decisionId,
-          status: 'ADMITTED_AMBIGUOUS',
-          source: input.source,
-          now,
         });
-        channel.scan_status = 'ENRICHMENT_PENDING';
-        channel.inspection_trail = [{
-          step: 'BIO',
-          title: 'Deterministic admission abstained',
-          status: 'FOUND',
-          details: `${reasonCodes.join(', ')}; evidence acquisition precedes the full classifier.`,
-          timestamp: now,
-        }];
-        await insertChannelIfAbsent(channel);
-      } else if (!preserveExistingDecision) {
-        const expectedSnapshot = { scan_status: existing.scan_status, trading_status: existing.trading_status };
-        existing.admission_status = 'ADMITTED_AMBIGUOUS';
-        existing.admission_decision_id = decisionId;
-        existing.scan_status = 'ENRICHMENT_PENDING';
-        existing.trading_status = 'UNCERTAIN';
-        existing.trading_confidence_score = 0;
-        existing.last_checked = now;
-        existing.inspection_trail = [...(existing.inspection_trail || []), {
-          step: 'BIO',
-          title: 'Deterministic admission abstained',
-          status: 'FOUND',
-          details: `${reasonCodes.join(', ')}; evidence acquisition precedes the full classifier.`,
-          timestamp: now,
-        }];
-        const applied = await upsertChannelWithResult(existing, {
-          preserveDiscordOnUpdate: true,
-          requireStatusSnapshot: expectedSnapshot,
-        });
-        if (!applied) {
-          // Another worker changed the channel between our read and write.
-          // Preserve only a terminal decision; a nonterminal transition still
-          // needs the enrichment handoff, otherwise the candidate is stranded.
-          const refreshed = await getChannelById(evidence.channelId);
-          preserveExistingDecision = Boolean(refreshed && (
-            refreshed.trading_status === 'TRADING_CONFIRMED'
-            || refreshed.trading_status === 'NON_TRADING'
-            || refreshed.trading_status === 'HUMAN_REJECTED'
-            || refreshed.scan_status === 'COMPLETED'
-            || refreshed.scan_status === 'SKIPPED_NON_TRADING'
-          ));
-        }
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
       }
-      if (!preserveExistingDecision) {
-        await markChannelAdmitted({ channelId: evidence.channelId, decisionId, status: 'ADMITTED_AMBIGUOUS' });
-      }
-      if (preserveExistingDecision) {
-        return {
-          channelId: evidence.channelId,
-          channelName: evidence.channelName,
-          decision: 'ADMIT_AMBIGUOUS',
-          status: 'ADMITTED_AMBIGUOUS',
-          reasonCodes: [...reasonCodes, 'EXISTING_TERMINAL_DECISION_PRESERVED'],
-          evidence,
-          deterministicRoute,
-          decisionSource: 'DETERMINISTIC',
-          priority: deterministic.priority,
-        };
-      }
-      const queued = await enqueueEnrichmentAfterAmbiguousAdmission({
-        candidate: input.candidate,
-        row,
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'HOLD_MISSING_EVIDENCE',
+        status,
+        reasonCodes,
         evidence,
-        decisionId,
-        targetCountry: input.targetCountry,
-        source: input.source,
-        query: input.query,
-        queryId: input.queryId,
-        queryRunId: input.queryRunId,
-        discoveryJobId: input.discoveryJobId || undefined,
-      });
-      if (!queued) throw new Error('ADMISSION_ENRICHMENT_ENQUEUE_FAILED');
+        deterministicRoute,
+        decisionSource: 'DETERMINISTIC',
+        priority: 20,
+      };
     }
-    return {
-      channelId: evidence.channelId,
-      channelName: evidence.channelName,
-      decision: 'ADMIT_AMBIGUOUS',
-      status: 'ADMITTED_AMBIGUOUS',
-      reasonCodes,
-      evidence,
-      deterministicRoute,
-      decisionSource: 'DETERMINISTIC',
-      priority: deterministic.priority,
+
+    let preCatalogError: string | null = null;
+    const classified = await classifyTradingRelevanceDetailed(evidenceToInput(evidence)).catch(error => {
+      preCatalogError = error instanceof Error ? error.message : String(error);
+      return null;
+    });
+    if (!classified) {
+      const reasonCodes = ['EVIDENCE_PROVIDER_DEFERRED', 'PRE_CATALOG_CLASSIFIER_FAILED', preCatalogError || 'UNKNOWN'];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          ...providerDeferredCandidateFields(row.attempts),
+          decision: null,
+          reasonCodes,
+          evidence,
+          evidenceHash: hash,
+          nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
+        reasonCodes,
+        evidence,
+        decisionSource: 'SEMANTIC',
+        priority: 20,
+      };
+    }
+
+    const decision = classified.decision;
+    if (!options.dryRun) {
+      // The pre-catalog judge is the authoritative classification decision.
+      // Persist its diagnostic before any catalog row exists so the
+      // post-catalog recheck reuses it instead of running a second judgment.
+      await recordProductionClassification({
+        channelId: evidence.channelId,
+        input: classified.input,
+        decision,
+        queryRunId: input.queryRunId,
+        jobId: input.discoveryJobId,
+      });
+    }
+    if (isPreCatalogProviderDeferredDecision(decision)) {
+      const reasonCodes = [
+        'EVIDENCE_PROVIDER_DEFERRED',
+        'PRE_CATALOG_CLASSIFIER_PROVIDER_FAILURE',
+        ...(decision.decisionPolicy?.reasonCodes || []),
+      ];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          ...providerDeferredCandidateFields(row.attempts),
+          decision: null,
+          reasonCodes,
+          evidence,
+          evidenceHash: hash,
+          nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
+        reasonCodes,
+        evidence,
+        deterministicRoute,
+        decisionSource: 'SEMANTIC',
+        priority: 20,
+      };
+    }
+    const semanticProvider = decision.classificationMethod === 'SEMANTIC_GROQ'
+      ? 'groq_semantic'
+      : decision.classificationMethod === 'SEMANTIC_GEMINI_FREE'
+        ? 'gemini_free_semantic'
+        : decision.classificationMethod === 'SEMANTIC_GEMINI'
+          ? 'gemini_semantic'
+          : undefined;
+    const semanticModel = decision.geminiSemanticSummary?.modelUsed || decision.versions?.geminiModelVersion || 'evidence-engine';
+    const positiveCitations = tradingCitations(evidence, decision);
+    let negativeCitations = unrelatedCitations(evidence, decision);
+    const pending = async (reasonCodes: string[]): Promise<AdmissionVerificationResult> => {
+      const attempts = Number(row.attempts || 0) + 1;
+      const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+      const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
+      const codes = [
+        ...reasonCodes,
+        expired ? 'EVIDENCE_ACQUISITION_EXHAUSTED'
+          : attempts >= 2 ? 'EVIDENCE_ACQUISITION_IN_PROGRESS' : 'EVIDENCE_ACQUISITION_REQUIRED',
+      ];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          status,
+          decision: null,
+          reasonCodes: codes,
+          evidence,
+          evidenceHash: hash,
+          attempts,
+          nextCheckAt: expired ? null : new Date(Date.now() + retryDelayMs(attempts)).toISOString(),
+          expiresAt: row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'HOLD_MISSING_EVIDENCE',
+        status: status as AdmissionVerificationResult['status'],
+        reasonCodes: codes,
+        evidence,
+        deterministicRoute,
+        decisionSource: 'SEMANTIC' as const,
+        priority: 20,
+      };
     };
+
+    if (decision.status === 'TRADING_CONFIRMED') {
+      if (positiveCitations.length === 0) {
+        return pending(['PRE_CATALOG_TRADING_WITHOUT_CITATIONS', 'SEMANTIC_ABSTENTION']);
+      }
+      judgment = {
+        mainSubject: 'TRADING',
+        tradingFocus: decision.confidenceScore,
+        unrelatedDomains: [],
+        incidentalTradingMentions: [],
+        citations: positiveCitations,
+        explanation: decision.mathematicalJustification,
+        model: semanticModel,
+        provider: semanticProvider,
+      };
+      policy = {
+        decision: 'ADMIT',
+        status: 'ADMITTED',
+        reasonCodes: ['PRE_CATALOG_TRADING_CONFIRMED', ...(decision.decisionPolicy?.reasonCodes || [])],
+        rejected: false,
+        admitted: true,
+        hold: false,
+        ambiguous: false,
+        citationsValid: true,
+        independentUnrelatedCitations: 0,
+        independentTradingCitations: positiveCitations.length,
+        effectiveRole: 'PRIMARY',
+      };
+      decisionSource = 'SEMANTIC';
+    } else if (decision.status === 'NON_TRADING') {
+      const taxonomyLabel = String(decision.geminiSemanticSummary?.taxonomyLabel || decision.category || '');
+      const financeAdjacent = ['FINANCIAL_NEWS', 'PERSONAL_FINANCE'].includes(taxonomyLabel);
+      if (negativeCitations.length === 0) {
+        negativeCitations = categoryFallbackCitations(evidence);
+      }
+      if (negativeCitations.length === 0) {
+        return pending(['PRE_CATALOG_NON_TRADING_WITHOUT_CITATIONS', 'SEMANTIC_ABSTENTION']);
+      }
+      judgment = {
+        mainSubject: financeAdjacent ? 'FINANCE_ADJACENT' : 'UNRELATED',
+        tradingFocus: decision.confidenceScore,
+        unrelatedDomains: [{ domain: taxonomyLabel || 'NON_TRADING', confidence: Math.max(0, Math.min(1, decision.confidenceScore / 100)) }],
+        incidentalTradingMentions: [],
+        citations: negativeCitations,
+        explanation: decision.mathematicalJustification,
+        model: semanticModel,
+        provider: semanticProvider,
+      };
+      policy = {
+        decision: financeAdjacent ? 'REJECT_NON_TRADING' : 'REJECT_UNRELATED',
+        status: 'REJECTED_UNRELATED',
+        reasonCodes: [
+          financeAdjacent ? 'PRE_CATALOG_FINANCE_ADJACENT_NON_TRADING' : 'PRE_CATALOG_NON_TRADING_CONFIRMED',
+          ...(decision.decisionPolicy?.reasonCodes || []),
+        ],
+        rejected: true,
+        admitted: false,
+        hold: false,
+        ambiguous: false,
+        citationsValid: true,
+        independentUnrelatedCitations: negativeCitations.length,
+        independentTradingCitations: 0,
+        effectiveRole: 'PRIMARY',
+      };
+      decisionSource = 'SEMANTIC';
+    } else {
+      return pending([
+        'PRE_CATALOG_CLASSIFICATION_UNCERTAIN',
+        ...(decision.evidenceCollection?.reasonCodes || []),
+        ...(decision.decisionPolicy?.reasonCodes || []),
+      ]);
+    }
   }
 
   const effectiveJudgment = policy.effectiveRole === 'SECOND' && secondJudgment ? secondJudgment : judgment;
@@ -1152,7 +1286,6 @@ export async function verifyAdmissionCandidate(
 
 export {
   ADMISSION_POLICY_VERSION,
-  decideAdmission,
   getAdmissionMode,
   findAdmissionCandidate,
   fetchAdmissionEvidence,

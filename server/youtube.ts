@@ -199,6 +199,8 @@ export interface DiscoveredChannelRaw {
   channelTopics?: string[];
   /** Temporary keyless evidence-acquisition failure that must stay retryable. */
   evidenceAcquisitionFailure?: string;
+  /** Failure that prevented a video sample, distinct from an authoritative empty channel. */
+  videoSampleFailure?: string;
   /** Retry bookkeeping for precision-adjudicator deferrals on ENRICH_CHANNEL jobs. */
   adjudicatorDeferralAttempts?: number;
   adjudicatorFirstDeferredAt?: string;
@@ -1702,11 +1704,19 @@ export function adaptInnertubeVideosToRecentItems(
  * deliberately best-effort: a temporary fetch failure must not be treated as
  * authoritative empty evidence.
  */
+const PLAYLIST_DISCOVERY_SIGNAL = /\b(?:trading|trader|market|invest|futures|forex|crypto|bitcoin|stock|finance|financial|broker|portfolio|technical analysis|price action)\b/iu;
+
 export function shouldAttemptAdmissionPublicAbout(input: {
   description?: string;
   links?: string[];
+  hasVideoSample?: boolean;
 }): boolean {
-  return !hasMeaningfulCreatorText(input.description) || (input.links?.length || 0) === 0;
+  // A meaningful bio plus a real video sample is sufficient creator evidence;
+  // most creators keep links in YouTube's About widget rather than the bio, so
+  // a missing bio-URL alone must not trigger two more unofficial HTML fetches.
+  if (!hasMeaningfulCreatorText(input.description)) return true;
+  if (input.hasVideoSample) return false;
+  return (input.links?.length || 0) === 0;
 }
 
 /**
@@ -1867,7 +1877,8 @@ export async function fetchYouTubeChannelEnrichment(
       let extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
       // Public About is creator-owned fallback, not a replacement for the
       // Data API. A temporary About failure leaves the API evidence intact.
-      if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks })) {
+      const hasUsableRecentVideo = recentItems.some((item: any) => String(item.snippet?.title || '').trim() || String(item.snippet?.description || '').trim());
+      if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks, hasVideoSample: hasUsableRecentVideo })) {
         // Keyless channel-browse About is attempted before the public HTML
         // page. Both results are cached outside the key loop so a failover
         // cannot repeat unofficial fetches.
@@ -1883,7 +1894,7 @@ export async function fetchYouTubeChannelEnrichment(
         }
         // Recheck after merging InnerTube: if it supplied the missing bio
         // and links, do not spend two more HTML requests.
-        if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks })) {
+        if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks, hasVideoSample: hasUsableRecentVideo })) {
           const publicAbout = await loadPublicAbout();
           if (publicAbout?.status === 'AVAILABLE' && publicAbout.about) {
             if (!hasMeaningfulCreatorText(description) && hasMeaningfulCreatorText(publicAbout.about.bio)) {
@@ -1907,8 +1918,14 @@ export async function fetchYouTubeChannelEnrichment(
       }
       let videos: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string}>=recentItems.map((item:any)=>({id:item.id?.videoId,title:String(item.snippet?.title||''),description:String(item.snippet?.description||''),published_at:item.snippet?.publishedAt,content_type:'youtube_video'})).filter((video:any)=>String(video.title||'').trim()||String(video.description||'').trim());
       let playlists=fallback.playlists||[];
-      if(stage>=2){
-        const ids=videos.map(video=>video.id).filter(Boolean).join(',');
+      // Stage 2 search.list costs 100 units. Spend it only when stage 1/InnerTube
+      // produced no video sample, no playlists are already available, and the
+      // creator text has a trading/finance signal that could justify discovery.
+      const playlistDiscoveryJustified = stage >= 2
+        && videos.length === 0
+        && playlists.length === 0
+        && PLAYLIST_DISCOVERY_SIGNAL.test(`${description} ${fallback.channelName || ''}`);
+      if(playlistDiscoveryJustified){
         if(!playlistsCheckpoint){
           if(attempt>0)await topUp(100);
           const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition,priority,apiKey);
@@ -1918,6 +1935,12 @@ export async function fetchYouTubeChannelEnrichment(
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
+      }
+      // The 1-unit videos.list follow-up is independent of the 100-unit
+      // playlist search: keep hydrating descriptions/languages whenever a
+      // stage-2 pass already has a video sample.
+      if(stage>=2){
+        const ids=videos.map(video=>video.id).filter(Boolean).join(',');
         if(ids){
           if(!videoDetailsCheckpoint){
             try {
@@ -1985,6 +2008,7 @@ export async function fetchYouTubeChannelEnrichment(
         uploadTimestamps, latestUploadAt, uploadsLast30Days, uploadsLast90Days, uploadsLast365Days,
         activityBand, activityScore, activityObservedAt: observedAt.toISOString(), enrichmentStage:stage,
         evidenceAcquisitionFailure: evidenceAcquisitionFailure || videoSampleFailure,
+        videoSampleFailure,
         externalLinkDetails:extractedLinks.map(url=>{try{return {url,domain:new URL(url).hostname.toLowerCase()};}catch{return {url};}})
       };
     } catch (error: any) {
