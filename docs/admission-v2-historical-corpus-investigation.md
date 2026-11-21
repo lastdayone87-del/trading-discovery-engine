@@ -5,6 +5,13 @@
 **Production changes:** none  
 **Outcome:** no executable Admission V2 corpus was located
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. The Railway target and inventory described below were
+> a separate configured database that was mistakenly treated as production; they
+> are not the production access path. The observed facts are retained; only the
+> host role is corrected. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## Executive result
 
 The required creator-level historical corpus could not be found in any database
@@ -16,8 +23,9 @@ or backup accessible from this workspace:
 - The live Railway inventory supplied for this investigation reports the
   migration-026 query-candidate tables but not
   `decision_evaluation_datasets`, `decision_evaluation_examples`, or their later
-  creator-evidence dependencies. On that evidence, the reported Railway database
-  does not contain an Admission V2 corpus.
+  creator-evidence dependencies. On that evidence, the reported Railway inventory
+  does not contain an Admission V2 corpus. It was not the Coolify production
+  database.
 - No staging connection, read replica, backup connection, Railway CLI/session, or
   database dump is configured or present in this environment.
 - The checked-in legacy `.db` files contain none of the required table names and
@@ -25,8 +33,8 @@ or backup accessible from this workspace:
 
 Therefore the existing Admission V2 CLI cannot currently be executed against a
 real sealed dataset from this environment. This is a **corpus-not-located** result,
-not proof that every externally administered Railway backup is empty. Staging and
-backup contents remain unverified because no endpoint, restored database, or
+not proof that every externally administered production backup is empty. Staging
+and backup contents remain unverified because no endpoint, restored database, or
 backup artifact was made available. Source code cannot establish their contents.
 
 ## 1. Stores actually investigated
@@ -36,7 +44,7 @@ backup artifact was made available. Source code cannot establish their contents.
 | Configured Railway PostgreSQL (`DATABASE_URL`) | Connection string present | DNS failed before authentication or SQL; no query reached the server | Independently unverified; supplied live table inventory lacks required schema |
 | Other production database/replica | No endpoint or credentials | No target to query | Unknown |
 | Staging database | No endpoint or credentials | No target to query | Unknown |
-| Railway/database backup | No backup API/session, restore endpoint, or dump | No artifact to inspect | Unknown |
+| Production/database backup | No backup API/session, restore endpoint, or dump | No artifact to inspect | Unknown |
 | Repository/workspace files | Full read access | No PostgreSQL dump, sealed dataset export, JSONL corpus, or compatible local database | Not ready |
 | Legacy `data/*.db` files | Full read access | Required table-name signatures absent | Not compatible |
 
@@ -58,8 +66,8 @@ getaddrinfo EAI_AGAIN trolley.proxy.rlwy.net
 ```
 
 This occurred at name resolution. It proves that this execution environment did
-not inspect the remote rows; it does not prove that the server or a Railway backup
-does not contain them. The externally observed list of
+not inspect the remote rows; it does not prove that the server or a production
+backup does not contain them. The externally observed list of
 `candidate_evaluation_runs`, `candidate_evaluation_results`,
 `evaluation_policy_versions`, and `offline_evaluation_controls` is consistent with
 migration 026, but those tables are not creator-level equivalents.
@@ -103,9 +111,10 @@ is currently zero for every dataset available to this workspace.
 
 ## 5. Historical facts that are missing
 
-If the reported Railway database is the authoritative production store and no
-later backup contains unreported tables, the missing facts are not merely a
-dataset seal. They are:
+The Railway inventory is not the production store, and the Coolify production
+inventory was not inspected, so production contents remain unknown. Independently
+of which database is consulted, the historical facts required for evaluation are
+not merely a dataset seal. They are:
 
 ### Sampling history
 
@@ -189,7 +198,7 @@ observer, migration, setting, or production runtime path.
 An authorized operator must provide one of the following read-only artifacts:
 
 - a dedicated `SELECT`-only connection to production and staging;
-- a Railway backup restored into an isolated evaluator database; or
+- a Coolify production backup restored into an isolated evaluator database; or
 - a checksummed PostgreSQL dump of the migration ledger and required immutable
   tables, restored into an isolated database.
 
@@ -203,10 +212,11 @@ prospective shadow-history process above is the only valid path.
 ## Final determination
 
 No creator-level Admission V2 historical evaluation corpus is available to the
-current workspace, and the live production table inventory provided does not show
-one. Staging and externally managed backups could not be verified because no
-read-only access or restored artifact exists here. On the evidence currently
-available, the POC is **not executable**. Its missing prerequisite is real,
+current workspace. The only table inventory provided came from the separate
+Railway database, not Coolify production; the production inventory was never
+inspected and its contents remain unknown. Staging and externally managed
+backups could not be verified because no read-only access or restored artifact
+exists here. On the evidence currently available, the POC is **not executable**. Its missing prerequisite is real,
 propensity-sampled, human-labeled, diagnostic-linked Creator Intelligence and
 coverage history—not another loader implementation and not a translation of the
 older query-candidate evaluation tables.

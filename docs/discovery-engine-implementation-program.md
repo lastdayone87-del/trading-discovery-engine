@@ -3,6 +3,11 @@
 Date: 2026-07-29  
 Status: **Proposed for review; no implementation phase is approved by this document**
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. Railway references below are stale assumptions and
+> are not the production access path. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## 1. Purpose and authority
 
 This program converts the approved architecture in
@@ -257,7 +262,7 @@ values. Calibration versions coexist and can be restored.
 using an unrepresentative labeled corpus, and tuning to the test set. Use disposable
 staging, checksums, held-out sets, country strata, and an approved runbook.
 
-**Testing strategy.** Execute the production-readiness migration/Railway checklist;
+**Testing strategy.** Execute the production-readiness migration/Coolify checklist;
 compare durable table counts and samples; perform a restore into a new database;
 exercise real YouTube/Gemini paths; produce per-country confusion matrices,
 reliability curves, precision/recall, and baseline cost/coverage reports.

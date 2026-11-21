@@ -4,6 +4,13 @@
 **Scope:** schema and data compatibility only  
 **Production changes:** none
 
+> **Infrastructure correction (2026-10-27):** Production is hosted on
+> **Coolify**, not Railway. The Railway inventory described below was a separate
+> configured database that was mistakenly treated as production; it is not the
+> production access path. The reported objects are retained as observations of
+> that inventory. See
+> [Production infrastructure](./production-infrastructure.md).
+
 ## Executive conclusion
 
 The Admission V2 POC is **not using renamed or outdated table names**. The
@@ -16,10 +23,11 @@ subjects and purposes:
    propensity-sampled, diagnostic-pinned examples and writes
    `decision_evaluation_*` records.
 
-The tables reported in Railway are the older migration-026 query-catalog control
-plane. They are not equivalents of the migration-037 creator decision-evaluation
-tables and cannot supply Admission V2's creator identity, label, diagnostic,
-Creator Intelligence, or evidence-coverage inputs. Their presence alongside the
+The tables reported in the Railway inventory are the older migration-026
+query-catalog control plane. That inventory was not the Coolify production
+database. They are not equivalents of the migration-037 creator
+decision-evaluation tables and cannot supply Admission V2's creator identity,
+label, diagnostic, Creator Intelligence, or evidence-coverage inputs. Their presence alongside the
 absence of `decision_evaluation_datasets` is evidence of deployment-schema lag or
 an environment running an earlier migration set, not evidence that the repository
 renamed the newer schema.
@@ -28,17 +36,17 @@ Applying missing DDL alone would create empty tables and would not make the
 evaluation executable. The minimum safe next step is to reconcile the deployed
 `schema_migrations` ledger on an isolated database restore, then inventory whether
 the later immutable observations exist anywhere. If they never accumulated, the
-current Railway data is insufficient and real creator-level shadow history must
-be collected before Admission V2 can be evaluated.
+current Railway inventory is insufficient and real creator-level shadow history
+must be collected before Admission V2 can be evaluated.
 
 ## 1. Repository chronology proves two schemas, not a rename
 
 Migration filenames are ordered and the PostgreSQL runner applies each numbered
 file once using `schema_migrations`. Migration 026 creates the tables observed in
-Railway. Migration 037 later creates `decision_evaluation_datasets` and its
-supporting creator-decision evaluation tables. Migration 036 first adds production
-classification diagnostics; migrations 055–057 later add immutable evidence
-documents/assertions, coverage snapshots, and creator-focus snapshots.
+the Railway inventory. Migration 037 later creates `decision_evaluation_datasets`
+and its supporting creator-decision evaluation tables. Migration 036 first adds
+production classification diagnostics; migrations 055–057 later add immutable
+evidence documents/assertions, coverage snapshots, and creator-focus snapshots.
 
 No migration drops, renames, or transforms the migration-026 tables into the
 migration-037 tables. Both sets remain referenced by separate runtime modules:
@@ -54,7 +62,7 @@ answer a different question.
 
 ## 2. Table-by-table mapping
 
-| Admission V2 expected object | Railway-reported object that looks similar | Equivalent? | Reason |
+| Admission V2 expected object | Railway-inventory object that looks similar | Equivalent? | Reason |
 | --- | --- | --- | --- |
 | `decision_evaluation_datasets` | `candidate_evaluation_runs` | **No** | A run stores a caller-supplied dataset version/checksum and query-policy execution metadata. It does not materialize or identify creator examples, labels, splits, or diagnostics. |
 | `decision_evaluation_examples` | `candidate_evaluation_results` | **No** | Results are aggregated per `candidate_key`, country, and lane with `ACCEPT`/`REJECT`/`INSUFFICIENT_EVIDENCE`. Admission V2 needs one labeled creator/diagnostic example with a TEST split and inclusion probability. |
@@ -135,7 +143,7 @@ Even when all tables exist, the following joined historical facts must be nonzer
 7. sufficient genuine and non-trading effective sample size across the required
    country, language, acquisition-source, and time cells.
 
-The Railway-reported migration-026 tables supply none of items 1–6. A populated
+The Railway-inventory migration-026 tables supply none of items 1–6. A populated
 query evaluation run does not reduce this gap.
 
 ## 4. Sufficiency determination
@@ -181,7 +189,7 @@ ledger.
 
 ### Step 2 — use an isolated restore
 
-Restore the Railway database into a separate, network-restricted evaluation
+Restore the production database into a separate, network-restricted evaluation
 database. Do not start the application against production merely to “catch up”:
 the repository migration runner applies every unapplied numbered migration, and
 this checkout contains migrations through 080, far beyond the four tables under
@@ -238,7 +246,7 @@ currently no evidence supporting that change.
 The database did not evolve *from* `decision_evaluation_*` *to*
 `candidate_evaluation_*`. The repository evolved in the opposite chronological
 direction and retained both systems for different purposes. The observed Railway
-schema exposes the earlier query-catalog evaluator but apparently lacks the later
+inventory exposes the earlier query-catalog evaluator but apparently lacks the later
 creator-decision evaluation plane required by Admission V2. Until the migration
 ledger and other environments/backups are inventoried, the exact cause is not
 fully proven; however, the reported tables are definitively not sufficient to run
