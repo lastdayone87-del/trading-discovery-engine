@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assessExtractedQueryAdmission, decideAdmission } from './policy';
+import { assessExtractedQueryAdmission, decideAdmission, hasStrongTradingSupport, validCitations } from './policy';
 import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
@@ -1080,10 +1080,11 @@ test('only transient provider evidence failures defer without consuming attempts
     'read ECONNRESET',
     'Service unavailable (503)',
     'unexpected provider payload shape',
+    'FULL_DESCRIPTIONS_UNAVAILABLE:quota exhausted',
   ]) {
     assert.equal(isProviderEvidenceFailure(reason), true, reason);
   }
-  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'FULL_DESCRIPTIONS_UNAVAILABLE:no description', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
+  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
     assert.equal(isProviderEvidenceFailure(reason), false, String(reason));
   }
 });
@@ -1309,4 +1310,45 @@ test('admission semantic route health treats unconfigured providers as unavailab
   assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: true }), false);
   assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: false }), true);
   assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: true }), false);
+});
+
+test('playlist citations are validated as creator-owned admission evidence', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
+    playlists: [{ name: 'Futures trading recaps', description: 'Weekly execution reviews' }],
+  };
+  const validated = validCitations(fixture, judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('playlist_name', 'Futures trading recaps', 0, 'TRADING')],
+  }));
+  assert.equal(validated.length, 1);
+  assert.equal(validated[0].field, 'playlist_name');
+});
+
+test('playlist text participates in the one-citation trading-anchor path', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
+    playlists: [{ name: 'Futures trading recaps', description: 'Weekly execution reviews' }],
+  };
+  const j = judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('playlist_name', 'Futures trading recaps', 0, 'TRADING')],
+  });
+  assert.equal(validCitations(fixture, j).length, 1);
+  assert.equal(hasStrongTradingSupport(fixture, j), true);
+});
+
+test('a trading channel name cannot be the lexical anchor for a single citation', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Futures Trading Daily', bio: 'Cooking recipes', videos: [] }),
+  };
+  const j = judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('bio', 'Cooking recipes', undefined, 'TRADING')],
+  });
+  assert.equal(validCitations(fixture, j).length, 1);
+  assert.equal(hasStrongTradingSupport(fixture, j), false);
 });

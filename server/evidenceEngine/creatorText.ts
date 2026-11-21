@@ -1,0 +1,81 @@
+/**
+ * Creator-owned text quality checks.
+ *
+ * A non-empty bio is not automatically meaningful: YouTube fills empty About
+ * sections with generic boilerplate, and a channel title is a name prior, not
+ * creator content. Both the semantic provider and the staged classifier use
+ * this shared check so a short real bio ("NQ futures trader") is admissible
+ * while generated placeholder text never manufactures creator context.
+ */
+const YOUTUBE_BOILERPLATE_EXACT = new Set([
+  'share your videos with friends family and the world',
+  'share your videos with friends family and the world.',
+  'welcome to my channel',
+  'welcome to my channel!',
+  'welcome to our channel',
+  'welcome to our channel!',
+  'welcome to my youtube channel',
+  'welcome to my youtube channel!',
+  'welcome to our youtube channel',
+  'welcome to our youtube channel!',
+  'official youtube channel',
+  'official youtube channel.',
+  'youtube channel',
+  'subscribe',
+  'subscribe!',
+  'subscribe to my channel',
+  'subscribe to my channel!',
+  'subscribe to our channel',
+  'subscribe to our channel!',
+  'this channel has no videos',
+  'this channel has no videos.',
+  'no videos',
+  'no videos.',
+  'coming soon',
+  'coming soon.',
+]);
+
+export function isYouTubeBoilerplateText(value: string | null | undefined): boolean {
+  const normalized = String(value || '')
+    .normalize('NFKC')
+    .toLocaleLowerCase('en')
+    .replace(/[\s\u00a0]+/g, ' ')
+    .replace(/[“”"'’.,!?;:()[\]{}<>/\\|@#$%^&*+=~`_-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized) return true;
+  return YOUTUBE_BOILERPLATE_EXACT.has(normalized);
+}
+
+/**
+ * True when text carries actual creator-authored meaning after boilerplate
+ * removal. No arbitrary character-count threshold: short real bios count.
+ */
+export function hasMeaningfulCreatorText(value: string | null | undefined): boolean {
+  const text = String(value || '').trim();
+  if (!text || isYouTubeBoilerplateText(text)) return false;
+  // Strip punctuation/emoji-only strings, which convey no creator context.
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+/** True when any independent creator-owned field carries meaningful content. */
+export function hasMeaningfulCreatorFields(input: {
+  description?: string | null;
+  video_titles?: string[] | null;
+  video_descriptions?: string[] | null;
+  videos?: Array<{ title?: string | null; description?: string | null }> | null;
+  external_links?: string[] | null;
+  playlists?: Array<{ name?: string | null; description?: string | null }> | null;
+  transcript_excerpts?: Array<{ text?: string | null }> | null;
+  pinned_comment?: string | null;
+}): boolean {
+  if (hasMeaningfulCreatorText(input.description)) return true;
+  if ((input.video_titles || []).some(title => hasMeaningfulCreatorText(title))) return true;
+  if ((input.video_descriptions || []).some(description => hasMeaningfulCreatorText(description))) return true;
+  if ((input.videos || []).some(video => hasMeaningfulCreatorText(video?.title) || hasMeaningfulCreatorText(video?.description))) return true;
+  if ((input.external_links || []).some(link => String(link || '').trim().length > 0)) return true;
+  if ((input.playlists || []).some(playlist => hasMeaningfulCreatorText(playlist?.name) || hasMeaningfulCreatorText(playlist?.description))) return true;
+  if ((input.transcript_excerpts || []).some(excerpt => hasMeaningfulCreatorText(excerpt?.text))) return true;
+  if (hasMeaningfulCreatorText(input.pinned_comment)) return true;
+  return false;
+}

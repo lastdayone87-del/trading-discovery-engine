@@ -647,6 +647,9 @@ export async function verifyAdmissionCandidate(
     queryRunId: input.queryRunId,
     pageNumber: input.pageNumber,
     resultRank: input.resultRank,
+    // First acquisition is always stage 1. A bounded evidence retry may spend
+    // the stage-2 playlist search, but never on the initial attempt.
+    stage: Number(row.attempts || 0) >= 1 ? 2 : 1,
   });
   const hash = evidenceHash(evidence);
 
