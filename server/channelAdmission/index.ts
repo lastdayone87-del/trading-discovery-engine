@@ -717,7 +717,7 @@ export async function verifyAdmissionCandidate(
             reasonCodes,
             evidence,
             evidenceHash: hash,
-            attempts: Number(row.attempts || 0) + 1,
+            attempts: options.evidenceAttemptsPreserved ? Number(row.attempts || 0) : Number(row.attempts || 0) + 1,
             expectedStatus: row.status,
             expectedAttempts: row.attempts,
           },
@@ -766,8 +766,11 @@ export async function verifyAdmissionCandidate(
         priority: 20,
       };
     }
-    const attempts = Number(row.attempts || 0) + 1;
-    const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+    const attempts = options.evidenceAttemptsPreserved
+      ? Number(row.attempts || 0)
+      : Number(row.attempts || 0) + 1;
+    const expired = !options.evidenceAttemptsPreserved
+      && (attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false));
     const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
     const reasonCodes = [expired ? 'MISSING_EVIDENCE_EXPIRED' : 'MISSING_EVIDENCE_RETRY', evidence.failureReason || 'EVIDENCE_INCOMPLETE'];
     if (!options.dryRun) {
@@ -1170,7 +1173,7 @@ export async function verifyAdmissionCandidate(
         evidenceHash: hash,
         judgment: effectiveJudgment,
         model: effectiveJudgment.model,
-        attempts: Number(row.attempts || 0) + 1,
+        attempts: options.evidenceAttemptsPreserved ? Number(row.attempts || 0) : Number(row.attempts || 0) + 1,
         nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
         expiresAt: policy.hold ? (row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()) : null,
         expectedStatus: row.status,
