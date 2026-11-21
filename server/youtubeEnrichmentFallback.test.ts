@@ -37,6 +37,14 @@ test('public About is attempted only when bio or links are insufficient', () => 
     shouldAttemptAdmissionPublicAbout({ description: 'A sufficiently descriptive creator bio.', links: ['https://a.example'] }),
     false,
   );
+  assert.equal(
+    shouldAttemptAdmissionPublicAbout({ description: 'A sufficiently descriptive creator bio.', links: [], hasVideoSample: true }),
+    false,
+  );
+  assert.equal(
+    shouldAttemptAdmissionPublicAbout({ description: 'A sufficiently descriptive creator bio.', links: [], hasVideoSample: false }),
+    true,
+  );
 });
 
 test('enrichment wires topicDetails, Innertube uploads fallback, and public About fallback', () => {
@@ -49,7 +57,11 @@ test('enrichment wires topicDetails, Innertube uploads fallback, and public Abou
   assert.match(source, /fetchChannelAboutViaInnertube\(channelId\)/);
   assert.match(source, /channelTopics: parseChannelTopicDetails\(channel\)/);
   assert.match(source, /publicAboutCheckpoint !== undefined/);
-  assert.match(source, /shouldAttemptAdmissionPublicAbout\(\{ description, links: extractedLinks \}\)/);
+  assert.match(source, /shouldAttemptAdmissionPublicAbout\(\{ description, links: extractedLinks, hasVideoSample: recentItems\.length > 0 \}\)/);
   assert.match(source, /hasMeaningfulCreatorText\(description\)/);
   assert.match(source, /evidenceAcquisitionFailure: evidenceAcquisitionFailure \|\| videoSampleFailure/);
+  assert.match(source, /playlistDiscoveryJustified/);
+  assert.match(source, /videos\.length === 0/);
+  assert.match(source, /PLAYLIST_DISCOVERY_SIGNAL/);
+  assert.match(source, /videoSampleFailure/);
 });

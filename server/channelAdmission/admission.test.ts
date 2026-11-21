@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { assessExtractedQueryAdmission, decideAdmission, hasStrongTradingSupport, validCitations } from './policy';
-import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
+import { categoryFallbackCitations, decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading, unrelatedCitations } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
@@ -1351,4 +1351,44 @@ test('a trading channel name cannot be the lexical anchor for a single citation'
   });
   assert.equal(validCitations(fixture, j).length, 1);
   assert.equal(hasStrongTradingSupport(fixture, j), false);
+});
+
+test('playlist and external-link negative citations resolve to source text', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Link Fixture', bio: '', videos: [] }),
+    links: ['https://broker.example/accounts'],
+    playlists: [{ name: 'Bank wealth products', description: 'Savings and insurance' }],
+  };
+  const decision = {
+    negativeEvidence: [{
+      provenance: { fields: [
+        { field: 'external_link_domain', index: 0 },
+        { field: 'playlist_name', index: 0 },
+      ] },
+    }],
+  } as any;
+  const citations = unrelatedCitations(fixture, decision);
+  assert.ok(citations.some(citation => citation.field === 'link' && /broker\.example/.test(citation.quote)));
+  assert.ok(citations.some(citation => citation.field === 'playlist_name' && /Bank wealth/.test(citation.quote)));
+});
+
+test('category fallback citations keep an auditable creator quote', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Maybank2usg', bio: 'Wealth products and banking services.', videos: [] }),
+  };
+  const citations = categoryFallbackCitations(fixture);
+  assert.equal(citations.length > 0, true);
+  assert.match(citations[0].quote, /Wealth products|Maybank2usg/);
+});
+
+test('finance-adjacent insurance content never takes the strict unrelated path', () => {
+  const fixture = evidence({
+    name: 'Insurance Guide',
+    bio: 'Car insurance comparison, budgeting and savings account tips.',
+    videos: [
+      { title: 'Compare car insurance policies', description: 'Vehicle insurance comparison and savings.' },
+      { title: 'Budgeting for car insurance', description: 'Car and vehicle insurance savings.' },
+    ],
+  });
+  assert.equal(evaluateStrictRejection(fixture), null);
 });

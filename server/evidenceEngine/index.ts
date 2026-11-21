@@ -361,6 +361,7 @@ export class EvidenceBasedTradingEngine {
 
     let semanticResult: SemanticChainResult = { items: [], reports: [] };
     const shouldRunSemantic = semanticAvailable
+      && hasCreatorContext
       && preliminaryRecognition.semanticPolicy !== 'SKIP'
       && preliminaryRecognition.semanticPolicy !== 'NONE';
     if (shouldRunSemantic) {

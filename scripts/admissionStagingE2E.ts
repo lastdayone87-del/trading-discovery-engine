@@ -83,8 +83,10 @@ const cookingEvidence = fixtureEvidence({
 const reviewEvidence = fixtureEvidence({
   channelId: `${PREFIX}REVIEW`,
   channelName: 'Sparse Review Candidate',
-  description: 'Short bio',
-  videos: [{ title: 'One video' }],
+  // No meaningful creator content: the check must never depend on a live AI
+  // provider or on arbitrary short text being judged as evidence.
+  description: 'Share your videos with friends, family, and the world',
+  videos: [],
 });
 
 const humanAdmitEvidence = fixtureEvidence({

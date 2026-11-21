@@ -87,6 +87,7 @@ export function assessAdmissionEvidenceCoverage(input: {
   playlists?: Array<{ name?: string; description?: string }>;
   detailFailure?: string;
   acquisitionFailure?: string;
+  videoSampleFailure?: string;
 }): AdmissionCoverageAssessment {
   const description = String(input.description || '').trim();
   const meaningfulDescription = hasMeaningfulCreatorText(description);
@@ -94,17 +95,20 @@ export function assessAdmissionEvidenceCoverage(input: {
     hasMeaningfulCreatorText(playlist.name) || hasMeaningfulCreatorText(playlist.description));
   const missingVideoDescriptions = input.videos.some(video => !String(video.description || '').trim());
   const completeVideoSample = input.videos.length > 0 && (!input.detailFailure || !missingVideoDescriptions);
+  const videoAcquisitionFailed = input.videos.length === 0 && Boolean(input.videoSampleFailure);
   const coverage: AdmissionEvidence['evidenceCoverage'] =
-    completeVideoSample || (!input.detailFailure && (meaningfulDescription || meaningfulPlaylists))
+    !videoAcquisitionFailed && (completeVideoSample || (!input.detailFailure && (meaningfulDescription || meaningfulPlaylists)))
       ? 'COMPLETE'
       : 'PARTIAL';
   const failureReason = coverage === 'COMPLETE'
     ? undefined
     : input.detailFailure
       ? `FULL_DESCRIPTIONS_UNAVAILABLE:${input.detailFailure}`
-      : input.acquisitionFailure
-        ? `PROVIDER_EVIDENCE_UNAVAILABLE:${input.acquisitionFailure}`
-        : 'NO_CREATOR_TEXT_AVAILABLE';
+      : input.videoSampleFailure
+        ? `PROVIDER_EVIDENCE_UNAVAILABLE:${input.videoSampleFailure}`
+        : input.acquisitionFailure
+          ? `PROVIDER_EVIDENCE_UNAVAILABLE:${input.acquisitionFailure}`
+          : 'NO_CREATOR_TEXT_AVAILABLE';
   const evidenceSample: NonNullable<AdmissionEvidence['evidenceSample']> = input.videos.length > 0
     ? 'VIDEO_SAMPLE'
     : meaningfulPlaylists
@@ -189,6 +193,7 @@ export async function fetchAdmissionEvidence(input: {
       playlists,
       detailFailure,
       acquisitionFailure: enriched.evidenceAcquisitionFailure,
+      videoSampleFailure: enriched.videoSampleFailure,
     });
     return {
       ...base,
@@ -211,10 +216,27 @@ export async function fetchAdmissionEvidence(input: {
     // the shared InnerTube/About fallbacks before declaring a provider wait.
     try {
       const { fetchPublicAboutEvidence } = await import('../youtubePublicAbout');
-      const { fetchChannelAboutViaInnertube } = await import('../youtubeInnertubeProvider');
+      const { fetchChannelAboutViaInnertube, fetchChannelVideoDescriptionsViaInnertube } = await import('../youtubeInnertubeProvider');
+      let fallbackVideos: AdmissionEvidence['videos'] = [];
+      let videoSampleFailure: string | undefined;
       const [about, innertubeAbout] = await Promise.all([
         fetchPublicAboutEvidence(`https://www.youtube.com/channel/${input.candidate.channelId}`).catch(() => null),
         fetchChannelAboutViaInnertube(input.candidate.channelId).catch(() => null),
+        fetchChannelVideoDescriptionsViaInnertube(input.candidate.channelId, { maxVideos: 10 })
+          .then(sample => {
+            fallbackVideos = sample.items
+              .map(item => ({
+                videoId: item.videoId,
+                title: String(item.title || ''),
+                description: String(item.description || ''),
+                publishedAt: item.publishedAt,
+              }))
+              .filter(video => video.title.trim() || video.description.trim())
+              .slice(0, 10);
+          })
+          .catch(error => {
+            videoSampleFailure = error instanceof Error ? error.message : String(error);
+          }),
       ]);
       const fallback = selectKeylessFallbackEvidence({
         aboutBio: about?.status === 'AVAILABLE' ? about.about?.bio : undefined,
@@ -224,14 +246,23 @@ export async function fetchAdmissionEvidence(input: {
         aboutSubscriberCount: about?.status === 'AVAILABLE' ? about.about?.subscriberCountText : undefined,
         innertubeSubscriberCount: innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.subscriberCount : undefined,
       });
-      if (fallback.usable) {
+      if (fallback.usable || fallbackVideos.length) {
+        const assessment = assessAdmissionEvidenceCoverage({
+          description: fallback.description,
+          videos: fallbackVideos,
+          playlists: base.playlists,
+          acquisitionFailure: failureReason,
+          videoSampleFailure,
+        });
         return {
           ...base,
           description: fallback.description,
           links: uniqueLinks([...base.links, ...fallback.addedLinks]),
           subscriberCount: fallback.subscriberCount || base.subscriberCount,
-          evidenceCoverage: 'COMPLETE',
-          evidenceSample: 'METADATA_ONLY',
+          videos: fallbackVideos,
+          evidenceCoverage: assessment.coverage,
+          evidenceSample: assessment.evidenceSample,
+          failureReason: assessment.failureReason,
         };
       }
     } catch {

@@ -27,6 +27,28 @@ export interface PublicYouTubeChannelAbout {
   truncated?: boolean;
 }
 
+let publicAboutCooldownUntilMs = 0;
+let nextPublicAboutRequestAtMs = 0;
+const PUBLIC_ABOUT_MIN_INTERVAL_MS = 1_000;
+const PUBLIC_ABOUT_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const PUBLIC_ABOUT_CONSENT_COOLDOWN_MS = 5 * 60_000;
+
+export function resetPublicAboutPacingForTests(): void {
+  publicAboutCooldownUntilMs = 0;
+  nextPublicAboutRequestAtMs = 0;
+}
+
+export function publicAboutCooldownRemainingMs(now: number = Date.now()): number {
+  return Math.max(0, publicAboutCooldownUntilMs - now);
+}
+
+async function pacePublicAboutRequest(): Promise<void> {
+  const now = Date.now();
+  const scheduled = Math.max(now, nextPublicAboutRequestAtMs);
+  nextPublicAboutRequestAtMs = scheduled + PUBLIC_ABOUT_MIN_INTERVAL_MS;
+  if (scheduled > now) await new Promise(resolve => setTimeout(resolve, scheduled - now));
+}
+
 /** Match inspection short-bio threshold: treat under 20 chars as insufficient About text. */
 export const INSUFFICIENT_DESCRIPTION_MAX_LEN = 20;
 
@@ -126,6 +148,7 @@ export async function fetchPublicYouTubePageDetailed(
   fetchImpl: typeof fetch = fetch,
 ): Promise<PublicAboutPageFetch> {
   if (depth > 2) return { status: 'TEMPORARY_FAILURE', reason: 'REDIRECT_DEPTH' };
+  await pacePublicAboutRequest();
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -144,6 +167,7 @@ export async function fetchPublicYouTubePageDetailed(
         return { status: 'NOT_FOUND', httpStatus: res.status, reason: `HTTP_${res.status}` };
       }
       if (res.status === 429) {
+        publicAboutCooldownUntilMs = Math.max(publicAboutCooldownUntilMs, Date.now() + PUBLIC_ABOUT_RATE_LIMIT_COOLDOWN_MS);
         return { status: 'RATE_LIMITED', httpStatus: res.status, reason: 'HTTP_429' };
       }
       return { status: 'TEMPORARY_FAILURE', httpStatus: res.status, reason: `HTTP_${res.status}` };
@@ -159,6 +183,7 @@ export async function fetchPublicYouTubePageDetailed(
     const bounded = await readBoundedResponseText(res);
     const consentBlocked = /consent\.youtube\.com|Before you continue to YouTube|We use cookies and data/i.test(bounded.text.slice(0, 20_000));
     if (consentBlocked) {
+      publicAboutCooldownUntilMs = Math.max(publicAboutCooldownUntilMs, Date.now() + PUBLIC_ABOUT_CONSENT_COOLDOWN_MS);
       return { status: 'CONSENT_BLOCKED', httpStatus: res.status, reason: 'CONSENT_WALL' };
     }
     if (!bounded.text.trim()) {
@@ -430,6 +455,10 @@ export async function fetchPublicAboutEvidence(
 ): Promise<{ status: PublicAboutAcquisitionStatus; about?: PublicYouTubeChannelAbout; reason?: string }> {
   if (!youtubeUrl || !youtubeUrl.startsWith('http')) {
     return { status: 'NOT_FOUND', reason: 'INVALID_URL' };
+  }
+  const cooldownRemaining = publicAboutCooldownRemainingMs();
+  if (cooldownRemaining > 0) {
+    return { status: 'RATE_LIMITED', reason: `COOLDOWN_${cooldownRemaining}MS` };
   }
   const aboutUrl = youtubeChannelAboutUrl(youtubeUrl);
   const [aboutPage, rootPage] = await Promise.all([
