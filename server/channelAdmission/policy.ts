@@ -221,9 +221,9 @@ export function hasCorroboratedUnrelatedDomain(judgment: SemanticJudgment): bool
     || (Number(domains[0].confidence) >= 0.8 && Number(domains[1]?.confidence || 0) < 0.5);
 }
 
-function admissionEvidenceText(evidence: AdmissionEvidence): string {
+function admissionEvidenceText(evidence: AdmissionEvidence, includeName: boolean): string {
   return [
-    evidence.channelName,
+    ...(includeName ? [evidence.channelName] : []),
     evidence.description,
     ...evidence.videos.map(video => `${video.title} ${video.description}`),
     ...(evidence.playlists || []).map(playlist => `${playlist.name} ${playlist.description || ''}`),
@@ -231,7 +231,7 @@ function admissionEvidenceText(evidence: AdmissionEvidence): string {
 }
 
 export function hasStrongTradingSupport(evidence: AdmissionEvidence, judgment: SemanticJudgment): boolean {
-  const evidenceText = admissionEvidenceText(evidence);
+  const evidenceText = admissionEvidenceText(evidence, false);
   if (judgment.mainSubject === 'TRADING') {
     return independentCitationCount(evidence, judgment, 'TRADING') >= 2
       || (independentCitationCount(evidence, judgment, 'TRADING') >= 1 && hasTradingAnchor(evidenceText));
@@ -285,7 +285,7 @@ export function decideAdmission(input: {
     || (primary.mainSubject === 'UNRELATED' && primaryUnrelatedCitations < 2)
   ) ? secondary : primary;
   const effectiveRole = effective === secondary ? 'SECOND' : 'PRIMARY';
-  const evidenceText = admissionEvidenceText(evidence);
+  const evidenceText = admissionEvidenceText(evidence, true);
   const tradingCitations = independentCitationCount(evidence, effective, 'TRADING');
   const financeCitations = independentCitationCount(evidence, effective, 'FINANCE_ADJACENT');
   const unrelatedCitations = independentCitationCount(evidence, effective, 'UNRELATED');

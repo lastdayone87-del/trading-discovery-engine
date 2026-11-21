@@ -1339,3 +1339,16 @@ test('playlist text participates in the one-citation trading-anchor path', () =>
   assert.equal(validCitations(fixture, j).length, 1);
   assert.equal(hasStrongTradingSupport(fixture, j), true);
 });
+
+test('a trading channel name cannot be the lexical anchor for a single citation', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Futures Trading Daily', bio: '', videos: [] }),
+  };
+  const j = judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('bio', '', 0, 'TRADING')],
+  });
+  // The empty citation is invalid, so there is no content citation to support.
+  assert.equal(hasStrongTradingSupport(fixture, j), false);
+});
