@@ -2986,9 +2986,9 @@ export async function processNextSearchJob(
         deferredReason: usingV2 ? decisionV2.deferReason : null,
       };
       await recordAutonomousPage(pageObservation);
-      // The page is now durable; a replay failure can be retried by recovery
-      // without buying the provider page again.
-      await replayPageAdmissionOutcomesSafe(queryRunId, pageNumber);
+      // The page is now durable. A strict replay failure retries from the saved
+      // page through recovery, without buying the provider page again.
+      await replayPageAdmissionOutcomesSafe(queryRunId, pageNumber, true);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
       if (!queryResultHold && deferDecision) {
         if (decisionV2.deferReason === 'QUOTA') await deferAutonomousRunForQuota(queryRunId, decisionV2.primaryReason);

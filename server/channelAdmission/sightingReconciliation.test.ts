@@ -174,5 +174,8 @@ test('the resume boundary waits for page-level settlement and re-applies the gua
   assert.match(queue, /Number\(pageOutcomes\.pending \|\| 0\) > 0/);
   assert.match(queue, /getAutonomousPageSettledGuardMetrics\(run\.runId, run\.pagesCompleted\)/);
   assert.match(queue, /priorZeroQualityPages: priorState\.v2Streaks\.lowValue/);
-  assert.match(queue, /replayPageAdmissionOutcomesSafe\(queryRunId, pageNumber\)/);
+  assert.match(
+    queue,
+    /recordAutonomousPage\(pageObservation\);[\s\S]*replayPageAdmissionOutcomesSafe\(queryRunId, pageNumber, true\)/,
+  );
 });
