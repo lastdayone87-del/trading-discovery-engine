@@ -133,7 +133,7 @@ const TRADING_ANALYSIS_TERMS = /\b(?:technical analysis|market analysis|analisi 
 const TRADING_ANALYSIS_CJK = /(?:分析|分析技術)/u;
 // A generic CJK "analysis" word is not enough for a bank's primary-trading
 // exemption: require explicit trading/investing analysis context.
-const TRADING_PRIMARY_CJK = /(?:技术分析|技術分析|行情分析|市场分析|市場分析|价格分析|價格分析|黄金分析|金价分析|股票分析|期货分析|期貨分析|外匯分析|外汇分析|加密貨幣分析|加密货币分析)/u;
+const TRADING_PRIMARY_CJK = /(?:技术分析|技術分析|行情分析|市场分析|市場分析|价格分析|價格分析|黄金分析|金价分析|股票分析|期货分析|期貨分析|外匯分析|外汇分析|加密貨幣分析|加密货币分析|テクニカル分析|チャート分析|相場分析|株式分析|先物分析|為替分析|金相場分析|ビットコイン分析)/u;
 const EDUCATION_TERMS = /\b(?:course|learn|learning|education|educational|academy|training|tutorial|guide|lesson|mentor|coaching|explained|how to)\b/iu;
 // Explicit teaching/branding terms only. "Strategy" or "analysis" appear in
 // almost every signal-seller bio and must not exempt a signal-first channel.

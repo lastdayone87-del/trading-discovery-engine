@@ -419,3 +419,12 @@ test('generic Chinese analysis titles do not exempt a bank, but trading analysis
   });
   assert.equal(tradingAnalysis, null);
 });
+
+test('Japanese trading-analysis titles establish a primary trading sample', () => {
+  const japanese = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking services and trading education.',
+    video_titles: ['テクニカル分析', 'チャート分析', '株式分析'],
+  });
+  assert.equal(japanese, null);
+});
