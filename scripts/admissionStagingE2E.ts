@@ -329,27 +329,22 @@ async function main(): Promise<void> {
     return { channel: channel?.admission_status, classificationJobs: jobs.rowCount };
   });
 
-  await check('deterministic ambiguity enqueues stage-1 enrichment without a semantic judgment', async () => {
+  await check('deterministic ambiguity stays in the ledger without a catalog row or enrichment judgment', async () => {
     const input = candidateInput(reviewEvidence);
     const row = await upsertAdmissionCandidate(input);
     const result = await verifyAdmissionCandidate(input, { row, evidenceOverride: reviewEvidence });
-    assert.equal(result.status, 'ADMITTED_AMBIGUOUS');
+    assert.equal(result.status, 'WAITING_EVIDENCE');
     const candidate = await findAdmissionCandidate(reviewEvidence.channelId);
-    assert.equal(candidate?.status, 'ADMITTED_AMBIGUOUS');
-    assert.equal(candidate?.semantic_output, null, 'ambiguity must not persist a semantic admission judgment');
+    assert.equal(candidate?.status, 'WAITING_EVIDENCE');
+    assert.equal(candidate?.semantic_output, null, 'an unresolved candidate must not persist a semantic admission judgment');
+    assert.ok((candidate?.reason_codes || []).includes('EVIDENCE_ACQUISITION_REQUIRED'));
     const ledger = await db.query(`SELECT decision,semantic_output FROM semantic_admission_decisions WHERE channel_id=$1 LIMIT 1`, [reviewEvidence.channelId]);
-    assert.equal(ledger.rows[0]?.decision, 'ADMIT_AMBIGUOUS');
-    assert.equal(ledger.rows[0]?.semantic_output, null, 'the decision ledger must not record a semantic judgment');
+    assert.equal(ledger.rowCount, 0, 'unresolved evidence must not write a terminal decision');
     const channel = await getChannelById(reviewEvidence.channelId);
-    assert.equal(channel?.admission_status, 'ADMITTED_AMBIGUOUS');
-    assert.equal(channel?.scan_status, 'ENRICHMENT_PENDING');
-    const jobs = await db.query(`SELECT type,payload FROM jobs WHERE payload->>'channelId'=$1`, [reviewEvidence.channelId]);
-    assert.equal(jobs.rowCount, 1);
-    assert.equal(jobs.rows[0].type, 'ENRICH_CHANNEL');
-    assert.equal(Number(jobs.rows[0].payload.enrichmentStage), 1);
-    assert.equal(jobs.rows[0].payload.candidate?.admissionConfirmedTrading, false);
-    assert.equal(jobs.rows[0].payload.candidate?.admissionDecisionSource, 'DETERMINISTIC');
-    return { candidateStatus: candidate?.status, jobType: jobs.rows[0].type, stage: jobs.rows[0].payload.enrichmentStage };
+    assert.equal(channel, null, 'unresolved evidence must never create a catalog row');
+    const jobs = await db.query(`SELECT type FROM jobs WHERE payload->>'channelId'=$1`, [reviewEvidence.channelId]);
+    assert.equal(jobs.rowCount, 0, 'the pre-catalog judge runs before any enrichment handoff');
+    return { candidateStatus: candidate?.status, reasonCodes: candidate?.reason_codes };
   });
 
   await check('human review ADMIT creates a channel and one durable classification', async () => {
