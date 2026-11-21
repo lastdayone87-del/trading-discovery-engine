@@ -89,6 +89,7 @@ for (const raw of selected.rows as Array<Record<string, any>>) {
       evidenceOverride: evidence,
       dryRun: !apply,
       archiveRejectedExistingChannel: true,
+      evidenceAttemptsPreserved: true,
     });
     if (apply && (result.status === 'WAITING_EVIDENCE' || result.status === 'PROVIDER_DEFERRED')) {
       const refreshed = await findAdmissionCandidate(row.channel_id);

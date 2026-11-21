@@ -174,6 +174,7 @@ function hasTerminalNegativeEvidence(decision: RoutingInput): boolean {
   // evidence. The status cannot be terminalized by isolated keywords.
   return reasons.some(code =>
     code === 'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'
+    || code === 'HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION'
     || code === 'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION',
   );
 }

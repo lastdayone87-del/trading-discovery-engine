@@ -648,6 +648,8 @@ export interface VerifyAdmissionOptions {
   archiveRejectedExistingChannel?: boolean;
   /** Test/cohort seam: evaluate this evidence instead of refetching it. */
   evidenceOverride?: AdmissionEvidence;
+  /** Snapshot-only audits must not spend an evidence attempt or expire. */
+  evidenceAttemptsPreserved?: boolean;
 }
 
 export async function verifyAdmissionCandidate(
@@ -863,8 +865,11 @@ export async function verifyAdmissionCandidate(
       external_links: evidence.links,
       playlists: evidence.playlists,
     })) {
-      const attempts = Number(row.attempts || 0) + 1;
-      const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+      const attempts = options.evidenceAttemptsPreserved
+        ? Number(row.attempts || 0)
+        : Number(row.attempts || 0) + 1;
+      const expired = !options.evidenceAttemptsPreserved
+        && (attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false));
       const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
       const reasonCodes = [
         expired ? 'EVIDENCE_ACQUISITION_EXHAUSTED'
@@ -990,8 +995,11 @@ export async function verifyAdmissionCandidate(
     const positiveCitations = tradingCitations(evidence, decision);
     let negativeCitations = unrelatedCitations(evidence, decision);
     const pending = async (reasonCodes: string[]): Promise<AdmissionVerificationResult> => {
-      const attempts = Number(row.attempts || 0) + 1;
-      const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+      const attempts = options.evidenceAttemptsPreserved
+        ? Number(row.attempts || 0)
+        : Number(row.attempts || 0) + 1;
+      const expired = !options.evidenceAttemptsPreserved
+        && (attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false));
       const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
       const codes = [
         ...reasonCodes,

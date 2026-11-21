@@ -13,6 +13,7 @@ test('admission backlog reconciliation is dry-run by default and bounded', () =>
   assert.match(source, /ADMITTED_AMBIGUOUS/);
   assert.match(source, /NEEDS_REVIEW/);
   assert.match(source, /archiveRejectedExistingChannel: true/);
+  assert.match(source, /evidenceAttemptsPreserved: true/);
 });
 
 test('backlog reconciliation respects admission mode, backoff and retry scheduling', () => {
