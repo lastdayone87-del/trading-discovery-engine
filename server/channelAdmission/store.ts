@@ -239,6 +239,78 @@ export async function enqueueAdmissionVerification(input: {
   });
 }
 
+interface AdmissionSightingDisposition {
+  persisted: boolean;
+  funnelOutcome: string;
+  countryOutcome: string | null;
+  tradingOutcome: string | null;
+}
+
+/**
+ * Terminal admission outcomes must be projected back onto the original
+ * discovery sightings. Page novelty and continuation decisions read
+ * channel_sightings.persisted/was_known, not the admission tables; leaving the
+ * sighting at persisted=false makes a productive page look empty forever.
+ *
+ * ADMITTED/ADMITTED_AMBIGUOUS become persisted CLASSIFICATION_PENDING rows so
+ * the existing classification reconciliation can later replace the provisional
+ * outcome with the real country/trading verdict. Rejections and evidence
+ * exhaustion are terminal at admission time and are recorded as such.
+ */
+const ADMISSION_SIGHTING_DISPOSITIONS: Partial<Record<AdmissionStatus, AdmissionSightingDisposition>> = {
+  ADMITTED: { persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', countryOutcome: null, tradingOutcome: null },
+  ADMITTED_AMBIGUOUS: { persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', countryOutcome: null, tradingOutcome: null },
+  REJECTED_COUNTRY: { persisted: false, funnelOutcome: 'COUNTRY_REJECTED', countryOutcome: 'REJECTED', tradingOutcome: 'UNCERTAIN' },
+  REJECTED_UNRELATED: { persisted: false, funnelOutcome: 'NON_TRADING', countryOutcome: null, tradingOutcome: 'UNCERTAIN' },
+  NEEDS_REVIEW: { persisted: false, funnelOutcome: 'NEEDS_REVIEW', countryOutcome: null, tradingOutcome: 'UNCERTAIN' },
+  EXPIRED_MISSING_EVIDENCE: { persisted: false, funnelOutcome: 'UNCERTAIN', countryOutcome: null, tradingOutcome: 'UNCERTAIN' },
+};
+
+export async function reconcileAdmissionSightings(input: {
+  candidateId: string;
+  channelId: string;
+  status: AdmissionStatus;
+  client?: AdmissionQueryable;
+}): Promise<number> {
+  const disposition = ADMISSION_SIGHTING_DISPOSITIONS[input.status];
+  if (!disposition) return 0;
+  const db = input.client || await getDb();
+  const metadata = {
+    admissionStatus: input.status,
+    admissionSightingReconciledAt: new Date().toISOString(),
+  };
+  const result = await db.query(
+    `WITH target AS (
+       SELECT id,channel_id
+         FROM semantic_admission_candidates
+        WHERE id=$1::uuid AND channel_id=$2
+     )
+     UPDATE channel_sightings cs
+        SET persisted=$3,
+            funnel_outcome=$4,
+            country_outcome=COALESCE($5::text,cs.country_outcome),
+            trading_outcome=COALESCE($6::text,cs.trading_outcome),
+            metadata=COALESCE(cs.metadata,'{}'::jsonb)||$7::jsonb
+       FROM semantic_admission_sightings s, target t
+      WHERE s.candidate_id=t.id
+        AND cs.query_run_id=s.query_run_id
+        AND cs.channel_id=t.channel_id
+        AND cs.was_known=false
+        -- Terminal classification outcomes are authoritative. Reconciliation
+        -- only resolves a still-pending sighting; it must never rewrite a
+        -- completed TRADING_CONFIRMED/NON_TRADING/COUNTRY_REJECTED verdict.
+        AND (cs.funnel_outcome IS NULL OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN'))
+        AND cs.page_number IS NOT DISTINCT FROM s.page_number
+        AND (s.result_rank IS NULL OR cs.result_rank=s.result_rank)`,
+    [
+      input.candidateId, input.channelId, disposition.persisted,
+      disposition.funnelOutcome, disposition.countryOutcome, disposition.tradingOutcome,
+      JSON.stringify(metadata),
+    ],
+  );
+  return result.rowCount || 0;
+}
+
 export async function updateAdmissionCandidate(input: {
   id: string;
   status: AdmissionStatus;
@@ -283,7 +355,16 @@ export async function updateAdmissionCandidate(input: {
       input.expectedStatus ?? null, input.expectedAttempts ?? null,
     ],
   );
-  return result.rows[0] ? mapRow(result.rows[0]) : null;
+  const updated = result.rows[0] ? mapRow(result.rows[0]) : null;
+  if (updated && ADMISSION_SIGHTING_DISPOSITIONS[updated.status] && updated.status !== 'ADMITTED' && updated.status !== 'ADMITTED_AMBIGUOUS') {
+    await reconcileAdmissionSightings({
+      candidateId: updated.id,
+      channelId: updated.channel_id,
+      status: updated.status,
+      client: db,
+    });
+  }
+  return updated;
 }
 
 export async function recordAdmissionDecision(input: {

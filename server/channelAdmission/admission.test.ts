@@ -476,7 +476,7 @@ test('admission verification outranks classification, which outranks ENRICH back
   assert.equal(admissionVerificationPriority(40), 40);
 });
 
-test('pending admissions do not trip the contamination guard', () => {
+test('pending admissions defer the run instead of tripping the contamination guard', () => {
   const decision = evaluateQueryAdmissionGuard({
     pageNumber: 2,
     outcomes: { admitted: 0, ambiguous: 0, rejected: 8, held: 0, pending: 10, total: 8 },
@@ -486,7 +486,9 @@ test('pending admissions do not trip the contamination guard', () => {
     priorZeroQualityPages: 2,
   });
   assert.equal(decision.stop, true);
+  assert.equal(decision.defer, true);
   assert.equal(decision.quarantine, false);
+  assert.deepEqual(decision.reasonCodes, ['ADMISSION_PENDING_WAIT']);
 });
 
 test('admission jobs resolve NORMAL/PROBE provenance before a channels row exists', async () => {

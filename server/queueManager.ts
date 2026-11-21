@@ -48,6 +48,8 @@ import {
   getExcludedCountries,
   getAutonomousQuotaAvailability,
   getQueryRunProgress,
+  getQuotaFallbackRunState,
+  retargetQuotaBlockedRunToInnertube,
   updateQueryRunProgress,
   markQueryRunDeferred,
   markQueryRunResumeUnavailable,
@@ -118,8 +120,14 @@ import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromoted
 import { recordQueryArmOutcome } from './queryDiscoveryArms';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
-import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
+import { YOUTUBE_INNERTUBE_MAX_PAGES, YOUTUBE_INNERTUBE_PROVIDER, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
 import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
+import {
+  evaluateInnertubeQuotaFallback,
+  innertubeFallbackCursor,
+  quotaFallbackMetadata,
+  requiresContinuationHandoff,
+} from './quotaFallback';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import {
@@ -132,6 +140,7 @@ import {
   getPageNoveltyMetrics,
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
+  markAutonomousPageDeferredForAdmission,
   recordAutonomousPage,
 } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
@@ -609,6 +618,14 @@ interface AutonomousRunFinalizationArgs {
   continuationExplorationPagesRemaining: number;
   continuationResumeMode: ContinuationResumeMode;
   queryHold?: import('./queryResultConsistency').QueryResultConsistencyDecision | null;
+  /**
+   * Official pages actually charged when a quota-denied page hands off to
+   * InnerTube. Absent on ordinary finalization (current page was retrieved).
+   */
+  quotaChargedPages?: number;
+  /** Provider override for the continuation handoff (quota fallback). */
+  childProviderOverride?: ProviderAllocation;
+  childMetadataPatch?: Record<string, unknown>;
 }
 
 /**
@@ -675,7 +692,8 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
       providerRateLimited,
     });
   }
-  const quotaConsumed = providerCostUsd > 0 || args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : args.pageNumber * 100;
+  const quotaChargedPages = args.quotaChargedPages === undefined ? args.pageNumber : args.quotaChargedPages;
+  const quotaConsumed = providerCostUsd > 0 || args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : quotaChargedPages * 100;
   const queryRecord = args.queryId ? await getQueryById(args.queryId) : null;
   const performance = queryRecord
     ? await evaluateQueryPerformance(queryRecord, finalMetrics, {
@@ -701,9 +719,12 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
       nextPageToken: args.nextPageToken,
       resumeMode: args.continuationResumeMode,
       explorationPagesRemaining: args.continuationExplorationPagesRemaining,
+      ...(args.childProviderOverride ? { providerOverride: args.childProviderOverride } : {}),
+      ...(args.childMetadataPatch ? { metadataPatch: args.childMetadataPatch } : {}),
     });
     const childJob = await enqueueJob('SEARCH_YOUTUBE', {
       ...args.job.payload,
+      ...(args.childProviderOverride ? { provider: args.childProviderOverride } : {}),
       queryRunId: segment.childRunId,
       pageNumber: 1,
       pageToken: args.nextPageToken,
@@ -714,13 +735,16 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
     });
     await setQueryRunJobId(segment.childRunId, childJob.id);
     console.log(JSON.stringify({
-      event: 'autonomous_page_ceiling_continuation',
+      event: args.childProviderOverride
+        ? 'autonomous_provider_fallback_continuation'
+        : 'autonomous_page_ceiling_continuation',
       parentRunId: args.queryRunId,
       childRunId: segment.childRunId,
       childJobId: childJob.id,
       segment: segment.segment,
       pageNumber: args.pageNumber,
       resumeMode: segment.resumeMode,
+      ...(args.childProviderOverride ? { childProvider: args.childProviderOverride.providerKey } : {}),
       timestamp: new Date().toISOString(),
     }));
   }
@@ -977,6 +1001,27 @@ async function deferAutonomousRunForTime(runId: string, reason: string): Promise
   console.log(JSON.stringify({
     event: 'autonomous_run_deferred_time',
     runId,
+    deferredUntil,
+    reason: reason.slice(0, 300),
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+/**
+ * Pending admission verdicts are a temporary evidence wait, not a terminal
+ * page outcome. Keep the run resumable on the existing DEFERRED_TIME path: the
+ * page observation is re-opened for continuation when the page actually has a
+ * next cursor, so the reconciler enqueues the next page once admissions settle
+ * instead of finalizing the run on a stale low-novelty decision.
+ */
+async function deferAutonomousRunForAdmission(runId: string, pageNumber: number, reason: string): Promise<void> {
+  await markAutonomousPageDeferredForAdmission(runId, pageNumber);
+  const deferredUntil = new Date(Date.now() + AUTONOMOUS_TIME_DEFER_MS).toISOString();
+  await markQueryRunDeferred(runId, 'DEFERRED_TIME', deferredUntil);
+  console.log(JSON.stringify({
+    event: 'autonomous_run_deferred_admission',
+    runId,
+    pageNumber,
     deferredUntil,
     reason: reason.slice(0, 300),
     timestamp: new Date().toISOString(),
@@ -2393,6 +2438,7 @@ export async function processNextSearchJob(
     let allocatedProvider: ProviderAllocation = YOUTUBE_SEARCH_PROVIDER;
     let braveProvider = false;
     let quotaFreeInnertubeProvider = false;
+    let quotaFallbackApplied = false;
     if (queryRunId) {
       allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
       const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
@@ -2417,14 +2463,104 @@ export async function processNextSearchJob(
         const budget=getDailyYouTubeQuotaBudget();
         const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
         if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent})){
-          // A denied page is deferred, never completed or failed: the run keeps
-          // its page number and next-page cursor for the reconciler. Persist
-          // the provider's resume mode first, otherwise a page-1 deferral has
-          // no cursor mode and the reconciler cannot recover it.
-          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
-          await deferAutonomousRunForQuota(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied');
-          await completeJob(job.id);
-          return true;
+          // The official search quota is exhausted. Before deferring, check
+          // whether this run can continue on the quota-free InnerTube lane.
+          // DATE-ordered, windowed, trial, treatment, and frontier-lineage
+          // runs are deliberately excluded: InnerTube cannot reproduce those
+          // retrieval semantics or lineage.
+          const fallbackState = await getQuotaFallbackRunState(queryRunId).catch(() => null);
+          const fallbackDecision = fallbackState
+            ? evaluateInnertubeQuotaFallback({
+                providerKey: fallbackState.providerKey,
+                searchOrdering: fallbackState.searchOrdering,
+                hasSearchWindow: fallbackState.hasSearchWindow || Boolean(searchWindow),
+                retrievalTreatmentOrigin: fallbackState.retrievalTreatmentOrigin,
+                allocationOrigin: fallbackState.allocationOrigin,
+                hasTrial: Boolean(job.payload.trial?.trialId),
+              })
+            : { eligible: false, reasonCodes: ['RUN_STATE_UNAVAILABLE'] };
+          if (fallbackDecision.eligible && !fallbackState!.continuedToRunId && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_MAX_PAGES) {
+            if (!requiresContinuationHandoff(fallbackState!.pagesCompleted)) {
+              // Zero completed pages: no official units were spent, so the
+              // run can move provider identity in place and continue now.
+              const retargeted = await retargetQuotaBlockedRunToInnertube({
+                runId: queryRunId,
+                jobId: job.id,
+                provider: YOUTUBE_INNERTUBE_PROVIDER,
+              }).catch(error => {
+                console.warn(JSON.stringify({
+                  event: 'innertube_quota_fallback_retarget_failed',
+                  runId: queryRunId,
+                  jobId: job.id,
+                  error: error instanceof Error ? error.message : String(error),
+                  timestamp: new Date().toISOString(),
+                }));
+                return false;
+              });
+              if (retargeted) {
+                allocatedProvider = providerSnapshot(YOUTUBE_INNERTUBE_PROVIDER);
+                quotaFreeInnertubeProvider = true;
+                quotaFallbackApplied = true;
+                providerQuotaUnits = 0;
+                job.payload = { ...job.payload, provider: allocatedProvider, pageNumber: 1, pageToken: null };
+                console.log(JSON.stringify({
+                  event: 'innertube_quota_fallback_retargeted',
+                  runId: queryRunId,
+                  jobId: job.id,
+                  pageNumber,
+                  fromProvider: 'youtube-search',
+                  timestamp: new Date().toISOString(),
+                }));
+              }
+            } else {
+              // Official pages already completed: hand the remaining cursor to
+              // an InnerTube continuation child so the official run keeps its
+              // own quota/cost accounting and immutable provider identity.
+              await finalizeAutonomousSearchRun({
+                job,
+                workerId,
+                queryRunId,
+                queryId,
+                query,
+                country,
+                pageNumber,
+                retrievalLane,
+                searchOrdering,
+                retrievalConfigKey,
+                pageMetrics: {} as QueryFunnelMetrics,
+                allocatedProvider,
+                providerCostUsd: 0,
+                searchWorkerStartMs,
+                searchQuotaWaitMs,
+                searchRetrievalGrossMs: 0,
+                searchTopUpWaitMs: 0,
+                channelLoopStartMs: Date.now(),
+                channelLoopEndMs: Date.now(),
+                trial: job.payload.trial || null,
+                nextPageToken: innertubeFallbackCursor(fallbackState!.pagesCompleted),
+                createContinuation: true,
+                continuationExplorationPagesRemaining: fallbackState!.explorationPagesRemaining,
+                continuationResumeMode: 'REWALK',
+                quotaChargedPages: fallbackState!.pagesCompleted,
+                childProviderOverride: YOUTUBE_INNERTUBE_PROVIDER,
+                childMetadataPatch: quotaFallbackMetadata({
+                  fromProvider: 'youtube-search',
+                  reason: 'OFFICIAL_QUOTA_EXHAUSTED',
+                  pagesCompleted: fallbackState!.pagesCompleted,
+                }),
+              });
+              await completeJob(job.id);
+              return true;
+            }
+          }
+          if (!quotaFallbackApplied) {
+            // No compatible free provider: keep the existing deferral. The run
+            // retains its page number and next-page cursor for the reconciler.
+            await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
+            await deferAutonomousRunForQuota(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied');
+            await completeJob(job.id);
+            return true;
+          }
         }
       }
       searchQuotaWaitMs += Date.now() - quotaWaitStartMs;
@@ -2434,7 +2570,7 @@ export async function processNextSearchJob(
         const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
         const retrievalStartMs = Date.now();
         try {
-          searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
+          searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:quotaFallbackApplied ? null : pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
             if(braveProvider||quotaFreeInnertubeProvider) return;
             const topUpStartMs = Date.now();
             const budget=getDailyYouTubeQuotaBudget();
@@ -2826,7 +2962,7 @@ export async function processNextSearchJob(
           throw error;
         }),
       ]);
-      const admissionGuard = admissionOutcomes && admissionPageOutcomes && Number(admissionPageOutcomes.pending || 0) === 0
+      const admissionGuard = admissionOutcomes && admissionPageOutcomes
         ? evaluateQueryAdmissionGuard({
             pageNumber,
             outcomes: admissionOutcomes,
@@ -2837,6 +2973,14 @@ export async function processNextSearchJob(
             priorZeroQualityPages: prior.v2Streaks.lowValue,
           })
         : { stop: false, quarantine: false, reasonCodes: [] as string[] };
+      // Pending admission verdicts are a temporary evidence wait. Defer the
+      // run and resume it after the verdicts settle; do not record a terminal
+      // page stop, quarantine the query, or abandon a productive next cursor.
+      if (admissionGuard.defer && searchPage?.nextPageToken) {
+        await deferAutonomousRunForAdmission(queryRunId, pageNumber, admissionGuard.reasonCodes.join(','));
+        await completeJob(job.id);
+        return true;
+      }
       if (admissionGuard.stop) {
         await (await getDb()).query(
           `UPDATE autonomous_query_page_observations SET stopping_reason=$3,decision_reason_codes=COALESCE(decision_reason_codes,'[]'::jsonb)||$4::jsonb WHERE query_run_id=$1 AND page_number=$2`,

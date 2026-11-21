@@ -6784,6 +6784,12 @@ export async function createContinuationRunSegment(args: {
   nextPageToken: string | null;
   resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
   explorationPagesRemaining?: number;
+  /**
+   * Provider handoff for the official-quota fallback. Absent means the child
+   * inherits the parent allocation exactly as before.
+   */
+  providerOverride?: ProviderAllocation;
+  metadataPatch?: Record<string, unknown>;
 }): Promise<ContinuationRunSegment> {
   const db = await getDb();
   const client = await db.connect();
@@ -6803,6 +6809,15 @@ export async function createContinuationRunSegment(args: {
       };
     }
     const segment = Number(parent.continuation_segment || 0) + 1;
+    const inheritedProvider = providerSnapshot(parent.provider_allocation_snapshot as ProviderAllocation);
+    const provider = args.providerOverride ? providerSnapshot(args.providerOverride) : inheritedProvider;
+    const quotaReserved = args.providerOverride && provider.costDomain === 'YOUTUBE_INNERTUBE_FREE'
+      ? 0
+      : Number(parent.quota_reserved || 0);
+    const parentMetadata = parent.metadata && typeof parent.metadata === 'object' ? parent.metadata : {};
+    const metadata = args.metadataPatch
+      ? { ...parentMetadata, ...args.metadataPatch }
+      : parentMetadata;
     const child = await client.query(
       `INSERT INTO query_runs(
          query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,
@@ -6813,14 +6828,16 @@ export async function createContinuationRunSegment(args: {
          continuation_segment,requested_page_depth
        )
        SELECT query_id,country,source,selection_strategy,selection_reason,retrieval_lane,search_ordering,
-         quota_reserved,metadata,allocation_origin,retrieval_config_key,retrieval_treatment_origin,
-         provider_key,retrieval_surface,provider_capability,cost_domain,provider_allocation_snapshot,
+         $7,$8::jsonb,allocation_origin,retrieval_config_key,retrieval_treatment_origin,
+         $9,$10,$11,$12,$13::jsonb,
          'SCHEDULED',now(),0,$2,$3,0,0,'RUNNING',$4,$1::text,$5,requested_page_depth
        FROM query_runs WHERE id=$6::uuid RETURNING id`,
       [
         args.parentRunId, args.nextPageToken, args.resumeMode,
         Math.max(0, Math.trunc(args.explorationPagesRemaining || 0)), segment,
-        args.parentRunId,
+        args.parentRunId, quotaReserved, JSON.stringify(metadata),
+        provider.providerKey, provider.retrievalSurface, provider.capability,
+        provider.costDomain, JSON.stringify(provider),
       ],
     );
     const childRunId = String(child.rows[0].id);
@@ -6847,6 +6864,129 @@ export async function createContinuationRunSegment(args: {
 export async function setQueryRunJobId(runId: string, jobId: string): Promise<void> {
   const db = await getDb();
   await db.query('UPDATE query_runs SET job_id=$2 WHERE id=$1', [runId, jobId]);
+}
+
+export interface QuotaFallbackRunState {
+  runId: string;
+  providerKey: string;
+  costDomain: string;
+  pagesCompleted: number;
+  allocationOrigin: string;
+  searchOrdering: string;
+  retrievalTreatmentOrigin: string;
+  hasSearchWindow: boolean;
+  status: string;
+  continuationStatus: string;
+  continuedToRunId: string | null;
+  explorationPagesRemaining: number;
+}
+
+export async function getQuotaFallbackRunState(runId: string): Promise<QuotaFallbackRunState | null> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT id,provider_key,cost_domain,pages_completed,allocation_origin,search_ordering,
+            retrieval_treatment_origin,status,continuation_status,continued_to_run_id,
+            exploration_pages_remaining,
+            COALESCE(metadata ? 'searchWindow',false) AS has_search_window
+       FROM query_runs WHERE id=$1`,
+    [runId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    runId: String(row.id),
+    providerKey: String(row.provider_key),
+    costDomain: String(row.cost_domain),
+    pagesCompleted: Number(row.pages_completed || 0),
+    allocationOrigin: String(row.allocation_origin || 'LEGACY'),
+    searchOrdering: String(row.search_ordering || 'RELEVANCE'),
+    retrievalTreatmentOrigin: String(row.retrieval_treatment_origin || 'CONTROL'),
+    hasSearchWindow: row.has_search_window === true,
+    status: String(row.status || ''),
+    continuationStatus: String(row.continuation_status || 'RUNNING'),
+    continuedToRunId: row.continued_to_run_id ? String(row.continued_to_run_id) : null,
+    explorationPagesRemaining: Number(row.exploration_pages_remaining || 0),
+  };
+}
+
+/**
+ * First-page official quota fallback. A run with zero completed pages has not
+ * spent official units, so moving its provider identity to InnerTube is safe
+ * and keeps a single-provider run (no mixed official/InnerTube accounting).
+ * The migration 200 trigger permits only this marker-gated transition.
+ */
+export async function retargetQuotaBlockedRunToInnertube(args: {
+  runId: string;
+  jobId: string;
+  provider: ProviderAllocation;
+  expectedProviderKey?: string;
+}): Promise<boolean> {
+  const db = await getDb();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query(
+      `SELECT provider_key,cost_domain,pages_completed,allocation_origin,search_ordering,
+              retrieval_treatment_origin,status,continuation_status,continued_to_run_id,
+              COALESCE(metadata ? 'searchWindow',false) AS has_search_window
+         FROM query_runs WHERE id=$1 FOR UPDATE`,
+      [args.runId],
+    );
+    const row = current.rows[0];
+    if (!row
+      || String(row.provider_key) !== (args.expectedProviderKey || 'youtube-search')
+      || Number(row.pages_completed || 0) !== 0
+      || String(row.allocation_origin || 'LEGACY') === 'FRONTIER_CANARY'
+      || String(row.search_ordering || 'RELEVANCE') !== 'RELEVANCE'
+      || String(row.retrieval_treatment_origin || 'CONTROL') !== 'CONTROL'
+      || row.has_search_window === true
+      || ['COMPLETED', 'FAILED'].includes(String(row.status || ''))
+      || row.continued_to_run_id) {
+      await client.query('COMMIT');
+      return false;
+    }
+    const provider = args.provider;
+    const marker = JSON.stringify({ quotaFallbackFrom: 'youtube-search', quotaFallbackAt: new Date().toISOString() });
+    await client.query(
+      `UPDATE query_runs
+          SET provider_key=$2,
+              retrieval_surface=$3,
+              provider_capability=$4,
+              cost_domain=$5,
+              provider_allocation_snapshot=$6::jsonb,
+              quota_reserved=0,
+              provider_reserved_amount=0,
+              provider_reservation_id=NULL,
+              provider_cursor=COALESCE(provider_cursor,'{}'::jsonb)||$7::jsonb,
+              metadata=COALESCE(metadata,'{}'::jsonb)||$8::jsonb,
+              resume_mode='REWALK',
+              next_page_token=NULL
+        WHERE id=$1`,
+      [
+        args.runId, provider.providerKey, provider.retrievalSurface,
+        provider.capability, provider.costDomain, JSON.stringify(provider), marker,
+        JSON.stringify({ providerQuotaFallback: { fromProvider: 'youtube-search', toProvider: provider.providerKey, reason: 'OFFICIAL_QUOTA_EXHAUSTED', pagesCompleted: 0, appliedAt: new Date().toISOString() } }),
+      ],
+    );
+    await client.query(
+      `UPDATE jobs
+          SET payload=payload||jsonb_build_object(
+                'provider',$2::jsonb,
+                'pageNumber',1,
+                'pageToken',NULL
+              ),
+              updated_at=now()
+        WHERE id=$1`,
+      [args.jobId, JSON.stringify(provider)],
+    );
+    await client.query('COMMIT');
+    return true;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export interface AutonomousQuotaAvailability {

@@ -14,6 +14,7 @@ import {
   findAdmissionCandidate,
   getAdmissionAmbiguousRate,
   getAdmissionMode,
+  reconcileAdmissionSightings,
   recordAdmissionOutcome,
   updateAdmissionCandidate,
   type AdmissionCandidateRow,
@@ -77,6 +78,8 @@ function admittedChannel(input: {
 }
 
 async function markChannelAdmitted(input: {
+  /** Optional: resolved from the channel when omitted. */
+  candidateId?: string;
   channelId: string;
   decisionId: string;
   status: 'ADMITTED' | 'ADMITTED_AMBIGUOUS';
@@ -86,6 +89,25 @@ async function markChannelAdmitted(input: {
     `UPDATE channels SET admitted_at=COALESCE(admitted_at,now()), admission_status=$2, admission_decision_id=$3, updated_at=now() WHERE channel_id=$1`,
     [input.channelId, input.status, input.decisionId],
   );
+  // The channel row is now durable, so the original discovery sightings can
+  // safely report this as a persisted fresh creator. Page novelty and
+  // continuation read these sightings; without this projection the admission
+  // remains invisible until (and unless) a later classification rewrites it.
+  let candidateId = input.candidateId;
+  if (!candidateId) {
+    const candidate = await db.query(
+      `SELECT id FROM semantic_admission_candidates WHERE channel_id=$1 ORDER BY created_at DESC LIMIT 1`,
+      [input.channelId],
+    ).catch(() => null);
+    candidateId = candidate?.rows[0]?.id ? String(candidate.rows[0].id) : undefined;
+  }
+  if (candidateId) {
+    await reconcileAdmissionSightings({
+      candidateId,
+      channelId: input.channelId,
+      status: input.status,
+    });
+  }
 }
 
 async function enqueueClassificationAfterAdmission(input: {
@@ -557,6 +579,15 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
     if (channel.scan_status === 'INTAKE_DEFERRED' || channel.scan_status === 'CLASSIFICATION_PENDING') {
       channel.scan_status = 'CLASSIFICATION_PENDING';
     }
+    // Resume can repair an admission whose channel row was already written by
+    // a previous attempt. Re-apply the sighting projection idempotently so a
+    // stale persisted=false sighting is corrected without waiting for another
+    // classification pass.
+    await reconcileAdmissionSightings({
+      candidateId: row.id,
+      channelId: row.channel_id,
+      status: admissionStatus,
+    });
   }
   // The decision ledger is authoritative. A stale candidate projection must
   // not change the confidence or citations used by resumed classification.

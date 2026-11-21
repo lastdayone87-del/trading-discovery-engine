@@ -59,7 +59,12 @@ export interface AutonomousPageObservation {
   marginalUtilityV2?: number;
   continuationDecisionV2?: ContinuationDecisionV2 | null;
   resumeMode?: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
-  deferredReason?: 'QUOTA' | 'TIME' | null;
+  /**
+   * ADMISSION is a provisional evidence wait: the page remains continuable and
+   * is retried after the async admission verdicts settle. QUOTA/TIME are the
+   * provider/worker budget deferrals.
+   */
+  deferredReason?: 'QUOTA' | 'TIME' | 'ADMISSION' | null;
 }
 
 function asContinuationDecisionV2(decision: AutonomousPageDecision): ContinuationDecisionV2 | null {
@@ -202,6 +207,31 @@ export async function getAutonomousPageObservation(runId: string, pageNumber: nu
     providerPageCostUsd: Math.max(0, Number(row.provider_page_cost_usd || 0)),
   };
 }
+/**
+ * Re-open a page whose only stop cause was an admission verdict still pending.
+ * The page is not terminal: preserving `should_continue=false` would make the
+ * resume reconciler finalize the run instead of enqueueing the next page after
+ * the admissions settle. The deferred_reason marker keeps the distinction
+ * observable without rewriting the recorded continuation decision.
+ */
+export async function markAutonomousPageDeferredForAdmission(runId: string, pageNumber: number): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE autonomous_query_page_observations
+        SET should_continue=true,
+            stopping_reason=NULL,
+            deferred_reason='ADMISSION',
+            decision_reason_codes=CASE
+              WHEN COALESCE(decision_reason_codes,'[]'::jsonb) @> '["ADMISSION_PENDING_WAIT"]'::jsonb
+                THEN COALESCE(decision_reason_codes,'[]'::jsonb)
+              ELSE COALESCE(decision_reason_codes,'[]'::jsonb)||'["ADMISSION_PENDING_WAIT"]'::jsonb
+            END
+      WHERE query_run_id=$1 AND page_number=$2`,
+    [runId, pageNumber],
+  );
+  return (result.rowCount || 0) > 0;
+}
+
 export async function getAutonomousRunMetrics(runId: string, clientOverride?: PageStoreRunner): Promise<QueryFunnelMetrics> {
   const db = clientOverride || await getDb();
   // Page metrics count distinct creators per page. Summing them overcounts a
