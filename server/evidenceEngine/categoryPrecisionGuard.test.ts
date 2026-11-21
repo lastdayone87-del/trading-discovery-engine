@@ -403,3 +403,19 @@ test('known compound bank brands remain banks while SoftBank/Fairbanks do not', 
     assert.equal(result?.category, 'BANK_OR_NON_TRADING_INSTITUTION', name);
   }
 });
+
+test('generic Chinese analysis titles do not exempt a bank, but trading analysis does', () => {
+  const productAnalysis = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking services and product information.',
+    video_titles: ['产品分析', '客户分析', '信用风险分析'],
+  });
+  assert.equal(productAnalysis?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const tradingAnalysis = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking services and trading education.',
+    video_titles: ['黄金技术分析', '股票行情分析', '期货市场分析'],
+  });
+  assert.equal(tradingAnalysis, null);
+});
