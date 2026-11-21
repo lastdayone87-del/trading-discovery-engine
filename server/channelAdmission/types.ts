@@ -131,8 +131,8 @@ export interface AdmissionEvidence {
   source: DiscoverySource;
   targetCountry: string;
   evidenceCoverage: 'COMPLETE' | 'PARTIAL';
-  /** Whether the evidence contains an authoritative video sample. */
-  evidenceSample?: 'VIDEO_SAMPLE' | 'METADATA_ONLY' | 'NONE';
+  /** Which creator-owned sample kind was acquired (video, playlist, metadata only, or none). */
+  evidenceSample?: 'VIDEO_SAMPLE' | 'PLAYLIST_SAMPLE' | 'METADATA_ONLY' | 'NONE';
   /** Acquisition stage that produced this snapshot. */
   evidenceStage?: 1 | 2 | 3;
   fetchedAt: string;
@@ -140,7 +140,7 @@ export interface AdmissionEvidence {
 }
 
 export interface SemanticCitation {
-  field: 'channel_name' | 'bio' | 'video_title' | 'video_description' | 'link';
+  field: 'channel_name' | 'bio' | 'video_title' | 'video_description' | 'playlist_name' | 'playlist_description' | 'link';
   index?: number;
   quote: string;
   supports: 'TRADING' | 'UNRELATED' | 'FINANCE_ADJACENT';

@@ -197,6 +197,8 @@ export interface DiscoveredChannelRaw {
   investigationId?: string;
   /** Platform topicDetails metadata; never creator-owned positive evidence. */
   channelTopics?: string[];
+  /** Temporary keyless evidence-acquisition failure that must stay retryable. */
+  evidenceAcquisitionFailure?: string;
   /** Retry bookkeeping for precision-adjudicator deferrals on ENRICH_CHANNEL jobs. */
   adjudicatorDeferralAttempts?: number;
   adjudicatorFirstDeferredAt?: string;
@@ -1681,11 +1683,13 @@ export function adaptInnertubeVideosToRecentItems(
 ): { items: Array<Record<string, any>> } {
   return {
     items: items
-      .filter(item => Boolean(item.videoId) && Boolean(String(item.title || '').trim()))
+      .filter(item => Boolean(item.videoId)
+        && Boolean(String(item.title || '').trim() || String(item.description || '').trim()))
       .map(item => ({
         id: { videoId: item.videoId },
         snippet: {
-          title: String(item.title || ''),
+          // A description-only response is still creator-authored evidence.
+          title: String(item.title || '').trim(),
           description: String(item.description || ''),
           ...(item.publishedAt ? { publishedAt: item.publishedAt } : {}),
         },
@@ -1733,6 +1737,32 @@ export async function fetchYouTubeChannelEnrichment(
   let playlistsCheckpoint:Record<string,any>|null=null;
   let videoDetailsCheckpoint:Record<string,any>|null=null;
   let quotaAdmissionError:unknown;
+  let innertubeAboutCheckpoint: any | undefined;
+  let publicAboutCheckpoint: any | undefined;
+  let evidenceAcquisitionFailure: string | undefined;
+  let videoSampleFailure: string | undefined;
+  const rememberAcquisitionFailure = (reason: string | undefined): void => {
+    if (reason) evidenceAcquisitionFailure ??= reason;
+  };
+  const loadInnertubeAbout = async (): Promise<any> => {
+    if (innertubeAboutCheckpoint !== undefined) return innertubeAboutCheckpoint;
+    innertubeAboutCheckpoint = await import('./youtubeInnertubeProvider')
+      .then(module => module.fetchChannelAboutViaInnertube(channelId))
+      .catch(error => ({ status: 'TEMPORARY_FAILURE', reason: error instanceof Error ? error.message : String(error) }));
+    if (!['AVAILABLE', 'AUTHORITATIVE_EMPTY', 'NOT_FOUND'].includes(String(innertubeAboutCheckpoint?.status))) {
+      rememberAcquisitionFailure(`INNERTUBE_ABOUT_${String(innertubeAboutCheckpoint?.status || 'FAILED')}:${String(innertubeAboutCheckpoint?.reason || '')}`);
+    }
+    return innertubeAboutCheckpoint;
+  };
+  const loadPublicAbout = async (): Promise<any> => {
+    if (publicAboutCheckpoint !== undefined) return publicAboutCheckpoint;
+    publicAboutCheckpoint = await fetchPublicAboutEvidence(`https://www.youtube.com/channel/${channelId}`)
+      .catch(error => ({ status: 'TEMPORARY_FAILURE', reason: error instanceof Error ? error.message : String(error) }));
+    if (!['AVAILABLE', 'AUTHORITATIVE_EMPTY', 'NOT_FOUND'].includes(String(publicAboutCheckpoint?.status))) {
+      rememberAcquisitionFailure(`PUBLIC_ABOUT_${String(publicAboutCheckpoint?.status || 'FAILED')}:${String(publicAboutCheckpoint?.reason || '')}`);
+    }
+    return publicAboutCheckpoint;
+  };
   const topUp=async(units:number):Promise<void>=>{
     try{await onAdditionalQuota?.(units);}catch(error){quotaAdmissionError=error;throw error;}
   };
@@ -1749,10 +1779,11 @@ export async function fetchYouTubeChannelEnrichment(
       const fallbackSample = await fetchChannelVideoDescriptionsViaInnertube(channelId, { maxVideos: 10 });
       return adaptInnertubeVideosToRecentItems(fallbackSample.items);
     } catch (error) {
+      videoSampleFailure ??= error instanceof Error ? error.message : String(error);
       console.warn(JSON.stringify({
         event: 'youtube_innertube_sample_unavailable',
         channelId,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: videoSampleFailure,
         timestamp: new Date().toISOString(),
       }));
       return { items: [] };
@@ -1838,39 +1869,43 @@ export async function fetchYouTubeChannelEnrichment(
       // Data API. A temporary About failure leaves the API evidence intact.
       if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks })) {
         // Keyless channel-browse About is attempted before the public HTML
-        // page: it shares the existing Innertube cooldown/circuit breaker and
-        // avoids a second unofficial HTML fetch when it succeeds.
-        const innertubeAbout = await import('./youtubeInnertubeProvider')
-          .then(module => module.fetchChannelAboutViaInnertube(channelId))
-          .catch(() => null);
+        // page. Both results are cached outside the key loop so a failover
+        // cannot repeat unofficial fetches.
+        const innertubeAbout = await loadInnertubeAbout();
         if (innertubeAbout?.status === 'AVAILABLE') {
-          if (!description.trim() && innertubeAbout.description?.trim()) description = innertubeAbout.description.trim();
+          if (!hasMeaningfulCreatorText(description) && hasMeaningfulCreatorText(innertubeAbout.description)) {
+            description = innertubeAbout.description.trim();
+          }
           if (innertubeAbout.links?.length) {
             extractedLinks = Array.from(new Set([...extractedLinks, ...innertubeAbout.links]));
           }
           publicAboutSubscriber = publicAboutSubscriber || innertubeAbout.subscriberCount;
         }
-        const publicAbout = await fetchPublicAboutEvidence(`https://www.youtube.com/channel/${channelId}`).catch(() => null);
-        if (publicAbout?.status === 'AVAILABLE' && publicAbout.about) {
-          if (publicAbout.about.bio?.trim()) description = publicAbout.about.bio.trim();
-          if (publicAbout.about.channelLinks?.length) {
-            extractedLinks = Array.from(new Set([...extractedLinks, ...publicAbout.about.channelLinks]));
+        // Recheck after merging InnerTube: if it supplied the missing bio
+        // and links, do not spend two more HTML requests.
+        if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks })) {
+          const publicAbout = await loadPublicAbout();
+          if (publicAbout?.status === 'AVAILABLE' && publicAbout.about) {
+            if (!hasMeaningfulCreatorText(description) && hasMeaningfulCreatorText(publicAbout.about.bio)) {
+              description = publicAbout.about.bio.trim();
+            }
+            if (publicAbout.about.channelLinks?.length) {
+              extractedLinks = Array.from(new Set([...extractedLinks, ...publicAbout.about.channelLinks]));
+            }
+            publicAboutSubscriber = publicAbout.about.subscriberCountText || publicAboutSubscriber;
+            publicAboutThumbnail = publicAbout.about.thumbnailUrl || publicAboutThumbnail;
+          } else if (publicAbout && !['AUTHORITATIVE_EMPTY', 'NOT_FOUND'].includes(publicAbout.status)) {
+            console.warn(JSON.stringify({
+              event: 'youtube_public_about_deferred',
+              channelId,
+              status: publicAbout.status,
+              reason: publicAbout.reason,
+              timestamp: new Date().toISOString(),
+            }));
           }
-          publicAboutSubscriber = publicAbout.about.subscriberCountText;
-          publicAboutThumbnail = publicAbout.about.thumbnailUrl;
-        } else if (publicAbout && !['AUTHORITATIVE_EMPTY', 'NOT_FOUND'].includes(publicAbout.status)) {
-          // Temporary failure: retain Data API evidence and let admission
-          // retry rather than treating the channel as evidence-empty.
-          console.warn(JSON.stringify({
-            event: 'youtube_public_about_deferred',
-            channelId,
-            status: publicAbout.status,
-            reason: publicAbout.reason,
-            timestamp: new Date().toISOString(),
-          }));
         }
       }
-      let videos: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string}>=recentItems.map((item:any)=>({id:item.id?.videoId,title:String(item.snippet?.title||''),description:String(item.snippet?.description||''),published_at:item.snippet?.publishedAt,content_type:'youtube_video'})).filter((video:any)=>video.title);
+      let videos: Array<{id?:string;title:string;description?:string;published_at?:string;content_type?:string;language?:string}>=recentItems.map((item:any)=>({id:item.id?.videoId,title:String(item.snippet?.title||''),description:String(item.snippet?.description||''),published_at:item.snippet?.publishedAt,content_type:'youtube_video'})).filter((video:any)=>String(video.title||'').trim()||String(video.description||'').trim());
       let playlists=fallback.playlists||[];
       if(stage>=2){
         const ids=videos.map(video=>video.id).filter(Boolean).join(',');
@@ -1949,6 +1984,7 @@ export async function fetchYouTubeChannelEnrichment(
         channelThumbnailUrl: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || publicAboutThumbnail || fallback.channelThumbnailUrl,
         uploadTimestamps, latestUploadAt, uploadsLast30Days, uploadsLast90Days, uploadsLast365Days,
         activityBand, activityScore, activityObservedAt: observedAt.toISOString(), enrichmentStage:stage,
+        evidenceAcquisitionFailure: evidenceAcquisitionFailure || videoSampleFailure,
         externalLinkDetails:extractedLinks.map(url=>{try{return {url,domain:new URL(url).hostname.toLowerCase()};}catch{return {url};}})
       };
     } catch (error: any) {

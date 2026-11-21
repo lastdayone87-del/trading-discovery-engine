@@ -20,6 +20,32 @@ test('public About distinguishes available evidence from authoritative empty', a
   assert.equal(empty.status, 'AUTHORITATIVE_EMPTY');
 });
 
+test('a subscriber-only About page is usable metadata, not authoritative empty', async () => {
+  const html = `<script>var ytInitialData = ${JSON.stringify({
+    contents: [{ aboutChannelRenderer: { metadata: { aboutChannelViewModel: { subscriberCountText: '12.3K subscribers' } } } }],
+  })};</script>`;
+  const subscriberOnly = await fetchPublicAboutEvidence('https://www.youtube.com/channel/UCtest', async () =>
+    htmlResponse(html));
+  assert.equal(subscriberOnly.status, 'AVAILABLE');
+  assert.equal(subscriberOnly.about?.subscriberCountText, '12.3K subscribers');
+});
+
+test('one empty surface plus one temporary failure stays retryable', async () => {
+  const mixed = await fetchPublicAboutEvidence('https://www.youtube.com/channel/UCtest', async (input) => {
+    if (String(input).includes('/about')) {
+      return htmlResponse('<html><head><title>YouTube</title></head><body>No about text</body></html>');
+    }
+    throw new Error('socket hang up');
+  });
+  assert.equal(mixed.status, 'TEMPORARY_FAILURE');
+});
+
+test('an empty 200 body is incomplete, not authoritative empty', async () => {
+  const empty = await fetchPublicAboutEvidence('https://www.youtube.com/channel/UCtest', async () =>
+    htmlResponse(''));
+  assert.equal(empty.status, 'INCOMPLETE_RESPONSE');
+});
+
 test('public About temporary failures never become authoritative empty', async () => {
   const rateLimited = await fetchPublicAboutEvidence('https://www.youtube.com/channel/UCtest', async () =>
     htmlResponse('too many requests', { status: 429 }));

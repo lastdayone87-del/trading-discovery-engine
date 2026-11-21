@@ -157,6 +157,20 @@ function citationKey(evidence: AdmissionEvidence, citation: SemanticCitation): s
       }
     }
   }
+  if (citation.field === 'playlist_name' || citation.field === 'playlist_description') {
+    const playlists = evidence.playlists || [];
+    const candidates = citation.index == null ? playlists : [playlists[citation.index]].filter(Boolean);
+    for (let index = 0; index < candidates.length; index += 1) {
+      const playlist = candidates[index];
+      if (!playlist) continue;
+      const actualIndex = citation.index == null ? index : citation.index;
+      const text = citation.field === 'playlist_name' ? playlist.name : (playlist.description || '');
+      if (textContainsCitation(text, quote)) {
+        // Name and description of the same playlist are one evidence source.
+        return `playlist:${actualIndex}`;
+      }
+    }
+  }
   return null;
 }
 
@@ -207,8 +221,17 @@ export function hasCorroboratedUnrelatedDomain(judgment: SemanticJudgment): bool
     || (Number(domains[0].confidence) >= 0.8 && Number(domains[1]?.confidence || 0) < 0.5);
 }
 
+function admissionEvidenceText(evidence: AdmissionEvidence, includeName: boolean): string {
+  return [
+    ...(includeName ? [evidence.channelName] : []),
+    evidence.description,
+    ...evidence.videos.map(video => `${video.title} ${video.description}`),
+    ...(evidence.playlists || []).map(playlist => `${playlist.name} ${playlist.description || ''}`),
+  ].join(' ');
+}
+
 export function hasStrongTradingSupport(evidence: AdmissionEvidence, judgment: SemanticJudgment): boolean {
-  const evidenceText = `${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`;
+  const evidenceText = admissionEvidenceText(evidence, false);
   if (judgment.mainSubject === 'TRADING') {
     return independentCitationCount(evidence, judgment, 'TRADING') >= 2
       || (independentCitationCount(evidence, judgment, 'TRADING') >= 1 && hasTradingAnchor(evidenceText));
@@ -262,7 +285,7 @@ export function decideAdmission(input: {
     || (primary.mainSubject === 'UNRELATED' && primaryUnrelatedCitations < 2)
   ) ? secondary : primary;
   const effectiveRole = effective === secondary ? 'SECOND' : 'PRIMARY';
-  const evidenceText = `${evidence.channelName} ${evidence.description} ${evidence.videos.map(video => `${video.title} ${video.description}`).join(' ')}`;
+  const evidenceText = admissionEvidenceText(evidence, true);
   const tradingCitations = independentCitationCount(evidence, effective, 'TRADING');
   const financeCitations = independentCitationCount(evidence, effective, 'FINANCE_ADJACENT');
   const unrelatedCitations = independentCitationCount(evidence, effective, 'UNRELATED');
@@ -421,7 +444,7 @@ export function normalizeSemanticJudgment(value: unknown, model?: string): Seman
       const supports = String(item?.supports || '').toUpperCase();
       const field = String(item?.field || '').trim();
       if (!['TRADING', 'UNRELATED', 'FINANCE_ADJACENT'].includes(supports)) return [];
-      if (!['channel_name', 'bio', 'link', 'video_title', 'video_description'].includes(field)) return [];
+      if (!['channel_name', 'bio', 'link', 'video_title', 'video_description', 'playlist_name', 'playlist_description'].includes(field)) return [];
       return [{
         field: field as SemanticCitation['field'],
         index: Number.isInteger(item?.index) ? item.index : undefined,

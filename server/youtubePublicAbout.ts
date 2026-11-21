@@ -161,6 +161,9 @@ export async function fetchPublicYouTubePageDetailed(
     if (consentBlocked) {
       return { status: 'CONSENT_BLOCKED', httpStatus: res.status, reason: 'CONSENT_WALL' };
     }
+    if (!bounded.text.trim()) {
+      return { status: 'INCOMPLETE_RESPONSE', httpStatus: res.status, reason: 'EMPTY_BODY' };
+    }
     return {
       status: 'AVAILABLE',
       html: bounded.text,
@@ -434,10 +437,10 @@ export async function fetchPublicAboutEvidence(
     aboutUrl === youtubeUrl ? Promise.resolve(null) : fetchPublicYouTubePageDetailed(youtubeUrl, 0, fetchImpl),
   ]);
   const pageStatuses = [aboutPage?.status, rootPage?.status].filter(Boolean) as string[];
+  const priority: PublicAboutAcquisitionStatus[] = ['RATE_LIMITED', 'CONSENT_BLOCKED', 'TEMPORARY_FAILURE', 'INCOMPLETE_RESPONSE', 'NOT_FOUND'];
+  const failureStatus = priority.find(candidate => pageStatuses.includes(candidate) && candidate !== 'NOT_FOUND');
   if (!pageStatuses.includes('AVAILABLE')) {
-    const priority: PublicAboutAcquisitionStatus[] = ['RATE_LIMITED', 'CONSENT_BLOCKED', 'TEMPORARY_FAILURE', 'INCOMPLETE_RESPONSE', 'NOT_FOUND'];
-    const status = priority.find(candidate => pageStatuses.includes(candidate)) || 'NOT_FOUND';
-    return { status, reason: pageStatuses.join(',') };
+    return { status: failureStatus || 'NOT_FOUND', reason: pageStatuses.join(',') };
   }
   const aboutParsed = aboutPage?.status === 'AVAILABLE' && aboutPage.html
     ? parseYouTubeChannelAboutFromHtml(aboutPage.html, { finalUrl: aboutPage.finalUrl })
@@ -448,23 +451,24 @@ export async function fetchPublicAboutEvidence(
   const bioSource = aboutParsed?.bio?.trim() ? aboutParsed : rootParsed;
   const bio = bioSource?.bio;
   const channelLinks = Array.from(new Set([...(aboutParsed?.channelLinks || []), ...(rootParsed?.channelLinks || [])]));
+  const subscriberCountText = aboutParsed?.subscriberCountText || rootParsed?.subscriberCountText;
   const truncated = Boolean(aboutPage?.truncated || rootPage?.truncated);
-  if (truncated && !bio?.trim() && channelLinks.length === 0) {
+  const hasUsableMetadata = Boolean(bio?.trim()) || channelLinks.length > 0 || Boolean(subscriberCountText);
+  if (truncated && !hasUsableMetadata) {
     return { status: 'INCOMPLETE_RESPONSE', reason: 'TRUNCATED_WITHOUT_EVIDENCE' };
   }
   const about: PublicYouTubeChannelAbout = {
     ...(bio?.trim() ? { bio } : {}),
     ...(channelLinks.length ? { channelLinks } : {}),
     thumbnailUrl: aboutParsed?.thumbnailUrl || rootParsed?.thumbnailUrl,
-    ...(aboutParsed?.subscriberCountText || rootParsed?.subscriberCountText
-      ? { subscriberCountText: aboutParsed?.subscriberCountText || rootParsed?.subscriberCountText }
-      : {}),
+    ...(subscriberCountText ? { subscriberCountText } : {}),
     ...(truncated ? { truncated: true } : {}),
   };
-  if (!about.bio?.trim() && !about.channelLinks?.length) {
-    return { status: 'AUTHORITATIVE_EMPTY', about };
-  }
-  return { status: 'AVAILABLE', about };
+  if (hasUsableMetadata) return { status: 'AVAILABLE', about };
+  // A successful but empty page cannot erase a failed companion surface.
+  // Subscriber-only or link-only metadata is usable and already returned above.
+  if (failureStatus) return { status: failureStatus, reason: pageStatuses.join(',') };
+  return { status: 'AUTHORITATIVE_EMPTY', about };
 }
 
 /**
