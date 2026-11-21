@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { decideJobFailure } from './dbCore';
-import { YouTubePermanentInputError, isYouTubePermanentInputError } from './youtubeKeyHealth';
+import { YouTubePermanentInputError, isYouTubePermanentInputError, isYouTubeUploadsPlaylistUnavailable } from './youtubeKeyHealth';
 
 const youtube = readFileSync(new URL('./youtube.ts', import.meta.url), 'utf8');
 
@@ -30,6 +30,32 @@ test('permanent-input marker survives provider error wrapping', () => {
   assert.equal(isYouTubePermanentInputError(new Error('YouTube HTTP 404')), false);
   assert.equal(isYouTubePermanentInputError({ status: 404, providerReasons: ['invalidPageToken'] }), false);
   assert.equal(isYouTubePermanentInputError({ status: 429 }), false);
+});
+
+test('an absent uploads playlist is a missing sample, not a provider outage', () => {
+  const permanent = new YouTubePermanentInputError(
+    'channel-uploads',
+    Object.assign(new Error('YouTube HTTP 404 (playlistNotFound)'), {
+      status: 404,
+      providerReasons: ['playlistNotFound'],
+    }),
+  );
+  assert.equal(isYouTubeUploadsPlaylistUnavailable(permanent), true);
+  assert.equal(isYouTubeUploadsPlaylistUnavailable({ name: 'ProviderCallError', cause: permanent }), true);
+  assert.equal(
+    isYouTubeUploadsPlaylistUnavailable(Object.assign(new Error('YouTube HTTP 404'), {
+      status: 404,
+      providerReasons: ['invalidPageToken'],
+    })),
+    false,
+  );
+  assert.equal(
+    isYouTubeUploadsPlaylistUnavailable(Object.assign(new Error('YouTube HTTP 403'), {
+      status: 403,
+      providerReasons: ['playlistNotFound'],
+    })),
+    false,
+  );
 });
 
 test('permanent invalid input fails the job without consuming retries', () => {
@@ -89,6 +115,15 @@ function catchBlockContaining(source: string, marker: string): string {
   throw new Error(`no catch block contains ${marker}`);
 }
 
+test('channel enrichment keeps metadata when the uploads playlist is absent', () => {
+  const block = functionBlock(
+    'export async function fetchYouTubeChannelEnrichment',
+    '/** One-unit basic metadata hydration used when country or subscriber evidence is missing. */',
+  );
+  assert.match(block, /isYouTubeUploadsPlaylistUnavailable\(error\)/);
+  assert.match(block, /uploadsCheckpoint = \{ items: \[\] \}/);
+});
+
 test('every official key loop stops rotating on permanent input', () => {
   // Source-order guards, not a runtime loop harness: these functions depend on
   // the live key pool, quota reservations, scheduler, and database. Each guard
@@ -109,7 +144,12 @@ test('every official key loop stops rotating on permanent input', () => {
     const catchBlock = catchBlockContaining(block, 'isYouTubePermanentInputError(');
     const permanent = catchBlock.indexOf('isYouTubePermanentInputError(');
     const rotation = catchBlock.indexOf('recordProviderFailure');
-    const rotationMarker = rotation >= 0 ? rotation : catchBlock.indexOf('attempt === keys.length - 1');
+    const rotationMarker = rotation >= 0
+      ? rotation
+      : Math.max(
+        catchBlock.indexOf('attempt === keys.length - 1'),
+        catchBlock.indexOf('attempt === providerIndexes.length - 1'),
+      );
     assert.ok(
       rotationMarker > permanent,
       `${start} must throw on permanent input before recording a key failure or rotating to another key`,
