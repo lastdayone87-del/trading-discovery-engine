@@ -29,6 +29,7 @@
     "phase2:retry-apply": "tsx scripts/phase2RetryBacklogApply.ts",
     "phase3:baseline": "tsx scripts/phase3Baseline.ts",
     "admission:v2-poc": "tsx scripts/evaluateAdmissionV2Offline.ts",
+    "admission:reconcile-backlog": "tsx scripts/reconcileAdmissionDecisions.ts",
     "phaseb:admission-v2-poc": "tsx scripts/phaseBAdmissionV2Poc.ts",
     "phaseb:validate-documents": "tsx scripts/phaseBValidateDocuments.ts",
     "phaseb:activate-assertions": "tsx scripts/phaseBActivateAssertions.ts",
