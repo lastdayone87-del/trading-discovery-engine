@@ -12,8 +12,9 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { Innertube } from 'youtubei.js';
-import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations } from '../server/channelAdmission/deterministic';
+import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations, categoryFallbackCitations } from '../server/channelAdmission/deterministic';
 import { classifyTradingRelevanceDetailed } from '../server/tradingRelevanceClassifier';
+import { isPreCatalogProviderDeferredDecision } from '../server/channelAdmission';
 import type { AdmissionEvidence } from '../server/channelAdmission/types';
 import {
   defaultClient as geminiDefaultClient,
@@ -44,14 +45,6 @@ function argValue(name: string): string | undefined {
 function argNumber(name: string, fallback: number): number {
   const value = Number(argValue(name));
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
-}
-
-function argNonNegative(name: string, fallback: number): number {
-  const raw = argValue(name);
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0) throw new Error(`INVALID_${name.replace(/-/g, '_').toUpperCase()}`);
-  return Math.floor(value);
 }
 
 function sha(value: string): string {
@@ -232,14 +225,32 @@ function semanticConfigured(): boolean {
   if (!['auto', 'gemini', 'gemini-free', 'groq'].includes(requested)) {
     throw new Error('INVALID_COHORT_SEMANTIC_PROVIDER');
   }
+  // The unified classifier reads SEMANTIC_PROVIDER. Map the cohort selector
+  // onto that contract so a requested route is the primary route; the normal
+  // configured fallback chain remains available.
+  if (requested !== 'auto') {
+    process.env.SEMANTIC_PROVIDER = requested;
+  }
   return ((requested === 'auto' || requested === 'gemini') && Boolean(geminiDefaultClient()))
     || ((requested === 'auto' || requested === 'gemini-free') && Boolean(geminiFreeDefaultClient()))
     || ((requested === 'auto' || requested === 'groq') && Boolean(groqDefaultClient()));
 }
 
 function finalFromUnified(evidence: AdmissionEvidence, decision: Awaited<ReturnType<typeof classifyTradingRelevanceDetailed>>['decision']): Record<string, unknown> {
+  if (isPreCatalogProviderDeferredDecision(decision)) {
+    return {
+      source: 'SEMANTIC',
+      decision: 'PROVIDER_DEFERRED',
+      status: 'PROVIDER_DEFERRED',
+      reasonCodes: ['EVIDENCE_PROVIDER_DEFERRED', ...(decision.decisionPolicy?.reasonCodes || [])],
+      admitted: false, rejected: false, review: false, ambiguous: true,
+    };
+  }
   const positive = tradingCitations(evidence, decision);
-  const negative = unrelatedCitations(evidence, decision);
+  let negative = unrelatedCitations(evidence, decision);
+  if (decision.status === 'NON_TRADING' && negative.length === 0) {
+    negative = categoryFallbackCitations(evidence);
+  }
   if (decision.status === 'TRADING_CONFIRMED' && positive.length > 0) {
     return {
       source: 'SEMANTIC',
@@ -254,11 +265,16 @@ function finalFromUnified(evidence: AdmissionEvidence, decision: Awaited<ReturnT
     };
   }
   if (decision.status === 'NON_TRADING' && negative.length > 0) {
+    const taxonomyLabel = String(decision.geminiSemanticSummary?.taxonomyLabel || decision.category || '');
+    const financeAdjacent = ['FINANCIAL_NEWS', 'PERSONAL_FINANCE'].includes(taxonomyLabel);
     return {
       source: 'SEMANTIC',
-      decision: 'REJECT_UNRELATED',
+      decision: financeAdjacent ? 'REJECT_NON_TRADING' : 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
-      reasonCodes: ['PRE_CATALOG_NON_TRADING_CONFIRMED', ...(decision.decisionPolicy?.reasonCodes || [])],
+      reasonCodes: [
+        financeAdjacent ? 'PRE_CATALOG_FINANCE_ADJACENT_NON_TRADING' : 'PRE_CATALOG_NON_TRADING_CONFIRMED',
+        ...(decision.decisionPolicy?.reasonCodes || []),
+      ],
       admitted: false, rejected: true, review: false, ambiguous: false,
       citationsValid: true,
       citations: negative,
@@ -281,8 +297,6 @@ async function evaluateOne(input: {
   session?: Innertube;
   semanticAvailable: boolean;
   evidenceOverride?: AdmissionEvidence;
-  aiDelayMs: number;
-  aiRetries: number;
 }): Promise<Record<string, unknown>> {
   const evidence = input.evidenceOverride || await collectKeylessEvidence({
     channelId: input.row.channelId,
@@ -424,8 +438,6 @@ async function main(): Promise<void> {
     held: argNumber('held', 10),
   };
   const requestedConcurrency = Math.max(1, Math.min(4, argNumber('concurrency', 2)));
-  const aiDelayMs = argNonNegative('ai-delay-ms', 0);
-  const aiRetries = argNonNegative('ai-retries', 0);
   const fromEvidence = argValue('from-evidence');
   const rows = readFileSync(manifest, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as PreservedResult);
   const cohort: Array<{ group: CohortGroup; row: PreservedResult; evidence?: AdmissionEvidence }> = fromEvidence
@@ -475,8 +487,6 @@ async function main(): Promise<void> {
     collectOnly,
     resume,
     semanticConcurrency,
-    aiDelayMs,
-    aiRetries,
     fromEvidence: fromEvidence || null,
     groups: GROUP_ORDER.reduce((acc, group) => ({ ...acc, [group]: cohort.filter(item => item.group === group).length }), {}),
     timestamp: new Date().toISOString(),
@@ -572,8 +582,6 @@ async function main(): Promise<void> {
           session,
           semanticAvailable,
           evidenceOverride: item.evidence,
-          aiDelayMs,
-          aiRetries,
         });
       } catch (error) {
         result = {
@@ -620,7 +628,7 @@ async function main(): Promise<void> {
   await Promise.all(workers);
   const usableDecisions = results.filter(result => {
     const decision = (result.final as any)?.decision;
-    return ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED'].includes(decision);
+    return ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED', 'REJECT_NON_TRADING'].includes(decision);
   }).length;
   console.log(JSON.stringify({
     event: 'admission_cohort_complete',

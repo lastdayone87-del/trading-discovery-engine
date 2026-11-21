@@ -4,8 +4,9 @@ import { readFileSync } from 'node:fs';
 import { buildAdmissionConfirmedClassification, normalizeAdmissionTradingConfidence } from './confirmedTrading';
 import { normalizeTradingFocus } from './confidence';
 import { normalizeSemanticJudgment } from './policy';
-import { parseAdmissionReviewAction } from './index';
+import { isPreCatalogProviderDeferredDecision, parseAdmissionReviewAction } from './index';
 import { classificationStageForCandidate } from '../youtube';
+import { admissionShortcutEligible } from '../ingestionPipeline';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
 const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
@@ -378,4 +379,28 @@ test('confirmed admission carries citations and flags missing confidence for rev
   assert.equal(missingConfidence.result.status, 'UNCERTAIN');
   assert.equal(missingConfidence.decision.evidenceCollection.sufficiency, 'INSUFFICIENT');
   assert.equal(missingConfidence.decision.deterministicRouting?.humanReview, true);
+});
+
+test('pre-catalog semantic decisions are reused by the post-catalog handoff', () => {
+  const base = { admissionConfirmedTrading: true, admissionDecisionId: 'decision-1', admissionDecisionSource: 'SEMANTIC' as const };
+  assert.equal(admissionShortcutEligible({ ...base, admissionClassified: false }, 'ACTIVE'), false);
+  assert.equal(admissionShortcutEligible({ ...base, admissionClassified: true }, 'ACTIVE'), true);
+});
+
+test('semantic provider outages become provider-deferred instead of missing evidence', () => {
+  const base = { evidenceCollection: { providers: [{ provider: 'gemini_semantic', availability: 'FAILED', outcome: 'FAILED_TIMEOUT' }] }, decisionPolicy: { reasonCodes: [] } } as any;
+  assert.equal(isPreCatalogProviderDeferredDecision(base), true);
+  assert.equal(isPreCatalogProviderDeferredDecision({
+    ...base,
+    evidenceCollection: { providers: [{ provider: 'gemini_semantic', availability: 'AVAILABLE', outcome: 'EXECUTED_WITH_EVIDENCE' }] },
+  }), false);
+  assert.equal(isPreCatalogProviderDeferredDecision({
+    ...base,
+    evidenceCollection: { providers: [] },
+    decisionPolicy: { reasonCodes: ['PRECISION_ADJUDICATOR_CAPACITY_DEFERRED'] },
+  }), true);
+  assert.equal(isPreCatalogProviderDeferredDecision({
+    ...base,
+    evidenceCollection: { providers: [{ provider: 'gemini_semantic', availability: 'UNAVAILABLE', outcome: 'UNAVAILABLE_CONFIGURATION' }] },
+  }), true);
 });

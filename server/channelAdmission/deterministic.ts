@@ -4,6 +4,7 @@ import type { VerificationDecision } from '../evidenceEngine/types';
 import { resolveClassificationRouting } from '../classificationRouting/deterministicFirst';
 import { hasTradingAnchor } from './policy';
 import type { AdmissionEvidence, SemanticCitation, SemanticJudgment } from './types';
+import { hasMeaningfulCreatorText } from '../evidenceEngine/creatorText';
 
 export interface DeterministicAdmissionResult {
   outcome: 'PASS' | 'REJECT' | 'AMBIGUOUS';
@@ -88,6 +89,13 @@ function citationFieldText(
       return typeof index === 'number' ? evidence.videos[index]?.title ?? null : null;
     case 'video_description':
       return typeof index === 'number' ? evidence.videos[index]?.description ?? null : null;
+    case 'playlist_name':
+      return typeof index === 'number' ? (evidence.playlists || [])[index]?.name ?? null : null;
+    case 'playlist_description':
+      return typeof index === 'number' ? (evidence.playlists || [])[index]?.description ?? null : null;
+    case 'external_link_domain':
+    case 'external_link_label':
+      return typeof index === 'number' ? evidence.links[index] ?? null : (evidence.links[0] ?? null);
     default:
       return null;
   }
@@ -119,6 +127,10 @@ function citationFromEvidenceItem(
           const quote = exactQuote(link, term);
           if (quote) return { field: 'link', quote, supports: 'TRADING' };
         }
+      }
+      if (item.provenance?.semantic) {
+        const link = typeof fieldRef.index === 'number' ? evidence.links[fieldRef.index] : evidence.links[0];
+        if (link) return { field: 'link', index: fieldRef.index, quote: link.slice(0, 240), supports: 'TRADING' };
       }
       continue;
     }
@@ -172,13 +184,43 @@ export function unrelatedCitations(evidence: AdmissionEvidence, decision: Verifi
         : fieldRef.field === 'channel_title' ? 'channel_name'
           : fieldRef.field === 'external_link_domain' || fieldRef.field === 'external_link_label' ? 'link'
             : fieldRef.field;
-      if (!['bio', 'channel_name', 'video_title', 'video_description', 'link'].includes(field)) continue;
+      if (!['bio', 'channel_name', 'video_title', 'video_description', 'playlist_name', 'playlist_description', 'link'].includes(field)) continue;
       if (citations.some(existing => existing.field === field && existing.index === fieldRef.index && existing.quote === quote)) continue;
       citations.push({ field: field as SemanticCitation['field'], index: fieldRef.index, quote, supports: 'UNRELATED' });
       if (citations.length >= 4) return citations;
     }
   }
   return citations;
+}
+
+
+/**
+ * The category precision guard can convert a positive first pass into a
+ * non-relevant category without appending a negative evidence item. Keep the
+ * rejection auditable by citing the strongest supplied creator field.
+ */
+export function categoryFallbackCitations(evidence: AdmissionEvidence): SemanticCitation[] {
+  const candidates: SemanticCitation[] = [];
+  if (hasMeaningfulCreatorText(evidence.description)) {
+    candidates.push({ field: 'bio', quote: evidence.description.trim().slice(0, 240), supports: 'UNRELATED' });
+  }
+  for (let index = 0; index < evidence.videos.length; index += 1) {
+    const video = evidence.videos[index];
+    if (hasMeaningfulCreatorText(video.title)) {
+      candidates.push({ field: 'video_title', index, quote: video.title.trim().slice(0, 240), supports: 'UNRELATED' });
+    } else if (hasMeaningfulCreatorText(video.description)) {
+      candidates.push({ field: 'video_description', index, quote: video.description.trim().slice(0, 240), supports: 'UNRELATED' });
+    }
+  }
+  for (const playlist of evidence.playlists || []) {
+    if (hasMeaningfulCreatorText(playlist.name)) {
+      candidates.push({ field: 'playlist_name', index: (evidence.playlists || []).indexOf(playlist), quote: playlist.name.trim().slice(0, 240), supports: 'UNRELATED' });
+    }
+  }
+  if (hasMeaningfulCreatorText(evidence.channelName)) {
+    candidates.push({ field: 'channel_name', quote: evidence.channelName.trim().slice(0, 240), supports: 'UNRELATED' });
+  }
+  return candidates.slice(0, 2);
 }
 
 interface RejectSource {
@@ -230,6 +272,10 @@ export function evaluateStrictRejection(evidence: AdmissionEvidence): {
   // rejected because the English lexical guard missed its terminology.
   const guardText = `${evidence.channelName}\n${evidence.links.join('\n')}\n${fullText}`;
   if (TRADING_FINANCE_GUARD.test(guardText) || hasTradingAnchor(guardText)) return null;
+  // Finance-adjacent creators (insurance, budgeting, savings, economics, etc.)
+  // must reach the pre-catalog classifier. Strict rejection is only for
+  // clearly non-financial domains.
+  if (isFinanceAdjacentWithoutActiveTrading(guardText)) return null;
 
   let best: { domain: string; total: number; matches: Array<{ source: RejectSource; quote: string }> } | null = null;
   for (const { domain, pattern } of REJECT_DOMAINS) {

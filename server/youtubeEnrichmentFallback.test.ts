@@ -9,7 +9,7 @@ test('InnerTube channel videos are adapted into the official playlist-item shape
     { videoId: 'v2', description: 'Title omitted by provider' },
     { videoId: '', title: 'No id' },
   ]);
-  assert.equal(adapted.items.length, 1);
+  assert.equal(adapted.items.length, 2);
   assert.deepEqual(adapted.items[0], {
     id: { videoId: 'v1' },
     snippet: {
@@ -17,6 +17,12 @@ test('InnerTube channel videos are adapted into the official playlist-item shape
       description: 'Execution and risk.',
       publishedAt: '2026-11-20',
     },
+  });
+  // A provider response may omit the title but still carry a creator-authored
+  // description; do not discard that evidence.
+  assert.deepEqual(adapted.items[1], {
+    id: { videoId: 'v2' },
+    snippet: { title: '', description: 'Title omitted by provider' },
   });
 });
 
@@ -31,6 +37,14 @@ test('public About is attempted only when bio or links are insufficient', () => 
     shouldAttemptAdmissionPublicAbout({ description: 'A sufficiently descriptive creator bio.', links: ['https://a.example'] }),
     false,
   );
+  assert.equal(
+    shouldAttemptAdmissionPublicAbout({ description: 'A sufficiently descriptive creator bio.', links: [], hasVideoSample: true }),
+    false,
+  );
+  assert.equal(
+    shouldAttemptAdmissionPublicAbout({ description: 'A sufficiently descriptive creator bio.', links: [], hasVideoSample: false }),
+    true,
+  );
 });
 
 test('enrichment wires topicDetails, Innertube uploads fallback, and public About fallback', () => {
@@ -42,4 +56,12 @@ test('enrichment wires topicDetails, Innertube uploads fallback, and public Abou
   assert.match(source, /fetchPublicAboutEvidence\(`https:\/\/www\.youtube\.com\/channel\/\$\{channelId\}`\)/);
   assert.match(source, /fetchChannelAboutViaInnertube\(channelId\)/);
   assert.match(source, /channelTopics: parseChannelTopicDetails\(channel\)/);
+  assert.match(source, /publicAboutCheckpoint !== undefined/);
+  assert.match(source, /shouldAttemptAdmissionPublicAbout\(\{ description, links: extractedLinks, hasVideoSample: hasUsableRecentVideo \}\)/);
+  assert.match(source, /hasMeaningfulCreatorText\(description\)/);
+  assert.match(source, /evidenceAcquisitionFailure: evidenceAcquisitionFailure \|\| videoSampleFailure/);
+  assert.match(source, /playlistDiscoveryJustified/);
+  assert.match(source, /videos\.length === 0/);
+  assert.match(source, /PLAYLIST_DISCOVERY_SIGNAL/);
+  assert.match(source, /videoSampleFailure/);
 });

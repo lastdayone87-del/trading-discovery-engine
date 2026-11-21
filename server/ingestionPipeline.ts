@@ -137,17 +137,21 @@ export interface IngestionCandidate extends DiscoveredChannelRaw {
  */
 export function admissionShortcutEligible(
   candidate: Pick<DiscoveredChannelRaw,
-    'admissionConfirmedTrading' | 'admissionDecisionId' | 'admissionDecisionSource'>,
+    'admissionConfirmedTrading' | 'admissionDecisionId' | 'admissionDecisionSource' | 'admissionClassified'>,
   admissionMode: 'ACTIVE' | 'OFF',
 ): boolean {
-  // A deterministic PASS or an explicit human ADMIT is already the final
-  // relevance decision. The semantic admission path is never eligible: it is
-  // a router and must reach the one full AI judge. Numeric admission focus is
-  // deliberately not a shortcut threshold for deterministic/human decisions;
-  // the deterministic gate's PASS is the decision.
+  // A deterministic PASS, an explicit human ADMIT, or a terminal semantic
+  // pre-catalog decision is already the final relevance decision. The
+  // semantic path is only eligible when the admission handoff marks it as
+  // pre-catalog classified; legacy semantic router rows still run the full
+  // classifier. Numeric admission focus is deliberately not a shortcut
+  // threshold for deterministic/human decisions.
+  const sourceEligible = candidate.admissionDecisionSource === 'DETERMINISTIC'
+    || candidate.admissionDecisionSource === 'HUMAN'
+    || (candidate.admissionDecisionSource === 'SEMANTIC' && candidate.admissionClassified === true);
   return candidate.admissionConfirmedTrading === true
     && Boolean(candidate.admissionDecisionId)
-    && (candidate.admissionDecisionSource === 'DETERMINISTIC' || candidate.admissionDecisionSource === 'HUMAN')
+    && sourceEligible
     && admissionMode === 'ACTIVE';
 }
 
@@ -1565,7 +1569,11 @@ async function processChannelThroughPipelineInContext(
       // materialize NEEDS_REVIEW; otherwise leave the row machine-owned and
       // retryable for a future discovery.
       if (productionClassification.decision.evidenceCollection.sufficiency !== 'SUFFICIENT') {
-        await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId).catch(() => undefined);
+        // Missing evidence is not completed review work. Keep it in the
+        // deferred intake state so recovery cannot materialize NEEDS_REVIEW
+        // from an enrichment job that simply had no usable sample. A failed
+        // projection must fail the job so the owning retry path can repair it.
+        await projectBlockedEnrichmentScanStatus(candidate.channelId,'INTAKE_DEFERRED',now,options?.jobId);
         const evidenceUnavailable = (await getChannelById(candidate.channelId)) || withheldChannel;
         return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:evidenceUnavailable.trading_status,discordStatus:evidenceUnavailable.discord_status,discordInvite:evidenceUnavailable.discord_invite??null,channelRecord:evidenceUnavailable};
       }

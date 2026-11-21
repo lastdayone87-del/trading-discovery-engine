@@ -10,7 +10,8 @@ import { ADMISSION_POLICY_VERSION, DEFAULT_AMBIGUOUS_RATE_CAP } from './policy';
 import { classifyTradingRelevanceDetailed } from '../tradingRelevanceClassifier';
 import { hasMeaningfulCreatorFields } from '../evidenceEngine/creatorText';
 import { recordProductionClassification } from '../classificationDiagnostics';
-import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations } from './deterministic';
+import type { VerificationDecision } from '../evidenceEngine/types';
+import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations, categoryFallbackCitations } from './deterministic';
 import {
   enqueueAdmissionVerification,
   findAdmissionCandidate,
@@ -622,6 +623,23 @@ export async function resumeAdmittedCandidate(input: AdmissionCandidateInput, ro
   return true;
 }
 
+
+/** Provider outages returned as UNCERTAIN must stay retryable. */
+export function isPreCatalogProviderDeferredDecision(decision: VerificationDecision): boolean {
+  const reports = decision.evidenceCollection?.providers || [];
+  const semanticReports = reports.filter(provider => /semantic/.test(String(provider.provider)));
+  const semanticServed = semanticReports.some(provider => provider.outcome === 'EXECUTED_WITH_EVIDENCE');
+  const semanticAttempted = semanticReports.filter(provider =>
+    !['SUPPRESSED_BY_POLICY', 'NOT_APPLICABLE'].includes(String(provider.outcome)));
+  const semanticUnavailable = semanticAttempted.length > 0 && semanticAttempted.every(provider =>
+    provider.availability === 'FAILED'
+    || /^FAILED_/.test(String(provider.outcome))
+    || provider.outcome === 'UNAVAILABLE_CONFIGURATION');
+  const precisionDeferred = (decision.decisionPolicy?.reasonCodes || []).some(code =>
+    /PRECISION_ADJUDICATOR_(UNAVAILABLE|OUTAGE|CAPACITY_DEFERRED)|PRECISION_DEFERRAL/.test(code));
+  return (semanticUnavailable && !semanticServed) || precisionDeferred;
+}
+
 export interface VerifyAdmissionOptions {
   row?: AdmissionCandidateRow;
   existingChannel?: ChannelRecord | null;
@@ -651,6 +669,8 @@ export async function verifyAdmissionCandidate(
     queryRunId: input.queryRunId,
     pageNumber: input.pageNumber,
     resultRank: input.resultRank,
+    // First acquisition is always stage 1. A bounded evidence retry may spend
+    // the stage-2 playlist search, but never on the initial attempt.
     stage: Number(row.attempts || 0) >= 1 ? 2 : 1,
   });
   const hash = evidenceHash(evidence);
@@ -841,6 +861,7 @@ export async function verifyAdmissionCandidate(
       videos: evidence.videos,
       video_titles: evidence.videos.map(video => video.title),
       external_links: evidence.links,
+      playlists: evidence.playlists,
     })) {
       const attempts = Number(row.attempts || 0) + 1;
       const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
@@ -852,7 +873,7 @@ export async function verifyAdmissionCandidate(
         ...deterministic.reasonCodes,
       ];
       if (!options.dryRun) {
-        await updateAdmissionCandidate({
+        const updated = await updateAdmissionCandidate({
           id: row.id,
           status,
           decision: null,
@@ -865,6 +886,7 @@ export async function verifyAdmissionCandidate(
           expectedStatus: row.status,
           expectedAttempts: row.attempts,
         });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
       }
       return {
         channelId: evidence.channelId,
@@ -887,7 +909,7 @@ export async function verifyAdmissionCandidate(
     if (!classified) {
       const reasonCodes = ['EVIDENCE_PROVIDER_DEFERRED', 'PRE_CATALOG_CLASSIFIER_FAILED', preCatalogError || 'UNKNOWN'];
       if (!options.dryRun) {
-        await updateAdmissionCandidate({
+        const updated = await updateAdmissionCandidate({
           id: row.id,
           ...providerDeferredCandidateFields(row.attempts),
           decision: null,
@@ -898,6 +920,7 @@ export async function verifyAdmissionCandidate(
           expectedStatus: row.status,
           expectedAttempts: row.attempts,
         });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
       }
       return {
         channelId: evidence.channelId,
@@ -922,12 +945,50 @@ export async function verifyAdmissionCandidate(
         decision,
         queryRunId: input.queryRunId,
         jobId: input.discoveryJobId,
-      }).catch(error => {
-        console.warn(`[ChannelAdmission] pre-catalog diagnostic write failed for ${evidence.channelId}:`, error instanceof Error ? error.message : error);
       });
     }
+    if (isPreCatalogProviderDeferredDecision(decision)) {
+      const reasonCodes = [
+        'EVIDENCE_PROVIDER_DEFERRED',
+        'PRE_CATALOG_CLASSIFIER_PROVIDER_FAILURE',
+        ...(decision.decisionPolicy?.reasonCodes || []),
+      ];
+      if (!options.dryRun) {
+        const updated = await updateAdmissionCandidate({
+          id: row.id,
+          ...providerDeferredCandidateFields(row.attempts),
+          decision: null,
+          reasonCodes,
+          evidence,
+          evidenceHash: hash,
+          nextCheckAt: new Date(Date.now() + retryDelayMs(1)).toISOString(),
+          expectedStatus: row.status,
+          expectedAttempts: row.attempts,
+        });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
+      }
+      return {
+        channelId: evidence.channelId,
+        channelName: evidence.channelName,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
+        reasonCodes,
+        evidence,
+        deterministicRoute,
+        decisionSource: 'SEMANTIC',
+        priority: 20,
+      };
+    }
+    const semanticProvider = decision.classificationMethod === 'SEMANTIC_GROQ'
+      ? 'groq_semantic'
+      : decision.classificationMethod === 'SEMANTIC_GEMINI_FREE'
+        ? 'gemini_free_semantic'
+        : decision.classificationMethod === 'SEMANTIC_GEMINI'
+          ? 'gemini_semantic'
+          : undefined;
+    const semanticModel = decision.geminiSemanticSummary?.modelUsed || decision.versions?.geminiModelVersion || 'evidence-engine';
     const positiveCitations = tradingCitations(evidence, decision);
-    const negativeCitations = unrelatedCitations(evidence, decision);
+    let negativeCitations = unrelatedCitations(evidence, decision);
     const pending = async (reasonCodes: string[]): Promise<AdmissionVerificationResult> => {
       const attempts = Number(row.attempts || 0) + 1;
       const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
@@ -938,7 +999,7 @@ export async function verifyAdmissionCandidate(
           : attempts >= 2 ? 'EVIDENCE_ACQUISITION_IN_PROGRESS' : 'EVIDENCE_ACQUISITION_REQUIRED',
       ];
       if (!options.dryRun) {
-        await updateAdmissionCandidate({
+        const updated = await updateAdmissionCandidate({
           id: row.id,
           status,
           decision: null,
@@ -951,6 +1012,7 @@ export async function verifyAdmissionCandidate(
           expectedStatus: row.status,
           expectedAttempts: row.attempts,
         });
+        if (!updated) throw new Error('ADMISSION_CANDIDATE_STALE');
       }
       return {
         channelId: evidence.channelId,
@@ -975,9 +1037,9 @@ export async function verifyAdmissionCandidate(
         unrelatedDomains: [],
         incidentalTradingMentions: [],
         citations: positiveCitations,
-        explanation: decision.mathmaticalJustification,
-        model: decision.classificationMethod || 'evidence-engine',
-        provider: decision.geminiSemanticSummary?.modelUsed,
+        explanation: decision.mathematicalJustification,
+        model: semanticModel,
+        provider: semanticProvider,
       };
       policy = {
         decision: 'ADMIT',
@@ -994,23 +1056,31 @@ export async function verifyAdmissionCandidate(
       };
       decisionSource = 'SEMANTIC';
     } else if (decision.status === 'NON_TRADING') {
+      const taxonomyLabel = String(decision.geminiSemanticSummary?.taxonomyLabel || decision.category || '');
+      const financeAdjacent = ['FINANCIAL_NEWS', 'PERSONAL_FINANCE'].includes(taxonomyLabel);
+      if (negativeCitations.length === 0) {
+        negativeCitations = categoryFallbackCitations(evidence);
+      }
       if (negativeCitations.length === 0) {
         return pending(['PRE_CATALOG_NON_TRADING_WITHOUT_CITATIONS', 'SEMANTIC_ABSTENTION']);
       }
       judgment = {
-        mainSubject: 'UNRELATED',
+        mainSubject: financeAdjacent ? 'FINANCE_ADJACENT' : 'UNRELATED',
         tradingFocus: decision.confidenceScore,
-        unrelatedDomains: [{ domain: decision.category || 'NON_TRADING', confidence: Math.max(0, Math.min(1, decision.confidenceScore / 100)) }],
+        unrelatedDomains: [{ domain: taxonomyLabel || 'NON_TRADING', confidence: Math.max(0, Math.min(1, decision.confidenceScore / 100)) }],
         incidentalTradingMentions: [],
         citations: negativeCitations,
-        explanation: decision.mathmaticalJustification,
-        model: decision.classificationMethod || 'evidence-engine',
-        provider: decision.geminiSemanticSummary?.modelUsed,
+        explanation: decision.mathematicalJustification,
+        model: semanticModel,
+        provider: semanticProvider,
       };
       policy = {
-        decision: 'REJECT_UNRELATED',
+        decision: financeAdjacent ? 'REJECT_NON_TRADING' : 'REJECT_UNRELATED',
         status: 'REJECTED_UNRELATED',
-        reasonCodes: ['PRE_CATALOG_NON_TRADING_CONFIRMED', ...(decision.decisionPolicy?.reasonCodes || [])],
+        reasonCodes: [
+          financeAdjacent ? 'PRE_CATALOG_FINANCE_ADJACENT_NON_TRADING' : 'PRE_CATALOG_NON_TRADING_CONFIRMED',
+          ...(decision.decisionPolicy?.reasonCodes || []),
+        ],
         rejected: true,
         admitted: false,
         hold: false,
