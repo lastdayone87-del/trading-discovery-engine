@@ -100,10 +100,7 @@ export function hasCreatorLevelSemanticUnrelatedNegative(
     && isSemanticClassificationSource(item.source)
     && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED'
     && Number(item.provenance?.semantic?.calibratedConfidence) >= SEMANTIC_TOP_CALIBRATED_CONFIDENCE
-    && (item.provenance?.fields || []).some(field =>
-      field.field === 'channel_bio'
-      && Boolean(field.sourceId || field.sourceFamilyId),
-    ),
+    && (item.provenance?.fields || []).some(field => field.field === 'channel_bio'),
   );
 }
 

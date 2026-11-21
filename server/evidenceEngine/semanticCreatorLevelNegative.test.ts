@@ -205,6 +205,8 @@ test('the semantic creator-level helper stays safe at the boundaries', () => {
   });
   assert.equal(hasCreatorLevelSemanticUnrelatedNegative([familyOnly], { description: 'DAD VIBES' }), true);
 
+  // Field-built semantic citations may legitimately omit generated ids when the
+  // input has no canonical entity/family id; the non-empty bio is the guard.
   const unattributedBio = semanticNegative('n1', { fields: [{ field: 'channel_bio' }] });
-  assert.equal(hasCreatorLevelSemanticUnrelatedNegative([unattributedBio], { description: 'DAD VIBES' }), false);
+  assert.equal(hasCreatorLevelSemanticUnrelatedNegative([unattributedBio], { description: 'DAD VIBES' }), true);
 });
