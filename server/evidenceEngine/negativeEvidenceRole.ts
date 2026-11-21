@@ -3,7 +3,10 @@ import type {
   EvidenceFieldType,
   EvidenceItem,
   NegativeEvidenceRole,
+  RawChannelInput,
 } from './types';
+import { isSemanticClassificationSource } from './types';
+import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 
 const CREATOR_LEVEL_FIELDS: ReadonlySet<EvidenceFieldType> = new Set<EvidenceFieldType>([
   'channel_bio',
@@ -75,6 +78,30 @@ function hasCreatorLevelAttributionSet(items: EvidenceItem[]): boolean {
       .filter((value): value is string => Boolean(value)),
   );
   return families.size >= 2;
+}
+
+/**
+ * A governed semantic `UNRELATED` verdict that cites the creator bio is
+ * creator-level evidence in its own right. Bio length is not a reliable proxy
+ * for attribution quality: a short real bio is still creator-owned evidence,
+ * while a long unrelated bio does not by itself make a non-semantic observation
+ * terminal. This keeps rejection authority with the AI judge without allowing
+ * title-only, empty-bio, low-confidence, disclaimer/quote, or non-semantic
+ * evidence to reject on its own.
+ */
+export function hasCreatorLevelSemanticUnrelatedNegative(
+  items: EvidenceItem[],
+  input: Pick<RawChannelInput, 'description'>,
+): boolean {
+  const bio = String(input.description || '').trim();
+  if (!bio) return false;
+  return items.some(item =>
+    classifyNegativeEvidenceRole(item, { terminalEligible: true }) === 'TERMINAL'
+    && isSemanticClassificationSource(item.source)
+    && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED'
+    && Number(item.provenance?.semantic?.calibratedConfidence) >= SEMANTIC_TOP_CALIBRATED_CONFIDENCE
+    && (item.provenance?.fields || []).some(field => field.field === 'channel_bio'),
+  );
 }
 
 /** Resolve the policy role of one negative evidence item. */

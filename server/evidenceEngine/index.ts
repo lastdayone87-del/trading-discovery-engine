@@ -15,6 +15,7 @@ import { buildCanonicalEvidenceCorpus, validateEvidenceProvenance } from './cano
 import { contentLanguagePacks } from './multilingualTerminology';
 import { buildContextualComposition, isThinRetrievalComposition } from './contextualComposition';
 import { assessRecognitionState } from './recognitionState';
+import { hasCreatorLevelSemanticUnrelatedNegative } from './negativeEvidenceRole';
 import type { ContextualCompositionReport } from './contextualComposition';
 import type { RecognitionAssessment } from './recognitionState';
 
@@ -311,9 +312,16 @@ export class EvidenceBasedTradingEngine {
       const negativeFields=evidence.filter(item=>item.polarity==='NEGATIVE').flatMap(item=>item.provenance?.fields||[]);
       const negativeObservationKeys=new Set(negativeFields.map(field=>field.sourceFamilyId||`${field.field}:${field.sourceId||field.index||''}`));
       const negativeSourceFamilies=new Set(negativeFields.map(field=>field.sourceFamilyId).filter((value):value is string=>!!value));
-      const creatorLevelCoverage=(input.description?.trim().length||0)>=40&&negativeFields.some(field=>field.field==='channel_bio');
+      // A governed top-tier semantic `UNRELATED` verdict that cites the creator
+      // bio is creator-level evidence in its own right. Bio length is not a
+      // reliable proxy for attribution quality: a short real bio is still
+      // creator-owned evidence, while a long unrelated bio does not by itself
+      // make a non-semantic observation terminal.
+      const semanticCreatorLevelNegative = hasCreatorLevelSemanticUnrelatedNegative(evidence, input);
+      const legacyCreatorLevelCoverage = (input.description?.trim().length || 0) >= 40 && negativeFields.some(field => field.field === 'channel_bio');
+      const creatorLevelCoverage = semanticCreatorLevelNegative || legacyCreatorLevelCoverage;
       const independentNegativeSupport=negativeObservationKeys.size>=2&&(negativeSourceFamilies.size>=2||new Set(negativeFields.map(field=>field.field==='video_title'||field.field==='video_description'?`video:${field.sourceId||field.index}`:field.field)).size>=2);
-      const terminalNegativeSufficiency={status:creatorLevelCoverage||independentNegativeSupport?'SUFFICIENT' as const:'INSUFFICIENT' as const,creatorLevelCoverage,independentSourceFamilies:negativeSourceFamilies.size,independentObservations:negativeObservationKeys.size,reasonCodes:creatorLevelCoverage?['CREATOR_LEVEL_NEGATIVE_COVERAGE']:independentNegativeSupport?['INDEPENDENT_NEGATIVE_SUPPORT']:['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']};
+      const terminalNegativeSufficiency={status:creatorLevelCoverage||independentNegativeSupport?'SUFFICIENT' as const:'INSUFFICIENT' as const,creatorLevelCoverage,independentSourceFamilies:negativeSourceFamilies.size,independentObservations:negativeObservationKeys.size,reasonCodes:semanticCreatorLevelNegative?['SEMANTIC_CREATOR_LEVEL_NEGATIVE']:creatorLevelCoverage?['CREATOR_LEVEL_NEGATIVE_COVERAGE']:independentNegativeSupport?['INDEPENDENT_NEGATIVE_SUPPORT']:['TERMINAL_NEGATIVE_EVIDENCE_INSUFFICIENT']};
       // C3: provider coverage, a populated field or a long bio never suffices
       // on its own. Only a real evidence item, or an explicit creator-level
       // negative, can make the collection SUFFICIENT.
