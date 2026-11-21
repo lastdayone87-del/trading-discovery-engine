@@ -224,7 +224,27 @@ export interface DiscoveredChannelRaw {
   admissionCategory?: string;
   /** True when this admission created the channel row; reporting must not call it known. */
   admissionNewlyCreated?: boolean;
+  /**
+   * True only for the admission→classification handoff. This is a decision
+   * boundary, not a hydration marker: `enrichmentStage` keeps reporting the
+   * actual hydration state so downstream stage-based checks are unchanged.
+   */
+  admissionClassified?: boolean;
 }
+
+/**
+ * Stage seen by the classifier input. Admission-side classification is
+ * post-acquisition even when the candidate has not been hydrated, so it must
+ * not replay the stage-0 retrieval-only probe. Hydration state itself stays in
+ * `enrichmentStage` for evidence planning and paid metadata fetches.
+ */
+export function classificationStageForCandidate(
+  candidate: Pick<DiscoveredChannelRaw, 'enrichmentStage' | 'admissionClassified'>,
+): number {
+  const stage = Math.max(0, Number(candidate.enrichmentStage || 0));
+  return candidate.admissionClassified === true ? Math.max(1, stage) : stage;
+}
+
 export interface PlaylistChannelObservation {channelId:string;channelName:string;description:string;videoTitles:string[];observedAt:string}
 
 /** One bounded channelSections.list request; only explicit multipleChannels IDs survive parsing. */

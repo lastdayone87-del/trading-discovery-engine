@@ -5,9 +5,11 @@ import { buildAdmissionConfirmedClassification, normalizeAdmissionTradingConfide
 import { normalizeTradingFocus } from './confidence';
 import { normalizeSemanticJudgment } from './policy';
 import { parseAdmissionReviewAction } from './index';
+import { classificationStageForCandidate } from '../youtube';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
 const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
+const index = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
 const dbCore = readFileSync(new URL('../dbCore.ts', import.meta.url), 'utf8');
 const queryIntelligence = readFileSync(new URL('../queryIntelligence.ts', import.meta.url), 'utf8');
 
@@ -268,6 +270,25 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
   assert.doesNotMatch(verify, /ProviderAdmissionJudge|judge\.judge\(evidence/);
   assert.match(verify, /:DETERMINISTIC_AMBIGUOUS:/);
   assert.match(index, /admissionStatus === 'ADMITTED_AMBIGUOUS' && decisionSource === 'DETERMINISTIC'/);
+});
+
+test('classification stage reflects the admission handoff without claiming hydration', () => {
+  assert.equal(classificationStageForCandidate({ admissionClassified: true, enrichmentStage: 0 }), 1);
+  assert.equal(classificationStageForCandidate({ admissionClassified: true, enrichmentStage: 2 }), 2);
+  assert.equal(classificationStageForCandidate({ admissionClassified: false, enrichmentStage: 0 }), 0);
+  assert.equal(classificationStageForCandidate({ admissionClassified: false, enrichmentStage: 1 }), 1);
+  assert.equal(classificationStageForCandidate({ admissionClassified: false }), 0);
+});
+
+test('admission classification marks the handoff without mutating hydration state', () => {
+  const start = index.indexOf('async function enqueueClassificationAfterAdmission(');
+  assert.ok(start >= 0, 'classification handoff must exist');
+  const end = index.indexOf('\nexport ', start + 10);
+  const enqueue = index.slice(start, end < 0 ? undefined : end);
+  assert.match(enqueue, /admissionClassified: true/);
+  assert.doesNotMatch(enqueue, /enrichmentStage: Math\.max\(1, Number\(input\.candidate\.enrichmentStage \|\| 0\)\)/);
+  assert.doesNotMatch(enqueue, /UPDATE jobs/);
+  assert.match(pipeline, /enrichment_stage:classificationStageForCandidate\(candidate\)/);
 });
 
 test('extracted query offer uses the trading-anchor/gambling guard', () => {

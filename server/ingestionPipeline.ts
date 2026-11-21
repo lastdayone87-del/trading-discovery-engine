@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ChannelRecord, CountryStatus, DiscoverySource, DiscordStatus, TradingClassificationResult } from '../src/types';
-import { DiscoveredChannelRaw, classifierLanguageInputs, fetchYouTubeChannelCountryMetadata } from './youtube';
+import { DiscoveredChannelRaw, classificationStageForCandidate, classifierLanguageInputs, fetchYouTubeChannelCountryMetadata } from './youtube';
 import { aggregatedLanguageCandidateSet, validateChannelCountry, type ValidationResult } from './countryValidator';
 import { bumpGate1Evaluation } from './operationsTelemetry';
 import type { AcquisitionLane } from './acquisitionLaneKeys';
@@ -1351,7 +1351,7 @@ async function processChannelThroughPipelineInContext(
     video_titles:candidate.videoTitles,video_descriptions:candidate.videoDescriptions||[],videoDescriptionsAuthoritative:candidate.videoDescriptionsAuthoritative,
     playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:languageInputs.detected_languages,visual_evidence:candidate.visualEvidence,
-    pinned_comment:candidate.pinnedComment,enrichment_stage:candidate.enrichmentStage||0,
+    pinned_comment:candidate.pinnedComment,enrichment_stage:classificationStageForCandidate(candidate),
     // Completed Discord validation is stored evidence. Supply it to the
     // existing DiscordProvider so classification evaluates the complete
     // evidence set; the provider/policy still decides whether it is enough.
