@@ -43,6 +43,10 @@ test('quota fallback fails closed for semantics InnerTube cannot reproduce', () 
     ['TRIAL_ACTIVE'],
   );
   assert.deepEqual(
+    evaluateInnertubeQuotaFallback({ ...compatible, isContinuationChild: true }).reasonCodes,
+    ['CONTINUATION_CHILD_CURSOR'],
+  );
+  assert.deepEqual(
     evaluateInnertubeQuotaFallback({ ...compatible, providerKey: 'youtube-innertube' }).reasonCodes,
     ['PROVIDER_NOT_OFFICIAL'],
   );
@@ -72,7 +76,9 @@ test('worker wires the fallback before the quota deferral and keeps the existing
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(queue, /getQuotaFallbackRunState\(queryRunId\)/);
   assert.match(queue, /retargetQuotaBlockedRunToInnertube\(\{/);
+  assert.match(queue, /isInnertubeQuotaFallbackAvailable\(\)/);
   assert.match(queue, /childProviderOverride: YOUTUBE_INNERTUBE_PROVIDER/);
+  assert.match(queue, /Object\.keys\(args\.pageMetrics \|\| \{\}\)\.length \? args\.pageMetrics : finalMetrics/);
   assert.match(queue, /innertubeFallbackCursor\(fallbackState!\.pagesCompleted\)/);
   assert.match(queue, /await deferAutonomousRunForQuota\(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied'\)/);
   // The fallback must be attempted before the official deferral path.
@@ -91,6 +97,10 @@ test('first-page retarget is marker-gated and restricted to zero completed pages
   assert.match(body, /quotaFallbackFrom: 'youtube-search'/);
   assert.match(body, /resume_mode='REWALK'/);
   assert.match(migration, /OLD\.pages_completed=0/);
+  assert.match(migration, /OLD\.allocation_origin <> 'FRONTIER_CANARY'/);
+  assert.match(migration, /OLD\.search_ordering='RELEVANCE'/);
+  assert.match(migration, /OLD\.retrieval_treatment_origin='CONTROL'/);
+  assert.match(migration, /OLD\.continued_from_run_id IS NULL/);
   assert.match(migration, /NEW\.provider_cursor->>'quotaFallbackFrom'='youtube-search'/);
   assert.match(migration, /RAISE EXCEPTION 'IMMUTABLE_QUERY_RUN_PROVIDER_LINEAGE'/);
   // Admission-pending deferral needs its own durable state, not a terminal

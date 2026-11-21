@@ -77,14 +77,18 @@ function admittedChannel(input: {
   };
 }
 
-async function markChannelAdmitted(input: {
+type AdmissionWriteClient = {
+  query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }>;
+};
+
+export async function markChannelAdmitted(input: {
   /** Optional: resolved from the channel when omitted. */
   candidateId?: string;
   channelId: string;
   decisionId: string;
   status: 'ADMITTED' | 'ADMITTED_AMBIGUOUS';
-}): Promise<void> {
-  const db = await getDb();
+}, clientOverride?: AdmissionWriteClient): Promise<void> {
+  const db = clientOverride || await getDb();
   await db.query(
     `UPDATE channels SET admitted_at=COALESCE(admitted_at,now()), admission_status=$2, admission_decision_id=$3, updated_at=now() WHERE channel_id=$1`,
     [input.channelId, input.status, input.decisionId],
@@ -98,16 +102,16 @@ async function markChannelAdmitted(input: {
     const candidate = await db.query(
       `SELECT id FROM semantic_admission_candidates WHERE channel_id=$1 ORDER BY created_at DESC LIMIT 1`,
       [input.channelId],
-    ).catch(() => null);
-    candidateId = candidate?.rows[0]?.id ? String(candidate.rows[0].id) : undefined;
+    );
+    candidateId = candidate.rows[0]?.id ? String(candidate.rows[0].id) : undefined;
   }
-  if (candidateId) {
-    await reconcileAdmissionSightings({
-      candidateId,
-      channelId: input.channelId,
-      status: input.status,
-    });
-  }
+  if (!candidateId) throw new Error('ADMISSION_CANDIDATE_MISSING');
+  await reconcileAdmissionSightings({
+    candidateId,
+    channelId: input.channelId,
+    status: input.status,
+    client: db,
+  });
 }
 
 async function enqueueClassificationAfterAdmission(input: {

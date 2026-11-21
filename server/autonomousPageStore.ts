@@ -163,6 +163,7 @@ export interface PersistedAutonomousPage {
   continuationDecisionV2: ContinuationDecisionV2 | null;
   pageMetrics: QueryFunnelMetrics;
   resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
+  deferredReason: 'QUOTA' | 'TIME' | 'ADMISSION' | null;
   elapsedMs: number;
   retrievalMs: number;
   processingMs: number;
@@ -179,7 +180,7 @@ export async function getAutonomousPageObservation(runId: string, pageNumber: nu
   const db = await getDb();
   const r = await db.query(
     `SELECT page_number,next_page_token,should_continue,primary_reason,continuation_decision_v2,
-            page_metrics,resume_mode,elapsed_ms,retrieval_ms,processing_ms,
+            page_metrics,resume_mode,deferred_reason,elapsed_ms,retrieval_ms,processing_ms,
             provider_page_cost_units,provider_page_cost_usd
      FROM autonomous_query_page_observations
      WHERE query_run_id=$1 AND page_number=$2`,
@@ -200,6 +201,9 @@ export async function getAutonomousPageObservation(runId: string, pageNumber: nu
     continuationDecisionV2: parseContinuationDecisionV2(parse<unknown>(row.continuation_decision_v2, null)),
     pageMetrics: parse<QueryFunnelMetrics>(row.page_metrics, {} as QueryFunnelMetrics),
     resumeMode: String(row.resume_mode || 'NONE') as PersistedAutonomousPage['resumeMode'],
+    deferredReason: row.deferred_reason === 'QUOTA' || row.deferred_reason === 'TIME' || row.deferred_reason === 'ADMISSION'
+      ? row.deferred_reason
+      : null,
     elapsedMs: Math.max(0, Number(row.elapsed_ms || 0)),
     retrievalMs: Math.max(0, Number(row.retrieval_ms || 0)),
     processingMs: Math.max(0, Number(row.processing_ms || 0)),
@@ -226,8 +230,35 @@ export async function markAutonomousPageDeferredForAdmission(runId: string, page
                 THEN COALESCE(decision_reason_codes,'[]'::jsonb)
               ELSE COALESCE(decision_reason_codes,'[]'::jsonb)||'["ADMISSION_PENDING_WAIT"]'::jsonb
             END
-      WHERE query_run_id=$1 AND page_number=$2`,
+      WHERE query_run_id=$1 AND page_number=$2
+        AND should_continue=true
+        AND stopping_reason IS NULL`,
     [runId, pageNumber],
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+/**
+ * The resume boundary owns the final admission-deferral decision. Once the
+ * page's verdicts are settled, either keep the page continuable (cursor
+ * present and no guard stop) or record the real terminal decision. Clearing
+ * deferred_reason prevents the page from being mistaken for an unresolved
+ * admission wait on a later sweep.
+ */
+export async function settleAutonomousPageAdmissionDeferral(
+  runId: string,
+  pageNumber: number,
+  shouldContinue: boolean,
+  stoppingReason: string | null,
+): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE autonomous_query_page_observations
+        SET should_continue=$3,
+            stopping_reason=$4,
+            deferred_reason=NULL
+      WHERE query_run_id=$1 AND page_number=$2 AND deferred_reason='ADMISSION'`,
+    [runId, pageNumber, shouldContinue, stoppingReason],
   );
   return (result.rowCount || 0) > 0;
 }

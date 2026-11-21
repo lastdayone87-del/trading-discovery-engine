@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { reconcileAdmissionSightings } from './store';
+import { reconcileAdmissionSightings, replayAdmissionOutcomesForPage } from './store';
+import { markChannelAdmitted } from './index';
 
 function capture() {
   const calls: Array<{ sql: string; params?: unknown[] }> = [];
@@ -37,6 +38,21 @@ test('admission success marks the original discovery sighting persisted and clas
   assert.match(calls[0].sql, /FROM semantic_admission_sightings s, target t/);
   assert.match(calls[0].sql, /cs\.was_known=false/);
   assert.match(calls[0].sql, /cs\.page_number IS NOT DISTINCT FROM s\.page_number/);
+  assert.match(calls[0].sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata \? 'admissionStatus'/);
+});
+
+test('ambiguous admission is also persisted and classification-pending', async () => {
+  const { calls, client } = capture();
+  await reconcileAdmissionSightings({
+    candidateId: '44444444-4444-4444-4444-444444444444',
+    channelId: 'UCabcdefghijklmnopqrstuv',
+    status: 'ADMITTED_AMBIGUOUS',
+    client,
+  });
+  const [, , persisted, funnel] = calls[0].params as any[];
+  assert.equal(persisted, true);
+  assert.equal(funnel, 'CLASSIFICATION_PENDING');
+  assert.equal(JSON.parse(calls[0].params![6] as string).admissionStatus, 'ADMITTED_AMBIGUOUS');
 });
 
 test('terminal admission rejection updates the sighting without claiming persistence', async () => {
@@ -66,31 +82,92 @@ test('non-terminal provider waits leave the sighting untouched', async () => {
   assert.equal(calls.length, 0);
 });
 
-test('pending admission verdicts defer and re-open the page instead of ending the run', () => {
+test('page-scoped replay repairs verdicts that landed before sighting insertion', async () => {
+  const { calls, client } = capture();
+  const count = await replayAdmissionOutcomesForPage({
+    queryRunId: '55555555-5555-5555-5555-555555555555',
+    pageNumber: 3,
+    client,
+  });
+  assert.equal(count, 1);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].params?.slice(0, 2), ['55555555-5555-5555-5555-555555555555', 3]);
+  const sql = calls[0].sql;
+  assert.match(sql, /c\.status IN \(/);
+  assert.match(sql, /'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED'/);
+  assert.match(sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata \? 'admissionStatus'/);
+  assert.match(sql, /s\.result_rank IS NULL OR s\.result_rank=cs\.result_rank/);
+});
+
+test('markChannelAdmitted writes the channel first, then reconciles the sighting', async () => {
+  const calls: Array<{ sql: string; params?: unknown[] }> = [];
+  const client = {
+    query: async (sql: string, params?: unknown[]) => {
+      calls.push({ sql, params });
+      if (sql.includes('SELECT id FROM semantic_admission_candidates')) {
+        return { rows: [{ id: '66666666-6666-6666-6666-666666666666' }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  await markChannelAdmitted({
+    channelId: 'UCabcdefghijklmnopqrstuv',
+    decisionId: 'decision-1',
+    status: 'ADMITTED',
+  }, client);
+  assert.equal(calls.length, 3);
+  assert.match(calls[0].sql, /UPDATE channels SET admitted_at/);
+  assert.match(calls[1].sql, /SELECT id FROM semantic_admission_candidates/);
+  assert.match(calls[2].sql, /UPDATE channel_sightings cs/);
+  assert.equal(calls[2].params?.[0], '66666666-6666-6666-6666-666666666666');
+  assert.equal(calls[2].params?.[1], 'UCabcdefghijklmnopqrstuv');
+  assert.equal(calls[2].params?.[2], true);
+});
+
+test('a failed candidate lookup fails admission instead of silently skipping reconciliation', async () => {
+  const client = {
+    query: async (sql: string) => {
+      if (sql.includes('SELECT id FROM semantic_admission_candidates')) throw new Error('lookup failed');
+      return { rows: [], rowCount: 1 };
+    },
+  };
+  await assert.rejects(
+    markChannelAdmitted({
+      channelId: 'UCabcdefghijklmnopqrstuv',
+      decisionId: 'decision-1',
+      status: 'ADMITTED',
+    }, client),
+    /lookup failed/,
+  );
+});
+
+test('pending admission verdicts defer only continuable pages and never write contamination', () => {
   const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
   const pageStore = readFileSync(new URL('../autonomousPageStore.ts', import.meta.url), 'utf8');
-  assert.match(queue, /if \(admissionGuard\.defer && searchPage\?\.nextPageToken\)/);
-  assert.match(queue, /deferAutonomousRunForAdmission\(queryRunId, pageNumber/);
-  // A provisional guard stop must not write the terminal contamination reason.
-  const deferIndex = queue.indexOf('if (admissionGuard.defer && searchPage?.nextPageToken)');
-  const terminalIndex = queue.indexOf("'ADMISSION_CONTAMINATION'", deferIndex);
-  assert.ok(deferIndex > -1 && terminalIndex > deferIndex);
+  const deferStart = queue.indexOf('const admissionDeferEligible');
+  const deferReturn = queue.indexOf('return true;', deferStart);
+  assert.ok(deferStart > -1 && deferReturn > deferStart, 'admission defer branch must exist');
+  const deferBlock = queue.slice(deferStart, deferReturn);
+  assert.match(deferBlock, /admissionPageOutcomes\?\.pending/);
+  assert.match(deferBlock, /continuationEnabled/);
+  assert.match(deferBlock, /decision\.shouldContinue === true/);
+  assert.doesNotMatch(deferBlock, /ADMISSION_CONTAMINATION/);
+  const terminalIndex = queue.indexOf("'ADMISSION_CONTAMINATION'", deferReturn);
+  assert.ok(terminalIndex > deferReturn, 'terminal contamination must only follow the provisional return');
+  assert.match(queue, /admissionGuard\.stop && !admissionGuard\.defer/);
   assert.match(pageStore, /markAutonomousPageDeferredForAdmission/);
-  assert.match(pageStore, /should_continue=true/);
+  assert.match(pageStore, /AND should_continue=true/);
+  assert.match(pageStore, /AND stopping_reason IS NULL/);
   assert.match(pageStore, /deferred_reason='ADMISSION'/);
 });
 
-test('admitted channels reconcile only after the channel write succeeds', () => {
-  const index = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
-  const start = index.indexOf('async function markChannelAdmitted');
-  const end = index.indexOf('async function enqueueClassificationAfterAdmission', start);
-  const body = index.slice(start, end);
-  assert.match(body, /UPDATE channels SET admitted_at/);
-  assert.ok(body.indexOf('UPDATE channels SET admitted_at') < body.indexOf('reconcileAdmissionSightings'));
-  assert.match(body, /reconcileAdmissionSightings\(\{/);
-  // Rejections happen without a channel write, so the candidate store owns
-  // their terminal projection.
-  const store = readFileSync(new URL('./store.ts', import.meta.url), 'utf8');
-  assert.match(store, /updated\.status !== 'ADMITTED'/);
-  assert.match(store, /reconcileAdmissionSightings\(\{/);
+test('the resume boundary waits for page-level settlement and re-applies the guard', () => {
+  const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
+  assert.match(queue, /lastObservation\?\.deferredReason === 'ADMISSION'/);
+  assert.match(queue, /getAdmissionPageOutcomes\(run\.runId, run\.pagesCompleted\)/);
+  assert.match(queue, /Number\(pageOutcomes\.pending \|\| 0\) > 0/);
+  assert.match(queue, /settleAutonomousPageAdmissionDeferral\(/);
+  assert.match(queue, /settledGuard\.stop && !settledGuard\.defer/);
+  assert.match(queue, /replayPageAdmissionOutcomesSafe\(queryRunId, pageNumber\)/);
+  assert.match(queue, /replayPageAdmissionOutcomesSafe\(run\.runId, run\.pagesCompleted\)/);
 });

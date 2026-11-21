@@ -6878,7 +6878,20 @@ export interface QuotaFallbackRunState {
   status: string;
   continuationStatus: string;
   continuedToRunId: string | null;
+  continuedFromRunId: string | null;
   explorationPagesRemaining: number;
+}
+
+/** Registry proof that the quota-free fallback provider is still servable. */
+export async function isInnertubeQuotaFallbackAvailable(): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `SELECT mode,quota_domain,capabilities
+       FROM discovery_provider_registry
+      WHERE provider_key='youtube-innertube'`,
+  );
+  const row = result.rows[0];
+  return Boolean(row && isQuotaFreeSearchProviderRow(row));
 }
 
 export async function getQuotaFallbackRunState(runId: string): Promise<QuotaFallbackRunState | null> {
@@ -6886,7 +6899,7 @@ export async function getQuotaFallbackRunState(runId: string): Promise<QuotaFall
   const result = await db.query(
     `SELECT id,provider_key,cost_domain,pages_completed,allocation_origin,search_ordering,
             retrieval_treatment_origin,status,continuation_status,continued_to_run_id,
-            exploration_pages_remaining,
+            continued_from_run_id,exploration_pages_remaining,
             COALESCE(metadata ? 'searchWindow',false) AS has_search_window
        FROM query_runs WHERE id=$1`,
     [runId],
@@ -6905,6 +6918,7 @@ export async function getQuotaFallbackRunState(runId: string): Promise<QuotaFall
     status: String(row.status || ''),
     continuationStatus: String(row.continuation_status || 'RUNNING'),
     continuedToRunId: row.continued_to_run_id ? String(row.continued_to_run_id) : null,
+    continuedFromRunId: row.continued_from_run_id ? String(row.continued_from_run_id) : null,
     explorationPagesRemaining: Number(row.exploration_pages_remaining || 0),
   };
 }
@@ -6928,6 +6942,7 @@ export async function retargetQuotaBlockedRunToInnertube(args: {
     const current = await client.query(
       `SELECT provider_key,cost_domain,pages_completed,allocation_origin,search_ordering,
               retrieval_treatment_origin,status,continuation_status,continued_to_run_id,
+              continued_from_run_id,
               COALESCE(metadata ? 'searchWindow',false) AS has_search_window
          FROM query_runs WHERE id=$1 FOR UPDATE`,
       [args.runId],
@@ -6941,7 +6956,18 @@ export async function retargetQuotaBlockedRunToInnertube(args: {
       || String(row.retrieval_treatment_origin || 'CONTROL') !== 'CONTROL'
       || row.has_search_window === true
       || ['COMPLETED', 'FAILED'].includes(String(row.status || ''))
-      || row.continued_to_run_id) {
+      || row.continued_to_run_id
+      || row.continued_from_run_id) {
+      await client.query('COMMIT');
+      return false;
+    }
+    const registry = await client.query(
+      `SELECT mode,quota_domain,capabilities
+         FROM discovery_provider_registry
+        WHERE provider_key=$1 FOR SHARE`,
+      [args.provider.providerKey],
+    );
+    if (!registry.rows[0] || !isQuotaFreeSearchProviderRow(registry.rows[0])) {
       await client.query('COMMIT');
       return false;
     }

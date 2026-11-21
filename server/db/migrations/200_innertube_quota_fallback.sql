@@ -23,8 +23,16 @@ BEGIN
     IF OLD.provider_key='youtube-search'
        AND OLD.cost_domain='YOUTUBE_DATA_API'
        AND OLD.pages_completed=0
+       AND OLD.allocation_origin <> 'FRONTIER_CANARY'
+       AND OLD.search_ordering='RELEVANCE'
+       AND OLD.retrieval_treatment_origin='CONTROL'
+       AND NOT (OLD.metadata ? 'searchWindow')
+       AND OLD.status NOT IN ('COMPLETED','FAILED')
+       AND OLD.continued_to_run_id IS NULL
+       AND OLD.continued_from_run_id IS NULL
        AND NEW.provider_key='youtube-innertube'
        AND NEW.cost_domain='YOUTUBE_INNERTUBE_FREE'
+       AND NEW.quota_reserved=0
        AND NEW.provider_cursor->>'quotaFallbackFrom'='youtube-search'
     THEN
       RETURN NEW;

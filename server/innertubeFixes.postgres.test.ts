@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { getDb } from './db';
 import {
   createContinuationRunSegment,
+  isInnertubeQuotaFallbackAvailable,
   retargetQuotaBlockedRunToInnertube,
 } from './dbCore';
 import { markAutonomousPageDeferredForAdmission } from './autonomousPageStore';
@@ -117,6 +118,107 @@ maybe('admission reconciliation rewrites the original discovery sighting', async
   }
 });
 
+maybe('a review-held sighting becomes persisted when the operator later admits', async () => {
+  const db = await getDb();
+  const suffix = `review-admit-${Date.now()}-${process.pid}`;
+  const channelId = `UC${suffix.replace(/\W/g, '').slice(-22)}`.padEnd(24, 'x').slice(0, 24);
+  let queryId: number | undefined;
+  let runId: string | undefined;
+  let candidateId: string | undefined;
+  try {
+    queryId = await insertQuery(db, suffix);
+    runId = await insertRun(db, queryId, suffix);
+    candidateId = String((await db.query(
+      `INSERT INTO semantic_admission_candidates(
+         candidate_key,channel_id,channel_name,youtube_url,source,query_id,query_run_id,
+         page_number,result_rank,target_country,status
+       ) VALUES($1,$2,'Trader','https://youtube.com/channel/x','automated_query',$3,$4,1,1,'France','NEEDS_REVIEW')
+       RETURNING id`,
+      [`admission:${channelId}:v1`, channelId, queryId, runId],
+    )).rows[0].id);
+    await db.query(
+      `INSERT INTO semantic_admission_sightings(candidate_id,query_run_id,page_number,result_rank)
+       VALUES($1,$2,1,1)`,
+      [candidateId, runId],
+    );
+    await db.query(
+      `INSERT INTO channel_sightings(
+         query_run_id,query_id,channel_id,result_rank,search_lane,page_number,was_known,
+         persisted,country_outcome,trading_outcome,funnel_outcome,metadata
+       ) VALUES($1,$2,$3,1,'VIDEO',1,false,false,'UNCERTAIN','UNCERTAIN','UNCERTAIN','{}'::jsonb)`,
+      [runId, queryId, channelId],
+    );
+    const { reconcileAdmissionSightings } = await import('./channelAdmission/store');
+    assert.equal(await reconcileAdmissionSightings({ candidateId, channelId, status: 'NEEDS_REVIEW' }), 1);
+    assert.equal(await reconcileAdmissionSightings({ candidateId, channelId, status: 'ADMITTED' }), 1);
+    const row = (await db.query(
+      `SELECT persisted,funnel_outcome,metadata FROM channel_sightings WHERE query_run_id=$1 AND channel_id=$2`,
+      [runId, channelId],
+    )).rows[0];
+    assert.equal(row.persisted, true);
+    assert.equal(row.funnel_outcome, 'CLASSIFICATION_PENDING');
+    assert.equal(row.metadata.admissionStatus, 'ADMITTED');
+  } finally {
+    if (runId) await db.query('DELETE FROM channel_sightings WHERE query_run_id=$1', [runId]).catch(() => undefined);
+    if (candidateId) {
+      await db.query('DELETE FROM semantic_admission_sightings WHERE candidate_id=$1', [candidateId]).catch(() => undefined);
+      await db.query('DELETE FROM semantic_admission_candidates WHERE id=$1', [candidateId]).catch(() => undefined);
+    }
+    if (runId) await db.query('DELETE FROM query_runs WHERE id=$1', [runId]).catch(() => undefined);
+    if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
+  }
+});
+
+maybe('early terminal admission verdict is replayed after the sighting insert', async () => {
+  const db = await getDb();
+  const suffix = `replay-${Date.now()}-${process.pid}`;
+  const channelId = `UC${suffix.replace(/\W/g, '').slice(-22)}`.padEnd(24, 'x').slice(0, 24);
+  let queryId: number | undefined;
+  let runId: string | undefined;
+  let candidateId: string | undefined;
+  try {
+    queryId = await insertQuery(db, suffix);
+    runId = await insertRun(db, queryId, suffix);
+    candidateId = String((await db.query(
+      `INSERT INTO semantic_admission_candidates(
+         candidate_key,channel_id,channel_name,youtube_url,source,query_id,query_run_id,
+         page_number,result_rank,target_country,status
+       ) VALUES($1,$2,'Trader','https://youtube.com/channel/x','automated_query',$3,$4,2,3,'France','ADMITTED')
+       RETURNING id`,
+      [`admission:${channelId}:v1`, channelId, queryId, runId],
+    )).rows[0].id);
+    await db.query(
+      `INSERT INTO semantic_admission_sightings(candidate_id,query_run_id,page_number,result_rank)
+       VALUES($1,$2,2,3)`,
+      [candidateId, runId],
+    );
+    await db.query(
+      `INSERT INTO channel_sightings(
+         query_run_id,query_id,channel_id,result_rank,search_lane,page_number,was_known,
+         persisted,country_outcome,trading_outcome,funnel_outcome,metadata
+       ) VALUES($1,$2,$3,3,'VIDEO',2,false,false,'UNCERTAIN','UNCERTAIN','UNCERTAIN','{}'::jsonb)`,
+      [runId, queryId, channelId],
+    );
+    const { replayAdmissionOutcomesForPage } = await import('./channelAdmission/store');
+    assert.equal(await replayAdmissionOutcomesForPage({ queryRunId: runId, pageNumber: 2 }), 1);
+    const row = (await db.query(
+      `SELECT persisted,funnel_outcome,metadata FROM channel_sightings WHERE query_run_id=$1 AND channel_id=$2`,
+      [runId, channelId],
+    )).rows[0];
+    assert.equal(row.persisted, true);
+    assert.equal(row.funnel_outcome, 'CLASSIFICATION_PENDING');
+    assert.equal(row.metadata.admissionStatus, 'ADMITTED');
+  } finally {
+    if (runId) await db.query('DELETE FROM channel_sightings WHERE query_run_id=$1', [runId]).catch(() => undefined);
+    if (candidateId) {
+      await db.query('DELETE FROM semantic_admission_sightings WHERE candidate_id=$1', [candidateId]).catch(() => undefined);
+      await db.query('DELETE FROM semantic_admission_candidates WHERE id=$1', [candidateId]).catch(() => undefined);
+    }
+    if (runId) await db.query('DELETE FROM query_runs WHERE id=$1', [runId]).catch(() => undefined);
+    if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
+  }
+});
+
 maybe('admission-pending page is re-opened for continuation, not recorded terminal', async () => {
   const db = await getDb();
   const suffix = `page-${Date.now()}-${process.pid}`;
@@ -129,8 +231,8 @@ maybe('admission-pending page is re-opened for continuation, not recorded termin
       `INSERT INTO autonomous_query_page_observations(
          query_run_id,page_number,retrieval_lane,should_continue,primary_reason,
          stopping_reason,decision_reason_codes,page_metrics,continuation_decision_v2
-       ) VALUES($1,1,'VIDEO',false,'MARGINAL_VALUE_LOW','ADMISSION_CONTAMINATION',
-         '["ADMISSION_PENDING_WAIT","MARGINAL_VALUE_LOW"]'::jsonb,'{}'::jsonb,'{}'::jsonb)`,
+       ) VALUES($1,1,'VIDEO',true,'ADMISSION_PENDING_WAIT',NULL,
+         '["ADMISSION_PENDING_WAIT"]'::jsonb,'{}'::jsonb,'{}'::jsonb)`,
       [runId],
     );
 
@@ -151,6 +253,23 @@ maybe('admission-pending page is re-opened for continuation, not recorded termin
       [runId],
     )).rows[0];
     assert.equal(row.decision_reason_codes.filter((code: string) => code === 'ADMISSION_PENDING_WAIT').length, 1);
+
+    // A real terminal stop must never be reopened by an admission wait.
+    await db.query(
+      `UPDATE autonomous_query_page_observations
+          SET should_continue=false,stopping_reason='PAGE_CEILING',deferred_reason=NULL
+        WHERE query_run_id=$1 AND page_number=1`,
+      [runId],
+    );
+    assert.equal(await markAutonomousPageDeferredForAdmission(runId, 1), false);
+    row = (await db.query(
+      `SELECT should_continue,stopping_reason,deferred_reason
+         FROM autonomous_query_page_observations WHERE query_run_id=$1 AND page_number=1`,
+      [runId],
+    )).rows[0];
+    assert.equal(row.should_continue, false);
+    assert.equal(row.stopping_reason, 'PAGE_CEILING');
+    assert.equal(row.deferred_reason, null);
   } finally {
     if (runId) await db.query('DELETE FROM autonomous_query_page_observations WHERE query_run_id=$1', [runId]).catch(() => undefined);
     if (runId) await db.query('DELETE FROM query_runs WHERE id=$1', [runId]).catch(() => undefined);
@@ -165,6 +284,8 @@ maybe('official first-page run retargets to InnerTube while completed runs must 
   let freshRunId: string | undefined;
   let completedRunId: string | undefined;
   let jobId: string | undefined;
+  let pausedRunId: string | undefined;
+  let pausedJobId: string | undefined;
   try {
     queryId = await insertQuery(db, suffix);
     freshRunId = await insertRun(db, queryId, `${suffix}-fresh`);
@@ -215,9 +336,48 @@ maybe('official first-page run retargets to InnerTube while completed runs must 
         [completedRunId, JSON.stringify(YOUTUBE_INNERTUBE_PROVIDER)]),
       /IMMUTABLE_QUERY_RUN_PROVIDER_LINEAGE/,
     );
+
+    // A continuation child already owns a non-page-1 cursor. Retargeting it
+    // would clear the cursor and re-walk the parent's results.
+    const childRunId = await insertRun(db, queryId, `${suffix}-child`);
+    await db.query(`UPDATE query_runs SET continued_from_run_id=$2 WHERE id=$1`, [childRunId, freshRunId]);
+    const childJobId = String((await db.query(
+      `INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
+       VALUES('SEARCH_YOUTUBE',$1::jsonb,20,3,$2) RETURNING id`,
+      [JSON.stringify({ queryRunId: childRunId, provider: OFFICIAL_PROVIDER, pageNumber: 1 }), `test-retarget-child-${suffix}`],
+    )).rows[0].id);
+    assert.equal(await retargetQuotaBlockedRunToInnertube({
+      runId: childRunId,
+      jobId: childJobId,
+      provider: YOUTUBE_INNERTUBE_PROVIDER,
+    }), false);
+    await db.query('DELETE FROM jobs WHERE id=$1', [childJobId]).catch(() => undefined);
+    await db.query('DELETE FROM query_runs WHERE id=$1', [childRunId]).catch(() => undefined);
+
+    // A PAUSED/SHADOW/RETIRED registry row must disable the fallback.
+    assert.equal(await isInnertubeQuotaFallbackAvailable(), true);
+    pausedRunId = await insertRun(db, queryId, `${suffix}-paused`);
+    pausedJobId = String((await db.query(
+      `INSERT INTO jobs(type,payload,priority,max_attempts,idempotency_key)
+       VALUES('SEARCH_YOUTUBE',$1::jsonb,20,3,$2) RETURNING id`,
+      [JSON.stringify({ queryRunId: pausedRunId, provider: OFFICIAL_PROVIDER, pageNumber: 1 }), `test-retarget-paused-${suffix}`],
+    )).rows[0].id);
+    await db.query(`UPDATE discovery_provider_registry SET mode='PAUSED' WHERE provider_key='youtube-innertube'`);
+    try {
+      assert.equal(await isInnertubeQuotaFallbackAvailable(), false);
+      assert.equal(await retargetQuotaBlockedRunToInnertube({
+        runId: pausedRunId,
+        jobId: pausedJobId,
+        provider: YOUTUBE_INNERTUBE_PROVIDER,
+      }), false);
+    } finally {
+      await db.query(`UPDATE discovery_provider_registry SET mode='ACTIVE' WHERE provider_key='youtube-innertube'`);
+    }
   } finally {
     if (jobId) await db.query('DELETE FROM jobs WHERE id=$1', [jobId]).catch(() => undefined);
+    if (pausedJobId) await db.query('DELETE FROM jobs WHERE id=$1', [pausedJobId]).catch(() => undefined);
     if (freshRunId) await db.query('DELETE FROM query_runs WHERE id=$1', [freshRunId]).catch(() => undefined);
+    if (pausedRunId) await db.query('DELETE FROM query_runs WHERE id=$1', [pausedRunId]).catch(() => undefined);
     if (completedRunId) await db.query('DELETE FROM query_runs WHERE id=$1', [completedRunId]).catch(() => undefined);
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
   }

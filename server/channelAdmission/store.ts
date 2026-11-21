@@ -299,7 +299,14 @@ export async function reconcileAdmissionSightings(input: {
         -- Terminal classification outcomes are authoritative. Reconciliation
         -- only resolves a still-pending sighting; it must never rewrite a
         -- completed TRADING_CONFIRMED/NON_TRADING/COUNTRY_REJECTED verdict.
-        AND (cs.funnel_outcome IS NULL OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN'))
+        -- NEEDS_REVIEW is admission-owned only when this projection wrote it,
+        -- so a later human ADMIT can replace the provisional hold while a
+        -- classification-owned NEEDS_REVIEW remains untouched.
+        AND (
+          cs.funnel_outcome IS NULL
+          OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
+          OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata ? 'admissionStatus')
+        )
         AND cs.page_number IS NOT DISTINCT FROM s.page_number
         AND (s.result_rank IS NULL OR cs.result_rank=s.result_rank)`,
     [
@@ -307,6 +314,79 @@ export async function reconcileAdmissionSightings(input: {
       disposition.funnelOutcome, disposition.countryOutcome, disposition.tradingOutcome,
       JSON.stringify(metadata),
     ],
+  );
+  return result.rowCount || 0;
+}
+
+/**
+ * Admission verification runs concurrently with page retrieval. A candidate
+ * can reach a terminal outcome before the search worker inserts the page's
+ * channel_sightings, so the candidate-scoped reconciliation above finds no
+ * row and the later insert would stay pending forever. This page-scoped replay
+ * runs after sighting insertion (and on saved-page recovery) and applies every
+ * already-terminal admission outcome to that page's rows.
+ */
+export async function replayAdmissionOutcomesForPage(input: {
+  queryRunId: string;
+  pageNumber: number;
+  client?: AdmissionQueryable;
+}): Promise<number> {
+  const db = input.client || await getDb();
+  const reconciledAt = new Date().toISOString();
+  const result = await db.query(
+    `WITH scoped AS (
+       SELECT DISTINCT cs.id AS sighting_id,
+              c.id AS candidate_id,
+              c.status AS admission_status
+         FROM channel_sightings cs
+         JOIN semantic_admission_sightings s
+           ON s.query_run_id=cs.query_run_id
+          AND s.page_number IS NOT DISTINCT FROM cs.page_number
+          AND (s.result_rank IS NULL OR s.result_rank=cs.result_rank)
+         JOIN semantic_admission_candidates c
+           ON c.id=s.candidate_id
+          AND c.channel_id=cs.channel_id
+        WHERE cs.query_run_id=$1
+          AND cs.page_number=$2
+          AND cs.was_known=false
+          AND c.status IN (
+            'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED',
+            'NEEDS_REVIEW','EXPIRED_MISSING_EVIDENCE'
+          )
+          AND (
+            cs.funnel_outcome IS NULL
+            OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
+            OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata ? 'admissionStatus')
+          )
+     )
+     UPDATE channel_sightings cs
+        SET persisted = CASE
+              WHEN sc.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS') THEN true
+              ELSE false
+            END,
+            funnel_outcome = CASE sc.admission_status
+              WHEN 'ADMITTED' THEN 'CLASSIFICATION_PENDING'
+              WHEN 'ADMITTED_AMBIGUOUS' THEN 'CLASSIFICATION_PENDING'
+              WHEN 'REJECTED_COUNTRY' THEN 'COUNTRY_REJECTED'
+              WHEN 'REJECTED_UNRELATED' THEN 'NON_TRADING'
+              WHEN 'NEEDS_REVIEW' THEN 'NEEDS_REVIEW'
+              ELSE 'UNCERTAIN'
+            END,
+            country_outcome = CASE
+              WHEN sc.admission_status='REJECTED_COUNTRY' THEN 'REJECTED'
+              ELSE cs.country_outcome
+            END,
+            trading_outcome = CASE
+              WHEN sc.admission_status IN ('REJECTED_COUNTRY','REJECTED_UNRELATED') THEN 'UNCERTAIN'
+              ELSE cs.trading_outcome
+            END,
+            metadata=COALESCE(cs.metadata,'{}'::jsonb)||jsonb_build_object(
+              'admissionStatus',sc.admission_status,
+              'admissionSightingReconciledAt',$3::text
+            )
+       FROM scoped sc
+      WHERE cs.id=sc.sighting_id`,
+    [input.queryRunId, input.pageNumber, reconciledAt],
   );
   return result.rowCount || 0;
 }

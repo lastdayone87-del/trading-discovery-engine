@@ -15,6 +15,8 @@ export interface InnertubeQuotaFallbackInput {
   retrievalTreatmentOrigin: string;
   allocationOrigin: string;
   hasTrial?: boolean;
+  /** A continuation child already carries a non-page-1 provider cursor. */
+  isContinuationChild?: boolean;
 }
 
 export interface InnertubeQuotaFallbackDecision {
@@ -32,6 +34,7 @@ export function evaluateInnertubeQuotaFallback(
   if (input.retrievalTreatmentOrigin !== 'CONTROL') reasonCodes.push('RETRIEVAL_TREATMENT_ACTIVE');
   if (input.allocationOrigin === 'FRONTIER_CANARY') reasonCodes.push('FRONTIER_LINEAGE_IMMUTABLE');
   if (input.hasTrial) reasonCodes.push('TRIAL_ACTIVE');
+  if (input.isContinuationChild) reasonCodes.push('CONTINUATION_CHILD_CURSOR');
   return { eligible: reasonCodes.length === 0, reasonCodes };
 }
 

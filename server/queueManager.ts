@@ -49,6 +49,7 @@ import {
   getAutonomousQuotaAvailability,
   getQueryRunProgress,
   getQuotaFallbackRunState,
+  isInnertubeQuotaFallbackAvailable,
   retargetQuotaBlockedRunToInnertube,
   updateQueryRunProgress,
   markQueryRunDeferred,
@@ -142,6 +143,7 @@ import {
   listPendingAutonomousRuns,
   markAutonomousPageDeferredForAdmission,
   recordAutonomousPage,
+  settleAutonomousPageAdmissionDeferral,
 } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate } from './candidateCorpus';
@@ -170,7 +172,7 @@ import { ADMISSION_VERIFICATION_JOB_TYPE, processAdmissionVerificationJob } from
 import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
 import { allRoutesCoolingDown, groqFallbackCoolingDown } from './channelAdmission/routeHealth';
 export { allRoutesCoolingDown, groqFallbackCoolingDown, judgeRoutePoolHealthy } from './channelAdmission/routeHealth';
-import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery } from './channelAdmission/store';
+import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery, replayAdmissionOutcomesForPage } from './channelAdmission/store';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
@@ -365,6 +367,19 @@ function isMissingAdmissionSchemaError(error: unknown): boolean {
   const namesAdmissionRelation = /semantic_admission_(candidates|decisions|sightings|model_calls)/i.test(message);
   const missingRelation = /relation ["']?[^"']*["']? does not exist/i.test(message);
   return namesAdmissionRelation && ((error as { code?: unknown })?.code === '42P01' || missingRelation);
+}
+
+/**
+ * Page-scoped admission replay is an accounting repair, not a retrieval
+ * dependency. The pre-admission schema must behave exactly as before; any
+ * other failure is real and must reach the worker retry path.
+ */
+async function replayPageAdmissionOutcomesSafe(queryRunId: string, pageNumber: number): Promise<void> {
+  try {
+    await replayAdmissionOutcomesForPage({ queryRunId, pageNumber });
+  } catch (error) {
+    if (!isMissingAdmissionSchemaError(error)) throw error;
+  }
 }
 
 /**
@@ -780,7 +795,7 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
       channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
       quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
       cycle_quality_score: performance.performanceScore,
-      logs: [`Durable autonomous ${args.retrievalLane} lane run ${args.queryRunId} completed by ${args.workerId} via ${args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 'YOUTUBE_INNERTUBE_FREE' : 'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(args.pageMetrics)}`],
+      logs: [`Durable autonomous ${args.retrievalLane} lane run ${args.queryRunId} completed by ${args.workerId} via ${args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 'YOUTUBE_INNERTUBE_FREE' : 'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(Object.keys(args.pageMetrics || {}).length ? args.pageMetrics : finalMetrics)}`],
     });
   }
   const neighborhoodInfo = await getNeighborhoodForQueryRun(args.queryRunId);
@@ -870,6 +885,10 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   const progress = await getQueryRunProgress(args.queryRunId);
   if (!progress) return;
   const observation = await getAutonomousPageObservation(args.queryRunId, args.pageNumber);
+  // Repair the insert-vs-admission race on replay as well: the page may have
+  // committed before an admission verdict and then crashed before the worker's
+  // post-insert replay ran.
+  await replayPageAdmissionOutcomesSafe(args.queryRunId, args.pageNumber);
   const [paginationSetting, cdlSetting] = await Promise.all([
     getAppSetting('autonomous_pagination_enabled', 'true'),
     getAppSetting('country_discovery_loop_enabled', 'true'),
@@ -2477,9 +2496,13 @@ export async function processNextSearchJob(
                 retrievalTreatmentOrigin: fallbackState.retrievalTreatmentOrigin,
                 allocationOrigin: fallbackState.allocationOrigin,
                 hasTrial: Boolean(job.payload.trial?.trialId),
+                isContinuationChild: Boolean(fallbackState.continuedFromRunId),
               })
             : { eligible: false, reasonCodes: ['RUN_STATE_UNAVAILABLE'] };
-          if (fallbackDecision.eligible && !fallbackState!.continuedToRunId && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_MAX_PAGES) {
+          if (fallbackDecision.eligible
+            && !fallbackState!.continuedToRunId
+            && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_MAX_PAGES
+            && await isInnertubeQuotaFallbackAvailable().catch(() => false)) {
             if (!requiresContinuationHandoff(fallbackState!.pagesCompleted)) {
               // Zero completed pages: no official units were spent, so the
               // run can move provider identity in place and continue now.
@@ -2761,7 +2784,13 @@ export async function processNextSearchJob(
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
-      if (sightings.length) await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+      if (sightings.length) {
+        await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+        // Admission verification can finish while this page is still being
+        // processed; replay those terminal outcomes after the sightings exist
+        // so an early verdict cannot leave a stale persisted=false row.
+        await replayPageAdmissionOutcomesSafe(queryRunId, pageNumber);
+      }
       const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '50'));
       // A malformed setting must not become an unbounded (or NaN) page
       // ceiling. Fall back to the same 50-page default the migration seeds;
@@ -2973,15 +3002,25 @@ export async function processNextSearchJob(
             priorZeroQualityPages: prior.v2Streaks.lowValue,
           })
         : { stop: false, quarantine: false, reasonCodes: [] as string[] };
-      // Pending admission verdicts are a temporary evidence wait. Defer the
-      // run and resume it after the verdicts settle; do not record a terminal
-      // page stop, quarantine the query, or abandon a productive next cursor.
-      if (admissionGuard.defer && searchPage?.nextPageToken) {
+      // Pending admission verdicts are a temporary evidence wait, but they can
+      // never override a real continuation stop (ceiling, run budget, low
+      // novelty, duplicate-heavy, wrong country) or an operator hold. Defer
+      // only when this page still needs more discovery and its own admission
+      // set is unresolved; run-level pending outcomes from an earlier page
+      // must not reopen a later page.
+      const admissionDeferEligible = admissionGuard.defer === true
+        && Number(admissionPageOutcomes?.pending || 0) > 0
+        && !queryResultHold
+        && continuationEnabled
+        && decision.shouldContinue === true;
+      if (admissionDeferEligible) {
         await deferAutonomousRunForAdmission(queryRunId, pageNumber, admissionGuard.reasonCodes.join(','));
         await completeJob(job.id);
         return true;
       }
-      if (admissionGuard.stop) {
+      // A provisional pending-admission guard must never be recorded as
+      // terminal contamination, including on a final page with no cursor.
+      if (admissionGuard.stop && !admissionGuard.defer) {
         await (await getDb()).query(
           `UPDATE autonomous_query_page_observations SET stopping_reason=$3,decision_reason_codes=COALESCE(decision_reason_codes,'[]'::jsonb)||$4::jsonb WHERE query_run_id=$1 AND page_number=$2`,
           [queryRunId, pageNumber, 'ADMISSION_CONTAMINATION', JSON.stringify(admissionGuard.reasonCodes)],
@@ -3478,6 +3517,60 @@ export async function resumeOrphanedAutonomousPages(options: {
     // finalize it from the durable observation instead.
     if (!firstPage) {
       const lastObservation = await getAutonomousPageObservation(run.runId, run.pagesCompleted);
+      if (lastObservation?.deferredReason === 'ADMISSION') {
+        // A time-only wake-up is not proof that the admission verdicts
+        // settled. Keep the run parked while this page still has pending
+        // candidates; once settled, re-apply the guard before buying another
+        // page so a rejection cannot leak one extra fetch.
+        const [pageOutcomes, runOutcomes] = await Promise.all([
+          getAdmissionPageOutcomes(run.runId, run.pagesCompleted),
+          getAdmissionRunOutcomes(run.runId),
+        ]);
+        if (Number(pageOutcomes.pending || 0) > 0) {
+          await deferAutonomousRunForAdmission(run.runId, run.pagesCompleted, 'ADMISSION_PENDING_WAIT');
+          skipped++;
+          continue;
+        }
+        await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted);
+        const savedMetrics = lastObservation.pageMetrics || ({} as QueryFunnelMetrics);
+        const settledGuard = evaluateQueryAdmissionGuard({
+          pageNumber: run.pagesCompleted,
+          outcomes: runOutcomes,
+          tradingPrecision: Number(savedMetrics.tradingPrecision || 0),
+          qualityChannels: Number(savedMetrics.qualityChannels || 0),
+          tradingConfirmed: Number(savedMetrics.tradingConfirmed || 0),
+          classificationPending: Number(savedMetrics.classificationPending || 0),
+          priorZeroQualityPages: 0,
+        });
+        if (settledGuard.stop && !settledGuard.defer) {
+          await settleAutonomousPageAdmissionDeferral(
+            run.runId,
+            run.pagesCompleted,
+            false,
+            'ADMISSION_CONTAMINATION',
+          );
+          if (settledGuard.quarantine) {
+            await quarantineQuery(run.queryId, settledGuard.reasonCodes).catch(error => {
+              console.warn('[AdmissionGuard] failed to quarantine settled query:', error);
+            });
+          }
+          await finalizeLinkedAutonomousParent(run);
+          skipped++;
+          continue;
+        }
+        const hasCursor = Boolean(run.nextPageToken) && run.resumeMode !== 'NONE';
+        await settleAutonomousPageAdmissionDeferral(
+          run.runId,
+          run.pagesCompleted,
+          hasCursor,
+          null,
+        );
+        if (!hasCursor) {
+          await finalizeLinkedAutonomousParent(run);
+          skipped++;
+          continue;
+        }
+      }
       if (lastObservation && lastObservation.shouldContinue === false) {
         await finalizeLinkedAutonomousParent(run);
         skipped++;
