@@ -57,6 +57,22 @@ async function insertRun(
   )).rows[0].id);
 }
 
+async function insertAdmittedChannel(
+  db: Awaited<ReturnType<typeof getDb>>,
+  channelId: string,
+  status: 'ADMITTED' | 'ADMITTED_AMBIGUOUS' = 'ADMITTED',
+): Promise<void> {
+  await db.query(
+    `INSERT INTO channels(
+       channel_id,channel_name,youtube_url,country,country_status,discord_status,
+       scan_status,discovery_source,first_seen,trading_status,admission_status,
+       admitted_at,admission_decision_id
+     ) VALUES($1,'Trader','https://youtube.com/channel/x','France','UNCERTAIN','UNCERTAIN',
+       'CLASSIFICATION_PENDING','automated_query',now(),'UNCERTAIN',$2,now(),gen_random_uuid())`,
+    [channelId, status],
+  );
+}
+
 maybe('admission reconciliation rewrites the original discovery sighting', async () => {
   const db = await getDb();
   const suffix = `reconcile-${Date.now()}-${process.pid}`;
@@ -88,6 +104,7 @@ maybe('admission reconciliation rewrites the original discovery sighting', async
       [runId, queryId, channelId],
     );
 
+    await insertAdmittedChannel(db, channelId);
     const updated = await reconcileAdmissionSightings({ candidateId, channelId, status: 'ADMITTED' });
     assert.equal(updated, 1);
     const row = (await db.query(
@@ -113,6 +130,7 @@ maybe('admission reconciliation rewrites the original discovery sighting', async
       await db.query('DELETE FROM semantic_admission_sightings WHERE candidate_id=$1', [candidateId]).catch(() => undefined);
       await db.query('DELETE FROM semantic_admission_candidates WHERE id=$1', [candidateId]).catch(() => undefined);
     }
+    await db.query('DELETE FROM channels WHERE channel_id=$1', [channelId]).catch(() => undefined);
     if (runId) await db.query('DELETE FROM query_runs WHERE id=$1', [runId]).catch(() => undefined);
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
   }
@@ -150,6 +168,7 @@ maybe('a review-held sighting becomes persisted when the operator later admits',
     );
     const { reconcileAdmissionSightings } = await import('./channelAdmission/store');
     assert.equal(await reconcileAdmissionSightings({ candidateId, channelId, status: 'NEEDS_REVIEW' }), 1);
+    await insertAdmittedChannel(db, channelId);
     assert.equal(await reconcileAdmissionSightings({ candidateId, channelId, status: 'ADMITTED' }), 1);
     const row = (await db.query(
       `SELECT persisted,funnel_outcome,metadata FROM channel_sightings WHERE query_run_id=$1 AND channel_id=$2`,
@@ -164,6 +183,7 @@ maybe('a review-held sighting becomes persisted when the operator later admits',
       await db.query('DELETE FROM semantic_admission_sightings WHERE candidate_id=$1', [candidateId]).catch(() => undefined);
       await db.query('DELETE FROM semantic_admission_candidates WHERE id=$1', [candidateId]).catch(() => undefined);
     }
+    await db.query('DELETE FROM channels WHERE channel_id=$1', [channelId]).catch(() => undefined);
     if (runId) await db.query('DELETE FROM query_runs WHERE id=$1', [runId]).catch(() => undefined);
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
   }
@@ -200,6 +220,9 @@ maybe('early terminal admission verdict is replayed after the sighting insert', 
       [runId, queryId, channelId],
     );
     const { replayAdmissionOutcomesForPage } = await import('./channelAdmission/store');
+    // Admission status alone is not enough: the channel write must be durable.
+    assert.equal(await replayAdmissionOutcomesForPage({ queryRunId: runId, pageNumber: 2 }), 0);
+    await insertAdmittedChannel(db, channelId);
     assert.equal(await replayAdmissionOutcomesForPage({ queryRunId: runId, pageNumber: 2 }), 1);
     const row = (await db.query(
       `SELECT persisted,funnel_outcome,metadata FROM channel_sightings WHERE query_run_id=$1 AND channel_id=$2`,
@@ -214,6 +237,7 @@ maybe('early terminal admission verdict is replayed after the sighting insert', 
       await db.query('DELETE FROM semantic_admission_sightings WHERE candidate_id=$1', [candidateId]).catch(() => undefined);
       await db.query('DELETE FROM semantic_admission_candidates WHERE id=$1', [candidateId]).catch(() => undefined);
     }
+    await db.query('DELETE FROM channels WHERE channel_id=$1', [channelId]).catch(() => undefined);
     if (runId) await db.query('DELETE FROM query_runs WHERE id=$1', [runId]).catch(() => undefined);
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
   }
@@ -337,8 +361,8 @@ maybe('official first-page run retargets to InnerTube while completed runs must 
       /IMMUTABLE_QUERY_RUN_PROVIDER_LINEAGE/,
     );
 
-    // A continuation child already owns a non-page-1 cursor. Retargeting it
-    // would clear the cursor and re-walk the parent's results.
+    // A continuation child (continued_from_run_id set) must not be retargeted;
+    // doing so would clear the inherited cursor and re-walk the parent's results.
     const childRunId = await insertRun(db, queryId, `${suffix}-child`);
     await db.query(`UPDATE query_runs SET continued_from_run_id=$2 WHERE id=$1`, [childRunId, freshRunId]);
     const childJobId = String((await db.query(
@@ -362,6 +386,9 @@ maybe('official first-page run retargets to InnerTube while completed runs must 
        VALUES('SEARCH_YOUTUBE',$1::jsonb,20,3,$2) RETURNING id`,
       [JSON.stringify({ queryRunId: pausedRunId, provider: OFFICIAL_PROVIDER, pageNumber: 1 }), `test-retarget-paused-${suffix}`],
     )).rows[0].id);
+    const originalMode = String((await db.query(
+      `SELECT mode FROM discovery_provider_registry WHERE provider_key='youtube-innertube'`,
+    )).rows[0].mode);
     await db.query(`UPDATE discovery_provider_registry SET mode='PAUSED' WHERE provider_key='youtube-innertube'`);
     try {
       assert.equal(await isInnertubeQuotaFallbackAvailable(), false);
@@ -371,7 +398,7 @@ maybe('official first-page run retargets to InnerTube while completed runs must 
         provider: YOUTUBE_INNERTUBE_PROVIDER,
       }), false);
     } finally {
-      await db.query(`UPDATE discovery_provider_registry SET mode='ACTIVE' WHERE provider_key='youtube-innertube'`);
+      await db.query(`UPDATE discovery_provider_registry SET mode=$1 WHERE provider_key='youtube-innertube'`, [originalMode]);
     }
   } finally {
     if (jobId) await db.query('DELETE FROM jobs WHERE id=$1', [jobId]).catch(() => undefined);

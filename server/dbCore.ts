@@ -1684,6 +1684,7 @@ export async function reconcileClassificationSighting(input: {
       input.persisted,
       JSON.stringify({
         classificationReconciledAt: new Date().toISOString(),
+        sightingOutcomeSource: 'CLASSIFICATION',
         ...(input.jobId ? { classificationJobId: input.jobId } : {}),
         ...(input.metadata || {}),
       }),

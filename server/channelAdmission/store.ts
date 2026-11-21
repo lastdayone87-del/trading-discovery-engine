@@ -277,6 +277,7 @@ export async function reconcileAdmissionSightings(input: {
   const db = input.client || await getDb();
   const metadata = {
     admissionStatus: input.status,
+    sightingOutcomeSource: 'ADMISSION',
     admissionSightingReconciledAt: new Date().toISOString(),
   };
   const result = await db.query(
@@ -296,6 +297,15 @@ export async function reconcileAdmissionSightings(input: {
         AND cs.query_run_id=s.query_run_id
         AND cs.channel_id=t.channel_id
         AND cs.was_known=false
+        AND (
+          $3::boolean=false
+          OR EXISTS (
+            SELECT 1 FROM channels ch
+             WHERE ch.channel_id=t.channel_id
+               AND ch.admitted_at IS NOT NULL
+               AND ch.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          )
+        )
         -- Terminal classification outcomes are authoritative. Reconciliation
         -- only resolves a still-pending sighting; it must never rewrite a
         -- completed TRADING_CONFIRMED/NON_TRADING/COUNTRY_REJECTED verdict.
@@ -305,7 +315,7 @@ export async function reconcileAdmissionSightings(input: {
         AND (
           cs.funnel_outcome IS NULL
           OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
-          OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata ? 'admissionStatus')
+          OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
         )
         AND cs.page_number IS NOT DISTINCT FROM s.page_number
         AND (s.result_rank IS NULL OR cs.result_rank=s.result_rank)`,
@@ -349,6 +359,15 @@ export async function replayAdmissionOutcomesForPage(input: {
         WHERE cs.query_run_id=$1
           AND cs.page_number=$2
           AND cs.was_known=false
+          AND (
+            c.status NOT IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+            OR EXISTS (
+              SELECT 1 FROM channels ch
+               WHERE ch.channel_id=c.channel_id
+                 AND ch.admitted_at IS NOT NULL
+                 AND ch.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+            )
+          )
           AND c.status IN (
             'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED',
             'NEEDS_REVIEW','EXPIRED_MISSING_EVIDENCE'
@@ -356,7 +375,7 @@ export async function replayAdmissionOutcomesForPage(input: {
           AND (
             cs.funnel_outcome IS NULL
             OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
-            OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata ? 'admissionStatus')
+            OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
           )
      )
      UPDATE channel_sightings cs
@@ -382,6 +401,7 @@ export async function replayAdmissionOutcomesForPage(input: {
             END,
             metadata=COALESCE(cs.metadata,'{}'::jsonb)||jsonb_build_object(
               'admissionStatus',sc.admission_status,
+              'sightingOutcomeSource','ADMISSION',
               'admissionSightingReconciledAt',$3::text
             )
        FROM scoped sc

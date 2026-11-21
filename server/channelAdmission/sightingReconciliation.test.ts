@@ -38,7 +38,7 @@ test('admission success marks the original discovery sighting persisted and clas
   assert.match(calls[0].sql, /FROM semantic_admission_sightings s, target t/);
   assert.match(calls[0].sql, /cs\.was_known=false/);
   assert.match(calls[0].sql, /cs\.page_number IS NOT DISTINCT FROM s\.page_number/);
-  assert.match(calls[0].sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata \? 'admissionStatus'/);
+  assert.match(calls[0].sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata->>'sightingOutcomeSource'='ADMISSION'/);
 });
 
 test('ambiguous admission is also persisted and classification-pending', async () => {
@@ -95,7 +95,7 @@ test('page-scoped replay repairs verdicts that landed before sighting insertion'
   const sql = calls[0].sql;
   assert.match(sql, /c\.status IN \(/);
   assert.match(sql, /'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED'/);
-  assert.match(sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata \? 'admissionStatus'/);
+  assert.match(sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata->>'sightingOutcomeSource'='ADMISSION'/);
   assert.match(sql, /s\.result_rank IS NULL OR s\.result_rank=cs\.result_rank/);
 });
 
@@ -163,11 +163,16 @@ test('pending admission verdicts defer only continuable pages and never write co
 
 test('the resume boundary waits for page-level settlement and re-applies the guard', () => {
   const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /lastObservation\?\.deferredReason === 'ADMISSION'/);
-  assert.match(queue, /getAdmissionPageOutcomes\(run\.runId, run\.pagesCompleted\)/);
+  const gate = queue.indexOf("lastObservation?.deferredReason === 'ADMISSION'");
+  const settle = queue.indexOf('getAdmissionPageOutcomes(run.runId, run.pagesCompleted)', gate);
+  const replay = queue.indexOf('replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted, true)', settle);
+  const guard = queue.indexOf('settledGuard.stop && !settledGuard.defer', replay);
+  assert.ok(
+    gate > -1 && settle > gate && replay > settle && guard > replay,
+    'resume boundary must settle, replay, then re-apply the guard in order',
+  );
   assert.match(queue, /Number\(pageOutcomes\.pending \|\| 0\) > 0/);
-  assert.match(queue, /settleAutonomousPageAdmissionDeferral\(/);
-  assert.match(queue, /settledGuard\.stop && !settledGuard\.defer/);
+  assert.match(queue, /getAutonomousPageSettledGuardMetrics\(run\.runId, run\.pagesCompleted\)/);
+  assert.match(queue, /priorZeroQualityPages: priorState\.v2Streaks\.lowValue/);
   assert.match(queue, /replayPageAdmissionOutcomesSafe\(queryRunId, pageNumber\)/);
-  assert.match(queue, /replayPageAdmissionOutcomesSafe\(run\.runId, run\.pagesCompleted\)/);
 });

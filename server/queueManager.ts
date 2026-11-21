@@ -138,6 +138,7 @@ import {
   getAutonomousContinuationState,
   getAutonomousPageMarginalMetrics,
   getAutonomousPageObservation,
+  getAutonomousPageSettledGuardMetrics,
   getPageNoveltyMetrics,
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
@@ -374,11 +375,22 @@ function isMissingAdmissionSchemaError(error: unknown): boolean {
  * dependency. The pre-admission schema must behave exactly as before; any
  * other failure is real and must reach the worker retry path.
  */
-async function replayPageAdmissionOutcomesSafe(queryRunId: string, pageNumber: number): Promise<void> {
+async function replayPageAdmissionOutcomesSafe(queryRunId: string, pageNumber: number, strict = false): Promise<void> {
   try {
     await replayAdmissionOutcomesForPage({ queryRunId, pageNumber });
   } catch (error) {
-    if (!isMissingAdmissionSchemaError(error)) throw error;
+    if (isMissingAdmissionSchemaError(error)) return;
+    if (strict) throw error;
+    // Before the page observation is durable, a replay failure must not turn
+    // into a provider re-fetch. The post-observation replay and recovery path
+    // both retry the repair strictly.
+    console.warn(JSON.stringify({
+      event: 'admission_sighting_replay_failed',
+      queryRunId,
+      pageNumber,
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString(),
+    }));
   }
 }
 
@@ -888,7 +900,7 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   // Repair the insert-vs-admission race on replay as well: the page may have
   // committed before an admission verdict and then crashed before the worker's
   // post-insert replay ran.
-  await replayPageAdmissionOutcomesSafe(args.queryRunId, args.pageNumber);
+  await replayPageAdmissionOutcomesSafe(args.queryRunId, args.pageNumber, true);
   const [paginationSetting, cdlSetting] = await Promise.all([
     getAppSetting('autonomous_pagination_enabled', 'true'),
     getAppSetting('country_discovery_loop_enabled', 'true'),
@@ -2974,6 +2986,9 @@ export async function processNextSearchJob(
         deferredReason: usingV2 ? decisionV2.deferReason : null,
       };
       await recordAutonomousPage(pageObservation);
+      // The page is now durable; a replay failure can be retried by recovery
+      // without buying the provider page again.
+      await replayPageAdmissionOutcomesSafe(queryRunId, pageNumber);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
       if (!queryResultHold && deferDecision) {
         if (decisionV2.deferReason === 'QUOTA') await deferAutonomousRunForQuota(queryRunId, decisionV2.primaryReason);
@@ -3531,16 +3546,19 @@ export async function resumeOrphanedAutonomousPages(options: {
           skipped++;
           continue;
         }
-        await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted);
-        const savedMetrics = lastObservation.pageMetrics || ({} as QueryFunnelMetrics);
+        await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted, true);
+        const [settledMetrics, priorState] = await Promise.all([
+          getAutonomousPageSettledGuardMetrics(run.runId, run.pagesCompleted),
+          getAutonomousContinuationState(run.runId, run.pagesCompleted),
+        ]);
         const settledGuard = evaluateQueryAdmissionGuard({
           pageNumber: run.pagesCompleted,
           outcomes: runOutcomes,
-          tradingPrecision: Number(savedMetrics.tradingPrecision || 0),
-          qualityChannels: Number(savedMetrics.qualityChannels || 0),
-          tradingConfirmed: Number(savedMetrics.tradingConfirmed || 0),
-          classificationPending: Number(savedMetrics.classificationPending || 0),
-          priorZeroQualityPages: 0,
+          tradingPrecision: settledMetrics.tradingPrecision,
+          qualityChannels: settledMetrics.qualityChannels,
+          tradingConfirmed: settledMetrics.tradingConfirmed,
+          classificationPending: settledMetrics.classificationPending,
+          priorZeroQualityPages: priorState.v2Streaks.lowValue,
         });
         if (settledGuard.stop && !settledGuard.defer) {
           await settleAutonomousPageAdmissionDeferral(
@@ -3548,6 +3566,7 @@ export async function resumeOrphanedAutonomousPages(options: {
             run.pagesCompleted,
             false,
             'ADMISSION_CONTAMINATION',
+            settledGuard.reasonCodes,
           );
           if (settledGuard.quarantine) {
             await quarantineQuery(run.queryId, settledGuard.reasonCodes).catch(error => {
@@ -3563,7 +3582,7 @@ export async function resumeOrphanedAutonomousPages(options: {
           run.runId,
           run.pagesCompleted,
           hasCursor,
-          null,
+          hasCursor ? null : 'NO_NEXT_PAGE',
         );
         if (!hasCursor) {
           await finalizeLinkedAutonomousParent(run);

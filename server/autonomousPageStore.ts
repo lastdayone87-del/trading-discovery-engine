@@ -9,7 +9,7 @@ import {
   type ContinuationDecisionV2,
   type ContinuationStreaks,
 } from './continuationPolicy';
-import { creatorDiscoveryScoreFromComponents, type QueryFunnelMetrics } from './queryPerformance';
+import { creatorDiscoveryScoreFromComponents, QUALITY_CREATOR_SCORE_THRESHOLD, type QueryFunnelMetrics } from './queryPerformance';
 
 export type AutonomousPageDecision = ContinuationDecision | ContinuationDecisionV2;
 
@@ -250,17 +250,71 @@ export async function settleAutonomousPageAdmissionDeferral(
   pageNumber: number,
   shouldContinue: boolean,
   stoppingReason: string | null,
+  reasonCodes: string[] = [],
 ): Promise<boolean> {
   const db = await getDb();
   const result = await db.query(
     `UPDATE autonomous_query_page_observations
         SET should_continue=$3,
             stopping_reason=$4,
-            deferred_reason=NULL
+            deferred_reason=NULL,
+            decision_reason_codes=CASE
+              WHEN $5::jsonb='[]'::jsonb THEN decision_reason_codes
+              ELSE COALESCE(decision_reason_codes,'[]'::jsonb)||$5::jsonb
+            END
       WHERE query_run_id=$1 AND page_number=$2 AND deferred_reason='ADMISSION'`,
-    [runId, pageNumber, shouldContinue, stoppingReason],
+    [runId, pageNumber, shouldContinue, stoppingReason, JSON.stringify(reasonCodes)],
   );
   return (result.rowCount || 0) > 0;
+}
+
+export interface AutonomousPageSettledGuardMetrics {
+  distinctCreators: number;
+  tradingConfirmed: number;
+  qualityChannels: number;
+  classificationPending: number;
+  tradingPrecision: number;
+}
+
+/**
+ * Guard metrics from the CURRENT sighting/channel projection, not the page
+ * snapshot recorded before admissions settled. The resume boundary must not
+ * stop a run using pre-settlement precision.
+ */
+export async function getAutonomousPageSettledGuardMetrics(
+  runId: string,
+  pageNumber: number,
+): Promise<AutonomousPageSettledGuardMetrics> {
+  const db = await getDb();
+  const result = await db.query(
+    `WITH page_channels AS (
+       SELECT cs.channel_id,
+              bool_or(cs.funnel_outcome='CLASSIFICATION_PENDING') AS classification_pending
+         FROM channel_sightings cs
+        WHERE cs.query_run_id=$1 AND cs.page_number=$2
+        GROUP BY cs.channel_id
+     )
+     SELECT COUNT(*)::int AS distinct_creators,
+            COUNT(*) FILTER (WHERE c.trading_status='TRADING_CONFIRMED')::int AS trading_confirmed,
+            COUNT(*) FILTER (
+              WHERE c.trading_status='TRADING_CONFIRMED'
+                AND COALESCE(c.quality_score,0)>=${QUALITY_CREATOR_SCORE_THRESHOLD}
+            )::int AS quality_channels,
+            COUNT(*) FILTER (WHERE pc.classification_pending)::int AS classification_pending
+       FROM page_channels pc
+       LEFT JOIN channels c ON c.channel_id=pc.channel_id`,
+    [runId, pageNumber],
+  );
+  const row = result.rows[0] || {};
+  const distinctCreators = Math.max(0, Number(row.distinct_creators || 0));
+  const tradingConfirmed = Math.max(0, Number(row.trading_confirmed || 0));
+  return {
+    distinctCreators,
+    tradingConfirmed,
+    qualityChannels: Math.max(0, Number(row.quality_channels || 0)),
+    classificationPending: Math.max(0, Number(row.classification_pending || 0)),
+    tradingPrecision: distinctCreators > 0 ? tradingConfirmed / distinctCreators : 0,
+  };
 }
 
 export async function getAutonomousRunMetrics(runId: string, clientOverride?: PageStoreRunner): Promise<QueryFunnelMetrics> {
