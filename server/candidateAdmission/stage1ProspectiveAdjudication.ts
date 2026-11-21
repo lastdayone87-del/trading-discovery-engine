@@ -1,6 +1,6 @@
 import { getDb } from '../db';
 import {
-  CREATOR_TYPES,
+  CONFIRMABLE_CREATOR_TYPES,
   recordEvaluationGroundTruth,
   type CreatorType
 } from '../decisionEvaluation';
@@ -120,7 +120,7 @@ export async function commitStage1ProspectiveAdjudication(input: {
 }) {
   if (input.confirmation !== STAGE1_PROSPECTIVE_ADJUDICATION_CONFIRMATION) throw new Error('EXPLICIT_CONFIRMATION_REQUIRED');
   if (input.label !== 'TRADING_CONFIRMED' && input.label !== 'NON_TRADING') throw new Error('INVALID_ADJUDICATION_LABEL');
-  if (!CREATOR_TYPES.includes(input.creatorType)) throw new Error('INVALID_CREATOR_TYPE');
+  if (!CONFIRMABLE_CREATOR_TYPES.includes(input.creatorType)) throw new Error('INVALID_CREATOR_TYPE');
   const reasonCodes = [...new Set(input.reasonCodes.map(code => code.trim()).filter(Boolean))];
   if (!reasonCodes.length) throw new Error('REASON_CODES_REQUIRED');
   if (!input.reviewer.trim()) throw new Error('REVIEWER_REQUIRED');

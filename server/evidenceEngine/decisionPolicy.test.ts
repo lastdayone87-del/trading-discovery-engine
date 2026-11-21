@@ -325,3 +325,63 @@ test('LEGACY routing restores the pre-v2 confirmation veto for the same verdict'
     else process.env.DETERMINISTIC_CLASSIFICATION_ROUTING = previous;
   }
 });
+
+const semanticLabel = (label: string, polarity: 'POSITIVE' | 'NEGATIVE' = 'NEGATIVE'): EvidenceItem => ({
+  id: `semantic-${label}`,
+  source: 'gemini_semantic',
+  polarity,
+  category: polarity === 'POSITIVE' ? 'METHODOLOGY_CONCEPT' : 'IRRELEVANT_DOMAIN',
+  fact: `Semantic ${label}`,
+  rawMatches: ['trading'],
+  confidence: 84,
+  reliability: 'MEDIUM',
+  reliabilityMultiplier: 0.65,
+  rawWeight: 26,
+  finalWeight: polarity === 'POSITIVE' ? 17 : -17,
+  provenance: {
+    provider: 'gemini_semantic',
+    type: polarity === 'POSITIVE' ? 'METHODOLOGY_CONCEPT' : 'IRRELEVANT_DOMAIN',
+    matchedTerm: label,
+    sourceRef: 'semantic',
+    fields: [{ field: 'channel_bio', sourceId: 'bio:v1', sourceFamilyId: 'bio:v1' }],
+    semantic: {
+      modelVersion: 'test', promptVersion: 'test', featureVersion: 'test', calibrationVersion: 'test',
+      taxonomyLabel: label, calibratedConfidence: 84, rawConfidence: 95, detectedLanguages: [], reasonCodes: [],
+    },
+  },
+  timestamp: '2026-01-01T00:00:00Z',
+});
+
+test('bank/non-trading institution is a terminal negative while a trading platform is not', () => {
+  const bank = evaluateUnifiedDecisionPolicy({
+    evidence: [semanticLabel('BANK_OR_NON_TRADING_INSTITUTION')],
+    collection: collection(),
+    lifecycleAction: 'REJECT',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    contentCategory: 'BANK_OR_NON_TRADING_INSTITUTION',
+  });
+  assert.equal(bank.status, 'NON_TRADING');
+  assert.ok(bank.reasonCodes.includes('HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION'));
+
+  const platform = evaluateUnifiedDecisionPolicy({
+    evidence: [semanticLabel('TRADING_PLATFORM_OR_FIRM', 'POSITIVE')],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    contentCategory: 'TRADING_PLATFORM_OR_FIRM',
+  });
+  assert.equal(platform.status, 'TRADING_CONFIRMED');
+
+  const bankCategory = evaluateUnifiedDecisionPolicy({
+    evidence: [positive('channel_bio')],
+    collection: collection(),
+    lifecycleAction: 'CONFIRM',
+    minimumPositiveWeight: 1,
+    minimumTradingScore: 1,
+    contentCategory: 'BANK_OR_NON_TRADING_INSTITUTION',
+  });
+  assert.equal(bankCategory.status, 'UNCERTAIN');
+  assert.ok(bankCategory.reasonCodes.includes('CONTENT_CATEGORY_NOT_TRADING_RELEVANT'));
+});

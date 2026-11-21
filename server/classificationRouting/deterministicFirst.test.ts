@@ -157,6 +157,19 @@ test('terminal creator-level negative can be deterministic non-trading', () => {
   assert.equal(routed.fastTrack, true);
 });
 
+test('terminal creator-level bank negative can be deterministic non-trading', () => {
+  const routed = resolveClassificationRouting(decision({
+    status: 'NON_TRADING',
+    confidenceScore: 10,
+    recognitionState: 'DECISIVE_NON_TRADING',
+    semanticPolicy: 'SKIP',
+    terminalStatus: 'SUFFICIENT',
+    policyReasons: ['HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION'],
+    providers: [semanticProvider('SUPPRESSED_BY_POLICY')],
+  }));
+  assert.equal(routed.route, 'DETERMINISTIC_NON_TRADING');
+});
+
 test('non-trading without terminal creator-level negative evidence goes to human review', () => {
   const routed = resolveClassificationRouting(decision({
     status: 'NON_TRADING',

@@ -87,7 +87,7 @@ test('provider failures are observable degradation and never become negative evi
     async collectEvidence() { throw new Error('synthetic provider outage'); }
   };
   const engine = new EvidenceBasedTradingEngine([failingProvider]);
-  const decision = await engine.evaluateChannel({ channel_name: 'Unrecognized creator', description: '', country: 'France' });
+  const decision = await engine.evaluateChannel({ channel_name: 'Unrecognized creator', description: 'Trading education', country: 'France' });
   assert.equal(decision.status, 'UNCERTAIN');
   assert.equal(decision.evidenceCollection.degraded, true);
   assert.equal(decision.evidenceCollection.providers[0].availability, 'FAILED');

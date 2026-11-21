@@ -19,7 +19,7 @@ for (const line of readFileSync(predictionsPath, 'utf8').split('\n')) {
   if (row.id !== undefined && row.prediction?.label) predictions.set(String(row.id), { label: row.prediction.label });
 }
 
-const RELEVANT = new Set(['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'MARKET_INSTITUTION', 'HYPE']);
+const RELEVANT = new Set(['ACTIVE_TRADING', 'TRADING_EDUCATION', 'INVESTING_EDUCATION', 'TRADING_PLATFORM_OR_FIRM', 'MARKET_INSTITUTION', 'HYPE']);
 const FINANCE_ADJACENT = new Set(['FINANCIAL_NEWS', 'PERSONAL_FINANCE']);
 const relevance = (label?: string) => label && RELEVANT.has(label) ? 'RELEVANT' : label && FINANCE_ADJACENT.has(label) ? 'ADJACENT' : 'UNRELATED';
 

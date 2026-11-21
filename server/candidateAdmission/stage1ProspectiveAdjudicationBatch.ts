@@ -1,4 +1,4 @@
-import { CREATOR_TYPES, type CreatorType } from '../decisionEvaluation';
+import { CONFIRMABLE_CREATOR_TYPES, type CreatorType } from '../decisionEvaluation';
 import type { Stage1AdjudicationLabel } from './stage1ProspectiveAdjudication';
 
 export const STAGE1_BATCH_ADJUDICATION_CONFIRMATION = 'COMMIT_STAGE1_PROSPECTIVE_ADJUDICATION_BATCH';
@@ -40,7 +40,7 @@ export function parseStage1BatchAdjudicationEntries(raw: string): Stage1BatchAdj
 
     if (!channel) throw new Error(`BATCH_CHANNEL_REQUIRED:${index}`);
     if (label !== 'TRADING_CONFIRMED' && label !== 'NON_TRADING') throw new Error(`BATCH_LABEL_INVALID:${index}`);
-    if (!CREATOR_TYPES.includes(creatorType)) throw new Error(`BATCH_CREATOR_TYPE_INVALID:${index}`);
+    if (!CONFIRMABLE_CREATOR_TYPES.includes(creatorType)) throw new Error(`BATCH_CREATOR_TYPE_INVALID:${index}`);
     if (!reasonCodes.length) throw new Error(`BATCH_REASON_CODES_REQUIRED:${index}`);
 
     const key = channel.toLocaleLowerCase('en-US');

@@ -477,11 +477,13 @@ export class GeminiFreeSemanticProvider implements EvidenceProvider {
     const positive = result.label === 'ACTIVE_TRADING'
       || result.label === 'TRADING_EDUCATION'
       || result.label === 'INVESTING_EDUCATION'
-      // Commercial, broker/platform, signal and promotional channels are
-      // trading/investing content when their actual material is trading.
+      // Only a trading platform/firm is trading-relevant. A bank, insurer,
+      // wealth manager, or ordinary fund is a non-trading institution.
+      || result.label === 'TRADING_PLATFORM_OR_FIRM'
       || result.label === 'MARKET_INSTITUTION'
       || result.label === 'HYPE';
-    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : positive ? 'METHODOLOGY_CONCEPT' : 'NON_TRADING_ADJACENT';
+    const nonTradingInstitution = result.label === 'BANK_OR_NON_TRADING_INSTITUTION';
+    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : (result.label === 'UNRELATED' || nonTradingInstitution) ? 'IRRELEVANT_DOMAIN' : positive ? 'METHODOLOGY_CONCEPT' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
     const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : [])] };

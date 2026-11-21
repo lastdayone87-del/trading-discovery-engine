@@ -1356,6 +1356,7 @@ async function processChannelThroughPipelineInContext(
     playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:languageInputs.detected_languages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:classificationStageForCandidate(candidate),
+    channelBioAuthoritative: classificationStageForCandidate(candidate) > 0 || candidate.admissionClassified === true,
     topic_details:candidate.channelTopics,
     // Completed Discord validation is stored evidence. Supply it to the
     // existing DiscordProvider so classification evaluates the complete

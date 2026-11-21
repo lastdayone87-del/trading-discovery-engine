@@ -225,7 +225,7 @@ test('groq availability reports missing keys and inapplicable inputs', () => {
   });
   const provider = new GroqSemanticProvider(of({}));
   assert.equal(
-    provider.availability({ ...input, search_match_context: { type: 'CHANNEL' }, enrichment_stage: 0, description: 'short' } as any).availability,
+    provider.availability({ ...input, search_match_context: { type: 'CHANNEL' }, enrichment_stage: 0, description: 'Share your videos with friends, family, and the world', video_titles: [], video_descriptions: [] } as any).availability,
     'NOT_APPLICABLE',
   );
 });

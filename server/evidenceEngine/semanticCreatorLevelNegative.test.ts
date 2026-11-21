@@ -210,3 +210,23 @@ test('the semantic creator-level helper stays safe at the boundaries', () => {
   const unattributedBio = semanticNegative('n1', { fields: [{ field: 'channel_bio' }] });
   assert.equal(hasCreatorLevelSemanticUnrelatedNegative([unattributedBio], { description: 'DAD VIBES' }), true);
 });
+
+test('transcript and pinned citations survive a boilerplate bio and invalid confidence', () => {
+  const transcript = semanticNegative('n-transcript', {
+    fields: [{ field: 'channel_bio', sourceId: 'bio-1' }, { field: 'transcript_excerpt', sourceId: 'transcript-1' }],
+  });
+  assert.equal(hasCreatorLevelSemanticUnrelatedNegative([transcript], {
+    description: 'Share your videos with friends, family, and the world',
+  }), true);
+
+  const pinned = semanticNegative('n-pinned', {
+    fields: [{ field: 'pinned_comment', sourceId: 'pinned-1' }],
+  });
+  assert.equal(hasCreatorLevelSemanticUnrelatedNegative([pinned], { description: 'DAD VIBES' }), true);
+
+  const invalidConfidence = semanticNegative('n-invalid', {
+    fields: [{ field: 'transcript_excerpt', sourceId: 'transcript-1' }],
+    calibratedConfidence: Number.NaN,
+  });
+  assert.equal(hasCreatorLevelSemanticUnrelatedNegative([invalidConfidence], { description: 'DAD VIBES' }), false);
+});

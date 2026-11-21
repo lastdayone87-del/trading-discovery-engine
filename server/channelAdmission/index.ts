@@ -36,6 +36,25 @@ function evidenceHash(evidence: AdmissionEvidence): string {
   return admissionEvidenceChecksum(evidence);
 }
 
+/**
+ * Snapshot-only audits do not acquire evidence, so they must not consume an
+ * evidence attempt or turn an incomplete snapshot into terminal expiry.
+ */
+export function nextAdmissionEvidenceAttempt(currentAttempts: number | undefined, preserved: boolean): number {
+  const current = Number(currentAttempts || 0);
+  return preserved ? current : current + 1;
+}
+
+export function admissionEvidenceExpired(
+  attempts: number,
+  preserved: boolean,
+  expiresAt: string | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (preserved) return false;
+  return attempts >= 3 || (expiresAt ? Date.parse(expiresAt) <= now : false);
+}
+
 function retryDelayMs(attempt: number): number {
   if (attempt <= 1) return 60 * 60 * 1000;
   if (attempt === 2) return 6 * 60 * 60 * 1000;
@@ -648,6 +667,8 @@ export interface VerifyAdmissionOptions {
   archiveRejectedExistingChannel?: boolean;
   /** Test/cohort seam: evaluate this evidence instead of refetching it. */
   evidenceOverride?: AdmissionEvidence;
+  /** Snapshot-only audits must not spend an evidence attempt or expire. */
+  evidenceAttemptsPreserved?: boolean;
 }
 
 export async function verifyAdmissionCandidate(
@@ -715,7 +736,7 @@ export async function verifyAdmissionCandidate(
             reasonCodes,
             evidence,
             evidenceHash: hash,
-            attempts: Number(row.attempts || 0) + 1,
+            attempts: nextAdmissionEvidenceAttempt(row.attempts, options.evidenceAttemptsPreserved === true),
             expectedStatus: row.status,
             expectedAttempts: row.attempts,
           },
@@ -764,8 +785,8 @@ export async function verifyAdmissionCandidate(
         priority: 20,
       };
     }
-    const attempts = Number(row.attempts || 0) + 1;
-    const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+    const attempts = nextAdmissionEvidenceAttempt(row.attempts, options.evidenceAttemptsPreserved === true);
+    const expired = admissionEvidenceExpired(attempts, options.evidenceAttemptsPreserved === true, row.expires_at);
     const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
     const reasonCodes = [expired ? 'MISSING_EVIDENCE_EXPIRED' : 'MISSING_EVIDENCE_RETRY', evidence.failureReason || 'EVIDENCE_INCOMPLETE'];
     if (!options.dryRun) {
@@ -863,8 +884,8 @@ export async function verifyAdmissionCandidate(
       external_links: evidence.links,
       playlists: evidence.playlists,
     })) {
-      const attempts = Number(row.attempts || 0) + 1;
-      const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+      const attempts = nextAdmissionEvidenceAttempt(row.attempts, options.evidenceAttemptsPreserved === true);
+      const expired = admissionEvidenceExpired(attempts, options.evidenceAttemptsPreserved === true, row.expires_at);
       const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
       const reasonCodes = [
         expired ? 'EVIDENCE_ACQUISITION_EXHAUSTED'
@@ -990,8 +1011,8 @@ export async function verifyAdmissionCandidate(
     const positiveCitations = tradingCitations(evidence, decision);
     let negativeCitations = unrelatedCitations(evidence, decision);
     const pending = async (reasonCodes: string[]): Promise<AdmissionVerificationResult> => {
-      const attempts = Number(row.attempts || 0) + 1;
-      const expired = attempts >= 3 || (row.expires_at ? Date.parse(row.expires_at) <= Date.now() : false);
+      const attempts = nextAdmissionEvidenceAttempt(row.attempts, options.evidenceAttemptsPreserved === true);
+      const expired = admissionEvidenceExpired(attempts, options.evidenceAttemptsPreserved === true, row.expires_at);
       const status = expired ? 'EXPIRED_MISSING_EVIDENCE' : 'WAITING_EVIDENCE';
       const codes = [
         ...reasonCodes,
@@ -1162,7 +1183,7 @@ export async function verifyAdmissionCandidate(
         evidenceHash: hash,
         judgment: effectiveJudgment,
         model: effectiveJudgment.model,
-        attempts: Number(row.attempts || 0) + 1,
+        attempts: nextAdmissionEvidenceAttempt(row.attempts, options.evidenceAttemptsPreserved === true),
         nextCheckAt: policy.hold ? new Date(Date.now() + retryDelayMs(1)).toISOString() : null,
         expiresAt: policy.hold ? (row.expires_at || new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()) : null,
         expectedStatus: row.status,

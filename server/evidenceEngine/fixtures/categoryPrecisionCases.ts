@@ -23,13 +23,13 @@ export const FALSE_POSITIVE_CASES: CategoryPrecisionCase[] = [
     name: "Tradespoon",
     description: "Tradespoon is a daily stock pick service designed by trading system expert Vlad Karpel. Tradespoon uses a proprietary quantitative trading system built upon statistical analysis and in-depth algorithms. Our daily picks include a stock pick, an option pick and an option spread pick, all of which include recommendations on when to close the traded position.",
     videoTitles: ["NVIDIA CEO Jensen Huang RESIGNS — Is the AI Stock Bubble About to BURST?", "After Today's CPI: Can You Trust This Market Rebound?", "Nasdaq CRASHES 5.5% — Is This Rebound a Trap?", "Election Day MARKET ALERT: Wall Street Braces for the Next Big Move!", "NASDAQ PLUNGES: Amazon, Google &amp; Intel Spark AI Selloff | LIVE", "FOMC TODAY: The Fed's Biggest Market Risk Isn't What You Think | LIVE", "Fed Decision Tomorrow: Breakout or Bull Trap? Watch These 4 Signals", "Dow Plunges 500+ as Oil Surges — Is Wall Street in Trouble?", "AI Stocks Under Pressure, Oil Surges | Vlad Trades the Market Open LIVE", "They BEAT Earnings… So Why Did the Stock CRASH?! (How to Trade Earnings Season)"],
-    expected: "MARKET_INSTITUTION",
+    expected: "TRADING_PLATFORM_OR_FIRM",
   },
   {
     name: "Emerge Profit",
     description: "⚠️ Aviso: Emerge Profit no es un bróker ni asesor financiero. Todas nuestras cuentas son simuladas (demo); los pagos son recompensas por cumplir las reglas de nuestros programas, no rendimientos de inversión. Operar futuros, divisas y CFD con capital real implica un riesgo sustancial de pérdida y no es apto para todos los inversores. Los resultados mostrados no garantizan resultados futuros. Contenido educativo, no asesoramiento financiero.",
     videoTitles: ["Divergencia RSI: la señal de que la caída pierde fuerza (y cómo confirmarla)  #trading", "Estrella de la Mañana: la vela que avisa que la caída puede terminar 🌅 #shorts  #tradingdesdecero", "CONFLUENCIAS CON TENDENCIA 🚨 Cómo Encontrar Entradas de Mayor Calidad en Trading  #tradingdesdecero", "¿QUÉ ES EL PERFIL DE VOLUMEN CON RANGO?  Aprende a Utilizarlo  #tradingdesdecero #trader #trading", "¿QUÉ ES UN ROMPIMIENTO CON CUERPO? 📊 La Clave de las Velas #trading #trader #tradingdesdecero", "DIFERENCIAS ENTRE NETTING Y HEDGING  #tradingdesdecero #trader #trading #tradingview", "ANÁLISIS MACRO EN TEMPORALIDADES BAJAS  #forex #trader #futuros", "¿QUÉ ES UN PLAN DE TRADING? 📊 Todo Trader Debe Tener Uno  #trading #tradingdesdecero #trader", "¿CÓMO ELIMINAR EL RUIDO DEL MERCADO? 📊 Aprende a Filtrar Señales  #trading #tradingdesdecero #trader", "LOS SÍMBOLOS MÁS VOLÁTILES EN TRADING  #tradingdesdecero #trading #trader"],
-    expected: "MARKET_INSTITUTION",
+    expected: "TRADING_PLATFORM_OR_FIRM",
   },
   {
     name: "Adam Gold Signals",
@@ -59,13 +59,13 @@ export const FALSE_POSITIVE_CASES: CategoryPrecisionCase[] = [
     name: "12TradePro Com",
     description: "auto trader ,stock market ,finance ,auto trader ,strategy,futures,day trading,algorithms,scalp,trading,autotrade,ninjatrader,online trading,swing trading,algorithmic,strategic day trading,trading software,trading online,\ne-mini s&amp;p 500,autotrader,automated trader,ninjatrader,autotrader signal trading,best automated trading systems,automated swing trading,auto trading software,autotrader trading software,online trading,e-mini s&amp;p 500,\ntrading software,best automated trading systems,scalp trading,futures,trading strategies,strategic day trading,gold futures,investment,\n\nninjatrader,forex,day trading,trading with signal,forex,trading,finance,investment,E-mini S&amp;P 500 Futures,Crude Oil Futures,\nFutures Russel,E-Mini Nasdaq,E-mini Dow,DAX Futures FDAX,Gold Futures,Forex Trading.stock market,finance,reversel trading,NYSE,OPTIONS,EURO,DOLLAR,NinjaTrader,FXCM,tastytrade,\nninjatraderbrokerage,kinetick,",
     videoTitles: ["Automated pro trading .8223", "12TradePro Com Live Stream", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/", "100% Automated Trading Ninja Trader, BEST PRO TRADING, BPT Autotrader, http://www.12tradepro.com/"],
-    expected: "MARKET_INSTITUTION",
+    expected: "TRADING_PLATFORM_OR_FIRM",
   },
   {
     name: "Fx Crack Robo House",
     description: "Educational Forex content | Trading systems &amp; EA analysis\nNo profit guarantees • No financial advice\nTrade responsibly &amp; manage risk\n",
     videoTitles: ["SCRAPER GOLD EA ⚡ | 4 Live Signals &amp; Gold Trading", "CLASSIC BREAKOUT SURFER MT5 v1.3 ⚡ | Gold Breakout Trading EA", "💠 KRIVIX GOLD MT5 V2.1 GOLD TRADING EXPERT ADVISOR | XAUUSD🚀", "🔥 DSTR NOVAA BOT MT5 👑", "STEEV GTS EA MT5 – AUTOMATED TRADING EXPERT ADVISOR", "Yuvi FX Trader Nexora MT5 EA | XAUUSD Gold System", "JANUS ZONE MT5 V1.0 💠 | Gold Trading Expert Advisor", "⚡ PROTOTYPE AI MT5 – A New Way to Trade Gold!", "OSOK GOLD KILLER V3.1 | $19.5K Reported Trading Result | MT5 GOLD EA", "🚀 GOLD BEAVER V5.57 REVIEW | MT5 Gold Expert Advisor | Live Signal &amp; Unlimited Accounts"],
-    expected: "MARKET_INSTITUTION",
+    expected: "TRADING_PLATFORM_OR_FIRM",
   },
   {
     name: "shashwat01 ",
@@ -77,13 +77,13 @@ export const FALSE_POSITIVE_CASES: CategoryPrecisionCase[] = [
     name: "Quantiva - Trading infrastructure in real time.",
     description: "En QuantivaAI una IA narra el mercado en directo, minuto a minuto: quién compra, quién vende, dónde están los muros y qué hacen las órdenes grandes en Bitcoin, Oro y Nasdaq.\n\nCada ronda, 10 IAs (ChatGPT, Gemini, Claude, Grok, DeepSeek…) apuestan si el precio sube o baja, y tú juegas contra ellas desde el chat. ¿Quién acierta más, la gente o las máquinas?\n\n📊 Panel completo con todos los datos: quantiva.live\nContenido informativo y educativo. Las IAs juegan con dinero ficticio. No es recomendación de inversión.\n",
     videoTitles: ["🔴 Oro, Nasdaq y Bitcoin · Bitcoin: los muros del libro · Análisis en profundidad con IA | QuantivaAI", "El 71 % del volumen del Nasdaq, en solo 410 puntos 🚨", "🔴 Oro, Nasdaq y Bitcoin · Oro se mueve: qué hay detrás · Análisis en profundidad con IA | QuantivaAI", "Vi 105 contratos absorbidos en 27.430 y el precio hizo esto 📈", "Las IA votaron: nueve de diez dicen que el bitcoin BAJA 🤖", "🔴 Oro, Nasdaq y Bitcoin · Bitcoin: los muros del libro · Análisis en profundidad con IA | QuantivaAI", "🔴 Oro, Nasdaq y Bitcoin · Bitcoin: los muros del libro · Análisis en profundidad con IA | QuantivaAI", "Bitcoin en directo HOY 🔴 La IA te dice qué hacen los grandes", "🔴 Oro, Nasdaq y Bitcoin · Bitcoin: los muros del libro · Análisis en profundidad con IA | QuantivaAI", "Bitcoin en directo HOY 🔴 La IA te dice qué hacen los grandes"],
-    expected: "MARKET_INSTITUTION",
+    expected: "TRADING_PLATFORM_OR_FIRM",
   },
   {
     name: "BeursInside",
     description: "BeursInside is er speciaal voor de nieuwe belegger met live en online events, masterclasses, snelcursussen, video content en meer. Hier komen de ervaringen van de finfluencers samen met de expertise van de beleggingsprofessionals!",
     videoTitles: ["Crypto Congres 2026: wat is er nieuw? | BeursInside", "Crypto Congres 2026 wordt onderdeel van de BeleggersFair | BeursInside", "3 crypto tips van Mahler Capital winnaar BeursInside Crypto Award | BeursInside", "AI &amp; Memecoins: De Gouden Mix volgens Sjuul Föllings | BeursInside #beursinside #crypto #memecoins", "Trump's Bitcoin-reserve: Wat betekent dit voor beleggers? | Crypto Congres 17.04.2025 RAI Amsterdam", "Bitcoin, Ethereum &amp; Solana: Jouw Beste Crypto-Portfolio? | BeursInside", "🎥 Crypto Congres 2025: Een dag vol inspiratie en kennis! | BeursInside", "🚀 Elroy Heisterkamp’s gouden crypto tip | BeursInside 2024", "Janneke Willemse’s Gouden Tip BeursInside 2024 | BeursInside", "🌍 Europa blijft achter op de VS – Corné van Zeijl legt uit waarom | BeursInside"],
-    expected: "MARKET_INSTITUTION",
+    expected: "TRADING_PLATFORM_OR_FIRM",
   },
   {
     name: "CryptoDexWorld",

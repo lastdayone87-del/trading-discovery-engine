@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { buildAdmissionConfirmedClassification, normalizeAdmissionTradingConfidence } from './confirmedTrading';
 import { normalizeTradingFocus } from './confidence';
 import { normalizeSemanticJudgment } from './policy';
-import { isPreCatalogProviderDeferredDecision, parseAdmissionReviewAction } from './index';
+import { admissionEvidenceExpired, isPreCatalogProviderDeferredDecision, nextAdmissionEvidenceAttempt, parseAdmissionReviewAction } from './index';
 import { classificationStageForCandidate } from '../youtube';
 import { admissionShortcutEligible } from '../ingestionPipeline';
 
@@ -272,6 +272,7 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
   assert.doesNotMatch(verify, /ProviderAdmissionJudge|judge\.judge\(evidence/);
   assert.doesNotMatch(verify, /decision: 'ADMIT_AMBIGUOUS'/);
   assert.match(verify, /EVIDENCE_ACQUISITION_REQUIRED/);
+
   assert.match(index, /admissionStatus === 'ADMITTED_AMBIGUOUS' && decisionSource === 'DETERMINISTIC'/);
 });
 
@@ -403,4 +404,12 @@ test('semantic provider outages become provider-deferred instead of missing evid
     ...base,
     evidenceCollection: { providers: [{ provider: 'gemini_semantic', availability: 'UNAVAILABLE', outcome: 'UNAVAILABLE_CONFIGURATION' }] },
   }), true);
+});
+
+test('snapshot-only audits preserve attempts and never expire', () => {
+  assert.equal(nextAdmissionEvidenceAttempt(2, true), 2);
+  assert.equal(nextAdmissionEvidenceAttempt(2, false), 3);
+  assert.equal(admissionEvidenceExpired(3, true, null), false);
+  assert.equal(admissionEvidenceExpired(3, false, null), true);
+  assert.equal(admissionEvidenceExpired(1, false, '2000-01-01T00:00:00.000Z'), true);
 });
