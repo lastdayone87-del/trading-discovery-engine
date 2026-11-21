@@ -121,7 +121,7 @@ test('channel enrichment keeps metadata when the uploads playlist is absent', ()
     '/** One-unit basic metadata hydration used when country or subscriber evidence is missing. */',
   );
   assert.match(block, /isYouTubeUploadsPlaylistUnavailable\(error\)/);
-  assert.match(block, /uploadsCheckpoint = \{ items: \[\] \}/);
+  assert.match(block, /uploadsCheckpoint = await innertubeSample\(\)/);
 });
 
 test('every official key loop stops rotating on permanent input', () => {

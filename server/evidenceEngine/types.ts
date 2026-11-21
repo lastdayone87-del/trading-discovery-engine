@@ -155,6 +155,8 @@ export interface RawChannelInput {
   videoDescriptionsAuthoritative?: boolean;
   activity_metadata?: { latest_upload_at?: string; uploads_last_30_days?: number; uploads_last_90_days?: number; uploads_last_365_days?: number; activity_band?: string; activity_score?: number; observed_at?: string };
   enrichment_stage?: number;
+  /** Platform topicDetails metadata. Routing/context only; not creator-owned. */
+  topic_details?: string[];
   /** Immutable provider input projection, populated by the engine. */
   evidence_corpus?: import('./canonicalEvidencePlane').CanonicalEvidenceDocument[];
   /** Retrieval provenance is persisted separately and never masquerades as channel About evidence. */

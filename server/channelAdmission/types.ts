@@ -117,6 +117,10 @@ export interface AdmissionEvidence {
   declaredLanguage?: string;
   subscriberCount?: string;
   videos: AdmissionVideo[];
+  /** Creator playlists; stage-2 acquisition only, never a substitute for videos. */
+  playlists?: Array<{ id?: string; name: string; description?: string }>;
+  /** Platform topic metadata (topicDetails); not creator-owned evidence. */
+  topics?: string[];
   matchedDocument?: Record<string, unknown>;
   relationshipProvenance?: Record<string, unknown>;
   query?: string;
@@ -127,6 +131,10 @@ export interface AdmissionEvidence {
   source: DiscoverySource;
   targetCountry: string;
   evidenceCoverage: 'COMPLETE' | 'PARTIAL';
+  /** Whether the evidence contains an authoritative video sample. */
+  evidenceSample?: 'VIDEO_SAMPLE' | 'METADATA_ONLY' | 'NONE';
+  /** Acquisition stage that produced this snapshot. */
+  evidenceStage?: 1 | 2 | 3;
   fetchedAt: string;
   failureReason?: string;
 }
