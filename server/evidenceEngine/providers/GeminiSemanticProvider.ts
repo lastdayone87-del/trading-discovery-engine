@@ -320,7 +320,7 @@ export function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean 
   // evidence. No arbitrary character threshold: a short real bio counts.
   const retrievalOnly = Boolean(input.search_match_context) && (input.enrichment_stage || 0) === 0;
   return hasMeaningfulCreatorFields(retrievalOnly
-    ? { ...input, video_titles: [], video_descriptions: [] }
+    ? { ...input, video_titles: [], video_descriptions: [], videos: [] }
     : input);
 }
 

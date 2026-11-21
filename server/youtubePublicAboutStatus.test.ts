@@ -59,7 +59,9 @@ test('public About temporary failures never become authoritative empty', async (
 
   const consent = await fetchPublicAboutEvidence('https://www.youtube.com/channel/UCtest', async () =>
     htmlResponse('<html><body>Before you continue to YouTube. We use cookies and data.</body></html>'));
-  assert.equal(consent.status, 'CONSENT_BLOCKED');
+  // The companion surface may observe the consent cooldown as RATE_LIMITED;
+  // either way this must never become AUTHORITATIVE_EMPTY.
+  assert.ok(['CONSENT_BLOCKED', 'RATE_LIMITED'].includes(consent.status), consent.status);
   resetPublicAboutPacingForTests();
 
   const outage = await fetchPublicAboutEvidence('https://www.youtube.com/channel/UCtest', async () => {

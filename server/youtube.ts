@@ -1877,7 +1877,8 @@ export async function fetchYouTubeChannelEnrichment(
       let extractedLinks = description.match(/https?:\/\/[^\s)\]}]+/g) || [];
       // Public About is creator-owned fallback, not a replacement for the
       // Data API. A temporary About failure leaves the API evidence intact.
-      if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks, hasVideoSample: recentItems.length > 0 })) {
+      const hasUsableRecentVideo = recentItems.some((item: any) => String(item.snippet?.title || '').trim() || String(item.snippet?.description || '').trim());
+      if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks, hasVideoSample: hasUsableRecentVideo })) {
         // Keyless channel-browse About is attempted before the public HTML
         // page. Both results are cached outside the key loop so a failover
         // cannot repeat unofficial fetches.
@@ -1893,7 +1894,7 @@ export async function fetchYouTubeChannelEnrichment(
         }
         // Recheck after merging InnerTube: if it supplied the missing bio
         // and links, do not spend two more HTML requests.
-        if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks, hasVideoSample: recentItems.length > 0 })) {
+        if (shouldAttemptAdmissionPublicAbout({ description, links: extractedLinks, hasVideoSample: hasUsableRecentVideo })) {
           const publicAbout = await loadPublicAbout();
           if (publicAbout?.status === 'AVAILABLE' && publicAbout.about) {
             if (!hasMeaningfulCreatorText(description) && hasMeaningfulCreatorText(publicAbout.about.bio)) {
@@ -1925,7 +1926,6 @@ export async function fetchYouTubeChannelEnrichment(
         && playlists.length === 0
         && PLAYLIST_DISCOVERY_SIGNAL.test(`${description} ${fallback.channelName || ''}`);
       if(playlistDiscoveryJustified){
-        const ids=videos.map(video=>video.id).filter(Boolean).join(',');
         if(!playlistsCheckpoint){
           if(attempt>0)await topUp(100);
           const playlistResponse=await youtubeFetch(buildYouTubeApiUrl('search',apiKey,{part:'snippet',channelId,type:'playlist',maxResults:10}),'enrichment-playlists',100,attempt+1,acquisition,priority,apiKey);
@@ -1935,6 +1935,12 @@ export async function fetchYouTubeChannelEnrichment(
         }
         const playlistPayload=playlistsCheckpoint;
         playlists=playlistPayload.items.map((item:any)=>({id:item.id?.playlistId,name:String(item.snippet?.title||''),description:String(item.snippet?.description||'')})).filter((item:any)=>item.name);
+      }
+      // The 1-unit videos.list follow-up is independent of the 100-unit
+      // playlist search: keep hydrating descriptions/languages whenever a
+      // stage-2 pass already has a video sample.
+      if(stage>=2){
+        const ids=videos.map(video=>video.id).filter(Boolean).join(',');
         if(ids){
           if(!videoDetailsCheckpoint){
             try {

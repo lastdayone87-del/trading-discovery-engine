@@ -70,6 +70,8 @@ test('short real bio is creator context even in retrieval-only stage zero', () =
   assert.equal(hasCreatorLevelSemanticContext({
     ...input,
     description: 'Share your videos with friends, family, and the world',
+    videos: [{ title: 'retrieval-selected match' }],
+    video_titles: ['retrieval-selected match'],
   }), false);
 });
 

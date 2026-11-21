@@ -149,6 +149,13 @@ export async function fetchPublicYouTubePageDetailed(
 ): Promise<PublicAboutPageFetch> {
   if (depth > 2) return { status: 'TEMPORARY_FAILURE', reason: 'REDIRECT_DEPTH' };
   await pacePublicAboutRequest();
+  // Check again after pacing: a companion request may have hit 429/consent
+  // while this request was waiting, and legacy callers use this fetcher
+  // directly without the outer admission cooldown guard.
+  const cooldownRemaining = publicAboutCooldownRemainingMs();
+  if (cooldownRemaining > 0) {
+    return { status: 'RATE_LIMITED', reason: `COOLDOWN_${cooldownRemaining}MS` };
+  }
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10_000);
   try {

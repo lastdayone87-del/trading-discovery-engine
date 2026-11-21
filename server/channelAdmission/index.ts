@@ -629,9 +629,10 @@ export function isPreCatalogProviderDeferredDecision(decision: VerificationDecis
   const reports = decision.evidenceCollection?.providers || [];
   const semanticReports = reports.filter(provider => /semantic/.test(String(provider.provider)));
   const semanticServed = semanticReports.some(provider => provider.outcome === 'EXECUTED_WITH_EVIDENCE');
-  const semanticUnavailable = semanticReports.length > 0 && semanticReports.every(provider =>
+  const semanticAttempted = semanticReports.filter(provider =>
+    !['SUPPRESSED_BY_POLICY', 'NOT_APPLICABLE'].includes(String(provider.outcome)));
+  const semanticUnavailable = semanticAttempted.length > 0 && semanticAttempted.every(provider =>
     provider.availability === 'FAILED'
-    || provider.availability === 'UNAVAILABLE'
     || /^FAILED_/.test(String(provider.outcome))
     || provider.outcome === 'UNAVAILABLE_CONFIGURATION');
   const precisionDeferred = (decision.decisionPolicy?.reasonCodes || []).some(code =>

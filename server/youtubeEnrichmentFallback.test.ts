@@ -57,7 +57,7 @@ test('enrichment wires topicDetails, Innertube uploads fallback, and public Abou
   assert.match(source, /fetchChannelAboutViaInnertube\(channelId\)/);
   assert.match(source, /channelTopics: parseChannelTopicDetails\(channel\)/);
   assert.match(source, /publicAboutCheckpoint !== undefined/);
-  assert.match(source, /shouldAttemptAdmissionPublicAbout\(\{ description, links: extractedLinks, hasVideoSample: recentItems\.length > 0 \}\)/);
+  assert.match(source, /shouldAttemptAdmissionPublicAbout\(\{ description, links: extractedLinks, hasVideoSample: hasUsableRecentVideo \}\)/);
   assert.match(source, /hasMeaningfulCreatorText\(description\)/);
   assert.match(source, /evidenceAcquisitionFailure: evidenceAcquisitionFailure \|\| videoSampleFailure/);
   assert.match(source, /playlistDiscoveryJustified/);

@@ -12,7 +12,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { Innertube } from 'youtubei.js';
-import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations } from '../server/channelAdmission/deterministic';
+import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations, categoryFallbackCitations } from '../server/channelAdmission/deterministic';
 import { classifyTradingRelevanceDetailed } from '../server/tradingRelevanceClassifier';
 import { isPreCatalogProviderDeferredDecision } from '../server/channelAdmission';
 import type { AdmissionEvidence } from '../server/channelAdmission/types';
@@ -230,7 +230,6 @@ function semanticConfigured(): boolean {
   // configured fallback chain remains available.
   if (requested !== 'auto') {
     process.env.SEMANTIC_PROVIDER = requested;
-    delete process.env.SEMANTIC_PROVIDER_FORCE_GEMINI;
   }
   return ((requested === 'auto' || requested === 'gemini') && Boolean(geminiDefaultClient()))
     || ((requested === 'auto' || requested === 'gemini-free') && Boolean(geminiFreeDefaultClient()))
@@ -248,7 +247,10 @@ function finalFromUnified(evidence: AdmissionEvidence, decision: Awaited<ReturnT
     };
   }
   const positive = tradingCitations(evidence, decision);
-  const negative = unrelatedCitations(evidence, decision);
+  let negative = unrelatedCitations(evidence, decision);
+  if (decision.status === 'NON_TRADING' && negative.length === 0) {
+    negative = categoryFallbackCitations(evidence);
+  }
   if (decision.status === 'TRADING_CONFIRMED' && positive.length > 0) {
     return {
       source: 'SEMANTIC',
@@ -263,11 +265,16 @@ function finalFromUnified(evidence: AdmissionEvidence, decision: Awaited<ReturnT
     };
   }
   if (decision.status === 'NON_TRADING' && negative.length > 0) {
+    const taxonomyLabel = String(decision.geminiSemanticSummary?.taxonomyLabel || decision.category || '');
+    const financeAdjacent = ['FINANCIAL_NEWS', 'PERSONAL_FINANCE'].includes(taxonomyLabel);
     return {
       source: 'SEMANTIC',
-      decision: 'REJECT_UNRELATED',
+      decision: financeAdjacent ? 'REJECT_NON_TRADING' : 'REJECT_UNRELATED',
       status: 'REJECTED_UNRELATED',
-      reasonCodes: ['PRE_CATALOG_NON_TRADING_CONFIRMED', ...(decision.decisionPolicy?.reasonCodes || [])],
+      reasonCodes: [
+        financeAdjacent ? 'PRE_CATALOG_FINANCE_ADJACENT_NON_TRADING' : 'PRE_CATALOG_NON_TRADING_CONFIRMED',
+        ...(decision.decisionPolicy?.reasonCodes || []),
+      ],
       admitted: false, rejected: true, review: false, ambiguous: false,
       citationsValid: true,
       citations: negative,
