@@ -753,6 +753,7 @@ export async function fetchChannelAboutViaInnertube(
       latencyMs: Date.now() - started,
       actualCost: 0,
       occurredAt: new Date().toISOString(),
+      errorClass: 'RATE_LIMIT' as const,
       requestMetadata: { ...base.requestMetadata, errorClass: 'COOLDOWN' },
     }).catch(() => undefined);
     return { status: 'RATE_LIMITED', reason: `COOLDOWN_${remainingMs}MS` };
@@ -776,6 +777,7 @@ export async function fetchChannelAboutViaInnertube(
       await emit({
         ...base, status: 'TRANSIENT_ERROR' as const, latencyMs: Date.now() - started,
         actualCost: 0, occurredAt: new Date().toISOString(),
+        errorClass: 'TRANSIENT' as const,
         requestMetadata: { ...base.requestMetadata, errorClass: 'CHANNEL_UNAVAILABLE' },
       }).catch(() => undefined);
       return { status: 'TEMPORARY_FAILURE', reason: 'INNERTUBE_CHANNEL_UNAVAILABLE' };
@@ -823,6 +825,7 @@ export async function fetchChannelAboutViaInnertube(
       await emit({
         ...base, status: 'RATE_LIMITED', latencyMs: Date.now() - started,
         actualCost: 0, occurredAt: new Date().toISOString(),
+        errorClass: 'RATE_LIMIT' as const,
         requestMetadata: { ...base.requestMetadata, errorClass: 'RATE_LIMIT' },
       }).catch(() => undefined);
       return { status: 'RATE_LIMITED', reason: typed.message };
@@ -831,6 +834,7 @@ export async function fetchChannelAboutViaInnertube(
       await emit({
         ...base, status: 'TRANSIENT_ERROR' as const, latencyMs: Date.now() - started,
         actualCost: 0, occurredAt: new Date().toISOString(),
+        errorClass: 'TIMEOUT' as const,
         requestMetadata: { ...base.requestMetadata, errorClass: 'TIMEOUT' },
       }).catch(() => undefined);
       return { status: 'TEMPORARY_FAILURE', reason: typed.message };
@@ -841,6 +845,7 @@ export async function fetchChannelAboutViaInnertube(
       latencyMs: Date.now() - started,
       actualCost: 0,
       occurredAt: new Date().toISOString(),
+      errorClass: 'TRANSIENT' as const,
       requestMetadata: { ...base.requestMetadata, errorClass: String(typed.code || 'UNKNOWN') },
     }).catch(() => undefined);
     return { status: /not.?found|404/i.test(typed.message) ? 'NOT_FOUND' : 'TEMPORARY_FAILURE', reason: typed.message };

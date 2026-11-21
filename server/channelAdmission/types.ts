@@ -131,7 +131,7 @@ export interface AdmissionEvidence {
   source: DiscoverySource;
   targetCountry: string;
   evidenceCoverage: 'COMPLETE' | 'PARTIAL';
-  /** Whether the evidence contains an authoritative video sample. */
+  /** Which creator-owned sample kind was acquired (video, playlist, metadata only, or none). */
   evidenceSample?: 'VIDEO_SAMPLE' | 'PLAYLIST_SAMPLE' | 'METADATA_ONLY' | 'NONE';
   /** Acquisition stage that produced this snapshot. */
   evidenceStage?: 1 | 2 | 3;

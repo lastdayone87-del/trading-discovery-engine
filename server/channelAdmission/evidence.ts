@@ -58,12 +58,15 @@ export function selectKeylessFallbackEvidence(input: {
   innertubeBio?: string;
   aboutLinks?: string[];
   innertubeLinks?: string[];
-}): { description: string; addedLinks: string[]; usable: boolean } {
+  aboutSubscriberCount?: string;
+  innertubeSubscriberCount?: string;
+}): { description: string; addedLinks: string[]; subscriberCount?: string; usable: boolean } {
   const description = [input.aboutBio, input.innertubeBio]
     .map(value => String(value || '').trim())
     .find(value => hasMeaningfulCreatorText(value)) || '';
   const addedLinks = uniqueLinks([...(input.aboutLinks || []), ...(input.innertubeLinks || [])]);
-  return { description, addedLinks, usable: hasMeaningfulCreatorText(description) || addedLinks.length > 0 };
+  const subscriberCount = String(input.aboutSubscriberCount || input.innertubeSubscriberCount || '').trim() || undefined;
+  return { description, addedLinks, subscriberCount, usable: hasMeaningfulCreatorText(description) || addedLinks.length > 0 };
 }
 
 export interface AdmissionCoverageAssessment {
@@ -218,12 +221,15 @@ export async function fetchAdmissionEvidence(input: {
         innertubeBio: innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.description : undefined,
         aboutLinks: about?.status === 'AVAILABLE' ? about.about?.channelLinks : undefined,
         innertubeLinks: innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.links : undefined,
+        aboutSubscriberCount: about?.status === 'AVAILABLE' ? about.about?.subscriberCountText : undefined,
+        innertubeSubscriberCount: innertubeAbout?.status === 'AVAILABLE' ? innertubeAbout.subscriberCount : undefined,
       });
       if (fallback.usable) {
         return {
           ...base,
           description: fallback.description,
           links: uniqueLinks([...base.links, ...fallback.addedLinks]),
+          subscriberCount: fallback.subscriberCount || base.subscriberCount,
           evidenceCoverage: 'COMPLETE',
           evidenceSample: 'METADATA_ONLY',
         };

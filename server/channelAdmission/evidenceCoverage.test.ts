@@ -73,8 +73,10 @@ test('keyless outage fallback accepts only recovered creator evidence', () => {
   const bio = selectKeylessFallbackEvidence({
     innertubeBio: 'NQ futures trader. Live execution and risk management.',
     innertubeLinks: ['https://example.com/trader'],
+    innertubeSubscriberCount: '12.3K subscribers',
   });
   assert.equal(bio.usable, true);
   assert.match(bio.description, /NQ futures trader/);
   assert.deepEqual(bio.addedLinks, ['https://example.com/trader']);
+  assert.equal(bio.subscriberCount, '12.3K subscribers');
 });
