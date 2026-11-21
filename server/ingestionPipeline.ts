@@ -1352,6 +1352,7 @@ async function processChannelThroughPipelineInContext(
     playlists:candidate.playlists,
     transcript_excerpts:candidate.transcriptExcerpts,detected_languages:languageInputs.detected_languages,visual_evidence:candidate.visualEvidence,
     pinned_comment:candidate.pinnedComment,enrichment_stage:classificationStageForCandidate(candidate),
+    topic_details:candidate.channelTopics,
     // Completed Discord validation is stored evidence. Supply it to the
     // existing DiscordProvider so classification evaluates the complete
     // evidence set; the provider/policy still decides whether it is enough.
@@ -1559,6 +1560,15 @@ async function processChannelThroughPipelineInContext(
         candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
         evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
         .catch(error=>console.warn(`[CandidateAdmission] post-enrichment withholding write failed for ${candidate.channelId}:`,error instanceof Error?error.message:error));
+      // Missing or insufficient evidence is an evidence-acquisition outcome,
+      // not human review debt. Only a sufficient-evidence ambiguity may
+      // materialize NEEDS_REVIEW; otherwise leave the row machine-owned and
+      // retryable for a future discovery.
+      if (productionClassification.decision.evidenceCollection.sufficiency !== 'SUFFICIENT') {
+        await projectBlockedEnrichmentScanStatus(candidate.channelId,'FAILED',now,options?.jobId).catch(() => undefined);
+        const evidenceUnavailable = (await getChannelById(candidate.channelId)) || withheldChannel;
+        return {channelId:candidate.channelId,channelName:candidate.channelName,isNew:!existing,wasKnown:!!existing,persisted:true,countryStatus:countryVal.status,tradingStatus:evidenceUnavailable.trading_status,discordStatus:evidenceUnavailable.discord_status,discordInvite:evidenceUnavailable.discord_invite??null,channelRecord:evidenceUnavailable};
+      }
       // One authoritative exhaustion path: create a review row and let the
       // review trigger project NEEDS_REVIEW. This replaces the previous race
       // between a direct NEEDS_REVIEW write and the eligibility reconciler.

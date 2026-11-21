@@ -18,6 +18,7 @@ import { assessRecognitionState } from './recognitionState';
 import { hasCreatorLevelSemanticUnrelatedNegative } from './negativeEvidenceRole';
 import type { ContextualCompositionReport } from './contextualComposition';
 import type { RecognitionAssessment } from './recognitionState';
+import { hasMeaningfulCreatorFields } from './creatorText';
 
 /**
  * Parse a positive finite millisecond budget. Non-numeric, zero/negative and
@@ -341,11 +342,11 @@ export class EvidenceBasedTradingEngine {
     const preliminaryEvidence = deterministicResults.flatMap(result => result.items);
     const preliminaryCollection = buildCollection(deterministicResults, preliminaryEvidence);
     const preliminaryStages = evaluateClassificationStages(input, preliminaryEvidence, preliminaryCollection, composition);
-    const hasCreatorContext = Boolean(
-      input.description?.trim() || input.video_titles?.length || input.video_descriptions?.length
-      || input.external_links?.length || input.playlists?.length || input.transcript_excerpts?.length
-      || input.pinned_comment?.trim() || input.discord_invite || input.activity_metadata || input.visual_evidence?.length
-    );
+    // Creator context means actual creator-owned material. Activity metadata,
+    // country, language hints, subscriber counts, the channel title, Discord
+    // invites and search-match context are retrieval/platform facts and must
+    // never make an otherwise empty channel eligible for semantic judgment.
+    const hasCreatorContext = hasMeaningfulCreatorFields(input);
     const preliminaryRecognition = assessRecognitionState({
       composition,
       evidence: preliminaryEvidence,

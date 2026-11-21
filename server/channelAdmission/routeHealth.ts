@@ -22,11 +22,12 @@ export function judgeRoutePoolHealthy(
 }
 
 /**
- * Preflight for the semantic-admission judge. Deterministic admission does not
- * need this check; ambiguous candidates call it before reserving model budget
- * so a cooling/unconfigured provider pool defers without a wasted call.
+ * Preflight for the unified pre-catalog semantic judge (the EvidenceEngine
+ * chain, not the retired admission-specific judge). Deterministic admission
+ * does not need this check; ambiguous candidates use the same provider pool
+ * as classification, so a cooling/unconfigured pool defers without a call.
  */
-export async function admissionSemanticRouteAvailable(): Promise<boolean> {
+export async function preCatalogSemanticRouteAvailable(): Promise<boolean> {
   const geminiRoutes = configuredGeminiRoutes();
   const groqRoutes = configuredGroqRoutes();
   if (geminiRoutes.length === 0 && groqRoutes.length === 0) return false;
@@ -46,3 +47,6 @@ export async function admissionSemanticRouteAvailable(): Promise<boolean> {
     { gemini: geminiCooling, groq: groqCooling },
   );
 }
+
+/** @deprecated Use preCatalogSemanticRouteAvailable. Kept for older callers. */
+export const admissionSemanticRouteAvailable = preCatalogSemanticRouteAvailable;

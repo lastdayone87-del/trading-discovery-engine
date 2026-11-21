@@ -48,7 +48,7 @@ export function isFinanceAdjacentWithoutActiveTrading(text: string): boolean {
   return FINANCE_ADJACENT_EVIDENCE.test(value) && !ACTIVE_TRADING_EVIDENCE.test(value);
 }
 
-function evidenceToInput(evidence: AdmissionEvidence): RawChannelInput {
+export function evidenceToInput(evidence: AdmissionEvidence): RawChannelInput {
   return {
     channel_id: evidence.channelId,
     channel_name: evidence.channelName,
@@ -65,10 +65,12 @@ function evidenceToInput(evidence: AdmissionEvidence): RawChannelInput {
     video_titles: evidence.videos.map(video => video.title),
     video_descriptions: evidence.videos.map(video => video.description),
     videoDescriptionsAuthoritative: true,
+    playlists: evidence.playlists,
     detected_languages: evidence.declaredLanguage
       ? [{ language: evidence.declaredLanguage }]
       : undefined,
-    enrichment_stage: 1,
+    enrichment_stage: evidence.evidenceStage || 1,
+    topic_details: evidence.topics,
   };
 }
 
@@ -109,7 +111,7 @@ function citationFromEvidenceItem(
   item: VerificationDecision['positiveEvidence'][number],
 ): SemanticCitation | null {
   const terms = citationTerms(String(item.provenance?.matchedTerm || ''));
-  if (!terms.length) return null;
+  if (!terms.length && !item.provenance?.semantic) return null;
   for (const fieldRef of item.provenance?.fields || []) {
     if (fieldRef.field === 'external_link_domain' || fieldRef.field === 'external_link_label') {
       for (const link of evidence.links) {
@@ -130,11 +132,20 @@ function citationFromEvidenceItem(
           : fieldRef.field as SemanticCitation['field'];
       return { field, index: fieldRef.index, quote, supports: 'TRADING' };
     }
+    // A governed semantic verdict cites fields directly; its concepts are
+    // explanatory, not guaranteed verbatim strings. The cited field text is
+    // the source-anchored quote.
+    if (item.provenance?.semantic && text.trim()) {
+      const field = fieldRef.field === 'channel_bio' ? 'bio'
+        : fieldRef.field === 'channel_title' ? 'channel_name'
+          : fieldRef.field as SemanticCitation['field'];
+      return { field, index: fieldRef.index, quote: text.trim().slice(0, 240), supports: 'TRADING' };
+    }
   }
   return null;
 }
 
-function tradingCitations(evidence: AdmissionEvidence, decision: VerificationDecision): SemanticCitation[] {
+export function tradingCitations(evidence: AdmissionEvidence, decision: VerificationDecision): SemanticCitation[] {
   const citations: SemanticCitation[] = [];
   for (const item of decision.positiveEvidence) {
     const citation = citationFromEvidenceItem(evidence, item);
@@ -143,6 +154,31 @@ function tradingCitations(evidence: AdmissionEvidence, decision: VerificationDec
     }
   }
   return citations.slice(0, 15);
+}
+
+/**
+ * Map a semantic non-relevant verdict's cited fields onto the admission
+ * evidence snapshot. The admission boundary must never persist an uncited
+ * rejection: every returned quote resolves to a supplied creator field.
+ */
+export function unrelatedCitations(evidence: AdmissionEvidence, decision: VerificationDecision): SemanticCitation[] {
+  const citations: SemanticCitation[] = [];
+  for (const item of decision.negativeEvidence) {
+    for (const fieldRef of item.provenance?.fields || []) {
+      const text = citationFieldText(evidence, fieldRef.field, fieldRef.index);
+      if (!text || !text.trim()) continue;
+      const quote = text.trim().slice(0, 240);
+      const field = fieldRef.field === 'channel_bio' ? 'bio'
+        : fieldRef.field === 'channel_title' ? 'channel_name'
+          : fieldRef.field === 'external_link_domain' || fieldRef.field === 'external_link_label' ? 'link'
+            : fieldRef.field;
+      if (!['bio', 'channel_name', 'video_title', 'video_description', 'link'].includes(field)) continue;
+      if (citations.some(existing => existing.field === field && existing.index === fieldRef.index && existing.quote === quote)) continue;
+      citations.push({ field: field as SemanticCitation['field'], index: fieldRef.index, quote, supports: 'UNRELATED' });
+      if (citations.length >= 4) return citations;
+    }
+  }
+  return citations;
 }
 
 interface RejectSource {
@@ -362,19 +398,6 @@ export async function evaluateDeterministicAdmission(evidence: AdmissionEvidence
     // than bypass it with a deterministic trading fast-pass.
     if (financeAdjacentOnly) passBlockedByFinanceAdjacency = true;
     if (!decisiveTradingShare) passBlockedByMinorityTrading = true;
-  }
-
-  // Finance-adjacent creators must never be deterministically rejected, even
-  // if the unrelated-domain matcher finds corroborated non-finance content.
-  if (financeAdjacentOnly) {
-    return {
-      outcome: 'AMBIGUOUS',
-      route: routing.route,
-      confidence: decision.confidenceScore,
-      reasonCodes: ['FINANCE_ADJACENT_DEFERRED_TO_DOWNSTREAM', 'DETERMINISTIC_AMBIGUOUS', ...routing.reasonCodes],
-      citations: [],
-      priority: 20,
-    };
   }
 
   if (routing.route === 'DETERMINISTIC_TRADING'

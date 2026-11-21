@@ -3,19 +3,18 @@
  *
  * Selects a reproducible stratified sample from the preserved 890-row result
  * file, fetches fresh public YouTube evidence without API keys (InnerTube about
- * page + channel RSS), runs the deterministic-first admission stage, and
- * optionally runs the semantic fallback when Gemini/Groq keys are configured.
+ * page + channel RSS), runs the same deterministic gate and unified
+ * pre-catalog EvidenceEngine classifier used by production admission, and
+ * records terminal ADMIT/REJECT plus evidence-pending states.
  *
  * It never writes candidates, decisions, channels, settings or jobs.
  */
 import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { Innertube } from 'youtubei.js';
-import { evaluateDeterministicAdmission } from '../server/channelAdmission/deterministic';
-import { decideAdmission, normalizeSemanticJudgment } from '../server/channelAdmission/policy';
-import { buildAdmissionPrompt, isSemanticDecisionFailure, needsSecondJudge, type AdmissionJudge } from '../server/channelAdmission/semanticJudge';
-import { resolveAdmissionPrimaryModel, resolveAdmissionSecondaryModel } from '../server/channelAdmission/admissionModels';
-import type { AdmissionEvidence, SemanticJudgment } from '../server/channelAdmission/types';
+import { evaluateDeterministicAdmission, evidenceToInput, tradingCitations, unrelatedCitations } from '../server/channelAdmission/deterministic';
+import { classifyTradingRelevanceDetailed } from '../server/tradingRelevanceClassifier';
+import type { AdmissionEvidence } from '../server/channelAdmission/types';
 import {
   defaultClient as geminiDefaultClient,
 } from '../server/evidenceEngine/providers/GeminiSemanticProvider';
@@ -40,36 +39,6 @@ const GROUP_ORDER: CohortGroup[] = ['trading', 'unrelated', 'ambiguous', 'held']
 
 function argValue(name: string): string | undefined {
   return process.argv.find(arg => arg.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
-}
-
-async function callJudgeWithPacing(
-  judge: AdmissionJudge,
-  evidence: AdmissionEvidence,
-  role: 'PRIMARY' | 'SECOND',
-  delayMs: number,
-  retries: number,
-): Promise<SemanticJudgment> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    try {
-      const judgment = await judge.judge(evidence, role);
-      await sleep(delayMs);
-      return judgment;
-    } catch (error) {
-      lastError = error;
-      if (isSemanticDecisionFailure(error)) throw error;
-      const retryAfter = Number((error as { retryAfterMs?: unknown })?.retryAfterMs || 0);
-      const waitMs = Math.min(120_000, Math.max(delayMs, retryAfter));
-      // One delay per failure: preserve provider pressure before either the
-      // retry or the next candidate starts.
-      await sleep(waitMs);
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error('ADMISSION_SEMANTIC_UNAVAILABLE');
 }
 
 function argNumber(name: string, fallback: number): number {
@@ -238,29 +207,6 @@ async function collectKeylessEvidence(input: {
   };
 }
 
-class CohortJudge implements AdmissionJudge {
-  constructor(
-    private readonly clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }>,
-  ) {}
-
-  async judge(evidence: AdmissionEvidence, role: 'PRIMARY' | 'SECOND'): Promise<SemanticJudgment> {
-    const ordered = role === 'PRIMARY' ? this.clients : [...this.clients].reverse();
-    let lastError: unknown;
-    for (const attempt of ordered) {
-      try {
-        const raw = await attempt.client.classify(buildAdmissionPrompt(evidence, role), attempt.model, {});
-        const normalized = normalizeSemanticJudgment(raw, attempt.model);
-        if (!normalized) throw new Error('ADMISSION_SEMANTIC_INVALID_OUTPUT');
-        if (attempt.provider) normalized.provider = attempt.provider;
-        return normalized;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error('ADMISSION_SEMANTIC_UNAVAILABLE');
-  }
-}
-
 function semanticClientsAllowedToWriteTelemetry(): boolean {
   const raw = String(process.env.DATABASE_URL || '');
   if (!raw) return false;
@@ -270,9 +216,6 @@ function semanticClientsAllowedToWriteTelemetry(): boolean {
   } catch {
     return false;
   }
-  // Provider clients append call events through getDb(), which can apply
-  // migrations. Only permit that against an explicitly disposable/local test
-  // database; never let a read-only cohort assessment touch production.
   if (['host', 'hostaddr', 'port', 'dbname', 'user', 'password'].some(key => url.searchParams.has(key))) return false;
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   const database = decodeURIComponent(url.pathname.replace(/^\/+/, '')).toLowerCase();
@@ -283,41 +226,52 @@ function semanticClientsAllowedToWriteTelemetry(): boolean {
   return (process.env.NODE_ENV === 'test' || process.env.COHORT_ALLOW_SEMANTIC_DB_WRITES === 'true');
 }
 
-function configuredJudge(): CohortJudge | null {
-  if (!semanticClientsAllowedToWriteTelemetry()) return null;
+function semanticConfigured(): boolean {
+  if (!semanticClientsAllowedToWriteTelemetry()) return false;
   const requested = String(process.env.COHORT_SEMANTIC_PROVIDER || 'auto').trim().toLowerCase();
   if (!['auto', 'gemini', 'gemini-free', 'groq'].includes(requested)) {
     throw new Error('INVALID_COHORT_SEMANTIC_PROVIDER');
   }
-  const clients: Array<{ client: SemanticModelClient; model: string; provider?: 'gemini_semantic' | 'gemini_free_semantic' | 'groq_semantic' }> = [];
-  if (requested === 'auto' || requested === 'gemini') {
-    const gemini = geminiDefaultClient();
-    if (gemini) clients.push({ client: gemini, model: resolveAdmissionPrimaryModel(), provider: 'gemini_semantic' });
-  }
-  if (requested === 'auto' || requested === 'gemini-free') {
-    const geminiFree = geminiFreeDefaultClient();
-    if (geminiFree) clients.push({ client: geminiFree, model: process.env.GEMINI_FREE_CANDIDATE_MODEL || DEFAULT_GEMINI_FREE_CANDIDATE_MODEL, provider: 'gemini_free_semantic' });
-  }
-  if (requested === 'auto' || requested === 'groq') {
-    const groq = groqDefaultClient();
-    if (groq) clients.push({ client: groq, model: resolveAdmissionSecondaryModel(), provider: 'groq_semantic' });
-  }
-  return clients.length ? new CohortJudge(clients) : null;
+  return ((requested === 'auto' || requested === 'gemini') && Boolean(geminiDefaultClient()))
+    || ((requested === 'auto' || requested === 'gemini-free') && Boolean(geminiFreeDefaultClient()))
+    || ((requested === 'auto' || requested === 'groq') && Boolean(groqDefaultClient()));
 }
 
-function resultFromPolicy(evidence: AdmissionEvidence, policy: ReturnType<typeof decideAdmission>, source: 'SEMANTIC'): Record<string, unknown> {
+function finalFromUnified(evidence: AdmissionEvidence, decision: Awaited<ReturnType<typeof classifyTradingRelevanceDetailed>>['decision']): Record<string, unknown> {
+  const positive = tradingCitations(evidence, decision);
+  const negative = unrelatedCitations(evidence, decision);
+  if (decision.status === 'TRADING_CONFIRMED' && positive.length > 0) {
+    return {
+      source: 'SEMANTIC',
+      decision: 'ADMIT',
+      status: 'ADMITTED',
+      reasonCodes: ['PRE_CATALOG_TRADING_CONFIRMED', ...(decision.decisionPolicy?.reasonCodes || [])],
+      admitted: true, rejected: false, review: false, ambiguous: false,
+      citationsValid: true,
+      citations: positive,
+      independentUnrelatedCitations: 0,
+      independentTradingCitations: positive.length,
+    };
+  }
+  if (decision.status === 'NON_TRADING' && negative.length > 0) {
+    return {
+      source: 'SEMANTIC',
+      decision: 'REJECT_UNRELATED',
+      status: 'REJECTED_UNRELATED',
+      reasonCodes: ['PRE_CATALOG_NON_TRADING_CONFIRMED', ...(decision.decisionPolicy?.reasonCodes || [])],
+      admitted: false, rejected: true, review: false, ambiguous: false,
+      citationsValid: true,
+      citations: negative,
+      independentUnrelatedCitations: negative.length,
+      independentTradingCitations: 0,
+    };
+  }
   return {
-    source,
-    decision: policy.decision,
-    status: policy.status,
-    reasonCodes: policy.reasonCodes,
-    admitted: policy.admitted,
-    rejected: policy.rejected,
-    review: policy.review === true,
-    ambiguous: policy.ambiguous,
-    citationsValid: policy.citationsValid,
-    independentUnrelatedCitations: policy.independentUnrelatedCitations,
-    independentTradingCitations: policy.independentTradingCitations,
+    source: 'SEMANTIC',
+    decision: 'HOLD_MISSING_EVIDENCE',
+    status: 'WAITING_EVIDENCE',
+    reasonCodes: ['PRE_CATALOG_CLASSIFICATION_UNCERTAIN', ...(decision.evidenceCollection?.reasonCodes || []), ...(decision.decisionPolicy?.reasonCodes || [])],
+    admitted: false, rejected: false, review: false, ambiguous: true,
   };
 }
 
@@ -325,7 +279,7 @@ async function evaluateOne(input: {
   group: CohortGroup;
   row: PreservedResult;
   session?: Innertube;
-  judge: CohortJudge | null;
+  semanticAvailable: boolean;
   evidenceOverride?: AdmissionEvidence;
   aiDelayMs: number;
   aiRetries: number;
@@ -352,6 +306,8 @@ async function evaluateOne(input: {
       description: evidence.description,
       links: evidence.links,
       videos: evidence.videos,
+      playlists: evidence.playlists || [],
+      topics: evidence.topics || [],
     },
   };
   if (evidence.evidenceCoverage !== 'COMPLETE') {
@@ -414,7 +370,7 @@ async function evaluateOne(input: {
     };
   }
 
-  if (!input.judge) {
+  if (!input.semanticAvailable) {
     return {
       ...base,
       deterministic: deterministicSummary,
@@ -431,69 +387,26 @@ async function evaluateOne(input: {
     };
   }
 
-  let judgment: SemanticJudgment | undefined;
-  let decisionFailure: string | undefined;
-  for (let attempt = 0; attempt < 3 && !judgment; attempt += 1) {
-    try {
-      judgment = await callJudgeWithPacing(input.judge, evidence, 'PRIMARY', input.aiDelayMs, input.aiRetries);
-    } catch (error) {
-      if (isSemanticDecisionFailure(error)) {
-        decisionFailure = error instanceof Error ? error.message : String(error);
-        continue;
-      }
-      return {
-        ...base,
-        deterministic: deterministicSummary,
-        final: {
-          source: 'SEMANTIC',
-          decision: 'PROVIDER_DEFERRED',
-          status: 'PROVIDER_DEFERRED',
-          reasonCodes: ['PROVIDER_RETRY_WITHOUT_ATTEMPT', 'SEMANTIC_UNAVAILABLE_RETRY', error instanceof Error ? error.message : String(error)],
-          admitted: false,
-          rejected: false,
-          review: false,
-          ambiguous: true,
-        },
-      };
-    }
-  }
-  if (!judgment) {
+  try {
+    const classified = await classifyTradingRelevanceDetailed(evidenceToInput(evidence));
+    return {
+      ...base,
+      deterministic: deterministicSummary,
+      final: finalFromUnified(evidence, classified.decision),
+    };
+  } catch (error) {
     return {
       ...base,
       deterministic: deterministicSummary,
       final: {
         source: 'SEMANTIC',
-        decision: 'NEEDS_REVIEW',
-        status: 'NEEDS_REVIEW',
-        reasonCodes: ['SEMANTIC_UNRESOLVED_NEEDS_REVIEW', decisionFailure || 'ADMISSION_SEMANTIC_INVALID_OUTPUT'],
-        admitted: false,
-        rejected: false,
-        review: true,
-        ambiguous: false,
+        decision: 'PROVIDER_DEFERRED',
+        status: 'PROVIDER_DEFERRED',
+        reasonCodes: ['EVIDENCE_PROVIDER_DEFERRED', 'PRE_CATALOG_CLASSIFIER_FAILED', error instanceof Error ? error.message : String(error)],
+        admitted: false, rejected: false, review: false, ambiguous: true,
       },
     };
   }
-
-  let secondJudgment: SemanticJudgment | undefined;
-  if (needsSecondJudge(judgment, evidence)) {
-    try {
-      secondJudgment = await callJudgeWithPacing(input.judge, evidence, 'SECOND', input.aiDelayMs, input.aiRetries);
-    } catch (error) {
-      console.warn(`[cohort] second judge unavailable for ${evidence.channelId}:`, error instanceof Error ? error.message : error);
-    }
-  }
-  const policy = decideAdmission({ evidence, judgment, secondJudgment });
-  const effective = policy.effectiveRole === 'SECOND' && secondJudgment ? secondJudgment : judgment;
-  return {
-    ...base,
-    deterministic: deterministicSummary,
-    final: {
-      ...resultFromPolicy(evidence, policy, 'SEMANTIC'),
-      citations: effective.citations,
-      judgment: effective,
-      secondJudgment: secondJudgment || null,
-    },
-  };
 }
 
 async function main(): Promise<void> {
@@ -536,6 +449,8 @@ async function main(): Promise<void> {
           country: saved.channel.country || saved.evidence.country || undefined,
           subscriberCount: saved.channel.subscriberCount || saved.evidence.subscriberCount || undefined,
           videos: saved.evidence.videos || [],
+          playlists: saved.evidence.playlists || [],
+          topics: saved.evidence.topics || [],
           source: 'automated_query',
           targetCountry: 'UNKNOWN',
           evidenceCoverage: saved.evidence.evidenceCoverage || saved.evidence.coverage || 'PARTIAL',
@@ -545,10 +460,10 @@ async function main(): Promise<void> {
       };
     }) as Array<{ group: CohortGroup; row: PreservedResult; evidence?: AdmissionEvidence }>
     : selectCohort(rows, counts, seed);
-  const judge = collectOnly ? null : configuredJudge();
+  const semanticAvailable = collectOnly ? false : semanticConfigured();
   // Semantic calls share a provider quota. Serialize them whenever pacing is
   // configured so two workers cannot burst the same organization.
-  const concurrency = judge ? semanticConcurrency : requestedConcurrency;
+  const concurrency = semanticAvailable ? semanticConcurrency : requestedConcurrency;
   console.log(JSON.stringify({
     event: 'admission_cohort_start',
     manifest,
@@ -556,7 +471,7 @@ async function main(): Promise<void> {
     counts,
     seed,
     concurrency,
-    semanticAvailable: Boolean(judge),
+    semanticAvailable,
     collectOnly,
     resume,
     semanticConcurrency,
@@ -655,7 +570,7 @@ async function main(): Promise<void> {
           group: item.group,
           row: item.row,
           session,
-          judge,
+          semanticAvailable,
           evidenceOverride: item.evidence,
           aiDelayMs,
           aiRetries,

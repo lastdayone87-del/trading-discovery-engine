@@ -6,14 +6,12 @@ import { enqueueAdmissionVerification, findAdmissionCandidate, getAdmissionMode 
 import { resumeAdmittedCandidate, verifyAdmissionCandidate } from './index';
 import { isRejectedAdmissionStatus, isWaitingAdmissionStatus } from './types';
 import type { AdmissionCandidateInput, AdmissionEvidence } from './types';
-import type { AdmissionJudge } from './semanticJudge';
 
 export const ADMISSION_VERIFICATION_JOB_TYPE = 'VERIFY_CHANNEL_ADMISSION';
 
 export interface AdmissionWorkerOverrides {
   /** Deterministic fixture seam for lifecycle tests. */
   evidenceOverride?: AdmissionEvidence;
-  judge?: AdmissionJudge;
 }
 
 /**
@@ -81,7 +79,6 @@ export async function processAdmissionVerificationJob(job: DurableJob, overrides
     existingChannel,
     archiveRejectedExistingChannel: legacyRevalidation,
     evidenceOverride: overrides.evidenceOverride,
-    judge: overrides.judge,
   });
 
   if (isWaitingAdmissionStatus(result.status)) {

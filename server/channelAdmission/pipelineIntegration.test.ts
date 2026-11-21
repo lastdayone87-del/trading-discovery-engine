@@ -265,10 +265,12 @@ test('admission dedupe and admitted preservation prevent duplicate classificatio
     && worker.indexOf('if (isRejectedAdmissionStatus(row.status))') < worker.indexOf('verifyAdmissionCandidate(input'),
   'review/rejected rows must not re-enter verification');
   assert.match(verify, /classificationCandidateForAdmission\(input\.candidate, \{ \.\.\.row, evidence_snapshot: evidence \}\)/);
-  assert.match(verify, /DETERMINISTIC_ADMISSION_ABSTAINED/);
-  assert.match(verify, /enqueueEnrichmentAfterAmbiguousAdmission/);
+  assert.match(verify, /NO_CREATOR_CONTENT_CONTEXT/);
+  assert.match(verify, /PRE_CATALOG_CLASSIFICATION_UNCERTAIN/);
+  assert.match(verify, /classifyTradingRelevanceDetailed/);
   assert.doesNotMatch(verify, /ProviderAdmissionJudge|judge\.judge\(evidence/);
-  assert.match(verify, /:DETERMINISTIC_AMBIGUOUS:/);
+  assert.doesNotMatch(verify, /decision: 'ADMIT_AMBIGUOUS'/);
+  assert.match(verify, /EVIDENCE_ACQUISITION_REQUIRED/);
   assert.match(index, /admissionStatus === 'ADMITTED_AMBIGUOUS' && decisionSource === 'DETERMINISTIC'/);
 });
 
