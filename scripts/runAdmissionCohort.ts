@@ -628,7 +628,7 @@ async function main(): Promise<void> {
   await Promise.all(workers);
   const usableDecisions = results.filter(result => {
     const decision = (result.final as any)?.decision;
-    return ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED'].includes(decision);
+    return ['ADMIT', 'ADMIT_AMBIGUOUS', 'REJECT_UNRELATED', 'REJECT_NON_TRADING'].includes(decision);
   }).length;
   console.log(JSON.stringify({
     event: 'admission_cohort_complete',
