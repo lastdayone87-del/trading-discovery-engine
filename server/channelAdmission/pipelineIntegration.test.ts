@@ -287,6 +287,10 @@ test('admission classification marks the handoff without mutating hydration stat
   const enqueue = index.slice(start, end < 0 ? undefined : end);
   assert.match(enqueue, /admissionClassified: true/);
   assert.doesNotMatch(enqueue, /enrichmentStage: Math\.max\(1, Number\(input\.candidate\.enrichmentStage \|\| 0\)\)/);
+  assert.match(enqueue, /UPDATE jobs/);
+  assert.match(enqueue, /candidate,admissionClassified/);
+  assert.ok(enqueue.indexOf('UPDATE jobs') < enqueue.indexOf('enqueueClassificationJobAtomic'),
+    'an active pre-admission classification job must be upgraded before the enqueue attempt');
   assert.match(pipeline, /enrichment_stage:classificationStageForCandidate\(candidate\)/);
 });
 

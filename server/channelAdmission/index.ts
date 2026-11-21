@@ -106,6 +106,26 @@ async function enqueueClassificationAfterAdmission(input: {
     ...input.candidate,
     admissionClassified: true,
   };
+  // An older classification job may already be active from a pre-admission
+  // discovery path. Upgrade its stored candidate so the worker does not keep
+  // replaying the stage-0 retrieval-only probe after admission.
+  const db = await getDb();
+  const activeClassification = await db.query(
+    `SELECT id FROM jobs
+      WHERE type=ANY($1::text[]) AND status IN ('PENDING','PROCESSING')
+        AND payload->>'channelId'=$2
+      ORDER BY created_at DESC LIMIT 1`,
+    [[CLASSIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'], candidate.channelId],
+  );
+  if (activeClassification.rowCount) {
+    await db.query(
+      `UPDATE jobs
+          SET payload=jsonb_set(payload,'{candidate,admissionClassified}','true'::jsonb,true),
+              updated_at=now()
+        WHERE id=$1`,
+      [activeClassification.rows[0].id],
+    );
+  }
   const payload = buildClassificationJobPayload({
     candidate,
     targetCountry: input.targetCountry,
