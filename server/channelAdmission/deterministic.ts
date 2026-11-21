@@ -57,6 +57,7 @@ function evidenceToInput(evidence: AdmissionEvidence): RawChannelInput {
     // as the creator country would apply the wrong regional knowledge pack.
     country: evidence.country || 'UNKNOWN',
     external_links: evidence.links,
+    playlists: evidence.playlists,
     videos: evidence.videos.map(video => ({
       title: video.title,
       description: video.description,
