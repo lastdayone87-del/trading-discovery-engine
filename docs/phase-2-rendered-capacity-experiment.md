@@ -132,6 +132,28 @@ Config verified in container `…20261120T212037`:
    own 5s gate outside the governor. Its saturation is out of scope for
    this experiment's knobs and is flagged for future measurement.
 
+## E3 — post-merge production validation (merged image, all fixes live)
+
+Deployed via the PR #673 merge, container started 00:00Z Nov 21. Config
+verified in-container: `BROWSER_RUNTIME_CONCURRENCY=2`, governor
+`64/72`, gate concurrency derived from the lease (2), demand-aware
+discovery floor, budget clock at lease grant, cgroup-aware memory guard.
+
+| Metric | E3 first ~50 min |
+|---|---|
+| Completed rendered crawls | **62** (~74/h instantaneous — two-slot overlap working; E2's full window was 44) |
+| Governor denials | **0** |
+| Container CPU | 143% – 566% bursts |
+| Host load1 | 1.3 – 5.5 |
+| Container memory | 0.8 – 1.15 GiB |
+| Host MemAvailable | 5.2 – 5.4 GB (guard threshold 1500MB comfortably satisfied) |
+
+Interpretation: with the gate coupled to the lease and the budget clock
+fixed, the second slot is actually usable and the retry lane runs
+unthrottled while discovery is idle — the E2 waste pattern is gone. The
+observation window continues; cohort drain (RETRY_PENDING) is the
+multi-day signal to watch in the weekly regression queries above.
+
 ## Validated permanent configuration
 
 | Knob | Old | New | Evidence |
