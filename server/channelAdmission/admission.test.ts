@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assessExtractedQueryAdmission, decideAdmission, validCitations } from './policy';
+import { assessExtractedQueryAdmission, decideAdmission, hasStrongTradingSupport, validCitations } from './policy';
 import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
@@ -1315,13 +1315,27 @@ test('admission semantic route health treats unconfigured providers as unavailab
 test('playlist citations are validated as creator-owned admission evidence', () => {
   const fixture: AdmissionEvidence = {
     ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
-    playlists: [{ name: 'NQ futures trade recaps', description: 'Weekly execution reviews' }],
+    playlists: [{ name: 'Futures trading recaps', description: 'Weekly execution reviews' }],
   };
   const validated = validCitations(fixture, judgment({
     subject: 'TRADING',
     focus: 90,
-    citations: [citation('playlist_name', 'NQ futures trade recaps', 0, 'TRADING')],
+    citations: [citation('playlist_name', 'Futures trading recaps', 0, 'TRADING')],
   }));
   assert.equal(validated.length, 1);
   assert.equal(validated[0].field, 'playlist_name');
+});
+
+test('playlist text participates in the one-citation trading-anchor path', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
+    playlists: [{ name: 'Futures trading recaps', description: 'Weekly execution reviews' }],
+  };
+  const j = judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('playlist_name', 'Futures trading recaps', 0, 'TRADING')],
+  });
+  assert.equal(validCitations(fixture, j).length, 1);
+  assert.equal(hasStrongTradingSupport(fixture, j), true);
 });
