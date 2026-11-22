@@ -56,7 +56,7 @@ test('provisional low-value stops wait for page admission settlement but hard st
   assert.match(queue, /deferAutonomousRunForAdmissionReview\(queryRunId, pageNumber/);
   assert.match(pageStore, /markAutonomousPageDeferredForAdmissionReview/);
   assert.match(pageStore, /deferred_reason='ADMISSION'/);
-  assert.match(queue, /if \(observation\?\.deferredReason === 'ADMISSION'\)/);
+  assert.match(queue, /if \(paginationEnabled && observation\?\.deferredReason === 'ADMISSION'\)/);
   assert.match(queue, /PERSISTED_PAGE_ADMISSION_REVIEW/);
   assert.match(queue, /PERSISTED_PAGE_PROVISIONAL_STOP/);
   assert.match(queue, /observation\.shouldContinue === false/);

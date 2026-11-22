@@ -902,10 +902,17 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   // committed before an admission verdict and then crashed before the worker's
   // post-insert replay ran.
   await replayPageAdmissionOutcomesSafe(args.queryRunId, args.pageNumber, true);
+  const [paginationSetting, cdlSetting] = await Promise.all([
+    getAppSetting('autonomous_pagination_enabled', 'true'),
+    getAppSetting('country_discovery_loop_enabled', 'true'),
+  ]);
+  const paginationEnabled = paginationSetting === 'true' && cdlSetting === 'true';
   // A duplicate retry of a page already parked for admission review must not
   // finalize the parent from its provisional should_continue=false decision.
-  // Keep it deferred; the orphan sweep owns the settled re-evaluation.
-  if (observation?.deferredReason === 'ADMISSION') {
+  // Keep it deferred; the orphan sweep owns the settled re-evaluation. When
+  // continuation is disabled there is no sweep owner, so finalize instead of
+  // stranding the run.
+  if (paginationEnabled && observation?.deferredReason === 'ADMISSION') {
     await deferAutonomousRunForAdmissionReview(
       args.queryRunId,
       args.pageNumber,
@@ -917,7 +924,8 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   // the review marker. A provisional stop with a cursor is always re-evaluated
   // by the orphan sweep, whether its admissions are still pending or settled
   // productive while the worker was down. Hard ceilings never use this path.
-  if (observation
+  if (paginationEnabled
+    && observation
     && observation.shouldContinue === false
     && observation.nextPageToken
     && !ADMISSION_REVIEW_HARD_STOP_REASONS.has(observation.primaryReason)
@@ -929,11 +937,6 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
     );
     return;
   }
-  const [paginationSetting, cdlSetting] = await Promise.all([
-    getAppSetting('autonomous_pagination_enabled', 'true'),
-    getAppSetting('country_discovery_loop_enabled', 'true'),
-  ]);
-  const paginationEnabled = paginationSetting === 'true' && cdlSetting === 'true';
   const action = planPersistedPageRecovery({
     pageNumber: args.pageNumber,
     pagesCompleted: progress.pagesCompleted,
