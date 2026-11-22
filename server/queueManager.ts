@@ -5647,7 +5647,9 @@ async function restoreConfirmedDecisionAfterFailedRecheck(
         Math.max(0, Math.min(100, Number(snapshot.trading_confidence_score) || 0)),
         snapshot.trading_category || 'General Trading',
         JSON.stringify(snapshot.trading_relevance_breakdown || {}),
-        snapshot.scan_status || 'COMPLETED',
+        ['NEEDS_REVIEW', 'ENRICHMENT_PENDING', 'ENRICHING', 'PENDING'].includes(String(snapshot.scan_status || ''))
+          ? 'COMPLETED'
+          : snapshot.scan_status || 'COMPLETED',
         JSON.stringify([{
           step: 'BIO',
           title: 'Confirmed decision restored after incomplete recheck',
