@@ -902,6 +902,17 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   // committed before an admission verdict and then crashed before the worker's
   // post-insert replay ran.
   await replayPageAdmissionOutcomesSafe(args.queryRunId, args.pageNumber, true);
+  // A duplicate retry of a page already parked for admission review must not
+  // finalize the parent from its provisional should_continue=false decision.
+  // Keep it deferred; the orphan sweep owns the settled re-evaluation.
+  if (observation?.deferredReason === 'ADMISSION') {
+    await deferAutonomousRunForAdmissionReview(
+      args.queryRunId,
+      args.pageNumber,
+      'PERSISTED_PAGE_ADMISSION_REVIEW',
+    );
+    return;
+  }
   const [paginationSetting, cdlSetting] = await Promise.all([
     getAppSetting('autonomous_pagination_enabled', 'true'),
     getAppSetting('country_discovery_loop_enabled', 'true'),
