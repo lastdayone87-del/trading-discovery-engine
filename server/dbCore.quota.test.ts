@@ -260,9 +260,11 @@ test('quota reservation transactions keep the tracker lock off the reservation s
   assert.doesNotMatch(topUp, /SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE/);
   // The aggregate must target the partial active-reservation index instead of
   // scanning all historical rows while the tracker row is locked.
-  assert.match(reserve, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED'/);
+  assert.match(reserve, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(topUp, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
+  assert.match(reserve, /SELECT status,units FROM quota_reservations[\s\S]*AND status='RESERVED' AND expires_at>now\(\)[\s\S]*FOR UPDATE/);
   assert.match(dbCore, /idx_quota_reservations_reserved_expiry/);
+  assert.match(dbCore, /quotaReservationIndexMigration\.rowCount\) await ensureQuotaReservationActiveIndex/);
 });
 
 test('probe allocation and per-key cap exhaustion defer without consuming an attempt', async () => {
@@ -402,10 +404,10 @@ test('normal-origin batches contain probe channel refusals; probe jobs still def
   );
 
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(source, /processPlaylistInspectionJob\(job,\(raw,country,source\)=>processDiscoveredChannelContained\(raw,country,source,\{lane:'DISCOVERY'/);
-  assert.match(source, /processFeaturedChannelInspectionJob\(job,\(raw,country,source\)=>processDiscoveredChannelContained\(raw,country,source,\{lane:'DISCOVERY'/);
+  assert.match(source, /processPlaylistInspectionJob\(job,\(raw,country,source\)=>processDiscoveredChannelContained\(raw,country,source,\{lane:'DISCOVERY',jobType:job\.type,jobId:job\.id\}\)\)/);
+  assert.match(source, /processFeaturedChannelInspectionJob\(job,\(raw,country,source\)=>processDiscoveredChannelContained\(raw,country,source,\{lane:'DISCOVERY',jobType:job\.type,jobId:job\.id\}\)\)/);
   assert.match(source, /inline: \(\) => processDiscoveredChannelContained\(raw, country, source/);
-  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{/);
+  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{\s*jobId,\s*lane: 'MANUAL',\s*jobType: 'MANUAL_SEARCH_PAGE',?\s*\}\);/);
   assert.match(source, /calculateQueryFunnel\(searchPage\?\.rawResultCount \?\? extracted\.length, observations, deferredResults\)/);
   assert.match(source, /deferredOnly: observations\.length === 0 && deferredResults > 0/);
   assert.match(source, /enqueueJob\('ENRICH_CHANNEL', deferred\.payload, deferred\.opts\)/);

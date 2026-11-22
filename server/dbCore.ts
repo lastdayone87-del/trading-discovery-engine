@@ -862,6 +862,7 @@ async function ensureQuotaReservationActiveIndex(client: { query: (text: string,
            i.indnatts, i.indnkeyatts,
            CASE WHEN to_regclass('public.quota_reservations') IS NULL THEN false
                 ELSE i.indrelid = to_regclass('public.quota_reservations') END AS correct_table,
+           pg_get_expr(i.indpred, i.indrelid) AS predicate,
            pg_get_indexdef(i.indexrelid) AS definition
       FROM pg_class c
       JOIN pg_index i ON i.indexrelid = c.oid
@@ -869,13 +870,14 @@ async function ensureQuotaReservationActiveIndex(client: { query: (text: string,
   `);
   const row = existing.rows[0];
   const definition = String(row?.definition || '');
+  const predicate = String(row?.predicate || '').replace(/[()]/g, '').replace(/\s+/g, ' ').trim();
   const correct = row?.correct_table === true
     && row?.has_predicate === true
     && Number(row?.indnatts) === 4
     && Number(row?.indnkeyatts) === 1
     && definition.includes('USING btree (expires_at)')
     && definition.includes('INCLUDE (units, operation_type, operation_id)')
-    && definition.includes("status = 'RESERVED'");
+    && predicate === "status = 'RESERVED'::text";
   if (row?.indisvalid && row?.indisready && correct) return;
   if (row?.oid) {
     await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
@@ -991,6 +993,11 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // idempotent and also repairs a build that failed on a previous boot.
     const corpusIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=206');
     if (corpusIndexMigration.rowCount) await ensureCorpusOccurrenceIndexes(client);
+    // Verify/repair the reservation index on every boot, not only before the
+    // first adoption. A dropped or invalid index would otherwise restore the
+    // historical-row scan that the tracker lock used to serialize behind.
+    const quotaReservationIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=207');
+    if (quotaReservationIndexMigration.rowCount) await ensureQuotaReservationActiveIndex(client);
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
     const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');
@@ -6421,8 +6428,8 @@ export async function tryReserveQuota(args: {
   units: number;
   dailyBudget: number;
   allocationPercent: number;
-}): Promise<boolean> {
-  const db = await getDb();
+}, dbOverride?: Pick<InstanceType<typeof Pool>, 'query' | 'connect'>): Promise<boolean> {
+  const db = dbOverride || await getDb();
   // Retries of an already-funded operation should not repeat the backlog and
   // seven-day consumption scans before the transaction's cheap re-check.
   const alreadyReserved = await db.query(
@@ -6451,7 +6458,10 @@ export async function tryReserveQuota(args: {
         daily_limit=excluded.daily_limit,
         last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
     const existing = await client.query(
-      `SELECT status,units FROM quota_reservations WHERE operation_type=$1 AND operation_id=$2 FOR UPDATE`,
+      `SELECT status,units FROM quota_reservations
+        WHERE operation_type=$1 AND operation_id=$2
+          AND status='RESERVED' AND expires_at>now()
+        FOR UPDATE`,
       [args.operationType, args.operationId]
     );
     const existingUnits = existing.rows[0]?.status === 'RESERVED' ? Number(existing.rows[0].units) : 0;
@@ -6466,7 +6476,7 @@ export async function tryReserveQuota(args: {
       `SELECT
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
          COALESCE((SELECT SUM(units) FROM quota_reservations
-                    WHERE status='RESERVED'
+                    WHERE status='RESERVED' AND expires_at>now()
                       AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS reserved_total`,
       [args.operationType, args.operationId]
     );

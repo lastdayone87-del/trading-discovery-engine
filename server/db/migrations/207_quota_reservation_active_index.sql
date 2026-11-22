@@ -3,8 +3,8 @@
 -- quota_reservations retains millions of historical rows. Reservation totals
 -- and expiry sweeps used to scan/update the whole table while holding the
 -- singleton quota_tracker row lock, serializing every YouTube worker behind a
--- ~1s scan. The partial index covers only RESERVED rows, which are bounded by
--- the 20-minute lease TTL.
+-- ~1s scan. The partial index covers only RESERVED rows, i.e. the live lease
+-- window (renewable by an active run), never the historical ledger.
 --
 -- The migration runner builds this index CONCURRENTLY before the transactional
 -- migration loop. This file only adopts a valid index or verifies an empty
@@ -30,7 +30,6 @@ BEGIN
   IF index_oid IS NOT NULL AND (
     pg_get_indexdef(index_oid) NOT LIKE '%USING btree (expires_at)%'
     OR pg_get_indexdef(index_oid) NOT LIKE '%INCLUDE (units, operation_type, operation_id)%'
-    OR pg_get_indexdef(index_oid) NOT LIKE '%status = ''RESERVED''%'
     OR NOT EXISTS (
       SELECT 1 FROM pg_index i
        WHERE i.indexrelid = index_oid
@@ -39,6 +38,7 @@ BEGIN
          AND i.indnkeyatts = 1
          AND i.indpred IS NOT NULL
          AND i.indexprs IS NULL
+         AND btrim(regexp_replace(pg_get_expr(i.indpred, i.indrelid), '[()]', '', 'g')) = 'status = ''RESERVED''::text'
     )
   ) THEN
     RAISE EXCEPTION 'idx_quota_reservations_reserved_expiry exists with the wrong table/keys/predicate; rebuild it CONCURRENTLY before applying migration 207';

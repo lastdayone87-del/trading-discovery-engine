@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test, { after } from 'node:test';
 import pg from 'pg';
-import type { Pool, PoolClient } from 'pg';
+import type { Pool } from 'pg';
+import { tryReserveQuota } from './dbCore';
 
 /**
  * Live-database regression coverage for the active quota-reservation index.
@@ -140,10 +141,9 @@ maybe('migration 207 adopts the partial index and the hot aggregate stays off a 
   assertUsesReservationIndex(expiryPlan.rows[0]['QUERY PLAN']);
 });
 
-maybe('a held per-key charge row cannot block a tracker-only reservation', async () => {
+maybe('a held per-key charge row cannot block the production reservation path', async () => {
   const db = requirePool();
-  const charge: PoolClient = await db.connect();
-  const reservation: PoolClient = await db.connect();
+  const charge = await db.connect();
   try {
     await charge.query(`BEGIN`);
     await charge.query(
@@ -152,18 +152,52 @@ maybe('a held per-key charge row cannot block a tracker-only reservation', async
        ON CONFLICT(quota_day,key_fingerprint) DO UPDATE SET units_used=youtube_key_quota_usage.units_used+excluded.units_used`,
     );
 
-    await reservation.query(`BEGIN`);
-    await reservation.query(`SET LOCAL lock_timeout='1500ms'`);
-    await reservation.query(
-      `INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
-       VALUES('youtube',100,10000,'2026-11-22')
-       ON CONFLICT(id) DO UPDATE SET units_used=quota_tracker.units_used+excluded.units_used`,
-    );
-    await reservation.query(`COMMIT`);
+    const admitted = await Promise.race([
+      tryReserveQuota({
+        operationType: 'LOCK_TEST',
+        operationId: 'lock-1',
+        allocation: 'MANUAL',
+        units: 100,
+        dailyBudget: 10000,
+        allocationPercent: 100,
+      }, db),
+      new Promise<boolean>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('reservation blocked behind a per-key row')), 1500);
+        timer.unref?.();
+      }),
+    ]);
+    assert.equal(admitted, true, 'the tracker-only admission must not wait for the held key row');
   } finally {
     await charge.query(`ROLLBACK`).catch(() => undefined);
     charge.release();
-    reservation.release();
+    await db.query(`DELETE FROM quota_reservations WHERE operation_type='LOCK_TEST'`).catch(() => undefined);
+  }
+});
+
+maybe('an expired existing lease cannot authorize a new reservation', async () => {
+  const db = requirePool();
+  await db.query(
+    `INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, expires_at)
+     VALUES('LOCK_TEST_EXPIRED','expired-1','MANUAL',100,'RESERVED',now()-interval '1 minute')`,
+  );
+  try {
+    const admitted = await tryReserveQuota({
+      operationType: 'LOCK_TEST_EXPIRED',
+      operationId: 'expired-1',
+      allocation: 'MANUAL',
+      units: 100,
+      // Actual + live reserved + the requested 100 already exceeds this
+      // budget. Only the expired lease could make the request look funded.
+      dailyBudget: 2100,
+      allocationPercent: 100,
+    }, db);
+    assert.equal(admitted, false, 'an expired lease must not authorize provider work');
+    const row = await db.query(
+      `SELECT status FROM quota_reservations WHERE operation_type='LOCK_TEST_EXPIRED' AND operation_id='expired-1'`,
+    );
+    assert.equal(row.rows[0]?.status, 'EXPIRED');
+  } finally {
+    await db.query(`DELETE FROM quota_reservations WHERE operation_type='LOCK_TEST_EXPIRED'`).catch(() => undefined);
   }
 });
 

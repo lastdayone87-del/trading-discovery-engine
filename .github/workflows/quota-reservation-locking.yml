@@ -5,6 +5,9 @@ on:
     paths:
       - 'server/dbCore.ts'
       - 'server/dbCore.quota.test.ts'
+      - 'server/quotaKeyCapShadow.ts'
+      - 'server/queueManager.ts'
+      - 'server/manualSearchStore.ts'
       - 'server/quotaReservationIndex.postgres.test.ts'
       - 'server/db/migrations/207_quota_reservation_active_index.sql'
       - '.github/workflows/quota-reservation-locking.yml'
