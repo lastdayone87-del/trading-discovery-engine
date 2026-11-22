@@ -13,7 +13,7 @@ test('corpus scoring has a concurrent normalized-span index migration', () => {
   assert.match(migration, /pg_get_indexdef/);
   assert.match(migration, /USING btree \(normalized_span, document_id, start_offset\)/);
   assert.match(migration, /octet_length\(normalized_span\)>2704/);
-  assert.match(migration, /i\.indrelid = 'public\.corpus_candidate_occurrences'::regclass/);
+  assert.match(migration, /i\.indrelid = to_regclass\('public\.corpus_candidate_occurrences'\)/);
   assert.match(migration, /i\.indnatts = 3/);
   assert.match(migration, /i\.indpred IS NULL/);
   assert.match(migration, /i\.indexprs IS NULL/);
@@ -31,6 +31,7 @@ test('the migration runner builds the corpus scoring index concurrently before t
   const ensure = dbCore.slice(dbCore.indexOf('async function ensureCorpusOccurrenceIndexes'), dbCore.indexOf('/**\n * Migration 168'));
   assert.match(ensure, /DROP INDEX CONCURRENTLY IF EXISTS public\.\$\{name\}/);
   assert.match(ensure, /USING btree \(normalized_span, document_id, start_offset\)/);
+  assert.match(ensure, /to_regclass\('public\.corpus_candidate_occurrences'\)/);
   assert.match(ensure, /row\?\.correct_table === true/);
   assert.match(ensure, /Number\(row\?\.indnatts\) === 3/);
   assert.match(ensure, /row\?\.no_predicate === true/);

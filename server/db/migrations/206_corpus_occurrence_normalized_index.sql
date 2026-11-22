@@ -31,7 +31,7 @@ BEGIN
     OR NOT EXISTS (
       SELECT 1 FROM pg_index i
        WHERE i.indexrelid = index_oid
-         AND i.indrelid = 'public.corpus_candidate_occurrences'::regclass
+         AND i.indrelid = to_regclass('public.corpus_candidate_occurrences')
          AND i.indnatts = 3
          AND i.indpred IS NULL
          AND i.indexprs IS NULL

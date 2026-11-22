@@ -735,7 +735,8 @@ async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, val
   const existing = await client.query(`
     SELECT c.oid, i.indisvalid, i.indisready, i.indnatts, i.indpred IS NULL AS no_predicate,
            i.indexprs IS NULL AS no_expressions,
-           i.indrelid = 'public.corpus_candidate_occurrences'::regclass AS correct_table,
+           CASE WHEN to_regclass('public.corpus_candidate_occurrences') IS NULL THEN false
+                ELSE i.indrelid = to_regclass('public.corpus_candidate_occurrences') END AS correct_table,
            pg_get_indexdef(i.indexrelid) AS definition
       FROM pg_class c
       JOIN pg_index i ON i.indexrelid = c.oid
@@ -755,7 +756,7 @@ async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, val
   const target = await client.query(`SELECT to_regclass('public.corpus_candidate_occurrences') AS oid`);
   if (!target.rows[0]?.oid) return;
   // A B-tree entry above ~2.7 KB cannot be built. New extraction is capped at
-  // 512 bytes, but legacy rows must be checked before the concurrent build.
+  // 2048 bytes, but legacy rows must be checked before the concurrent build.
   const oversized = await client.query(`SELECT 1 FROM corpus_candidate_occurrences WHERE octet_length(normalized_span)>2704 LIMIT 1`);
   if (oversized.rowCount) {
     console.warn(JSON.stringify({
