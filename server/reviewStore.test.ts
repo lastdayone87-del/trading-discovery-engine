@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveReviewTransition, ReviewConflictError } from './reviewStore';
+import { resolveReviewTransition, ReviewConflictError, supersedeConfirmedReviewDebt } from './reviewStore';
 
 test('pending review can be approved or rejected',()=>{
   assert.equal(resolveReviewTransition('PENDING','APPROVE'),'APPROVED');
@@ -26,4 +26,20 @@ test('a pending review can request more evidence without approving or rejecting'
   assert.equal(resolveReviewTransition('PENDING','REQUEST_RESCAN'),'SUPERSEDED');
   assert.throws(()=>resolveReviewTransition('APPROVED','REQUEST_RESCAN'),ReviewConflictError);
   assert.throws(()=>resolveReviewTransition('REJECTED','REQUEST_RESCAN'),ReviewConflictError);
+});
+
+test('confirmed review debt is superseded without changing the confirmed decision', async () => {
+  let captured = '';
+  const runner = {
+    query: async (text: string) => {
+      captured = text;
+      return { rowCount: 3 };
+    },
+  };
+  const superseded = await supersedeConfirmedReviewDebt(25, runner);
+  assert.equal(superseded, 3);
+  assert.match(captured, /c\.trading_status='TRADING_CONFIRMED'/);
+  assert.match(captured, /state='SUPERSEDED'/);
+  assert.match(captured, /supersededBy/);
+  assert.match(captured, /LIMIT \$1/);
 });

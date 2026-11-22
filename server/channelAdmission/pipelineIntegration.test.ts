@@ -270,6 +270,56 @@ test('confirmed semantic admission without provider metadata stays confirmed', (
   assert.ok(built.decision.positiveEvidence.some(item => item.source === 'admission_decision'));
 });
 
+test('legacy semantic probability boundary normalizes to 100 for a confirmed admission', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Legacy Probability Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-legacy-probability',
+      channelName: 'Legacy Probability Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-legacy-probability',
+      description: '',
+      videoTitles: ['Gold analysis'],
+      admissionDecisionId: 'decision-legacy-probability',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 1,
+      admissionCitations: [
+        { field: 'bio', quote: 'market sentiment and options strategies', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.confidenceScore, 100);
+  assert.equal(built.decision.deterministicRouting?.humanReview, false);
+  assert.equal(built.decision.positiveEvidence[0]?.provenance?.fields?.[0]?.field, 'channel_bio');
+});
+
+test('a genuinely low confirmed semantic admission remains reviewable', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Low Focus Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-low-focus',
+      channelName: 'Low Focus Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-low-focus',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-low-focus',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 5,
+      admissionCitations: [
+        { field: 'bio', quote: 'some trading content', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.confidenceScore, 5);
+  assert.equal(built.decision.deterministicRouting?.humanReview, true);
+});
+
 test('production-shaped semantic admission with bio citations survives missing provider', () => {
   const built = buildAdmissionConfirmedClassification(
     { channel_name: 'Da Stock Analyst', description: '', country: 'Unknown' },
