@@ -270,6 +270,34 @@ test('confirmed semantic admission without provider metadata stays confirmed', (
   assert.ok(built.decision.positiveEvidence.some(item => item.source === 'admission_decision'));
 });
 
+test('production-shaped semantic admission with bio citations survives missing provider', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Da Stock Analyst', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-production-bio',
+      channelName: 'Da Stock Analyst',
+      youtubeUrl: 'https://youtube.com/channel/UC-production-bio',
+      description: '',
+      videoTitles: ['#STI breakout', '#STI next week'],
+      admissionDecisionId: 'decision-production-bio',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionModel: 'gemini-3.5-flash-lite',
+      admissionCitations: [
+        { field: 'bio', quote: 'stocks', supports: 'TRADING' },
+        { field: 'bio', quote: 'trader', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.deterministicRouting?.humanReview, false);
+  assert.equal(built.decision.deterministicRouting?.route, 'SEMANTIC_TRADING');
+  assert.equal(built.decision.evidenceCollection.providers[0]?.provider, 'admission_decision');
+  assert.equal(built.decision.positiveEvidence.length, 2);
+});
+
 test('confirmed semantic admission without creator-owned citations stays reviewable', () => {
   const built = buildAdmissionConfirmedClassification(
     { channel_name: 'Legacy Trader', description: 'market analysis', country: 'France' },
