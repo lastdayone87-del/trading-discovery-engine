@@ -12,9 +12,25 @@ if (!DATABASE_URL) throw new Error('DATABASE_URL secret is required');
 
 const report = { generatedAt: new Date().toISOString(), readOnly: true, queries: {} };
 
-async function main() {
-  const client = new Client({ connectionString: DATABASE_URL, ssl: /railway|proxy|rlwy/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined });
-  await client.connect();
+async function connectWithRetry() {
+  let lastError;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const client = new Client({ connectionString: DATABASE_URL, ssl: /railway|proxy|rlwy/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined, keepAlive: true });
+    client.on('error', () => undefined);
+    try {
+      await client.connect();
+      return client;
+    } catch (error) {
+      lastError = error;
+      await client.end().catch(() => undefined);
+      await new Promise(resolve => setTimeout(resolve, Math.min(3000 + attempt * 2000, 10000)));
+    }
+  }
+  throw lastError;
+}
+
+async function collect() {
+  const client = await connectWithRetry();
   try {
     await client.query('BEGIN TRANSACTION READ ONLY');
     await client.query("SET LOCAL statement_timeout = '300s'");
@@ -246,6 +262,21 @@ async function main() {
     scheduler: report.queries.scheduler?.rows,
     queryRuns24h: report.queries.query_runs_24h?.rows,
   }, null, 2));
+}
+
+async function main() {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await collect();
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(`probe attempt ${attempt} failed: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+  throw lastError;
 }
 
 main().catch(error => {
