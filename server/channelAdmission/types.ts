@@ -95,6 +95,7 @@ export type AdmissionDecision =
   | 'ADMIT'
   | 'ADMIT_AMBIGUOUS'
   | 'REJECT_UNRELATED'
+  | 'REJECT_NON_TRADING'
   | 'REJECT_COUNTRY'
   | 'HOLD_MISSING_EVIDENCE'
   | 'PROVIDER_DEFERRED'
@@ -117,6 +118,10 @@ export interface AdmissionEvidence {
   declaredLanguage?: string;
   subscriberCount?: string;
   videos: AdmissionVideo[];
+  /** Creator playlists; stage-2 acquisition only, never a substitute for videos. */
+  playlists?: Array<{ id?: string; name: string; description?: string }>;
+  /** Platform topic metadata (topicDetails); not creator-owned evidence. */
+  topics?: string[];
   matchedDocument?: Record<string, unknown>;
   relationshipProvenance?: Record<string, unknown>;
   query?: string;
@@ -127,12 +132,16 @@ export interface AdmissionEvidence {
   source: DiscoverySource;
   targetCountry: string;
   evidenceCoverage: 'COMPLETE' | 'PARTIAL';
+  /** Which creator-owned sample kind was acquired (video, playlist, metadata only, or none). */
+  evidenceSample?: 'VIDEO_SAMPLE' | 'PLAYLIST_SAMPLE' | 'METADATA_ONLY' | 'NONE';
+  /** Acquisition stage that produced this snapshot. */
+  evidenceStage?: 1 | 2 | 3;
   fetchedAt: string;
   failureReason?: string;
 }
 
 export interface SemanticCitation {
-  field: 'channel_name' | 'bio' | 'video_title' | 'video_description' | 'link';
+  field: 'channel_name' | 'bio' | 'video_title' | 'video_description' | 'playlist_name' | 'playlist_description' | 'link';
   index?: number;
   quote: string;
   supports: 'TRADING' | 'UNRELATED' | 'FINANCE_ADJACENT';

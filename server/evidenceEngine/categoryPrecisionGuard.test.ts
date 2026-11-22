@@ -58,8 +58,8 @@ test('deterministic guard never downgrades a genuine education channel', () => {
 test('hybrid guard catches every false positive and keeps every genuine educator', async () => {
   const fallback: Record<string, PrecisionGuardResult['category']> = {
     BasedClips: 'FINANCIAL_NEWS',
-    '12TradePro Com': 'MARKET_INSTITUTION',
-    'Fx Crack Robo House': 'MARKET_INSTITUTION',
+    '12TradePro Com': 'TRADING_PLATFORM_OR_FIRM',
+    'Fx Crack Robo House': 'TRADING_PLATFORM_OR_FIRM',
     'Forex & Crypto Live': 'HYPE',
     'Golden Waves': 'HYPE',
     'Price Action Signals': 'HYPE',
@@ -172,8 +172,8 @@ test('adjudicator may downgrade only to the approved precision categories', asyn
       return value;
     },
   });
-  const market = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'MARKET_INSTITUTION', confidence: 91 }) });
-  assert.equal(market?.category, 'MARKET_INSTITUTION');
+  const market = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'TRADING_PLATFORM_OR_FIRM', confidence: 91 }) });
+  assert.equal(market?.category, 'TRADING_PLATFORM_OR_FIRM');
   // Providers may return a probability instead of a percentage.
   const probability = await adjudicateCategory(input(c), 'INVESTING_EDUCATION', { client: client({ label: 'UNRELATED', confidence: 0.95 }) });
   assert.equal(probability?.category, 'UNRELATED');
@@ -245,7 +245,7 @@ test('Arabic official channels and Chinese analysis survive Unicode boundaries',
     channel_name: 'القناة الرسمية',
     description: 'The official broker channel for our clients.',
     video_titles: ['Gold analysis'],
-  })?.category, 'MARKET_INSTITUTION');
+  })?.category, 'TRADING_PLATFORM_OR_FIRM');
   assert.equal(deterministicCategoryGuard({
     channel_name: '财经新闻',
     description: 'Daily financial news updates with 技术分析 and 支撑阻力.',
@@ -312,7 +312,7 @@ test('channel metadata is delimited as untrusted data in the adjudicator prompt'
 test('adjudicator prompt explicitly forbids relevant-to-relevant relabeling', () => {
   const c = FALSE_POSITIVE_CASES.find(value => value.name === 'CryptoDexWorld')!;
   const prompt = buildCategoryAdjudicatorPrompt(input(c), 'INVESTING_EDUCATION');
-  assert.match(prompt, /Allowed labels: MARKET_INSTITUTION, HYPE, FINANCIAL_NEWS, UNRELATED, KEEP_RELEVANT/);
+  assert.match(prompt, /Allowed labels: TRADING_PLATFORM_OR_FIRM, BANK_OR_NON_TRADING_INSTITUTION, HYPE, FINANCIAL_NEWS, UNRELATED, KEEP_RELEVANT/);
   assert.match(prompt, /When uncertain, return KEEP_RELEVANT/);
   assert.match(prompt, /Do not downgrade a genuine educator/);
   assert.match(prompt, /confidence \(0-100\)/);
@@ -320,4 +320,111 @@ test('adjudicator prompt explicitly forbids relevant-to-relevant relabeling', ()
   assert.match(prompt, /signal-first brand|named for signals/);
   assert.match(prompt, /analysis-only, forecast-style/);
   assert.match(prompt, /FINANCIAL_NEWS only when the primary product is reporting market events/);
+});
+
+test('official banks and asset managers split away from trading platforms', () => {
+  const bank = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank wealth products, market insight and banking services.',
+    video_titles: ['Market outlook', 'Wealth solutions', 'Banking made simple'],
+  });
+  assert.equal(bank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const officialBank = deterministicCategoryGuard({
+    channel_name: 'Maybank Official Channel',
+    description: 'Official YouTube channel of Maybank. Wealth products, market insight and banking services.',
+    video_titles: ['Market outlook', 'Wealth solutions', 'Banking made simple'],
+  });
+  assert.equal(officialBank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const platform = deterministicCategoryGuard({
+    channel_name: 'Apex Broker Official Channel',
+    description: 'Official channel of Apex Broker. Trading platform, execution and market analysis.',
+    video_titles: ['Platform walkthrough', 'Futures execution', 'Risk management'],
+  });
+  assert.equal(platform?.category, 'TRADING_PLATFORM_OR_FIRM');
+});
+
+test('Bank Nifty, SoftBank and Fairbanks are not bank institutions', () => {
+  const bankNifty = deterministicCategoryGuard({
+    channel_name: 'BankNifty Options Trader',
+    description: 'Daily Bank Nifty options scalping, live execution and risk management.',
+    video_titles: ['Bank Nifty live trading', 'Nifty options setup', 'Risk management recap'],
+  });
+  assert.notEqual(bankNifty?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const softbank = deterministicCategoryGuard({
+    channel_name: 'SoftBank Official Channel',
+    description: 'Official channel of SoftBank. Telecommunications, technology and investment.',
+    video_titles: ['Technology vision', 'Investment update', 'Telecom network'],
+  });
+  assert.notEqual(softbank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const fairbanks = deterministicCategoryGuard({
+    channel_name: 'Fairbanks Alaska',
+    description: 'Life in Fairbanks, Alaska. Travel, weather and local events.',
+    video_titles: ['Winter in Fairbanks', 'Northern lights', 'Local travel guide'],
+  });
+  assert.notEqual(fairbanks?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+});
+
+test('a bank brand with one market-analysis upload stays bank, but a primary trading sample does not', () => {
+  const bank = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank wealth products, market insight and banking services.',
+    video_titles: ['Market analysis', 'Wealth products', 'Savings accounts'],
+  });
+  assert.equal(bank?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const tradingBank = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking and trading education. Market analysis and technical analysis.',
+    video_titles: ['Technical analysis of futures', 'Price action setup', 'Market structure lesson', 'Risk management'],
+  });
+  assert.equal(tradingBank, null);
+});
+
+test('ordinary asset managers and mutual-fund marketers are non-trading institutions', () => {
+  const assetManager = deterministicCategoryGuard({
+    channel_name: 'Northstar Asset Management Official Channel',
+    description: 'Official channel of Northstar Asset Management. Mutual funds, retirement products and wealth management.',
+    video_titles: ['Mutual fund overview', 'Retirement planning', 'Market outlook'],
+  });
+  assert.equal(assetManager?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+});
+
+test('known compound bank brands remain banks while SoftBank/Fairbanks do not', () => {
+  for (const name of ['Citibank', 'Commerzbank', 'Maybank']) {
+    const result = deterministicCategoryGuard({
+      channel_name: `${name} Official Channel`,
+      description: `Official channel of ${name}. Banking services and market insight.`,
+      video_titles: ['Banking services', 'Market outlook', 'Savings products'],
+    });
+    assert.equal(result?.category, 'BANK_OR_NON_TRADING_INSTITUTION', name);
+  }
+});
+
+test('generic Chinese analysis titles do not exempt a bank, but trading analysis does', () => {
+  const productAnalysis = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking services and product information.',
+    video_titles: ['产品分析', '客户分析', '信用风险分析'],
+  });
+  assert.equal(productAnalysis?.category, 'BANK_OR_NON_TRADING_INSTITUTION');
+
+  const tradingAnalysis = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking services and trading education.',
+    video_titles: ['黄金技术分析', '股票行情分析', '期货市场分析'],
+  });
+  assert.equal(tradingAnalysis, null);
+});
+
+test('Japanese trading-analysis titles establish a primary trading sample', () => {
+  const japanese = deterministicCategoryGuard({
+    channel_name: 'Maybank2usg',
+    description: 'Maybank banking services and trading education.',
+    video_titles: ['テクニカル分析', 'チャート分析', '株式分析'],
+  });
+  assert.equal(japanese, null);
 });

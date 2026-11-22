@@ -375,6 +375,7 @@ type InnertubeSession = {
   search: (query: string, filters?: Record<string, unknown>) => Promise<InnertubeFeedLike>;
   getChannel?: (channelId: string) => Promise<{
     getVideos?: () => Promise<{ videos?: unknown }>;
+    getAbout?: () => Promise<unknown>;
   }>;
   getBasicInfo?: (videoId: string) => Promise<{ basic_info?: { short_description?: unknown } }>;
 };
@@ -697,7 +698,158 @@ registerRetrievalExecutor(YOUTUBE_INNERTUBE_PROVIDER, executeInnertubeRetrievalP
 
 export interface InnertubeVideoDescription {
   videoId: string;
+  title?: string;
   description: string;
+  publishedAt?: string;
+}
+
+
+export type InnertubeAcquisitionStatus =
+  | 'AVAILABLE'
+  | 'AUTHORITATIVE_EMPTY'
+  | 'NOT_FOUND'
+  | 'RATE_LIMITED'
+  | 'CONSENT_BLOCKED'
+  | 'TEMPORARY_FAILURE'
+  | 'INCOMPLETE_RESPONSE';
+
+export interface InnertubeChannelAbout {
+  status: InnertubeAcquisitionStatus;
+  description?: string;
+  links?: string[];
+  country?: string;
+  subscriberCount?: string;
+  reason?: string;
+}
+
+/**
+ * Keyless channel About fallback. Returns a structured status so temporary
+ * provider pressure is retryable and is never mistaken for authoritative
+ * empty evidence. Shares the module's cooldown and timeout contract.
+ */
+export async function fetchChannelAboutViaInnertube(
+  channelId: string,
+  opts: { jobId?: string } = {},
+): Promise<InnertubeChannelAbout> {
+  if (!channelId?.trim()) return { status: 'NOT_FOUND', reason: 'CHANNEL_ID_REQUIRED' };
+  const started = Date.now();
+  const base = {
+    id: randomUUID(),
+    provider: 'youtube-innertube',
+    operation: 'channel-about',
+    requestId: `adhoc:youtube-innertube:channel-about:${channelId}`,
+    runId: undefined,
+    jobId: opts.jobId,
+    requestMetadata: { channelId },
+    attempt: 1,
+    reservedCost: 0,
+    policyVersion: 'provider-resilience-v1',
+  };
+  const remainingMs = innertubeCooldownRemainingMs();
+  if (remainingMs > 0) {
+    await emit({
+      ...base,
+      status: 'RATE_LIMITED',
+      latencyMs: Date.now() - started,
+      actualCost: 0,
+      occurredAt: new Date().toISOString(),
+      errorClass: 'RATE_LIMIT' as const,
+      requestMetadata: { ...base.requestMetadata, errorClass: 'COOLDOWN' },
+    }).catch(() => undefined);
+    return { status: 'RATE_LIMITED', reason: `COOLDOWN_${remainingMs}MS` };
+  }
+  const deadlineAtMs = Date.now() + innertubeTimeoutMs();
+  const pacedCall = async <T>(work: () => Promise<T>): Promise<T> => {
+    await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+    return withInnertubeRemaining(work(), deadlineAtMs);
+  };
+  try {
+    const sessionAttempt = getInnertubeSession();
+    let session: InnertubeSession;
+    try {
+      session = await withInnertubeRemaining(sessionAttempt, deadlineAtMs);
+    } catch (error) {
+      invalidateStuckSessionAttempt(sessionAttempt);
+      throw error;
+    }
+    const getChannel = session.getChannel;
+    if (typeof getChannel !== 'function') {
+      await emit({
+        ...base, status: 'TRANSIENT_ERROR' as const, latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+        errorClass: 'TRANSIENT' as const,
+        requestMetadata: { ...base.requestMetadata, errorClass: 'CHANNEL_UNAVAILABLE' },
+      }).catch(() => undefined);
+      return { status: 'TEMPORARY_FAILURE', reason: 'INNERTUBE_CHANNEL_UNAVAILABLE' };
+    }
+    const channel = await pacedCall<any>(() => getChannel.call(session, channelId) as Promise<any>);
+    if (!channel) return { status: 'NOT_FOUND', reason: 'CHANNEL_NOT_FOUND' };
+    let aboutNode: any = null;
+    if (typeof channel.getAbout === 'function') {
+      try {
+        aboutNode = await pacedCall(() => channel.getAbout!());
+      } catch (error) {
+        // A missing About tab is authoritative empty; any other error is a
+        // provider failure that must stay retryable.
+        if (!/tab\s+"[^"]*"\s+not found/i.test(String((error as Error)?.message || ''))) throw error;
+      }
+    }
+    const metadata = aboutNode?.metadata || aboutNode;
+    const description = String(metadata?.description || '').trim();
+    const rawLinks = Array.isArray(metadata?.links) || typeof metadata?.links?.map === 'function'
+      ? metadata.links
+      : [];
+    const links = Array.from(rawLinks as Array<unknown>)
+      .map((link: any) => typeof link === 'string'
+        ? link.trim()
+        : String(link?.link || link?.url || link?.target || link?.canonical_url || '').trim())
+      .filter(Boolean);
+    const country = String(metadata?.country || '').trim() || undefined;
+    const subscriberCount = String(metadata?.subscriber_count || '').trim() || undefined;
+    const status: InnertubeAcquisitionStatus = description || links.length || subscriberCount || country
+      ? 'AVAILABLE'
+      : 'AUTHORITATIVE_EMPTY';
+    await emit({
+      ...base,
+      status: 'SUCCESS',
+      latencyMs: Date.now() - started,
+      actualCost: 0,
+      occurredAt: new Date().toISOString(),
+      requestMetadata: { ...base.requestMetadata, acquisitionStatus: status },
+    });
+    return { status, description: description || undefined, links: links.length ? links : undefined, country, subscriberCount };
+  } catch (error) {
+    const typed = classifyInnertubeError(error);
+    if (typed.code === INNERTUBE_RATE_LIMITED_CODE) {
+      innertubeCooldownUntilMs = Date.now() + innertubeCooldownMs();
+      await emit({
+        ...base, status: 'RATE_LIMITED', latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+        errorClass: 'RATE_LIMIT' as const,
+        requestMetadata: { ...base.requestMetadata, errorClass: 'RATE_LIMIT' },
+      }).catch(() => undefined);
+      return { status: 'RATE_LIMITED', reason: typed.message };
+    }
+    if (typed.code === INNERTUBE_TIMEOUT_CODE) {
+      await emit({
+        ...base, status: 'TRANSIENT_ERROR' as const, latencyMs: Date.now() - started,
+        actualCost: 0, occurredAt: new Date().toISOString(),
+        errorClass: 'TIMEOUT' as const,
+        requestMetadata: { ...base.requestMetadata, errorClass: 'TIMEOUT' },
+      }).catch(() => undefined);
+      return { status: 'TEMPORARY_FAILURE', reason: typed.message };
+    }
+    await emit({
+      ...base,
+      status: 'TRANSIENT_ERROR' as const,
+      latencyMs: Date.now() - started,
+      actualCost: 0,
+      occurredAt: new Date().toISOString(),
+      errorClass: 'TRANSIENT' as const,
+      requestMetadata: { ...base.requestMetadata, errorClass: String(typed.code || 'UNKNOWN') },
+    }).catch(() => undefined);
+    return { status: /not.?found|404/i.test(typed.message) ? 'NOT_FOUND' : 'TEMPORARY_FAILURE', reason: typed.message };
+  }
 }
 
 export interface InnertubeChannelDescriptions {
@@ -823,8 +975,11 @@ export async function fetchChannelVideoDescriptionsViaInnertube(
       videosAttempted += 1;
       try {
         const info = await pacedCall(() => getBasicInfo(ref.id));
-        const description = String((info as any)?.basic_info?.short_description || '').trim();
-        if (description) items.push({ videoId: ref.id, description });
+        const basic = (info as any)?.basic_info;
+        const description = String(basic?.short_description || '').trim();
+        const publishedAt = String(basic?.publish_date || basic?.published_time || '').trim() || undefined;
+        const title = ref.title.trim() || undefined;
+        if (title || description) items.push({ videoId: ref.id, title, description, publishedAt });
       } catch (error) {
         // Order matters: service-level failures must never read as
         // per-video unavailability. A numeric non-404 status, or a message

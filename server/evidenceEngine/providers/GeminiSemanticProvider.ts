@@ -9,8 +9,9 @@ import { applySemanticPrefilter, recordSemanticPrefilterOutcome } from '../../se
 import { classifySemanticPrompt, SEMANTIC_BATCH_PROMPT_VERSION, semanticBatchConfig, semanticResultWasBatched } from '../semanticBatch';
 import { citationsReferenceSuppliedDocuments, semanticFieldDocuments } from '../semanticDocumentRefs';
 import { SEMANTIC_RESULT_FIELD_NAMES, SEMANTIC_RESULT_LABELS, hasSemanticVerdictCore, isSemanticResultShape, type SemanticResultLabel } from '../semanticResultShape';
+import { hasMeaningfulCreatorFields } from '../creatorText';
 
-export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-4';
+export const SEMANTIC_PROMPT_VERSION = 'priority2-multilingual-structured-5-split-institutions';
 export const SEMANTIC_FEATURE_VERSION = 'field-aware-evidence-1';
 export const SEMANTIC_TAXONOMY = SEMANTIC_RESULT_LABELS;
 import { DEFAULT_MULTILINGUAL_CANDIDATE_MODEL, DEFAULT_MULTILINGUAL_ADJUDICATOR_MODEL } from '../modelDefaults';
@@ -314,13 +315,15 @@ export function defaultClient(): SemanticModelClient | undefined {
 
 /** Shared creator-context gate (see buildSemanticPrompt). */
 export function hasCreatorLevelSemanticContext(input: RawChannelInput): boolean {
-  const retrievalOnly = !!input.search_match_context && (input.enrichment_stage || 0) === 0;
-  if (!retrievalOnly) return true;
-  return (input.description?.trim().length || 0) >= 20 ||
-    (input.external_links?.length || 0) > 0 ||
-    (input.playlists?.length || 0) > 0 ||
-    (input.transcript_excerpts?.length || 0) > 0 ||
-    (input.videos?.length || 0) > 0;
+  // search_match_context is retrieval provenance, never creator context. At
+  // stage zero, retrieval-selected titles/descriptions are not creator-owned
+  // evidence; only bio, links, playlists, transcripts or a real video object
+  // can justify semantic spend. No arbitrary character threshold: a short
+  // real bio is creator context, while YouTube boilerplate is not.
+  const retrievalOnly = Boolean(input.search_match_context) && (input.enrichment_stage || 0) === 0;
+  return hasMeaningfulCreatorFields(retrievalOnly
+    ? { ...input, video_titles: [], video_descriptions: [], videos: [] }
+    : input);
 }
 
 function prompt(input: RawChannelInput, tier: 'CANDIDATE' | 'ADJUDICATION') {
@@ -336,21 +339,21 @@ export function buildSemanticPrompt(input: RawChannelInput, tier: 'CANDIDATE' | 
     task: tier, promptVersion: SEMANTIC_PROMPT_VERSION, closedTaxonomy: SEMANTIC_TAXONOMY,
     instructions: [
       'Infer meaning across languages, scripts, transliteration, loanwords, and code-switching.',
-      'Classify creator focus, not isolated keywords. Cite only supplied field references.',
+      'Classify creator focus, not isolated keywords. Cite only supplied field references. Platform topic metadata is routing context, never creator-owned evidence.',
       'Set supportedLanguage=false and label=AMBIGUOUS when meaning cannot be reliably interpreted.',
       'Distinguish active trading, trading education, investing education, financial news, personal finance, market institutions, hype, and unrelated content.',
       'Before choosing a label, determine the channel primary identity, primary commercial offer, and primary video content. Encode them in reasonCodes using only: PRIMARY_TRADER, PRIMARY_EDUCATOR, PRIMARY_ANALYST, PRIMARY_INSTITUTION, PRIMARY_VENDOR, PRIMARY_EDUCATION_BUSINESS, PRIMARY_NEWS_MEDIA, PRIMARY_HYPE, PRIMARY_UNRELATED; OFFER_NONE, OFFER_COURSE, OFFER_COMMUNITY, OFFER_SIGNALS, OFFER_SOFTWARE, OFFER_MANAGED_ACCOUNT, OFFER_BROKERAGE, OFFER_EVENTS, OFFER_NEWS; CONTENT_ANALYSIS, CONTENT_LIVE, CONTENT_RECAPS, CONTENT_LESSONS, CONTENT_NEWS, CONTENT_PROMO, CONTENT_ENTERTAINMENT, CONTENT_MIXED.',
       'Use TRADING_EDUCATION when the creator teaches trading method, psychology, platform use, or risk management, or primarily produces market or technical analysis intended to inform trading decisions: charts, price action, market structure, support and resistance, trends, scenarios, setups, or trade ideas. Analysis-only and forecast-style trading channels qualify; step-by-step lessons are not required.',
       'Use ACTIVE_TRADING when the creator primarily publishes live execution, trade recaps, or a documented trading journey. A free Discord, Telegram community, affiliate link, or side signal offer does not make an active trader HYPE when live execution/recaps are the primary content.',
-      'Use INVESTING_EDUCATION when the creator primarily produces investment analysis, stock, ETF, portfolio, valuation or company analysis, price targets, or long-term investing ideas, even without step-by-step lessons.',
-      'Use FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading or investing decisions.',
-      'Use MARKET_INSTITUTION for a broker, exchange, bank, fund, asset manager, data/software platform, trading-robot vendor, stock-pick service, or event business, including the official channel of such an institution even when it publishes educational videos. An independent trader who uses or reviews a platform is not the platform.',
+      'Use INVESTING_EDUCATION only when the creator primarily produces actionable investment analysis or education: portfolio construction, stock/ETF analysis, valuation, company analysis, price targets, or a long-term investing process. Do not use it for general economics, venture-capital or business podcasts, wealth-management marketing, mutual-fund advertisements, or generic financial commentary; those belong to FINANCIAL_NEWS, PERSONAL_FINANCE, BANK_OR_NON_TRADING_INSTITUTION, or UNRELATED.',
+      'Use FINANCIAL_NEWS only when the primary product is reporting market events, company announcements, economic developments, or financial headlines without primarily producing trading or investment analysis, trade ideas, or analysis intended to inform trading or investing decisions. General economics, business news, and venture-capital commentary are not investing education.',
+      'Use TRADING_PLATFORM_OR_FIRM for a broker, exchange, prop firm, trading-software/data platform, scanner/terminal, stock-pick service, trading-robot vendor, or trading-education event business whose primary content is trading/investing analysis, education, execution, or platform use. An independent trader who uses or reviews a platform is not the platform.\nUse BANK_OR_NON_TRADING_INSTITUTION for a retail/corporate bank, insurer, payment provider, consumer-finance company, ordinary wealth-management firm, mutual-fund marketing, or other financial institution without primary trading/investing analysis. Official bank channels that only publish market insight, wealth products, or brand content are non-trading.',
       'Use HYPE only when signals, VIP/paid access, guaranteed returns, 100x/memecoin/presale promotion, or affiliate-first promotion is the primary offer. A channel that publishes original analysis, lessons, live execution, or trade recaps is not HYPE merely because it mentions signals, a free Discord, a VIP community, or a broker affiliate link.',
       'Use UNRELATED when the primary content is non-financial, even if finance appears in a minority of videos.',
       'Use PERSONAL_FINANCE for budgeting, banking, taxes, insurance, savings products and consumer finance.',
       'Return JSON with label, confidence 0..100, supportedLanguage, reasonCodes, explanation, concepts, languages, citations.'
     ],
-    declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], documents: semanticFieldDocuments(input)
+    declaredCountry: input.country || null, declaredLanguageHints: input.detected_languages || [], platformTopics: input.topic_details || [], documents: semanticFieldDocuments(input)
   });
 }
 
@@ -481,11 +484,13 @@ export class GeminiSemanticProvider implements EvidenceProvider {
     const positive = result.label === 'ACTIVE_TRADING'
       || result.label === 'TRADING_EDUCATION'
       || result.label === 'INVESTING_EDUCATION'
-      // Commercial, broker/platform, signal and promotional channels are
-      // trading/investing content when their actual material is trading.
+      // Only a trading platform/firm is trading-relevant. A bank, insurer,
+      // wealth manager, or ordinary fund is a non-trading institution.
+      || result.label === 'TRADING_PLATFORM_OR_FIRM'
       || result.label === 'MARKET_INSTITUTION'
       || result.label === 'HYPE';
-    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : result.label === 'UNRELATED' ? 'IRRELEVANT_DOMAIN' : positive ? 'METHODOLOGY_CONCEPT' : 'NON_TRADING_ADJACENT';
+    const nonTradingInstitution = result.label === 'BANK_OR_NON_TRADING_INSTITUTION';
+    const category: EvidenceCategory = abstained ? 'SEMANTIC_ABSTENTION' : result.label === 'HYPE' ? 'HYPE_SPECULATION' : (result.label === 'UNRELATED' || nonTradingInstitution) ? 'IRRELEVANT_DOMAIN' : positive ? 'METHODOLOGY_CONCEPT' : 'NON_TRADING_ADJACENT';
     const rawWeight = abstained ? 0 : positive ? 24 : 26;
     const finalWeight = abstained ? 0 : rawWeight * .65 * (calibrated / 100) * (positive ? 1 : -1);
     const semantic = { modelVersion: model, promptVersion: SEMANTIC_PROMPT_VERSION, featureVersion: SEMANTIC_FEATURE_VERSION, calibrationVersion: SEMANTIC_CALIBRATION_VERSION, taxonomyLabel: result.label, rawConfidence: result.confidence, calibratedConfidence: calibrated, detectedLanguages: result.languages, reasonCodes: [...fallbackReasonCodes, ...result.reasonCodes, ...(abstained ? ['SEMANTIC_MODEL_ABSTAINED'] : [])] };

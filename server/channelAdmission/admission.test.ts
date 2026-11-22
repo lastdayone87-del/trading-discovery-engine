@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assessExtractedQueryAdmission, decideAdmission } from './policy';
-import { decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading } from './deterministic';
+import { assessExtractedQueryAdmission, decideAdmission, hasStrongTradingSupport, validCitations } from './policy';
+import { categoryFallbackCitations, decisionTradingVideoIndexes, evaluateDeterministicAdmission, evaluateStrictRejection, hasDecisiveTradingShare, isFinanceAdjacentWithoutActiveTrading, unrelatedCitations } from './deterministic';
 import { isProviderEvidenceFailure } from './evidence';
 import { isSemanticDecisionFailure } from './semanticJudge';
 import { nextAdmissionVerificationAttempt } from './worker';
@@ -1082,10 +1082,11 @@ test('only transient provider evidence failures defer without consuming attempts
     'read ECONNRESET',
     'Service unavailable (503)',
     'unexpected provider payload shape',
+    'FULL_DESCRIPTIONS_UNAVAILABLE:quota exhausted',
   ]) {
     assert.equal(isProviderEvidenceFailure(reason), true, reason);
   }
-  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'FULL_DESCRIPTIONS_UNAVAILABLE:no description', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
+  for (const reason of [undefined, '', 'NO_CREATOR_TEXT_AVAILABLE', 'YouTube HTTP 404 not found', 'channelNotFound', 'requested entity was not found']) {
     assert.equal(isProviderEvidenceFailure(reason), false, String(reason));
   }
 });
@@ -1311,4 +1312,113 @@ test('admission semantic route health treats unconfigured providers as unavailab
   assert.equal(judgeRoutePoolHealthy({ gemini: false, groq: true }, { gemini: false, groq: true }), false);
   assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: false }), true);
   assert.equal(judgeRoutePoolHealthy({ gemini: true, groq: true }, { gemini: true, groq: true }), false);
+});
+
+test('playlist citations are validated as creator-owned admission evidence', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
+    playlists: [{ name: 'Futures trading recaps', description: 'Weekly execution reviews' }],
+  };
+  const validated = validCitations(fixture, judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('playlist_name', 'Futures trading recaps', 0, 'TRADING')],
+  }));
+  assert.equal(validated.length, 1);
+  assert.equal(validated[0].field, 'playlist_name');
+});
+
+test('playlist text participates in the one-citation trading-anchor path', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Playlist Trader', bio: '', videos: [] }),
+    playlists: [{ name: 'Futures trading recaps', description: 'Weekly execution reviews' }],
+  };
+  const j = judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('playlist_name', 'Futures trading recaps', 0, 'TRADING')],
+  });
+  assert.equal(validCitations(fixture, j).length, 1);
+  assert.equal(hasStrongTradingSupport(fixture, j), true);
+});
+
+test('a trading channel name cannot be the lexical anchor for a single citation', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Futures Trading Daily', bio: 'Cooking recipes', videos: [] }),
+  };
+  const j = judgment({
+    subject: 'TRADING',
+    focus: 90,
+    citations: [citation('bio', 'Cooking recipes', undefined, 'TRADING')],
+  });
+  assert.equal(validCitations(fixture, j).length, 1);
+  assert.equal(hasStrongTradingSupport(fixture, j), false);
+});
+
+test('playlist and external-link negative citations resolve to source text', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Link Fixture', bio: '', videos: [] }),
+    links: ['https://broker.example/accounts'],
+    playlists: [{ name: 'Bank wealth products', description: 'Savings and insurance' }],
+  };
+  const decision = {
+    negativeEvidence: [{
+      provenance: { fields: [
+        { field: 'external_link_domain', index: 0 },
+        { field: 'playlist_name', index: 0 },
+      ] },
+    }],
+  } as any;
+  const citations = unrelatedCitations(fixture, decision);
+  assert.ok(citations.some(citation => citation.field === 'link' && /broker\.example/.test(citation.quote)));
+  assert.ok(citations.some(citation => citation.field === 'playlist_name' && /Bank wealth/.test(citation.quote)));
+});
+
+test('category fallback citations keep an auditable creator quote', () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({ name: 'Maybank2usg', bio: 'Wealth products and banking services.', videos: [] }),
+  };
+  const citations = categoryFallbackCitations(fixture);
+  assert.equal(citations.length > 0, true);
+  assert.match(citations[0].quote, /Wealth products|Maybank2usg/);
+});
+
+test('finance-adjacent insurance content never takes the strict unrelated path', () => {
+  const fixture = evidence({
+    name: 'Insurance Guide',
+    bio: 'Car insurance comparison, budgeting and savings account tips.',
+    videos: [
+      { title: 'Compare car insurance policies', description: 'Vehicle insurance comparison and savings.' },
+      { title: 'Budgeting for car insurance', description: 'Car and vehicle insurance savings.' },
+    ],
+  });
+  assert.equal(evaluateStrictRejection(fixture), null);
+});
+
+test('auto-generated music Topic channels reject deterministically from topicDetails', async () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({
+      name: 'Limp Bizkit - Topic',
+      bio: 'Provided to YouTube by Universal Music Group\n\nLimp Bizkit - Break Stuff\n\nAuto-generated by YouTube.',
+      videos: [],
+    }),
+    topics: ['https://en.wikipedia.org/wiki/Music'],
+  };
+  const decision = await evaluateDeterministicAdmission(fixture);
+  assert.equal(decision.outcome, 'REJECT');
+  assert.ok(decision.reasonCodes.includes('AUTOGENERATED_MUSIC_TOPIC'));
+  assert.ok(decision.citations.length > 0);
+});
+
+test('a legitimate trading creator with a music-topic tag is not rejected', async () => {
+  const fixture: AdmissionEvidence = {
+    ...evidence({
+      name: 'NQ Futures Trader',
+      bio: 'NQ futures trader. Live execution, risk management and trade recaps.',
+      videos: [{ title: 'NQ live execution', description: 'Risk management and trade recap.' }],
+    }),
+    topics: ['https://en.wikipedia.org/wiki/Music'],
+  };
+  const decision = await evaluateDeterministicAdmission(fixture);
+  assert.notEqual(decision.outcome, 'REJECT');
 });

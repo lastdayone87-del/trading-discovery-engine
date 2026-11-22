@@ -83,8 +83,9 @@ const hasProviderFailure = (collection: EvidenceCollectionReport): boolean =>
   collection.providers.some(provider => provider.availability === 'FAILED');
 
 /**
- * Assess the deterministic recognition state. `DECISIVE_*` and `QUERY_ONLY`
- * always skip semantic; only genuinely ambiguous states may wait.
+ * Assess the deterministic recognition state. Decisive states skip semantic;
+ * QUERY_ONLY may wait when real creator context exists and otherwise asks for
+ * evidence acquisition.
  */
 export function assessRecognitionState(input: RecognitionAssessmentInput): RecognitionAssessment {
   const { composition, evidence, collection } = input;
@@ -151,9 +152,13 @@ export function assessRecognitionState(input: RecognitionAssessmentInput): Recog
     semanticSkippedReason = input.semanticAttempted ? null : 'SEMANTIC_SKIPPED_DETERMINISTIC_DECISIVE';
     reasons.push('ALTERNATIVE_DOMINANT_WITH_CREATOR_LEVEL_NEGATIVE');
   } else if (composition.focus === 'QUERY_ONLY') {
+    // A retrieval-only composition is not proof that no creator content
+    // exists. When the supplied evidence has real creator context, the
+    // semantic judge can still interpret it; otherwise acquire evidence
+    // rather than permanently skipping AI on an empty channel.
     state = 'QUERY_ONLY';
-    semanticPolicy = 'SKIP';
-    semanticSkippedReason = 'SEMANTIC_SKIPPED_QUERY_ONLY';
+    semanticPolicy = input.semanticAvailable && input.hasCreatorContext ? 'BOUNDED_WAIT' : 'ENRICH';
+    semanticSkippedReason = null;
     gaps.add('QUERY_ONLY_EVIDENCE');
     reasons.push('NO_CREATOR_OWNED_OBSERVED_FAMILY');
   } else if (composition.focus === 'MIXED') {

@@ -27,6 +27,28 @@ export interface PublicYouTubeChannelAbout {
   truncated?: boolean;
 }
 
+let publicAboutCooldownUntilMs = 0;
+let nextPublicAboutRequestAtMs = 0;
+const PUBLIC_ABOUT_MIN_INTERVAL_MS = 1_000;
+const PUBLIC_ABOUT_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const PUBLIC_ABOUT_CONSENT_COOLDOWN_MS = 5 * 60_000;
+
+export function resetPublicAboutPacingForTests(): void {
+  publicAboutCooldownUntilMs = 0;
+  nextPublicAboutRequestAtMs = 0;
+}
+
+export function publicAboutCooldownRemainingMs(now: number = Date.now()): number {
+  return Math.max(0, publicAboutCooldownUntilMs - now);
+}
+
+async function pacePublicAboutRequest(): Promise<void> {
+  const now = Date.now();
+  const scheduled = Math.max(now, nextPublicAboutRequestAtMs);
+  nextPublicAboutRequestAtMs = scheduled + PUBLIC_ABOUT_MIN_INTERVAL_MS;
+  if (scheduled > now) await new Promise(resolve => setTimeout(resolve, scheduled - now));
+}
+
 /** Match inspection short-bio threshold: treat under 20 chars as insufficient About text. */
 export const INSUFFICIENT_DESCRIPTION_MAX_LEN = 20;
 
@@ -97,12 +119,43 @@ function extractExternalUrlsFromHtmlText(text: string): string[] {
  * Soft-failing HTTP GET used for public YouTube pages.
  * Returns null on timeout, non-OK status, network error, or non-HTML body.
  */
-export async function fetchPublicYouTubePage(
+export type PublicAboutAcquisitionStatus =
+  | 'AVAILABLE'
+  | 'AUTHORITATIVE_EMPTY'
+  | 'NOT_FOUND'
+  | 'RATE_LIMITED'
+  | 'CONSENT_BLOCKED'
+  | 'TEMPORARY_FAILURE'
+  | 'INCOMPLETE_RESPONSE';
+
+export interface PublicAboutPageFetch {
+  status: Exclude<PublicAboutAcquisitionStatus, 'AVAILABLE' | 'AUTHORITATIVE_EMPTY'> | 'AVAILABLE';
+  html?: string;
+  finalUrl?: string;
+  truncated?: boolean;
+  httpStatus?: number;
+  reason?: string;
+}
+
+/**
+ * Detailed public-page fetch. Unlike the legacy wrapper this distinguishes an
+ * authoritative 404 from a timeout, rate limit, consent wall, or truncated
+ * response so callers can defer instead of declaring evidence exhausted.
+ */
+export async function fetchPublicYouTubePageDetailed(
   url: string,
   depth = 0,
-  fetchImpl: typeof fetch = fetch
-): Promise<{ html: string; finalUrl: string; truncated: boolean } | null> {
-  if (depth > 2) return null;
+  fetchImpl: typeof fetch = fetch,
+): Promise<PublicAboutPageFetch> {
+  if (depth > 2) return { status: 'TEMPORARY_FAILURE', reason: 'REDIRECT_DEPTH' };
+  await pacePublicAboutRequest();
+  // Check again after pacing: a companion request may have hit 429/consent
+  // while this request was waiting, and legacy callers use this fetcher
+  // directly without the outer admission cooldown guard.
+  const cooldownRemaining = publicAboutCooldownRemainingMs();
+  if (cooldownRemaining > 0) {
+    return { status: 'RATE_LIMITED', reason: `COOLDOWN_${cooldownRemaining}MS` };
+  }
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -116,22 +169,59 @@ export async function fetchPublicYouTubePage(
       },
       redirect: 'follow'
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 404 || res.status === 410) {
+        return { status: 'NOT_FOUND', httpStatus: res.status, reason: `HTTP_${res.status}` };
+      }
+      if (res.status === 429) {
+        publicAboutCooldownUntilMs = Math.max(publicAboutCooldownUntilMs, Date.now() + PUBLIC_ABOUT_RATE_LIMIT_COOLDOWN_MS);
+        return { status: 'RATE_LIMITED', httpStatus: res.status, reason: 'HTTP_429' };
+      }
+      return { status: 'TEMPORARY_FAILURE', httpStatus: res.status, reason: `HTTP_${res.status}` };
+    }
     const contentType = res.headers.get('content-type') || '';
     if (
       !contentType.includes('text/html') &&
       !contentType.includes('json') &&
       !contentType.includes('plain')
     ) {
-      return null;
+      return { status: 'TEMPORARY_FAILURE', httpStatus: res.status, reason: 'NON_HTML_CONTENT' };
     }
     const bounded = await readBoundedResponseText(res);
-    return { html: bounded.text, finalUrl: res.url, truncated: bounded.truncated };
-  } catch {
-    return null;
+    const consentBlocked = /consent\.youtube\.com|Before you continue to YouTube|We use cookies and data/i.test(bounded.text.slice(0, 20_000));
+    if (consentBlocked) {
+      publicAboutCooldownUntilMs = Math.max(publicAboutCooldownUntilMs, Date.now() + PUBLIC_ABOUT_CONSENT_COOLDOWN_MS);
+      return { status: 'CONSENT_BLOCKED', httpStatus: res.status, reason: 'CONSENT_WALL' };
+    }
+    if (!bounded.text.trim()) {
+      return { status: 'INCOMPLETE_RESPONSE', httpStatus: res.status, reason: 'EMPTY_BODY' };
+    }
+    return {
+      status: 'AVAILABLE',
+      html: bounded.text,
+      finalUrl: res.url,
+      truncated: bounded.truncated,
+      httpStatus: res.status,
+    };
+  } catch (error) {
+    const message = String((error as Error)?.message || error || '');
+    if (/abort|timeout|timed out/i.test(message)) {
+      return { status: 'TEMPORARY_FAILURE', reason: 'TIMEOUT' };
+    }
+    return { status: 'TEMPORARY_FAILURE', reason: 'NETWORK_FAILURE' };
   } finally {
     clearTimeout(id);
   }
+}
+
+export async function fetchPublicYouTubePage(
+  url: string,
+  depth = 0,
+  fetchImpl: typeof fetch = fetch
+): Promise<{ html: string; finalUrl: string; truncated: boolean } | null> {
+  const fetched = await fetchPublicYouTubePageDetailed(url, depth, fetchImpl);
+  if (fetched.status !== 'AVAILABLE' || !fetched.html) return null;
+  return { html: fetched.html, finalUrl: fetched.finalUrl || url, truncated: Boolean(fetched.truncated) };
 }
 
 /**
@@ -360,6 +450,61 @@ export async function fetchLiveYouTubeChannelData(
   } catch {
     return null;
   }
+}
+
+/**
+ * Status-bearing About acquisition used by admission enrichment. A temporary
+ * provider failure is never converted into authoritative empty evidence.
+ */
+export async function fetchPublicAboutEvidence(
+  youtubeUrl: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ status: PublicAboutAcquisitionStatus; about?: PublicYouTubeChannelAbout; reason?: string }> {
+  if (!youtubeUrl || !youtubeUrl.startsWith('http')) {
+    return { status: 'NOT_FOUND', reason: 'INVALID_URL' };
+  }
+  const cooldownRemaining = publicAboutCooldownRemainingMs();
+  if (cooldownRemaining > 0) {
+    return { status: 'RATE_LIMITED', reason: `COOLDOWN_${cooldownRemaining}MS` };
+  }
+  const aboutUrl = youtubeChannelAboutUrl(youtubeUrl);
+  const [aboutPage, rootPage] = await Promise.all([
+    fetchPublicYouTubePageDetailed(aboutUrl, 0, fetchImpl),
+    aboutUrl === youtubeUrl ? Promise.resolve(null) : fetchPublicYouTubePageDetailed(youtubeUrl, 0, fetchImpl),
+  ]);
+  const pageStatuses = [aboutPage?.status, rootPage?.status].filter(Boolean) as string[];
+  const priority: PublicAboutAcquisitionStatus[] = ['RATE_LIMITED', 'CONSENT_BLOCKED', 'TEMPORARY_FAILURE', 'INCOMPLETE_RESPONSE', 'NOT_FOUND'];
+  const failureStatus = priority.find(candidate => pageStatuses.includes(candidate) && candidate !== 'NOT_FOUND');
+  if (!pageStatuses.includes('AVAILABLE')) {
+    return { status: failureStatus || 'NOT_FOUND', reason: pageStatuses.join(',') };
+  }
+  const aboutParsed = aboutPage?.status === 'AVAILABLE' && aboutPage.html
+    ? parseYouTubeChannelAboutFromHtml(aboutPage.html, { finalUrl: aboutPage.finalUrl })
+    : null;
+  const rootParsed = rootPage?.status === 'AVAILABLE' && rootPage.html
+    ? parseYouTubeChannelAboutFromHtml(rootPage.html, { finalUrl: rootPage.finalUrl })
+    : null;
+  const bioSource = aboutParsed?.bio?.trim() ? aboutParsed : rootParsed;
+  const bio = bioSource?.bio;
+  const channelLinks = Array.from(new Set([...(aboutParsed?.channelLinks || []), ...(rootParsed?.channelLinks || [])]));
+  const subscriberCountText = aboutParsed?.subscriberCountText || rootParsed?.subscriberCountText;
+  const truncated = Boolean(aboutPage?.truncated || rootPage?.truncated);
+  const hasUsableMetadata = Boolean(bio?.trim()) || channelLinks.length > 0 || Boolean(subscriberCountText);
+  if (truncated && !hasUsableMetadata) {
+    return { status: 'INCOMPLETE_RESPONSE', reason: 'TRUNCATED_WITHOUT_EVIDENCE' };
+  }
+  const about: PublicYouTubeChannelAbout = {
+    ...(bio?.trim() ? { bio } : {}),
+    ...(channelLinks.length ? { channelLinks } : {}),
+    thumbnailUrl: aboutParsed?.thumbnailUrl || rootParsed?.thumbnailUrl,
+    ...(subscriberCountText ? { subscriberCountText } : {}),
+    ...(truncated ? { truncated: true } : {}),
+  };
+  if (hasUsableMetadata) return { status: 'AVAILABLE', about };
+  // A successful but empty page cannot erase a failed companion surface.
+  // Subscriber-only or link-only metadata is usable and already returned above.
+  if (failureStatus) return { status: failureStatus, reason: pageStatuses.join(',') };
+  return { status: 'AUTHORITATIVE_EMPTY', about };
 }
 
 /**

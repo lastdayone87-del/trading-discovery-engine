@@ -7,7 +7,8 @@ import { collapseSourceIndependentObservations } from '../entityResolution';
 import { compositionConfirmsTrading, dedupeWeightByFieldGroup, hasAiLedTradingConfirmation, hasCreatorLevelUnrelatedAttribution, observedTradingFamilies } from './decisionPolicy';
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 import type { ContextualCompositionReport } from './contextualComposition';
-import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
+import { isNonRelevantSemanticLabel, negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
+import { hasMeaningfulCreatorText } from './creatorText';
 
 export const STAGED_CLASSIFICATION_VERSION = '3.3.0';
 
@@ -103,7 +104,7 @@ function terminalContradictionWeights(
  * positive blockers remain the responsibility of decisionPolicy.ts. */
 function hasCreatorLevelSemanticUnrelatedCandidate(negative: EvidenceItem[], collection: EvidenceCollectionReport): boolean {
   if (collection.terminalNegativeSufficiency?.status !== 'SUFFICIENT' || !collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
-  const semanticUnrelated=terminalNegativeItems(negative, { terminalEligible: true }).filter(item => isSemanticClassificationSource(item.source) && item.category === 'IRRELEVANT_DOMAIN' && item.provenance?.semantic?.taxonomyLabel === 'UNRELATED');
+  const semanticUnrelated=terminalNegativeItems(negative, { terminalEligible: true }).filter(item => isSemanticClassificationSource(item.source) && item.category === 'IRRELEVANT_DOMAIN' && isNonRelevantSemanticLabel(item.provenance?.semantic?.taxonomyLabel));
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
@@ -245,12 +246,13 @@ export function evaluateClassificationStages(input: RawChannelInput, evidence: E
   // confirm on the matched document. A strong creator-owned composition
   // (explicit creator statement, non-title Tier A family, no dominant
   // alternative) is already affirmative evidence and may confirm even when
-  // the hydrated video sample is absent. Everything else stays in review.
-  const substantialCreatorBio = String(input.description || '').trim().length >= 80;
+  // the hydrated video sample is absent. Bio length is not an evidence-quality
+  // proxy: a short real trading bio plus a Tier-A composition is sufficient.
   const creatorBioTierA = Boolean(composition?.familyClassifications?.some(family =>
     family.field === 'channel_bio' && family.tierA && family.focus === 'TRADING_CORE'));
   const strongCreatorComposition = resolveClassificationRoutingMode() === 'ACTIVE'
-    && substantialCreatorBio
+    && input.channelBioAuthoritative !== false
+    && hasMeaningfulCreatorText(input.description)
     && creatorBioTierA
     && Boolean(composition && compositionConfirmsTrading(composition));
   if (lifecycleAction === 'CONFIRM' && isThinRetrievalInputRequiringHydration(input) && !strongCreatorComposition) {

@@ -174,6 +174,7 @@ function hasTerminalNegativeEvidence(decision: RoutingInput): boolean {
   // evidence. The status cannot be terminalized by isolated keywords.
   return reasons.some(code =>
     code === 'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED'
+    || code === 'HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION'
     || code === 'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION',
   );
 }
@@ -287,8 +288,9 @@ export function resolveClassificationRouting(
     const categoryOwnsDecision = options.contentCategory === 'ACTIVE_TRADING'
       || options.contentCategory === 'TRADING_EDUCATION'
       || options.contentCategory === 'INVESTING_EDUCATION'
-      // Commercial, broker/platform, signal and promotional channels are
-      // still trading-relevant when their actual content is trading.
+      // Legacy market-institution and promotional labels keep their historical
+      // behavior. A split platform/firm label must still pass the video-focus
+      // guard because platform identity alone does not prove trading content.
       || options.contentCategory === 'MARKET_INSTITUTION'
       || options.contentCategory === 'HYPE';
     if (!categoryOwnsDecision && videoTexts.length >= 3) {

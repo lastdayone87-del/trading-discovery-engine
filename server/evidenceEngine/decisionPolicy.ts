@@ -4,7 +4,7 @@ import { SEMANTIC_TOP_CALIBRATED_CONFIDENCE } from './semanticCalibration';
 import type { ContextualCompositionReport } from './contextualComposition';
 import { CREATOR_OWNED_EVIDENCE_FIELDS } from './canonicalEvidencePlane';
 import type { RecognitionAssessment } from './recognitionState';
-import { negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
+import { isNonRelevantSemanticLabel, negativeEvidencePolicyWeight, terminalNegativeItems } from './negativeEvidenceRole';
 import { resolveClassificationRoutingMode } from '../classificationRouting/deterministicFirst';
 
 export const UNIFIED_DECISION_POLICY_VERSION='unified-selective-policy-v3-affirmative-evidence';
@@ -15,6 +15,9 @@ const AI_TRADING_LABELS = new Set([
   'ACTIVE_TRADING',
   'TRADING_EDUCATION',
   'INVESTING_EDUCATION',
+  // Legacy cached verdict accepted for compatibility; new verdicts use the
+  // split platform/bank taxonomy.
+  'TRADING_PLATFORM_OR_FIRM',
   'MARKET_INSTITUTION',
   'HYPE',
 ]);
@@ -89,7 +92,7 @@ export function observedTradingFamilies(
  * Unknown/future labels keep legacy behavior.
  */
 const NON_RELEVANT_CONTENT_CATEGORIES = new Set([
-  'FINANCIAL_NEWS','PERSONAL_FINANCE','UNRELATED','AMBIGUOUS',
+  'FINANCIAL_NEWS','PERSONAL_FINANCE','UNRELATED','AMBIGUOUS','BANK_OR_NON_TRADING_INSTITUTION',
 ]);
 
 export function isTradingRelevantCategory(category?:string):boolean{
@@ -122,7 +125,7 @@ export function evaluateDecisionScoreBoundary(evidence:EvidenceItem[],minimumPos
 
 export function hasCreatorLevelUnrelatedAttribution(items:EvidenceItem[]):boolean{
   const fields=items.flatMap(item=>item.provenance?.fields||[]);
-  if(fields.some(field=>field.field==='channel_bio')) return true;
+  if(fields.some(field=>field.field==='channel_bio'||field.field==='transcript_excerpt'||field.field==='pinned_comment')) return true;
   const videoFamilies=new Set(fields.filter(field=>field.field==='video_title'||field.field==='video_description').map(field=>field.sourceFamilyId||field.sourceId).filter((value):value is string=>Boolean(value)));
   return videoFamilies.size>=2;
 }
@@ -131,7 +134,7 @@ export function qualifiesSemanticUnrelatedTerminalReject(evidence:EvidenceItem[]
   if(collection.terminalNegativeSufficiency?.status!=='SUFFICIENT'||!collection.terminalNegativeSufficiency.creatorLevelCoverage) return false;
   const substantivePositiveWeight=evidence.filter(item=>item.polarity==='POSITIVE'&&item.rawMatches.length&&!isWeakVideoTerminologyEvidence(item)).reduce((sum,item)=>sum+Math.abs(item.finalWeight),0);
   if(substantivePositiveWeight>0) return false;
-  const semanticUnrelated=terminalNegativeItems(evidence, { terminalEligible: true }).filter(item=>isSemanticClassificationSource(item.source)&&item.category==='IRRELEVANT_DOMAIN'&&item.provenance?.semantic?.taxonomyLabel==='UNRELATED'&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
+  const semanticUnrelated=terminalNegativeItems(evidence, { terminalEligible: true }).filter(item=>isSemanticClassificationSource(item.source)&&item.category==='IRRELEVANT_DOMAIN'&&isNonRelevantSemanticLabel(item.provenance?.semantic?.taxonomyLabel)&&Number(item.provenance.semantic.calibratedConfidence)>=SEMANTIC_UNRELATED_TERMINAL_MIN_CONFIDENCE);
   return semanticUnrelated.length>0&&hasCreatorLevelUnrelatedAttribution(semanticUnrelated);
 }
 
@@ -221,7 +224,10 @@ export function evaluateUnifiedDecisionPolicy(input:UnifiedDecisionPolicyInput):
     : {});
   if(input.lifecycleAction==='CONFIRM'&&positiveBoundaryForDecision&&independentCreatorField&&compositionOk&&recognitionAllowsConfirmation&&contentCategoryAllowsConfirmation&&!materialContradiction){status='TRADING_CONFIRMED';reasons.push('CALIBRATED_SUPPORT_AND_INDEPENDENCE_SATISFIED','AFFIRMATIVE_EVIDENCE_SUFFICIENCY',...(aiLedTrading?['AI_LED_TRADING_CONFIRMATION']:[]));if(negative.some(item=>negativeEvidencePolicyWeight(item)>0&&!terminalNegative.includes(item)))reasons.push('NON_TERMINAL_NEGATIVE_PENALTY_ONLY');}
   else if(input.lifecycleAction==='REJECT'&&(semanticUnrelatedTerminal||dominantAttributedContradiction)){
-    status='NON_TRADING';reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
+    status='NON_TRADING';
+    const terminalLabels=new Set(terminalNegative.map(item=>String(item.provenance?.semantic?.taxonomyLabel||'')));
+    if(terminalLabels.has('BANK_OR_NON_TRADING_INSTITUTION'))reasons.push('HIGH_CONFIDENCE_CREATOR_LEVEL_BANK_OR_NON_TRADING_INSTITUTION');
+    else reasons.push(semanticUnrelatedTerminal?'HIGH_CONFIDENCE_CREATOR_LEVEL_UNRELATED':'DOMINANT_CREATOR_LEVEL_IRRELEVANT_CONTRADICTION');
   } else {
     if(input.lifecycleAction==='CONFIRM'&&!contentCategoryAllowsConfirmation)reasons.push('CONTENT_CATEGORY_NOT_TRADING_RELEVANT');
     if(input.lifecycleAction==='CONFIRM'&&!independentCreatorField)reasons.push('INDEPENDENT_CREATOR_OWNED_FIELD_REQUIRED');
