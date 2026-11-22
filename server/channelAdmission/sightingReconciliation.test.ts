@@ -97,6 +97,10 @@ test('page-scoped replay repairs verdicts that landed before sighting insertion'
   assert.match(sql, /'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED'/);
   assert.match(sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata->>'sightingOutcomeSource'='ADMISSION'/);
   assert.match(sql, /s\.result_rank IS NULL OR s\.result_rank=cs\.result_rank/);
+  // The final UPDATE must re-check the predicate after a possible lock wait;
+  // the CTE check alone can observe a stale pre-classification snapshot.
+  assert.ok((sql.match(/cs\.funnel_outcome IS NULL/g) || []).length >= 2);
+  assert.ok((sql.match(/sightingOutcomeSource'='ADMISSION/g) || []).length >= 2);
 });
 
 test('markChannelAdmitted writes the channel first, then reconciles the sighting', async () => {

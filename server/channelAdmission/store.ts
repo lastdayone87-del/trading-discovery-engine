@@ -405,7 +405,25 @@ export async function replayAdmissionOutcomesForPage(input: {
               'admissionSightingReconciledAt',$3::text
             )
        FROM scoped sc
-      WHERE cs.id=sc.sighting_id`,
+      WHERE cs.id=sc.sighting_id
+        AND cs.was_known=false
+        -- The CTE may have waited on a classification writer's row lock.
+        -- Re-check the pending/source predicate on the locked target row so a
+        -- verdict committed while waiting is never overwritten.
+        AND (
+          cs.funnel_outcome IS NULL
+          OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
+          OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
+        )
+        AND (
+          sc.admission_status NOT IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          OR EXISTS (
+            SELECT 1 FROM channels ch
+             WHERE ch.channel_id=cs.channel_id
+               AND ch.admitted_at IS NOT NULL
+               AND ch.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          )
+        )`,
     [input.queryRunId, input.pageNumber, reconciledAt],
   );
   return result.rowCount || 0;
