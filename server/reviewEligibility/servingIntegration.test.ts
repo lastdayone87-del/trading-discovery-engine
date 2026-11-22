@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { confirmedTradingBlocksReviewMaterialization } from '../release5/reviewMaterializer';
 
 const root=process.cwd();
 const read=(p:string)=>fs.readFileSync(path.join(root,p),'utf8');
@@ -54,3 +55,13 @@ test('review decision store uses monotonic evidence timestamps and reconciles li
 
 test('machine-owned authoritative projections supersede stale pending review debt and reconcile linked investigations',()=>{const source=read('server/reviewEligibility/store.ts');assert.match(source,/reconcileMachineOwnedReview/);assert.match(source,/state='SUPERSEDED'/);assert.match(source,/subject_type='CHANNEL' AND subject_id=\$1 AND state='NEEDS_REVIEW'/);});
 test('production persistence failures propagate and missing channels never synthesize review',()=>{const ingestion=read('server/ingestionPipeline.ts'),queue=read('server/queueManager.ts');assert.doesNotMatch(ingestion,/authoritative write failed/);assert.doesNotMatch(queue,/channel\?\.trading_status\|\|'NEEDS_REVIEW'/);assert.match(queue,/channel\?\.trading_status\|\|'POLICY_REJECTED'/);});
+
+
+test('confirmed trading blocks review rematerialization',()=>{
+  assert.equal(confirmedTradingBlocksReviewMaterialization('TRADING_CONFIRMED'),true);
+  assert.equal(confirmedTradingBlocksReviewMaterialization('UNCERTAIN'),false);
+  assert.equal(confirmedTradingBlocksReviewMaterialization('NEEDS_REVIEW'),false);
+  assert.equal(confirmedTradingBlocksReviewMaterialization(null),false);
+  const source=read('server/release5/reviewMaterializer.ts');
+  assert.match(source,/CONFIRMED_TRADING_AUTHORITATIVE/);
+});

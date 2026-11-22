@@ -4,6 +4,12 @@ import {REVIEW_ELIGIBILITY_POLICY_VERSION} from '../reviewEligibility/policy';
 
 type QueryClient={query:(text:string,values?:unknown[])=>Promise<any>};
 
+/** Confirmed trading is authoritative: a review projection must never reopen a
+ * review row or force a confirmed creator back into the human queue. */
+export function confirmedTradingBlocksReviewMaterialization(status?: string | null): boolean {
+  return String(status || '') === 'TRADING_CONFIRMED';
+}
+
 export async function materializeEligibleReviewInTransaction(client:QueryClient,input:{channelId:string;eligibilityDecisionId:string}){
   const projection=await client.query(`SELECT * FROM review_eligibility_projection WHERE channel_id=$1 FOR UPDATE`,[input.channelId]);
   if(!projection.rowCount||projection.rows[0].decision_id!==input.eligibilityDecisionId||projection.rows[0].status!=='ELIGIBLE')return {materialized:false,reason:'STALE_OR_NON_ELIGIBLE_PROJECTION'};
@@ -11,6 +17,9 @@ export async function materializeEligibleReviewInTransaction(client:QueryClient,
   if(!eligibility.rowCount||eligibility.rows[0].status!=='ELIGIBLE'||eligibility.rows[0].policy_version!==REVIEW_ELIGIBILITY_POLICY_VERSION||eligibility.rows[0].serving_authority!==true)throw new Error('ELIGIBLE_SERVING_DECISION_REQUIRED');
   const channel=await client.query('SELECT * FROM channels WHERE channel_id=$1 FOR UPDATE',[input.channelId]);
   if(!channel.rowCount)throw new Error('CHANNEL_NOT_FOUND');
+  if(confirmedTradingBlocksReviewMaterialization(channel.rows[0].trading_status)){
+    return {materialized:false,reason:'CONFIRMED_TRADING_AUTHORITATIVE'};
+  }
   const existing=await client.query('SELECT * FROM channel_reviews WHERE channel_id=$1 FOR UPDATE',[input.channelId]);
   const prior=existing.rows[0];
   const priorDecisionId=prior?.evidence_snapshot?.eligibilityDecisionId;

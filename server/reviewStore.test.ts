@@ -30,15 +30,20 @@ test('a pending review can request more evidence without approving or rejecting'
 
 test('confirmed review debt is superseded without changing the confirmed decision', async () => {
   let captured = '';
+  let capturedParams: unknown[] | undefined;
   const runner = {
-    query: async (text: string) => {
+    query: async (text: string, params?: unknown[]) => {
       captured = text;
+      capturedParams = params;
       return { rowCount: 3 };
     },
   };
   const superseded = await supersedeConfirmedReviewDebt(25, runner);
   assert.equal(superseded, 3);
+  assert.deepEqual(capturedParams, [25]);
   assert.match(captured, /c\.trading_status='TRADING_CONFIRMED'/);
+  assert.match(captured, /r\.state='PENDING'/);
+  assert.match(captured, /r\.review_version=s\.review_version/);
   assert.match(captured, /state='SUPERSEDED'/);
   assert.match(captured, /supersededBy/);
   assert.match(captured, /LIMIT \$1/);

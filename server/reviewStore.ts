@@ -145,7 +145,7 @@ export async function supersedeConfirmedReviewDebt(
   const bounded = Math.max(1, Math.min(2000, Math.trunc(Number(limit)) || 500));
   const result = await db.query(
     `WITH stale AS (
-       SELECT r.channel_id
+       SELECT r.channel_id, r.review_version, r.updated_at
          FROM channel_reviews r
          JOIN channels c USING(channel_id)
         WHERE r.state='PENDING' AND c.trading_status='TRADING_CONFIRMED'
@@ -158,8 +158,13 @@ export async function supersedeConfirmedReviewDebt(
             updated_at=now(),
             evidence_snapshot=COALESCE(r.evidence_snapshot,'{}'::jsonb)
               || jsonb_build_object('supersededBy','CONFIRMED_TRADING','supersededAt',now())
-       FROM stale
-      WHERE r.channel_id=stale.channel_id AND r.state='PENDING'
+       FROM stale s
+       JOIN channels c ON c.channel_id=s.channel_id
+      WHERE r.channel_id=s.channel_id
+        AND r.state='PENDING'
+        AND r.review_version=s.review_version
+        AND r.updated_at=s.updated_at
+        AND c.trading_status='TRADING_CONFIRMED'
       RETURNING r.channel_id`,
     [bounded],
   );

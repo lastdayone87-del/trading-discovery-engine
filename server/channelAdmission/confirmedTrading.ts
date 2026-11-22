@@ -41,12 +41,12 @@ function admissionCitationField(field: string): EvidenceFieldType | null {
  * to confirmed semantic admissions; generic 1% values and low-confidence
  * admissions remain reviewable.
  */
-function confirmedAdmissionConfidence(candidate: DiscoveredChannelRaw): number {
+function confirmedAdmissionConfidence(candidate: DiscoveredChannelRaw, hasUsableTradingCitation: boolean): number {
   const raw = Number(candidate.admissionTradingConfidence);
   if (candidate.admissionConfirmedTrading === true
     && candidate.admissionDecisionSource === 'SEMANTIC'
     && raw === 1
-    && (candidate.admissionCitations?.length || 0) > 0) {
+    && hasUsableTradingCitation) {
     return 100;
   }
   return normalizeAdmissionTradingConfidence(candidate.admissionTradingConfidence);
@@ -73,7 +73,6 @@ export function buildAdmissionConfirmedClassification(
   input: RawChannelInput,
   candidate: DiscoveredChannelRaw,
 ): { result: TradingClassificationResult; decision: VerificationDecision; input: RawChannelInput } {
-  const confidence = confirmedAdmissionConfidence(candidate);
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
@@ -108,6 +107,7 @@ export function buildAdmissionConfirmedClassification(
     creatorOwnedCitationFields.has(String(citation.field || '').trim().toLowerCase()));
   const usableCitations = nonSemantic ? citations : semanticCreatorCitations;
   const hasTradingCitation = usableCitations.some(citation => citation.supports === 'TRADING');
+  const confidence = confirmedAdmissionConfidence(candidate, hasTradingCitation);
   const evidenceProvider = nonSemantic
     ? 'channel_metadata' as const
     : (candidate.admissionProvider || (admissionConfirmed && usableCitations.length > 0 ? 'admission_decision' as const : undefined));
@@ -138,7 +138,7 @@ export function buildAdmissionConfirmedClassification(
             promptVersion: 'semantic-admission-v1',
             featureVersion: 'semantic-admission-v1',
             calibrationVersion: 'semantic-admission-v1',
-            taxonomyLabel: 'TRADING',
+            taxonomyLabel: 'ACTIVE_TRADING',
             rawConfidence: confidence,
             calibratedConfidence: confidence,
             detectedLanguages: [],

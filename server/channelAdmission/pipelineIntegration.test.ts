@@ -7,6 +7,7 @@ import { normalizeSemanticJudgment } from './policy';
 import { admissionEvidenceExpired, isPreCatalogProviderDeferredDecision, nextAdmissionEvidenceAttempt, parseAdmissionReviewAction } from './index';
 import { classificationStageForCandidate } from '../youtube';
 import { admissionShortcutEligible } from '../ingestionPipeline';
+import { hasAiLedTradingConfirmation } from '../evidenceEngine/decisionPolicy';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
 const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
@@ -294,6 +295,53 @@ test('legacy semantic probability boundary normalizes to 100 for a confirmed adm
   assert.equal(built.decision.confidenceScore, 100);
   assert.equal(built.decision.deterministicRouting?.humanReview, false);
   assert.equal(built.decision.positiveEvidence[0]?.provenance?.fields?.[0]?.field, 'channel_bio');
+});
+
+test('admission evidence with a real provider exposes the AI-led trading label', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Provider Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-provider-trader',
+      channelName: 'Provider Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-provider-trader',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-provider-trader',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionProvider: 'gemini_semantic',
+      admissionCitations: [
+        { field: 'bio', quote: 'price action and risk management', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.decision.positiveEvidence[0]?.provenance?.semantic?.taxonomyLabel, 'ACTIVE_TRADING');
+  assert.equal(hasAiLedTradingConfirmation(built.decision.positiveEvidence), true);
+});
+
+test('legacy probability normalization does not fire without a usable trading citation', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Title Only Legacy', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-legacy-title-only',
+      channelName: 'Title Only Legacy',
+      youtubeUrl: 'https://youtube.com/channel/UC-legacy-title-only',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-legacy-title-only',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 1,
+      admissionCitations: [
+        { field: 'channel_name', quote: 'Title Only Legacy', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.confidenceScore, 1);
 });
 
 test('a genuinely low confirmed semantic admission remains reviewable', () => {
