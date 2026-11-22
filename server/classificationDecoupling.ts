@@ -24,7 +24,7 @@ export const CLASSIFICATION_JOB_TYPE = 'CLASSIFY_DISCOVERED_CHANNEL' as const;
 export const CLASSIFICATION_DECOUPLING_FLAG = 'SEARCH_CLASSIFICATION_DECOUPLING_ENABLED';
 
 /** Global cap on PENDING/PROCESSING classification jobs. */
-export const CLASSIFICATION_MAX_PENDING_DEFAULT = 500;
+export const CLASSIFICATION_MAX_PENDING_DEFAULT = 1500;
 
 /** Per query-run/query scope cap on PENDING/PROCESSING classification jobs. */
 export const CLASSIFICATION_MAX_PER_QUERY_DEFAULT = 50;
@@ -122,6 +122,36 @@ export function resolveClassificationDecouplingConfig(
     maxPerQuery: positiveInt(env.CLASSIFY_DISCOVERED_CHANNEL_MAX_PER_QUERY, CLASSIFICATION_MAX_PER_QUERY_DEFAULT, 10_000),
     priority: positiveInt(env.CLASSIFY_DISCOVERED_CHANNEL_PRIORITY, CLASSIFICATION_JOB_PRIORITY_DEFAULT, 1_000),
     maxAttempts: positiveInt(env.CLASSIFY_DISCOVERED_CHANNEL_MAX_ATTEMPTS, CLASSIFICATION_JOB_MAX_ATTEMPTS_DEFAULT, 20),
+  };
+}
+
+/**
+ * Dedicated discovery lanes. These replace the single total-size split so
+ * admission and classification capacity cannot be throttled by the
+ * enrichment/classification health gate. Defaults are the first staged
+ * production allocation; operators raise them through the named env vars
+ * without rebuilding.
+ */
+export interface DiscoveryWorkerLanePlan {
+  admission: number;
+  classification: number;
+  process: number;
+  enrichment: number;
+  total: number;
+}
+
+export function resolveDiscoveryWorkerLanePlan(env: NodeJS.ProcessEnv = process.env): DiscoveryWorkerLanePlan {
+  const lane = (name: string, fallback: number): number => Math.min(20, positiveInt(env[name], fallback));
+  const admission = lane('ADMISSION_WORKER_CONCURRENCY', 4);
+  const classification = lane('CLASSIFICATION_WORKER_CONCURRENCY', 4);
+  const process = lane('PROCESS_DISCOVERY_WORKER_CONCURRENCY', 1);
+  const enrichment = lane('ENRICHMENT_ONLY_WORKER_CONCURRENCY', 1);
+  return {
+    admission,
+    classification,
+    process,
+    enrichment,
+    total: admission + classification + process + enrichment,
   };
 }
 

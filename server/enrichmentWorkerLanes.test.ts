@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ADMISSION_VERIFICATION_JOB_TYPE } from './channelAdmission/worker';
-import { CLASSIFICATION_JOB_TYPE, resolveEnrichmentWorkerSplit } from './classificationDecoupling';
-import { enrichmentWorkerLanes, startEnrichmentWorkerLanes } from './queueManager';
+import { CLASSIFICATION_JOB_TYPE, resolveDiscoveryWorkerLanePlan, resolveEnrichmentWorkerSplit } from './classificationDecoupling';
+import { dedicatedDiscoveryWorkerLanes, enrichmentWorkerLanes, startEnrichmentWorkerLanes } from './queueManager';
 
 interface LaunchedLane {
   type: string;
@@ -80,4 +80,34 @@ test('lane plan preserves the split total and omits zero lanes', () => {
     assert.ok(lanes.some(lane => lane.extraClaimableTypes.includes(CLASSIFICATION_JOB_TYPE)));
     assert.ok(lanes.some(lane => lane.extraClaimableTypes.length === 0));
   }
+});
+
+test('dedicated discovery lanes keep admission, classification, process, and enrichment independent', () => {
+  const plan = resolveDiscoveryWorkerLanePlan({} as NodeJS.ProcessEnv);
+  assert.deepEqual(dedicatedDiscoveryWorkerLanes(plan), [
+    {
+      type: 'VERIFY_CHANNEL_ADMISSION',
+      concurrency: 4,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_admission',
+    },
+    {
+      type: 'CLASSIFY_DISCOVERED_CHANNEL',
+      concurrency: 4,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_classification',
+    },
+    {
+      type: 'PROCESS_DISCOVERED_CHANNEL',
+      concurrency: 1,
+      extraClaimableTypes: [],
+      workerPrefix: 'discovery_process',
+    },
+    {
+      type: 'ENRICH_CHANNEL',
+      concurrency: 1,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_backlog',
+    },
+  ]);
 });

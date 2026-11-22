@@ -1,8 +1,9 @@
 import { browserCapabilityIsUnavailable } from './browserCapability';
 import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from './operationalEnrichmentRecovery';
-import { ENRICHMENT_WORKER_BASELINE, ENRICHMENT_WORKER_SCALE_CEILING, enrichmentScaleGateEnabled, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, loadEnrichmentScaleMetricsWithRetry, setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
+import { setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
 import {
   getDb,
+  databasePoolMax,
   enqueueJob,
   enqueueClassificationJobAtomic,
   claimNextJob,
@@ -160,7 +161,7 @@ import {
   classificationQueryScopeKey,
   mapClassificationOutcomeToFunnelOutcome,
   resolveClassificationDecouplingConfig,
-  resolveEnrichmentWorkerCount,
+  resolveDiscoveryWorkerLanePlan,
   resolveEnrichmentWorkerSplit,
   classificationRenderedFallbackMaxWaitMs,
   resolveSearchWorkerCount,
@@ -1046,6 +1047,30 @@ export function canClaimCommunityRetry(
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastSemanticCooldownEnrichProbeAt = 0;
+/**
+ * Claim-time stale recovery used to run a FOR UPDATE scan on every worker
+ * tick. With a dozen lanes that is a transaction storm that can starve
+ * heartbeats. Run it at most once per interval, with one shared in-flight
+ * promise so concurrent workers do not duplicate the scan.
+ */
+function boundedPositiveEnv(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(process.env[name] || fallback);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.floor(parsed))) : fallback;
+}
+const CLAIM_STALE_RECOVERY_INTERVAL_MS = boundedPositiveEnv('CLAIM_STALE_RECOVERY_INTERVAL_MS', 60_000, 5_000, 15 * 60_000);
+const JOB_STALE_AFTER_MINUTES = boundedPositiveEnv('JOB_STALE_AFTER_MINUTES', 5, 2, 60);
+let lastClaimStaleRecoveryAt = 0;
+let claimStaleRecoveryInFlight: Promise<number> | null = null;
+function recoverStaleJobsIfDue(): Promise<number> {
+  if (claimStaleRecoveryInFlight) return claimStaleRecoveryInFlight;
+  if (Date.now() - lastClaimStaleRecoveryAt < CLAIM_STALE_RECOVERY_INTERVAL_MS) {
+    return Promise.resolve(0);
+  }
+  lastClaimStaleRecoveryAt = Date.now();
+  claimStaleRecoveryInFlight = recoverStaleJobs(JOB_STALE_AFTER_MINUTES)
+    .finally(() => { claimStaleRecoveryInFlight = null; });
+  return claimStaleRecoveryInFlight;
+}
 let lastAutonomousResumeSweepAt = 0;
 
 /** Persist a resumable quota deferral. The run is not completed and the
@@ -1803,7 +1828,7 @@ export async function processNextSearchJob(
   // Phase B reconciliation) runs on the dedicated scheduler interval in
   // operationalMaintenanceScheduler.ts, so it cannot serialize ahead of every
   // claim in every pool.
-  await recoverStaleJobs();
+  await recoverStaleJobsIfDue();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
@@ -1824,7 +1849,7 @@ export async function processNextSearchJob(
   let enrichProbeOnly = false;
   const admissionModeActive = (await getAdmissionMode()) === 'ACTIVE';
   const admissionSemanticClaimable = admissionModeActive;
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) {
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes(CLASSIFICATION_JOB_TYPE) || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
     const geminiRoutes = !groqSelected && !geminiFreeSelected ? configuredGeminiRoutes() : [];
@@ -1864,8 +1889,18 @@ export async function processNextSearchJob(
       // while every semantic route is cooling. ENRICH is allowed as a bounded
       // probe: stage-1/2 evidence is persisted before the semantic attempt, so
       // the next pass can resume without re-spending YouTube quota.
-      if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE))) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
-      if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
+    }
+    // Classification and process lanes are separate from ENRICH backfill, so
+    // their own overrides must be accepted outside the ENRICH-only block.
+    if (enrichmentFullyClaimable && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+      claimableTypes.push(CLASSIFICATION_JOB_TYPE);
+    }
+    // Dedicated process lane: separate worker capacity removes classification
+    // starvation, while the semantic-availability gate prevents a defer storm.
+    // This must sit outside the ENRICH_CHANNEL-only block above so a
+    // process-only override can claim its job type.
+    if (enrichmentFullyClaimable && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
+      claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
   if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
@@ -6244,7 +6279,7 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
 
 export { SEARCH_WORKER_CONCURRENCY_DEFAULT, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, resolveSearchWorkerCount, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 
-function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = [], workerPrefix?: string): void {
+function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = [], workerPrefix?: string): void {
   // A zero lane is an intentional "no workers" decision (for example the
   // ENRICH-only lane of a one-worker pool). Do not let the legacy clamp turn
   // it into an extra worker beyond the operator's configured total. A NaN
@@ -6312,7 +6347,7 @@ export function enrichmentWorkerLanes(split: ReturnType<typeof resolveEnrichment
 }
 
 type EnrichmentWorkerLauncher = (
-  type: 'ENRICH_CHANNEL',
+  type: 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL',
   concurrency: number,
   extraClaimableTypes: ClaimableSearchJobType[],
   workerPrefix?: string,
@@ -6328,54 +6363,93 @@ export function startEnrichmentWorkerLanes(
   }
 }
 
+export interface DedicatedDiscoveryWorkerLane {
+  type: 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL';
+  concurrency: number;
+  extraClaimableTypes: ClaimableSearchJobType[];
+  workerPrefix: string;
+}
+
+/**
+ * Admission, classification, process-ingestion and generic enrichment are
+ * independent lanes. The first three are discovery-critical and must never be
+ * clamped by the enrichment health gate; the last remains the backfill lane.
+ */
+export function dedicatedDiscoveryWorkerLanes(plan: ReturnType<typeof resolveDiscoveryWorkerLanePlan>): DedicatedDiscoveryWorkerLane[] {
+  const lanes: DedicatedDiscoveryWorkerLane[] = [];
+  if (plan.admission > 0) {
+    lanes.push({
+      type: 'VERIFY_CHANNEL_ADMISSION',
+      concurrency: plan.admission,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_admission',
+    });
+  }
+  if (plan.classification > 0) {
+    lanes.push({
+      type: 'CLASSIFY_DISCOVERED_CHANNEL',
+      concurrency: plan.classification,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_classification',
+    });
+  }
+  if (plan.process > 0) {
+    lanes.push({
+      type: 'PROCESS_DISCOVERED_CHANNEL',
+      concurrency: plan.process,
+      extraClaimableTypes: [],
+      workerPrefix: 'discovery_process',
+    });
+  }
+  if (plan.enrichment > 0) {
+    lanes.push({
+      type: 'ENRICH_CHANNEL',
+      concurrency: plan.enrichment,
+      extraClaimableTypes: [],
+      workerPrefix: 'enrich_channel_backlog',
+    });
+  }
+  return lanes;
+}
+
+export function startDedicatedDiscoveryWorkerLanes(
+  plan: ReturnType<typeof resolveDiscoveryWorkerLanePlan>,
+  start: EnrichmentWorkerLauncher = startWorkerPool,
+): void {
+  for (const lane of dedicatedDiscoveryWorkerLanes(plan)) {
+    start(lane.type, lane.concurrency, lane.extraClaimableTypes, lane.workerPrefix);
+  }
+}
+
 let workersStarted = false;
 
 /**
- * Enrichment startup consults the Phase 4 measured scale gate, then applies
- * the Phase 3 classification split to the gate's effective total. A request
- * for more than the measured-safe baseline stays clamped at 3 unless semantic
- * success, p95 latency, and backlog stability all pass. The metrics read is
- * deadline-bounded, so a stalled query delays startup by at most that bound
- * before the baseline of 3 starts; it never leaves the pool stopped.
- *
- * The split itself keeps the total unchanged. Pools of three or more start
- * one admission-only lane, one classification/overflow lane, and one
- * ENRICH-only lane; admission scales one lane per three total workers and
- * classification takes the remaining lanes. One- and two-worker pools retain
- * the shared fallback, and the decoupling rollback keeps one shared worker to
- * drain old classification jobs.
+ * Discovery-critical lanes are explicitly sized and never clamped by the
+ * enrichment/classification health gate. Provider pacing, semantic cooldowns,
+ * quota guards and budget guards still apply inside each job. The gate remains
+ * available for diagnostics and legacy backfill policy, but it cannot reduce
+ * admission, classification, process-ingestion or generic-enrichment capacity
+ * at startup.
  */
-async function startGatedEnrichmentWorkers(): Promise<void> {
-  const requested = resolveEnrichmentWorkerCount();
-  const decoupling = resolveClassificationDecouplingConfig();
-  let effectiveWorkers = requested;
-  if (requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled()) {
-    // Never hold startup open on a stalled metrics query: the retry helper
-    // shares one startup-wide budget (ENRICHMENT_SCALE_METRICS_RETRY_BUDGET_MS,
-    // default 10s), aborts expired attempts, and fails closed to the baseline
-    // of 3 when the budget expires.
-    let metrics;
-    try {
-      metrics = await loadEnrichmentScaleMetricsWithRetry();
-    } catch (error) {
-      console.warn('[Queue] Enrichment scale metrics unavailable; staying at baseline.', error);
-    }
-    const decision = evaluateEnrichmentScaleGate(metrics, enrichmentScaleThresholds(), requested);
-    effectiveWorkers = decision.effectiveWorkers;
-    if (decision.effectiveWorkers < requested) {
-      console.warn(`[Queue] Enrichment scale gate clamped workers ${requested}->${decision.effectiveWorkers}: ${decision.reasons.join(',')}`);
-    }
+async function startDiscoveryWorkerLanes(): Promise<void> {
+  const plan = resolveDiscoveryWorkerLanePlan();
+  const poolMax = databasePoolMax();
+  if (plan.total > poolMax) {
+    console.warn(JSON.stringify({
+      event: 'discovery_lane_pool_underprovisioned',
+      workers: plan.total,
+      databasePoolMax: poolMax,
+      timestamp: new Date().toISOString(),
+    }));
   }
-  const enrichmentSplit = resolveEnrichmentWorkerSplit(Math.min(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers), decoupling.enabled);
-  setRunningEnrichmentWorkerCount(
-    enrichmentSplit.sharedWorkers
-      + enrichmentSplit.admissionWorkers
-      + enrichmentSplit.classificationWorkers
-      + enrichmentSplit.enrichmentOnlyWorkers,
-  );
-  // Admission and classification use separate claim lanes. A combined lane
-  // lets admission priority 40 monopolize every classification-capable worker.
-  startEnrichmentWorkerLanes(enrichmentSplit);
+  setRunningEnrichmentWorkerCount(plan.total);
+  console.log(JSON.stringify({
+    event: 'discovery_worker_lane_plan',
+    ...plan,
+    scaleGate: 'DECOUPLED',
+    timestamp: new Date().toISOString(),
+  }));
+  startDedicatedDiscoveryWorkerLanes(plan);
 }
 
 /**
@@ -6391,11 +6465,8 @@ export function startSearchWorkers(): void {
   // closed unless explicitly enabled, so default pool behavior is identical.
   startWorkerPool('SEARCH_YOUTUBE', resolveSearchWorkerCount(), ['RELATIONSHIP_CANARY_EXPANSION']);
   startWorkerPool('MANUAL_SEARCH_PAGE', Math.max(1, Number(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY || 1)));
-  // Enrichment defaults to 3 workers: measured service demand is ~334s mean
-  // per completion (~10.8/hr per worker), so 3 workers burst ~30/hr against
-  // ample provider headroom while staying within daily YouTube (~107k/day at
-  // full tilt vs 300k pool) and browser-gate bounds. Explicit requests above
-  // baseline must pass the Phase 4 measured scale gate; env override wins
-  // only when the gate is explicitly disabled.
-  void startGatedEnrichmentWorkers();
+  // Admission, classification, process-ingestion and enrichment are separate
+  // lanes with independent env-sized concurrency. The scale gate no longer
+  // throttles discovery-critical work.
+  void startDiscoveryWorkerLanes();
 }

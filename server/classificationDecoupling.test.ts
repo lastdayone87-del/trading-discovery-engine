@@ -20,6 +20,7 @@ import {
   enrichmentJobIdempotencyKey,
   mapClassificationOutcomeToFunnelOutcome,
   resolveClassificationDecouplingConfig,
+  resolveDiscoveryWorkerLanePlan,
   resolveEnrichmentWorkerCount,
   resolveEnrichmentWorkerSplit,
   resolveSearchWorkerCount,
@@ -54,7 +55,7 @@ test('an unrecognized rollback value warns once and keeps the default', () => {
 
 test('caps, priority, and attempts clamp to safe positives', () => {
   const defaults = resolveClassificationDecouplingConfig(env());
-  assert.equal(defaults.maxPending, 500);
+  assert.equal(defaults.maxPending, 1500);
   assert.equal(defaults.maxPerQuery, 50);
   assert.equal(defaults.priority, CLASSIFICATION_JOB_PRIORITY_DEFAULT);
   assert.equal(defaults.maxAttempts, 4);
@@ -72,8 +73,42 @@ test('caps, priority, and attempts clamp to safe positives', () => {
     CLASSIFY_DISCOVERED_CHANNEL_MAX_PENDING: '0',
     CLASSIFY_DISCOVERED_CHANNEL_MAX_PER_QUERY: 'abc',
   }));
-  assert.equal(invalid.maxPending, 500);
+  assert.equal(invalid.maxPending, 1500);
   assert.equal(invalid.maxPerQuery, 50);
+});
+
+test('dedicated discovery lanes are independently sized and default to the staged allocation', () => {
+  assert.deepEqual(resolveDiscoveryWorkerLanePlan(env()), {
+    admission: 4,
+    classification: 4,
+    process: 1,
+    enrichment: 1,
+    total: 10,
+  });
+  assert.deepEqual(resolveDiscoveryWorkerLanePlan(env({
+    ADMISSION_WORKER_CONCURRENCY: '6',
+    CLASSIFICATION_WORKER_CONCURRENCY: '5',
+    PROCESS_DISCOVERY_WORKER_CONCURRENCY: '2',
+    ENRICHMENT_ONLY_WORKER_CONCURRENCY: '1',
+  })), {
+    admission: 6,
+    classification: 5,
+    process: 2,
+    enrichment: 1,
+    total: 14,
+  });
+  assert.deepEqual(resolveDiscoveryWorkerLanePlan(env({
+    ADMISSION_WORKER_CONCURRENCY: '0',
+    CLASSIFICATION_WORKER_CONCURRENCY: 'junk',
+    PROCESS_DISCOVERY_WORKER_CONCURRENCY: '-4',
+    ENRICHMENT_ONLY_WORKER_CONCURRENCY: '999',
+  })), {
+    admission: 4,
+    classification: 4,
+    process: 1,
+    enrichment: 20,
+    total: 29,
+  });
 });
 
 test('worker counts stay at the production 2/3 defaults and env overrides still win', () => {
@@ -309,10 +344,10 @@ test('source wiring keeps the inline path as the explicit rollback fallback and 
   // behaviorally in enrichmentWorkerLanes.test.ts.
   assert.match(queue, /push\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE[\s\S]{0,120}processClassificationJob/);
-  assert.match(queue, /startEnrichmentWorkerLanes\(enrichmentSplit\)/);
-  // Phase 4 startup clamps through the measured gate and the approved hard
-  // ceiling before splitting into the two pools.
-  assert.match(queue, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
+  assert.match(queue, /startDedicatedDiscoveryWorkerLanes\(plan\)/);
+  // Discovery-critical lanes are sized independently of the enrichment gate.
+  assert.match(queue, /resolveDiscoveryWorkerLanePlan\(\)/);
+  assert.doesNotMatch(queue, /startEnrichmentWorkerLanes\(enrichmentSplit\)/);
   // The search run must not fail because a later classification failed.
   assert.match(queue, /job\.type === CLASSIFICATION_JOB_TYPE \|\| job\.type === 'PROCESS_DISCOVERED_CHANNEL' \? '' : String\(job\.payload\?\.queryRunId/);
   // Provisional rows are insert-only and classification reconciliation is durable.

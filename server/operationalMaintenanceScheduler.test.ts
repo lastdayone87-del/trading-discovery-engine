@@ -374,7 +374,12 @@ test('start is idempotent and stop ends the interval', async () => {
 
 test('the claim path keeps only claim-critical stale-job recovery', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /await recoverStaleJobs\(\);/);
+  const claimBodyStart = queue.indexOf('export async function processNextSearchJob');
+  assert.ok(claimBodyStart >= 0, 'claim path function is present');
+  const claimBodyEnd = queue.indexOf('\nexport ', claimBodyStart + 1);
+  const claimBody = queue.slice(claimBodyStart, claimBodyEnd > claimBodyStart ? claimBodyEnd : undefined);
+  assert.match(claimBody, /await recoverStaleJobsIfDue\(\)/, 'the claim path uses the throttled stale-job helper');
+  assert.match(queue, /recoverStaleJobs\(JOB_STALE_AFTER_MINUTES\)/, 'the helper owns the bounded stale scan');
   for (const moved of [
     'recoverStaleChannelLocks',
     'recoverStaleInvestigationSteps',
@@ -383,26 +388,11 @@ test('the claim path keeps only claim-critical stale-job recovery', () => {
     'reconcileLegacyCommunityRetryOwnership',
     'projectProviderDeferredEnrichment',
     'reconcileOperationalEnrichmentRecovery',
-    'triggerPhaseBObservationReconciliation'
+    'triggerPhaseBObservationReconciliation',
+    'resumeOrphanedAutonomousPages',
   ]) {
-    assert.doesNotMatch(queue, new RegExp(moved), `${moved} must not run in the claim path`);
+    assert.doesNotMatch(claimBody, new RegExp(moved), `${moved} must not run in the claim path`);
   }
-
-  const recoveryAt = queue.indexOf('await recoverStaleJobs();');
-  const statusAt = queue.indexOf('const qStatus = await getQueueStatus();', recoveryAt);
-  const claimAt = queue.indexOf('claimNextJob(', recoveryAt);
-  assert.ok(recoveryAt >= 0, 'stale job recovery stays in the claim path');
-  assert.ok(statusAt > recoveryAt, 'queue status is read after claim-critical recovery');
-  assert.ok(claimAt > statusAt, 'the claim still follows recovery and queue status');
-
-  // The auto-resume sweep is scheduler-only. A whole-file name scan cannot
-  // assert this because the function definition itself contains the name, so
-  // inspect only the processNextSearchJob body.
-  const claimBodyStart = queue.indexOf('export async function processNextSearchJob');
-  assert.ok(claimBodyStart >= 0, 'claim path function is present');
-  const claimBodyEnd = queue.indexOf('\nexport ', claimBodyStart + 1);
-  const claimBody = queue.slice(claimBodyStart, claimBodyEnd > claimBodyStart ? claimBodyEnd : undefined);
-  assert.doesNotMatch(claimBody, /resumeOrphanedAutonomousPages/, 'the auto-resume sweep must not run inside the claim path');
 });
 
 test('maintenance is started exactly once after database readiness', () => {

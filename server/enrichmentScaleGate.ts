@@ -352,7 +352,9 @@ export async function loadEnrichmentScaleMetricsWithinDeadline(
           controller.abort(new Error('Enrichment scale metrics deadline expired.'));
           resolve(undefined);
         }, timeoutMs);
-        timer.unref?.();
+        // Deliberately ref'd: the deadline is cleared in finally, and unref'ing
+        // it lets a process with no other handles exit before the deadline
+        // contract can settle (the CI test runner exposed this race).
       }),
     ]);
   } finally {

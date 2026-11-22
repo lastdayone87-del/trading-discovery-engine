@@ -183,14 +183,16 @@ test('the disabled rollback still never exceeds the approved ceiling of 6', () =
   assert.equal(decision.effectiveWorkers, ENRICHMENT_WORKER_SCALE_CEILING);
 });
 
-test('worker startup routes every above-baseline request through the measured gate and split', () => {
+test('worker startup decouples discovery-critical lanes from the enrichment gate', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
-  assert.match(source, /void startGatedEnrichmentWorkers\(\)/);
-  assert.match(source, /requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled\(\)/);
-  assert.match(source, /evaluateEnrichmentScaleGate\(metrics, enrichmentScaleThresholds\(\), requested\)/);
-  assert.match(source, /resolveEnrichmentWorkerSplit\(Math\.min\(ENRICHMENT_WORKER_SCALE_CEILING, effectiveWorkers\), decoupling\.enabled\)/);
-  assert.match(source, /setRunningEnrichmentWorkerCount\(/);
-  assert.match(source, /startEnrichmentWorkerLanes\(enrichmentSplit\)/);
+  assert.match(source, /void startDiscoveryWorkerLanes\(\)/);
+  assert.match(source, /resolveDiscoveryWorkerLanePlan\(\)/);
+  assert.match(source, /startDedicatedDiscoveryWorkerLanes\(plan\)/);
+  assert.match(source, /setRunningEnrichmentWorkerCount\(plan\.total\)/);
+  assert.doesNotMatch(source, /startGatedEnrichmentWorkers/);
+  const startupAt = source.indexOf('async function startDiscoveryWorkerLanes');
+  assert.ok(startupAt >= 0, 'dedicated lane startup exists');
+  assert.doesNotMatch(source.slice(startupAt, startupAt + 1500), /enrichmentScaleGateEnabled|loadEnrichmentScaleMetrics|evaluateEnrichmentScaleGate/);
 });
 
 test('diagnostics separate the live decision from the running worker count', () => {
@@ -201,17 +203,11 @@ test('diagnostics separate the live decision from the running worker count', () 
   assert.match(source, /evaluateEnrichmentScaleGate\(undefined,thresholds,requestedWorkers\)/);
 });
 
-test('the disabled gate skips the metrics load entirely', () => {
+test('startup does not load the scale-gate metrics at all', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
-  assert.match(source, /requested > ENRICHMENT_WORKER_BASELINE && enrichmentScaleGateEnabled\(\)/);
-  const disabledBranch = source.slice(source.indexOf('async function startGatedEnrichmentWorkers'));
-  assert.ok(disabledBranch.indexOf('enrichmentScaleGateEnabled()') < disabledBranch.indexOf('loadEnrichmentScaleMetricsWithRetry()'));
-});
-
-test('startup uses the deadline-bounded metrics loader', () => {
-  const source = readFileSync('server/queueManager.ts', 'utf8');
-  assert.match(source, /metrics = await loadEnrichmentScaleMetricsWithRetry\(\)/);
-  assert.doesNotMatch(source, /metrics = await loadEnrichmentScaleMetrics\(\)/);
+  const startupAt = source.indexOf('async function startDiscoveryWorkerLanes');
+  assert.ok(startupAt >= 0, 'dedicated lane startup exists');
+  assert.doesNotMatch(source.slice(startupAt, startupAt + 1500), /loadEnrichmentScaleMetrics/);
 });
 
 test('the metrics deadline defaults safely and clamps explicit values', () => {
