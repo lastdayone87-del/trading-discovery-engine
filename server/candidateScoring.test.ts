@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { aiAdjudicationAdmitted, aiAdjudicationCapacity, scoreCandidate, scoringBatchSize, SCORING_BATCH_GROUPS, validateBoundedAssertion } from './candidateScoring';
+import { aiAdjudicationAdmitted, aiAdjudicationCapacity, processCandidateScoringJob, scoreCandidate, scoringBatchSize, SCORING_BATCH_GROUPS, validateBoundedAssertion } from './candidateScoring';
+import { SCORE_CANDIDATES_BUDGET_GUARD } from './queueManager';
 
 const evidence=(span:string,cluster='c1',day='2026-07-01')=>({normalizedSpan:span,literalSpan:span,documentId:`d-${cluster}-${day}`,clusterKey:cluster,sourceType:'CHANNEL_METADATA',observedAt:`${day}T00:00:00.000Z`,language:'en',startOffset:0,endOffset:Array.from(span).length});
 
@@ -34,6 +35,107 @@ test('scoring continues through a durable bounded cursor without consuming attem
   assert.match(source,/rescheduleJob\(job\.id/);
   const db=readFileSync(new URL('./dbCore.ts',import.meta.url),'utf8');
   assert.match(db,/payload=COALESCE\(\$7::jsonb,payload\)/);
+});
+
+
+function scoringFakeDb() {
+  return {
+    query: async (sql: string, params: any[] = []) => {
+      const text = String(sql);
+      if (text.includes('FROM candidate_scoring_controls')) {
+        return { rows: [{ scoring_paused: false, daily_scoring_candidates: 1, ai_paused: true, daily_ai_assertions: 0, max_ai_cost_microunits: 0 }], rowCount: 1 };
+      }
+      if (text.includes('FROM candidate_feature_snapshots WHERE computed_at')) return { rows: [{ n: 0 }], rowCount: 1 };
+      if (text.includes('SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences')) {
+        return { rows: [{ normalized_span: 'order flow' }], rowCount: 1 };
+      }
+      if (text.includes('SELECT o.normalized_span')) {
+        return { rows: [{ normalized_span: 'order flow', literal_span: 'order flow', document_id: 'doc-1', entity_cluster_key: 'c1', source_type: 'CHANNEL_METADATA', observed_at: '2026-07-01T00:00:00Z', language: 'en', start_offset: 0, end_offset: 10 }], rowCount: 1 };
+      }
+      if (text.includes('FROM candidate_adjudication_results')) return { rows: [{ n: 0, cost: 0 }], rowCount: 1 };
+      if (text.includes("FROM jobs WHERE type='AI_ADJUDICATE_CANDIDATE'")) return { rows: [{ n: 0 }], rowCount: 1 };
+      if (text.includes('INSERT INTO candidate_feature_snapshots')) return { rows: [{ id: 'snap-1' }], rowCount: 1 };
+      if (text.includes('INSERT INTO classification_assertions') || text.includes('INSERT INTO candidate_anomaly_flags')) {
+        return { rows: [], rowCount: 1 };
+      }
+      if (text.includes('SELECT 1 FROM corpus_candidate_occurrences WHERE document_id')) {
+        return { rows: [{ exists: 1 }], rowCount: 1 };
+      }
+      throw new Error(`unexpected scoring SQL: ${text.slice(0, 120)} (${params.length} params)`);
+    },
+  };
+}
+
+test('a scored slice persists its cursor and claim identity before continuing', async () => {
+  let rescheduleArgs: any[] | undefined;
+  let completed = false;
+  await processCandidateScoringJob(
+    { id: 'job-1', payload: { payloadSchemaVersion: 1, featureSetVersion: 'candidate-features-v1', documentId: 'doc-1' }, attempts: 1, locked_by: 'worker-1', reopen_generation: 2 },
+    {
+      getDb: async () => scoringFakeDb() as any,
+      enqueueJob: async () => ({}) as any,
+      rescheduleJob: async (...args: any[]) => { rescheduleArgs = args; return true; },
+      completeJob: async () => { completed = true; },
+    },
+  );
+  assert.equal(completed, false);
+  assert.equal(rescheduleArgs?.[2], 'SCORING_BATCH_CONTINUE');
+  assert.deepEqual(rescheduleArgs?.[3], { workerId: 'worker-1', attemptNumber: 1, generation: 2 });
+  assert.equal(rescheduleArgs?.[4]?.cursor, 'order flow');
+});
+
+test('a lost continuation claim is not reported as completed progress', async () => {
+  let completed = false;
+  await processCandidateScoringJob(
+    { id: 'job-2', payload: { payloadSchemaVersion: 1, featureSetVersion: 'candidate-features-v1', documentId: 'doc-1' }, attempts: 3, locked_by: 'stale-worker', reopen_generation: 0 },
+    {
+      getDb: async () => scoringFakeDb() as any,
+      enqueueJob: async () => ({}) as any,
+      rescheduleJob: async () => false,
+      completeJob: async () => { completed = true; },
+    },
+  );
+  assert.equal(completed, false);
+});
+
+test('the scoring claim guard admits the next slice, not the whole document', async () => {
+  const sliceCalls: any[] = [];
+  const client = {
+    query: async (sql: string, params: any[] = []) => {
+      const text = String(sql);
+      if (text.includes('FROM candidate_scoring_controls')) return { rows: [{ paused: false, budget: 100 }] };
+      if (text.includes('FROM candidate_feature_snapshots')) return { rows: [{ n: 94 }] };
+      if (text.includes('COALESCE(sum(g.n)')) return { rows: [{ u: 0 }] };
+      if (text.includes('LIMIT $3) bounded')) {
+        sliceCalls.push(params);
+        return { rows: [{ n: 50 }] };
+      }
+      throw new Error(`unexpected guard SQL: ${text.slice(0, 120)}`);
+    },
+  };
+  const verdict = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-3', payload: { documentId: 'doc-1' } });
+  assert.deepEqual(verdict, { admitted: true, exhausted: false });
+  assert.deepEqual(sliceCalls[0], ['doc-1', null, SCORING_BATCH_GROUPS]);
+
+  const continued = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-4', payload: { documentId: 'doc-1', cursor: 'order flow' } });
+  assert.deepEqual(continued, { admitted: true, exhausted: false });
+  assert.deepEqual(sliceCalls[1], ['doc-1', 'order flow', SCORING_BATCH_GROUPS]);
+});
+
+test('the scoring claim guard stops only when no daily snapshot budget remains', async () => {
+  const client = {
+    query: async (sql: string) => {
+      const text = String(sql);
+      if (text.includes('FROM candidate_scoring_controls')) return { rows: [{ paused: false, budget: 100 }] };
+      if (text.includes('FROM candidate_feature_snapshots')) return { rows: [{ n: 100 }] };
+      if (text.includes('COALESCE(sum(g.n)')) return { rows: [{ u: 0 }] };
+      throw new Error(`unexpected guard SQL: ${text.slice(0, 120)}`);
+    },
+  };
+  assert.deepEqual(
+    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-5', payload: { documentId: 'doc-1' } }),
+    { admitted: false, exhausted: true },
+  );
 });
 
 test('ambiguous scoring only enqueues AI work through the paid-control gate',()=>{

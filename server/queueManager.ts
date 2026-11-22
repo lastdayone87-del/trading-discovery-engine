@@ -175,7 +175,7 @@ import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
 import { allRoutesCoolingDown, groqFallbackCoolingDown } from './channelAdmission/routeHealth';
 export { allRoutesCoolingDown, groqFallbackCoolingDown, judgeRoutePoolHealthy } from './channelAdmission/routeHealth';
 import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery, replayAdmissionOutcomesForPage } from './channelAdmission/store';
-import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
+import { processAiAdjudicationJob, processCandidateScoringJob, SCORING_BATCH_GROUPS } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
 import { getActiveCatalogPin } from './catalogPublication';
@@ -1210,11 +1210,9 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
   types: ['SCORE_CANDIDATES'],
   lockSql: `SELECT * FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`,
   isAdmitted: async (client, job) => {
-    // Reservation unit is the job's normalized-span group count: one job can
-    // create multiple snapshots, so per-job admission would overshoot the cap.
-    // Mirrors the processor exactly (spent check first, then per-job units):
-    // a zero-group job with no remaining headroom is denied rather than
-    // routed into the processor's budget throw.
+    // The processor works one bounded cursor slice at a time. Admission must
+    // reserve that slice, not the entire document: a 685-span document cannot
+    // fit a 100-snapshot budget, but its first 50-span slice can.
     const documentId = job?.payload?.documentId;
     if (typeof documentId !== 'string' || !documentId) return { admitted: false, exhausted: false };
     const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`);
@@ -1223,20 +1221,28 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
     if (Boolean(control.rows[0].paused) || !Number.isFinite(budget)) {
       return { admitted: false, exhausted: true };
     }
-    const groups = await client.query(`SELECT count(DISTINCT normalized_span)::int AS n FROM corpus_candidate_occurrences WHERE document_id=$1::uuid`, [documentId]);
+    const cursor = typeof job?.payload?.cursor === 'string' && job.payload.cursor ? job.payload.cursor : null;
     const spent = await client.query(`SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
     const inFlight = await client.query(
       `SELECT COALESCE(sum(g.n),0)::int AS u FROM jobs p LEFT JOIN LATERAL
-       (SELECT count(DISTINCT o.normalized_span)::int AS n FROM corpus_candidate_occurrences o
-        WHERE o.document_id::text=(p.payload->>'documentId')) g ON true
-       WHERE p.type='SCORE_CANDIDATES' AND p.status='PROCESSING' AND p.locked_at>=date_trunc('day',now())`
+       (SELECT LEAST(count(DISTINCT o.normalized_span)::int,$2::int) AS n FROM corpus_candidate_occurrences o
+        WHERE o.document_id::text=(p.payload->>'documentId')
+          AND (COALESCE(p.payload->>'cursor','')='' OR o.normalized_span>(p.payload->>'cursor'))) g ON true
+       WHERE p.type='SCORE_CANDIDATES' AND p.status='PROCESSING' AND p.locked_at>=date_trunc('day',now())`,
+      [SCORING_BATCH_GROUPS],
     );
     const remaining = budget - Number(spent.rows[0]?.n || 0) - Number(inFlight.rows[0]?.u || 0);
     if (remaining < 1) return { admitted: false, exhausted: true };
-    return { admitted: Number(groups.rows[0]?.n || 0) <= remaining, exhausted: false };
+    const slice = await client.query(
+      `SELECT count(*)::int AS n FROM
+         (SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences
+           WHERE document_id=$1::uuid AND ($2::text IS NULL OR normalized_span>$2)
+           ORDER BY normalized_span LIMIT $3) bounded`,
+      [documentId, cursor, SCORING_BATCH_GROUPS],
+    );
+    return { admitted: Number(slice.rows[0]?.n || 0) > 0, exhausted: false };
   },
 };
-
 export const CORPUS_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD];
 
 /**

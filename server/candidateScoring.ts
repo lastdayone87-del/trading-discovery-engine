@@ -115,15 +115,29 @@ export function aiAdjudicationCapacity(
 
 export async function enqueueCandidateScoring(documentId:string):Promise<void>{await enqueueJob('SCORE_CANDIDATES',{payloadSchemaVersion:1,documentId,featureSetVersion:FEATURE_SET_VERSION},{priority:4,maxAttempts:3,idempotencyKey:`candidate-score:${documentId}:${FEATURE_SET_VERSION}`});}
 
-export async function processCandidateScoringJob(job:{id:string;payload:any}):Promise<void>{
+export interface CandidateScoringDeps {
+  getDb?: typeof getDb;
+  enqueueJob?: typeof enqueueJob;
+  rescheduleJob?: typeof rescheduleJob;
+  completeJob?: typeof completeJob;
+}
+
+export async function processCandidateScoringJob(job:{id:string;payload:any;attempts?:number;locked_by?:string|null;reopen_generation?:number},deps:CandidateScoringDeps={}):Promise<void>{
   const p=job.payload;
   if(p.payloadSchemaVersion!==1||p.featureSetVersion!==FEATURE_SET_VERSION)throw new Error('Unsupported SCORE_CANDIDATES payload version.');
-  const db=await getDb();
+  const db=await (deps.getDb||getDb)();
+  const enqueue=deps.enqueueJob||enqueueJob;
+  const reschedule=deps.rescheduleJob||rescheduleJob;
+  const complete=deps.completeJob||completeJob;
+  // Continuation and deferrals must never mutate a newer claim after stale-job
+  // recovery. Bind every reschedule to this exact worker/attempt/generation.
+  const claim=job.attempts===undefined?undefined:{workerId:job.locked_by??null,attemptNumber:job.attempts,generation:job.reopen_generation??0};
   const control=await db.query('SELECT * FROM candidate_scoring_controls WHERE singleton=true');
   if(!control.rowCount||control.rows[0].scoring_paused){
     // An operator pause is not a candidate failure. Defer without consuming a
     // bounded attempt so the document resumes when scoring is re-enabled.
-    await rescheduleJob(job.id,new Date(Date.now()+60*60_000).toISOString(),'SCORING_PAUSED');
+    const deferred=await reschedule(job.id,new Date(Date.now()+60*60_000).toISOString(),'SCORING_PAUSED',claim);
+    if(!deferred)console.warn(JSON.stringify({event:'candidate_scoring_reschedule_lost',jobId:job.id,reason:'SCORING_PAUSED',timestamp:new Date().toISOString()}));
     return;
   }
   const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
@@ -133,7 +147,8 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
     // before any scoring work starts.
     const nextDay=await db.query(`SELECT (date_trunc('day',now())+interval '1 day') AS next_day`);
     const retryAt=nextDay.rows[0]?.next_day?new Date(nextDay.rows[0].next_day):new Date(Date.now()+24*60*60_000);
-    await rescheduleJob(job.id,retryAt.toISOString(),'SCORING_DAILY_BUDGET_EXHAUSTED',undefined,p);
+    const deferred=await reschedule(job.id,retryAt.toISOString(),'SCORING_DAILY_BUDGET_EXHAUSTED',claim,p);
+    if(!deferred)console.warn(JSON.stringify({event:'candidate_scoring_reschedule_lost',jobId:job.id,reason:'SCORING_DAILY_BUDGET_EXHAUSTED',timestamp:new Date().toISOString()}));
     return;
   }
   // Process at most one bounded slice of the document, and never more spans
@@ -141,7 +156,7 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
   const batchSize=scoringBatchSize(remaining);
   const cursor=typeof p.cursor==='string'&&p.cursor.length?p.cursor:null;
   const spans=await db.query(`SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1 AND ($2::text IS NULL OR normalized_span>$2) ORDER BY normalized_span LIMIT $3`,[p.documentId,cursor,batchSize]);
-  if(!spans.rowCount){await completeJob(job.id);return;}
+  if(!spans.rowCount){await complete(job.id);return;}
   const spanList=spans.rows.map((row:any)=>String(row.normalized_span));
   const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span=ANY($1::text[]) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[spanList]);
   const groups=new Map<string,CandidateEvidence[]>();
@@ -159,7 +174,7 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
     const flags:Array<{flag:string;severity:number;evidence:Record<string,number>}>=[];if(result.reasonCodes.includes('PROMPT_INJECTION_PATTERN'))flags.push({flag:'PROMPT_INJECTION',severity:1,evidence:{patternMatch:1}});const correlation=1-result.features.independentClusters/result.features.frequency;if(correlation>=.5)flags.push({flag:'CORRELATED_SOURCES',severity:correlation,evidence:{frequency:result.features.frequency,independentClusters:result.features.independentClusters}});if(result.features.frequency>=3&&result.features.burstScore>=.8)flags.push({flag:'TEMPORAL_BURST',severity:result.features.burstScore,evidence:{frequency:result.features.frequency,activeDays:result.features.activeDays}});for(const flag of flags)await db.query(`INSERT INTO candidate_anomaly_flags(candidate_key,feature_snapshot_id,flag,severity,evidence,flag_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(flag_key) DO NOTHING`,[result.candidateKey,snapshotId,flag.flag,flag.severity,JSON.stringify(flag.evidence),`anomaly:${snapshotId}:${flag.flag}`]);
     if(result.decision==='AMBIGUOUS'){
       if(aiAdmitted&&aiEnqueued<aiCapacity){
-        await enqueueJob('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:result.candidateKey,featureSnapshotId:snapshotId,literalSpan:rows[0].literalSpan,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${result.candidateKey}:${CLASSIFIER_VERSION}:${result.evidenceChecksum}`});
+        await enqueue('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:result.candidateKey,featureSnapshotId:snapshotId,literalSpan:rows[0].literalSpan,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${result.candidateKey}:${CLASSIFIER_VERSION}:${result.evidenceChecksum}`});
         aiEnqueued+=1;
       } else deferredAi+=1;
     }
@@ -170,10 +185,11 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
   if(hasMore){
     // Persist the cursor in the job payload and return the job to PENDING
     // without consuming an attempt. The next claim continues this document.
-    await rescheduleJob(job.id,new Date(Date.now()+1_000).toISOString(),'SCORING_BATCH_CONTINUE',undefined,{...p,cursor:lastSpan});
+    const continued=await reschedule(job.id,new Date(Date.now()+1_000).toISOString(),'SCORING_BATCH_CONTINUE',claim,{...p,cursor:lastSpan});
+    if(!continued)console.warn(JSON.stringify({event:'candidate_scoring_reschedule_lost',jobId:job.id,reason:'SCORING_BATCH_CONTINUE',timestamp:new Date().toISOString()}));
     return;
   }
-  await completeJob(job.id);
+  await complete(job.id);
 }
 
 /** Enqueue bounded ambiguous candidates that were deferred while AI was
