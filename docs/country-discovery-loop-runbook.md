@@ -43,15 +43,16 @@ enrichment/classification scale gate:
 | `PROCESS_DISCOVERY_WORKER_CONCURRENCY` | 1 | process/ingestion |
 | `ENRICHMENT_ONLY_WORKER_CONCURRENCY` | 1 | generic ENRICH backfill |
 
-Provider pacing, semantic cooldowns, quota reservations and daily budgets still
-apply inside each job. The Phase 4 scale gate remains available for diagnostics
+Each lane is capped at 20 workers by the resolver (total maximum 80). Provider
+pacing, semantic cooldowns, quota reservations and daily budgets still apply
+inside each job. Startup warns if the lane total exceeds `DATABASE_POOL_MAX`. The Phase 4 scale gate remains available for diagnostics
 and legacy backfill policy but no longer reduces startup capacity for the four
 lanes above. Raise lanes in production one step at a time while watching Gemini
 success, pacing, provider latency and heartbeat failures.
 
-`DATABASE_POOL_MAX` defaults to `25` and should be raised before adding many
-workers; the historical node-postgres default of 10 was below the combined lane
-count. Heartbeats use a dedicated two-connection pool, `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS`
+`DATABASE_POOL_MAX` defaults to `25` (hard maximum 50) and should be raised
+before adding many workers; the historical node-postgres default of 10 was below
+the combined lane count. Heartbeats use a dedicated two-connection pool, `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS`
 defaults to 60s, and claim-time stale recovery is throttled
 (`CLAIM_STALE_RECOVERY_INTERVAL_MS`, default 60s). `JOB_STALE_AFTER_MINUTES`
 defaults to 5 so a genuinely stalled lease cannot waste 15 minutes of a lane.

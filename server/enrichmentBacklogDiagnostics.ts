@@ -1,5 +1,5 @@
 import { getDb } from './db';
-import { CLASSIFICATION_JOB_TYPE, resolveDiscoveryWorkerLanePlan, resolveEnrichmentWorkerCount } from './classificationDecoupling';
+import { CLASSIFICATION_JOB_TYPE, resolveDiscoveryWorkerLanePlan } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
 import { semanticPrefilterSnapshot } from './semanticPrefilter';
 import { enrichmentScaleMetricsTimeoutMs, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetricsWithinDeadline } from './enrichmentScaleGate';
@@ -183,8 +183,8 @@ export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise
  * database error must never break the existing backlog diagnostic.
  */
 async function phase4Diagnostics():Promise<any>{
-  const requestedWorkers=resolveEnrichmentWorkerCount();
   const lanePlan=resolveDiscoveryWorkerLanePlan();
+  const requestedWorkers=lanePlan.enrichment;
   const thresholds=enrichmentScaleThresholds();
   let semanticCache:any=null;
   let enrichmentScale:any=null;

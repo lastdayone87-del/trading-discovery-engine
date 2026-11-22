@@ -187,6 +187,15 @@ function getHeartbeatDb(): InstanceType<typeof Pool> {
     ...runtimePoolConfig(requireDatabaseUrl(), 2, 'trading-discovery-heartbeat'),
     connectionTimeoutMillis: 5_000,
   });
+  // Idle-client failures are emitted on the pool, not the query promise.
+  // Without a listener node treats them as unhandled events.
+  (heartbeatPool as any).on('error', (error: unknown) => {
+    console.error(JSON.stringify({
+      event: 'heartbeat_pool_error',
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString(),
+    }));
+  });
   return heartbeatPool;
 }
 
@@ -200,6 +209,13 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
   initPromise = (async () => {
     const connectionString = requireDatabaseUrl();
     pool = new Pool(runtimePoolConfig(connectionString, databasePoolMax(), 'trading-discovery-engine'));
+    (pool as any).on('error', (error: unknown) => {
+      console.error(JSON.stringify({
+        event: 'database_pool_error',
+        error: error instanceof Error ? error.message : String(error),
+        timestamp: new Date().toISOString(),
+      }));
+    });
     try {
       await waitForPostgresReady(pool);
       await runMigrations();

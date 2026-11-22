@@ -97,6 +97,18 @@ test('dedicated discovery lanes are independently sized and default to the stage
     enrichment: 1,
     total: 14,
   });
+  assert.deepEqual(resolveDiscoveryWorkerLanePlan(env({
+    ADMISSION_WORKER_CONCURRENCY: '0',
+    CLASSIFICATION_WORKER_CONCURRENCY: 'junk',
+    PROCESS_DISCOVERY_WORKER_CONCURRENCY: '-4',
+    ENRICHMENT_ONLY_WORKER_CONCURRENCY: '999',
+  })), {
+    admission: 4,
+    classification: 4,
+    process: 1,
+    enrichment: 20,
+    total: 29,
+  });
 });
 
 test('worker counts stay at the production 2/3 defaults and env overrides still win', () => {

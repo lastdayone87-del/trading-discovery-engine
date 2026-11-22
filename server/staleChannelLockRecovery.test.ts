@@ -122,6 +122,7 @@ test('runtime recovery is bounded to old LOCKED rows without live ownership', ()
 });
 
 test('claim path recovers stale jobs while the maintenance interval recovers channel locks', () => {
+  assert.match(queueSource, /await recoverStaleJobsIfDue\(\)/);
   assert.match(queueSource, /recoverStaleJobs\(JOB_STALE_AFTER_MINUTES\)/);
   assert.doesNotMatch(queueSource, /recoverStaleChannelLocks/);
   assert.match(schedulerSource, /dependencies\.recoverStaleChannelLocks\(\)/);

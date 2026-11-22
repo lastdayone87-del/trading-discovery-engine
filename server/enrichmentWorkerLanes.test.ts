@@ -86,15 +86,15 @@ test('dedicated discovery lanes keep admission, classification, process, and enr
   const plan = resolveDiscoveryWorkerLanePlan({} as NodeJS.ProcessEnv);
   assert.deepEqual(dedicatedDiscoveryWorkerLanes(plan), [
     {
-      type: 'ENRICH_CHANNEL',
+      type: 'VERIFY_CHANNEL_ADMISSION',
       concurrency: 4,
-      extraClaimableTypes: [ADMISSION_VERIFICATION_JOB_TYPE],
+      extraClaimableTypes: [],
       workerPrefix: 'enrich_channel_admission',
     },
     {
-      type: 'ENRICH_CHANNEL',
+      type: 'CLASSIFY_DISCOVERED_CHANNEL',
       concurrency: 4,
-      extraClaimableTypes: [CLASSIFICATION_JOB_TYPE],
+      extraClaimableTypes: [],
       workerPrefix: 'enrich_channel_classification',
     },
     {

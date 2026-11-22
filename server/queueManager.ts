@@ -3,6 +3,7 @@ import { OPERATIONAL_ENRICHMENT_RECOVERY_PRIORITY } from './operationalEnrichmen
 import { setRunningEnrichmentWorkerCount } from './enrichmentScaleGate';
 import {
   getDb,
+  databasePoolMax,
   enqueueJob,
   enqueueClassificationJobAtomic,
   claimNextJob,
@@ -1052,14 +1053,12 @@ let lastSemanticCooldownEnrichProbeAt = 0;
  * heartbeats. Run it at most once per interval, with one shared in-flight
  * promise so concurrent workers do not duplicate the scan.
  */
-const CLAIM_STALE_RECOVERY_INTERVAL_MS = Math.max(
-  5_000,
-  Number(process.env.CLAIM_STALE_RECOVERY_INTERVAL_MS || 60_000) || 60_000,
-);
-const JOB_STALE_AFTER_MINUTES = Math.max(
-  2,
-  Number(process.env.JOB_STALE_AFTER_MINUTES || 5) || 5,
-);
+function boundedPositiveEnv(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(process.env[name] || fallback);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.floor(parsed))) : fallback;
+}
+const CLAIM_STALE_RECOVERY_INTERVAL_MS = boundedPositiveEnv('CLAIM_STALE_RECOVERY_INTERVAL_MS', 60_000, 5_000, 15 * 60_000);
+const JOB_STALE_AFTER_MINUTES = boundedPositiveEnv('JOB_STALE_AFTER_MINUTES', 5, 2, 60);
 let lastClaimStaleRecoveryAt = 0;
 let claimStaleRecoveryInFlight: Promise<number> | null = null;
 function recoverStaleJobsIfDue(): Promise<number> {
@@ -1850,7 +1849,7 @@ export async function processNextSearchJob(
   let enrichProbeOnly = false;
   const admissionModeActive = (await getAdmissionMode()) === 'ACTIVE';
   const admissionSemanticClaimable = admissionModeActive;
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION') || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) {
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes(CLASSIFICATION_JOB_TYPE) || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
     const geminiRoutes = !groqSelected && !geminiFreeSelected ? configuredGeminiRoutes() : [];
@@ -1890,10 +1889,18 @@ export async function processNextSearchJob(
       // while every semantic route is cooling. ENRICH is allowed as a bounded
       // probe: stage-1/2 evidence is persisted before the semantic attempt, so
       // the next pass can resume without re-spending YouTube quota.
-      if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE))) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
-      // Dedicated process lane: separate worker capacity removes classification
-      // starvation, while the semantic-availability gate prevents a defer storm.
-      if (enrichmentFullyClaimable && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
+    }
+    // Classification and process lanes are separate from ENRICH backfill, so
+    // their own overrides must be accepted outside the ENRICH-only block.
+    if (enrichmentFullyClaimable && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+      claimableTypes.push(CLASSIFICATION_JOB_TYPE);
+    }
+    // Dedicated process lane: separate worker capacity removes classification
+    // starvation, while the semantic-availability gate prevents a defer storm.
+    // This must sit outside the ENRICH_CHANNEL-only block above so a
+    // process-only override can claim its job type.
+    if (enrichmentFullyClaimable && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
+      claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
   if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
@@ -6272,7 +6279,7 @@ export async function executeFullManualSearch(userQuery: string, countryName: st
 
 export { SEARCH_WORKER_CONCURRENCY_DEFAULT, ENRICHMENT_WORKER_CONCURRENCY_DEFAULT, resolveSearchWorkerCount, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 
-function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = [], workerPrefix?: string): void {
+function startWorkerPool(type: 'SEARCH_YOUTUBE' | 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL' | 'MANUAL_SEARCH_PAGE', concurrency: number, extraClaimableTypes: ClaimableSearchJobType[] = [], workerPrefix?: string): void {
   // A zero lane is an intentional "no workers" decision (for example the
   // ENRICH-only lane of a one-worker pool). Do not let the legacy clamp turn
   // it into an extra worker beyond the operator's configured total. A NaN
@@ -6340,7 +6347,7 @@ export function enrichmentWorkerLanes(split: ReturnType<typeof resolveEnrichment
 }
 
 type EnrichmentWorkerLauncher = (
-  type: 'ENRICH_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL',
+  type: 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL',
   concurrency: number,
   extraClaimableTypes: ClaimableSearchJobType[],
   workerPrefix?: string,
@@ -6357,7 +6364,7 @@ export function startEnrichmentWorkerLanes(
 }
 
 export interface DedicatedDiscoveryWorkerLane {
-  type: 'ENRICH_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL';
+  type: 'ENRICH_CHANNEL' | 'VERIFY_CHANNEL_ADMISSION' | 'CLASSIFY_DISCOVERED_CHANNEL' | 'PROCESS_DISCOVERED_CHANNEL';
   concurrency: number;
   extraClaimableTypes: ClaimableSearchJobType[];
   workerPrefix: string;
@@ -6372,17 +6379,17 @@ export function dedicatedDiscoveryWorkerLanes(plan: ReturnType<typeof resolveDis
   const lanes: DedicatedDiscoveryWorkerLane[] = [];
   if (plan.admission > 0) {
     lanes.push({
-      type: 'ENRICH_CHANNEL',
+      type: 'VERIFY_CHANNEL_ADMISSION',
       concurrency: plan.admission,
-      extraClaimableTypes: [ADMISSION_VERIFICATION_JOB_TYPE],
+      extraClaimableTypes: [],
       workerPrefix: 'enrich_channel_admission',
     });
   }
   if (plan.classification > 0) {
     lanes.push({
-      type: 'ENRICH_CHANNEL',
+      type: 'CLASSIFY_DISCOVERED_CHANNEL',
       concurrency: plan.classification,
-      extraClaimableTypes: [CLASSIFICATION_JOB_TYPE],
+      extraClaimableTypes: [],
       workerPrefix: 'enrich_channel_classification',
     });
   }
@@ -6426,6 +6433,15 @@ let workersStarted = false;
  */
 async function startDiscoveryWorkerLanes(): Promise<void> {
   const plan = resolveDiscoveryWorkerLanePlan();
+  const poolMax = databasePoolMax();
+  if (plan.total > poolMax) {
+    console.warn(JSON.stringify({
+      event: 'discovery_lane_pool_underprovisioned',
+      workers: plan.total,
+      databasePoolMax: poolMax,
+      timestamp: new Date().toISOString(),
+    }));
+  }
   setRunningEnrichmentWorkerCount(plan.total);
   console.log(JSON.stringify({
     event: 'discovery_worker_lane_plan',

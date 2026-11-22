@@ -10,6 +10,8 @@ on:
       - 'server/enrichmentScaleGate.ts'
       - 'server/enrichmentScaleGate.test.ts'
       - 'server/enrichmentWorkerLanes.test.ts'
+      - 'server/enrichmentBacklogDiagnostics.ts'
+      - 'server/enrichmentBacklogDiagnostics.test.ts'
       - 'server/runtimeCapacityConfig.test.ts'
       - 'server/operationalMaintenanceScheduler.ts'
       - 'server/operationalMaintenanceScheduler.test.ts'
@@ -40,6 +42,7 @@ jobs:
           server/classificationDecoupling.test.ts
           server/enrichmentScaleGate.test.ts
           server/enrichmentWorkerLanes.test.ts
+          server/enrichmentBacklogDiagnostics.test.ts
           server/runtimeCapacityConfig.test.ts
           server/operationalMaintenanceScheduler.test.ts
           server/staleChannelLockRecovery.test.ts

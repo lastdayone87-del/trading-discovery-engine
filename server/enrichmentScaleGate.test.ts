@@ -190,8 +190,9 @@ test('worker startup decouples discovery-critical lanes from the enrichment gate
   assert.match(source, /startDedicatedDiscoveryWorkerLanes\(plan\)/);
   assert.match(source, /setRunningEnrichmentWorkerCount\(plan\.total\)/);
   assert.doesNotMatch(source, /startGatedEnrichmentWorkers/);
-  const startup = source.slice(source.indexOf('async function startDiscoveryWorkerLanes'));
-  assert.doesNotMatch(startup.slice(0, 1500), /enrichmentScaleGateEnabled|loadEnrichmentScaleMetrics|evaluateEnrichmentScaleGate/);
+  const startupAt = source.indexOf('async function startDiscoveryWorkerLanes');
+  assert.ok(startupAt >= 0, 'dedicated lane startup exists');
+  assert.doesNotMatch(source.slice(startupAt, startupAt + 1500), /enrichmentScaleGateEnabled|loadEnrichmentScaleMetrics|evaluateEnrichmentScaleGate/);
 });
 
 test('diagnostics separate the live decision from the running worker count', () => {
@@ -204,8 +205,9 @@ test('diagnostics separate the live decision from the running worker count', () 
 
 test('startup does not load the scale-gate metrics at all', () => {
   const source = readFileSync('server/queueManager.ts', 'utf8');
-  const startup = source.slice(source.indexOf('async function startDiscoveryWorkerLanes'));
-  assert.doesNotMatch(startup.slice(0, 1500), /loadEnrichmentScaleMetrics/);
+  const startupAt = source.indexOf('async function startDiscoveryWorkerLanes');
+  assert.ok(startupAt >= 0, 'dedicated lane startup exists');
+  assert.doesNotMatch(source.slice(startupAt, startupAt + 1500), /loadEnrichmentScaleMetrics/);
 });
 
 test('the metrics deadline defaults safely and clamps explicit values', () => {

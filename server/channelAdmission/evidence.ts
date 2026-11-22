@@ -177,27 +177,51 @@ function admissionEvidenceBase(input: AdmissionEvidenceInput): AdmissionEvidence
  * observation instead of holding an admission worker for the 15-minute stale
  * recovery window. Overlapping work may finish later but performs no writes.
  */
-export async function fetchAdmissionEvidence(input: AdmissionEvidenceInput): Promise<AdmissionEvidence> {
-  const timeoutMs = admissionEvidenceTimeoutMs();
+let admissionEvidenceLoaderForTests: ((input: AdmissionEvidenceInput, deadlineAtMs: number) => Promise<AdmissionEvidence>) | null = null;
+export function setAdmissionEvidenceLoaderForTests(
+  loader: ((input: AdmissionEvidenceInput, deadlineAtMs: number) => Promise<AdmissionEvidence>) | null,
+): void {
+  admissionEvidenceLoaderForTests = loader;
+}
+
+function evidenceTimeoutResult(input: AdmissionEvidenceInput): AdmissionEvidence {
+  return {
+    ...admissionEvidenceBase(input),
+    failureReason: 'ADMISSION_EVIDENCE_TIMEOUT',
+  };
+}
+
+/**
+ * Stop waiting once the evidence budget expires and prevent later fallback
+ * stages from starting. The already-running provider call is bounded by its
+ * own provider deadline; it performs no admission writes. The worker receives
+ * a retryable partial observation instead of a 15-minute stale lease.
+ */
+export async function fetchAdmissionEvidence(
+  input: AdmissionEvidenceInput,
+  options: { timeoutMs?: number } = {},
+): Promise<AdmissionEvidence> {
+  const timeoutMs = Math.max(1, options.timeoutMs ?? admissionEvidenceTimeoutMs());
+  const deadlineAtMs = Date.now() + timeoutMs;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<AdmissionEvidence>((resolve) => {
-    timer = setTimeout(() => resolve({
-      ...admissionEvidenceBase(input),
-      failureReason: 'ADMISSION_EVIDENCE_TIMEOUT',
-    }), timeoutMs);
+    timer = setTimeout(() => resolve(evidenceTimeoutResult(input)), timeoutMs);
     timer.unref?.();
   });
+  const loader = admissionEvidenceLoaderForTests ?? fetchAdmissionEvidenceUnbounded;
   try {
-    return await Promise.race([fetchAdmissionEvidenceUnbounded(input), timeout]);
+    return await Promise.race([loader(input, deadlineAtMs), timeout]);
   } finally {
     if (timer) clearTimeout(timer);
   }
 }
 
-async function fetchAdmissionEvidenceUnbounded(input: AdmissionEvidenceInput): Promise<AdmissionEvidence> {
+async function fetchAdmissionEvidenceUnbounded(input: AdmissionEvidenceInput, deadlineAtMs = Date.now() + admissionEvidenceTimeoutMs()): Promise<AdmissionEvidence> {
   const base = admissionEvidenceBase(input);
+  if (Date.now() >= deadlineAtMs) return evidenceTimeoutResult(input);
   try {
     const enriched = await fetchYouTubeChannelEnrichment(input.candidate.channelId, input.candidate, input.stage || 1);
+    if (Date.now() >= deadlineAtMs) return evidenceTimeoutResult(input);
     const ids = (enriched.videos || []).map(video => String(video.id || '')).filter(Boolean);
     let fullDetails: Awaited<ReturnType<typeof fetchVideoSnippetsByIds>> = [];
     let detailFailure: string | undefined;
@@ -248,6 +272,7 @@ async function fetchAdmissionEvidenceUnbounded(input: AdmissionEvidenceInput): P
     };
   } catch (error) {
     const failureReason = error instanceof Error ? error.message : String(error);
+    if (Date.now() >= deadlineAtMs) return evidenceTimeoutResult(input);
     // Official Data API failure must not hide keyless creator evidence. Try
     // the shared InnerTube/About fallbacks before declaring a provider wait.
     try {
