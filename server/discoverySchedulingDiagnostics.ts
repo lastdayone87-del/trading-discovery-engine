@@ -2,7 +2,7 @@ import { redactCauseSnippet } from './crawlerTelemetry';
 
 const SCHEDULING_ERROR_MESSAGE_LIMIT = 400;
 const GOOGLE_API_KEY = /AIza[0-9A-Za-z_-]{10,}/g;
-const BARE_KEY_ASSIGNMENT = /((?:^|[\s?&])key=)[^&\s]+/gi;
+const CREDENTIAL_ASSIGNMENT = /((?:^|[\s"'?&;])(?:key|token|secret|password|authorization|bearer)\s*[=:]\s*)[^&\s,;}]+/gi;
 const STRUCTURAL_MESSAGE_CODE = /^[A-Z][A-Z0-9_]{2,}$/;
 
 export interface SchedulingErrorDiagnostics {
@@ -33,7 +33,7 @@ export function schedulingErrorDiagnostics(error: unknown): SchedulingErrorDiagn
   const redacted = redactCauseSnippet(
     rawMessage
       .replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]')
-      .replace(BARE_KEY_ASSIGNMENT, '$1[REDACTED]'),
+      .replace(CREDENTIAL_ASSIGNMENT, '$1[REDACTED]'),
     SCHEDULING_ERROR_MESSAGE_LIMIT,
   );
   return {

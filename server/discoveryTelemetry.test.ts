@@ -73,9 +73,9 @@ test('scheduler error diagnostics bound long messages', () => {
 
 test('scheduler error diagnostics redact URL credentials and quoted options', () => {
   const details = schedulingErrorDiagnostics(new Error(
-    'scheduler failed https://user:s3cret@proxy:8080 {"password":"hunter2","headless":true}',
+    'scheduler failed https://user:s3cret@proxy:8080 {"password":"hunter2","headless":true} token:abc123 authorization:def456',
   ));
-  assert.doesNotMatch(details.logMessage || '', /s3cret|hunter2/);
+  assert.doesNotMatch(details.logMessage || '', /s3cret|hunter2|abc123|def456/);
   assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');
 });
 
