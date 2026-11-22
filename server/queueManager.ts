@@ -907,12 +907,16 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
     getAppSetting('country_discovery_loop_enabled', 'true'),
   ]);
   const paginationEnabled = paginationSetting === 'true' && cdlSetting === 'true';
+  // Never overwrite a status that already owns its outcome. The planner below
+  // has the same terminal/deferred guard; the deferral path must respect it too.
+  const recoveryOwnsStatus = !['COMPLETE', 'FAILED', 'RESUME_UNAVAILABLE', 'DEFERRED_QUOTA', 'DEFERRED_TIME']
+    .includes(String(progress.continuationStatus || ''));
   // A duplicate retry of a page already parked for admission review must not
   // finalize the parent from its provisional should_continue=false decision.
   // Keep it deferred; the orphan sweep owns the settled re-evaluation. When
   // continuation is disabled there is no sweep owner, so finalize instead of
   // stranding the run.
-  if (paginationEnabled && observation?.deferredReason === 'ADMISSION') {
+  if (paginationEnabled && recoveryOwnsStatus && observation?.deferredReason === 'ADMISSION') {
     await deferAutonomousRunForAdmissionReview(
       args.queryRunId,
       args.pageNumber,
@@ -925,6 +929,7 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   // by the orphan sweep, whether its admissions are still pending or settled
   // productive while the worker was down. Hard ceilings never use this path.
   if (paginationEnabled
+    && recoveryOwnsStatus
     && observation
     && observation.shouldContinue === false
     && observation.nextPageToken
