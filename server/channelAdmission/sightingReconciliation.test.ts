@@ -93,8 +93,11 @@ test('page-scoped replay repairs verdicts that landed before sighting insertion'
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].params?.slice(0, 2), ['55555555-5555-5555-5555-555555555555', 3]);
   const sql = calls[0].sql;
-  assert.match(sql, /c\.status IN \(/);
+  assert.match(sql, /WITH scoped AS MATERIALIZED/);
+  assert.match(sql, /FROM semantic_admission_candidates c[\s\S]*FOR SHARE/);
+  assert.match(sql, /lc\.status IN \(/);
   assert.match(sql, /'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED'/);
+  assert.match(sql, /cs\.metadata->>'admissionStatus' IS DISTINCT FROM lc\.status/);
   assert.match(sql, /cs\.funnel_outcome='NEEDS_REVIEW' AND cs\.metadata->>'sightingOutcomeSource'='ADMISSION'/);
   assert.match(sql, /s\.result_rank IS NULL OR s\.result_rank=cs\.result_rank/);
   // The final UPDATE must re-check the predicate after a possible lock wait;

@@ -224,6 +224,8 @@ maybe('early terminal admission verdict is replayed after the sighting insert', 
     assert.equal(await replayAdmissionOutcomesForPage({ queryRunId: runId, pageNumber: 2 }), 0);
     await insertAdmittedChannel(db, channelId);
     assert.equal(await replayAdmissionOutcomesForPage({ queryRunId: runId, pageNumber: 2 }), 1);
+    // Replaying the same terminal outcome is a no-op.
+    assert.equal(await replayAdmissionOutcomesForPage({ queryRunId: runId, pageNumber: 2 }), 0);
     const row = (await db.query(
       `SELECT persisted,funnel_outcome,metadata FROM channel_sightings WHERE query_run_id=$1 AND channel_id=$2`,
       [runId, channelId],

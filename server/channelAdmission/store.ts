@@ -344,10 +344,9 @@ export async function replayAdmissionOutcomesForPage(input: {
   const db = input.client || await getDb();
   const reconciledAt = new Date().toISOString();
   const result = await db.query(
-    `WITH scoped AS (
+    `WITH scoped AS MATERIALIZED (
        SELECT DISTINCT cs.id AS sighting_id,
-              c.id AS candidate_id,
-              c.status AS admission_status
+              c.id AS candidate_id
          FROM channel_sightings cs
          JOIN semantic_admission_sightings s
            ON s.query_run_id=cs.query_run_id
@@ -360,30 +359,23 @@ export async function replayAdmissionOutcomesForPage(input: {
           AND cs.page_number=$2
           AND cs.was_known=false
           AND (
-            c.status NOT IN ('ADMITTED','ADMITTED_AMBIGUOUS')
-            OR EXISTS (
-              SELECT 1 FROM channels ch
-               WHERE ch.channel_id=c.channel_id
-                 AND ch.admitted_at IS NOT NULL
-                 AND ch.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
-            )
-          )
-          AND c.status IN (
-            'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED',
-            'NEEDS_REVIEW','EXPIRED_MISSING_EVIDENCE'
-          )
-          AND (
             cs.funnel_outcome IS NULL
             OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
             OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
           )
+     ),
+     locked_candidates AS (
+       SELECT c.id,c.status
+         FROM semantic_admission_candidates c
+        WHERE c.id IN (SELECT candidate_id FROM scoped)
+        FOR SHARE
      )
      UPDATE channel_sightings cs
         SET persisted = CASE
-              WHEN sc.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS') THEN true
+              WHEN lc.status IN ('ADMITTED','ADMITTED_AMBIGUOUS') THEN true
               ELSE false
             END,
-            funnel_outcome = CASE sc.admission_status
+            funnel_outcome = CASE lc.status
               WHEN 'ADMITTED' THEN 'CLASSIFICATION_PENDING'
               WHEN 'ADMITTED_AMBIGUOUS' THEN 'CLASSIFICATION_PENDING'
               WHEN 'REJECTED_COUNTRY' THEN 'COUNTRY_REJECTED'
@@ -392,21 +384,29 @@ export async function replayAdmissionOutcomesForPage(input: {
               ELSE 'UNCERTAIN'
             END,
             country_outcome = CASE
-              WHEN sc.admission_status='REJECTED_COUNTRY' THEN 'REJECTED'
+              WHEN lc.status='REJECTED_COUNTRY' THEN 'REJECTED'
               ELSE cs.country_outcome
             END,
             trading_outcome = CASE
-              WHEN sc.admission_status IN ('REJECTED_COUNTRY','REJECTED_UNRELATED') THEN 'UNCERTAIN'
+              WHEN lc.status IN ('REJECTED_COUNTRY','REJECTED_UNRELATED') THEN 'UNCERTAIN'
               ELSE cs.trading_outcome
             END,
             metadata=COALESCE(cs.metadata,'{}'::jsonb)||jsonb_build_object(
-              'admissionStatus',sc.admission_status,
+              'admissionStatus',lc.status,
               'sightingOutcomeSource','ADMISSION',
               'admissionSightingReconciledAt',$3::text
             )
        FROM scoped sc
+       JOIN locked_candidates lc ON lc.id=sc.candidate_id
       WHERE cs.id=sc.sighting_id
         AND cs.was_known=false
+        AND lc.status IN (
+          'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED',
+          'NEEDS_REVIEW','EXPIRED_MISSING_EVIDENCE'
+        )
+        -- A repeat replay of the same terminal outcome is a no-op; only a
+        -- changed candidate status may replace an admission-owned projection.
+        AND cs.metadata->>'admissionStatus' IS DISTINCT FROM lc.status
         -- The CTE may have waited on a classification writer's row lock.
         -- Re-check the pending/source predicate on the locked target row so a
         -- verdict committed while waiting is never overwritten.
@@ -416,7 +416,7 @@ export async function replayAdmissionOutcomesForPage(input: {
           OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
         )
         AND (
-          sc.admission_status NOT IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          lc.status NOT IN ('ADMITTED','ADMITTED_AMBIGUOUS')
           OR EXISTS (
             SELECT 1 FROM channels ch
              WHERE ch.channel_id=cs.channel_id
