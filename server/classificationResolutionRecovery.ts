@@ -64,6 +64,12 @@ export function resolveResolutionRecoveryAction(input: ResolutionRecoveryDecisio
   if (input.recoveryCycles >= CLASSIFICATION_RESOLUTION_RECOVERY_CYCLE_LIMIT) {
     return { action: 'EXHAUSTED_REVIEW', reasonCodes: ['RECOVERY_ATTEMPTS_EXHAUSTED'] };
   }
+  if (input.scanStatus === 'INTAKE_DEFERRED' || input.scanStatus === 'PROVIDER_DEFERRED') {
+    // Sparse-evidence deferrals are not terminal. Re-open the row for one
+    // bounded enrichment pass; the cycle ceiling above converts repeated
+    // exhaustion into an explicit review instead of an endless stage-0 loop.
+    return { action: 'ENQUEUE_RECOVERY', reasonCodes: ['DEFERRED_EVIDENCE_RECOVERY'] };
+  }
   if (input.scanStatus === 'ENRICHMENT_PENDING' && !input.latestJobStatus) {
     return { action: 'ENQUEUE_RECOVERY', reasonCodes: ['ORPHAN_ENRICHMENT_PENDING'] };
   }
@@ -95,6 +101,8 @@ export async function ensureClassificationResolutionCutoff(): Promise<string> {
 export interface ClassificationResolutionRecoveryOptions {
   dryRun?: boolean;
   includeLegacy?: boolean;
+  /** Restrict the sweep to machine-deferred evidence states. */
+  deferredOnly?: boolean;
   limit?: number;
   cutoff?: string;
   now?: number;
@@ -213,7 +221,8 @@ export async function reconcileClassificationResolutionGaps(
           LIMIT 1
        ) latest ON true
       WHERE c.trading_status='UNCERTAIN'
-        AND c.scan_status IN('ENRICHMENT_PENDING','FAILED')
+        AND c.scan_status IN('ENRICHMENT_PENDING','FAILED','INTAKE_DEFERRED','PROVIDER_DEFERRED')
+        AND ($5::boolean OR c.scan_status IN('INTAKE_DEFERRED','PROVIDER_DEFERRED'))
         AND ($1::boolean OR COALESCE(c.last_checked,c.created_at) >= $2::timestamptz)
         AND COALESCE(c.country_status,'') <> 'REJECTED'
         AND NOT EXISTS(
@@ -240,7 +249,7 @@ export async function reconcileClassificationResolutionGaps(
         ))
       ORDER BY recovery_cooldown_active ASC,c.last_checked ASC NULLS FIRST,c.channel_id
       LIMIT $4`,
-    [Boolean(options.includeLegacy), cutoff, Boolean(dryRun), limit],
+    [Boolean(options.includeLegacy), cutoff, Boolean(dryRun), limit, Boolean(options.deferredOnly)],
   );
   const items: ClassificationResolutionRecoveryItem[] = [];
   let enqueued = 0, exhaustedReviews = 0, permanentFailures = 0, skipped = 0, failures = 0;
@@ -311,6 +320,19 @@ export async function reconcileClassificationResolutionGaps(
         }
         continue;
       }
+      if (item.scanStatus === 'INTAKE_DEFERRED' || item.scanStatus === 'PROVIDER_DEFERRED') {
+        // The enrichment worker refuses INTAKE_DEFERRED rows. Reopen the exact
+        // observed row atomically; a concurrent write means another owner has
+        // already changed the state.
+        const reopened = await db.query(
+          `UPDATE channels SET scan_status='ENRICHMENT_PENDING',updated_at=now()
+            WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status=$2
+              AND date_trunc('milliseconds',last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds',$3::timestamptz)
+            RETURNING channel_id`,
+          [item.channelId, item.scanStatus, item.lastChecked],
+        );
+        if (!reopened.rowCount) { skipped += 1; continue; }
+      }
       const channel = await loadChannel(db, item.channelId);
       if (!channel) { skipped += 1; continue; }
       const cycle = item.recoveryCycles + 1;
@@ -349,6 +371,16 @@ export async function reconcileClassificationResolutionGaps(
         });
         if (review.materialized) exhaustedReviews += 1;
         else {
+          if (item.scanStatus === 'INTAKE_DEFERRED' || item.scanStatus === 'PROVIDER_DEFERRED') {
+            // The reopen was only a precondition for the enqueue. If no job
+            // and no review now owns the row, restore the exact deferred state
+            // so the next bounded sweep can retry it.
+            await db.query(
+              `UPDATE channels SET scan_status=$2,updated_at=now()
+                WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status='ENRICHMENT_PENDING'`,
+              [item.channelId, item.scanStatus],
+            );
+          }
           skipped += 1;
           await recordClassificationResolutionBackoff(db, item, ['EXHAUSTED_REVIEW_NOT_MATERIALIZED', review.reason || 'UNKNOWN']);
         }

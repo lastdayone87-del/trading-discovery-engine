@@ -55,6 +55,16 @@ test('human rejected rows remain terminal even when old', () => {
   assert.equal(shouldPreserveExistingChannel(channel, source('automated_query'), false, NOW), true);
 });
 
+test('machine-deferred evidence states wait for the bounded recovery sweep', () => {
+  for (const status of ['INTAKE_DEFERRED', 'PROVIDER_DEFERRED'] as const) {
+    const deferred = base({ trading_status: 'UNCERTAIN', scan_status: status, last_checked: '2026-08-16T03:00:00.000Z' });
+    assert.equal(shouldPreserveExistingChannel(deferred, source('automated_query'), false, NOW), true);
+    assert.equal(shouldPreserveExistingChannel(deferred, source('autonomous'), false, NOW), true);
+    assert.equal(shouldPreserveExistingChannel(deferred, source('manual_search'), true, NOW), false, 'operator scan may retry immediately');
+    assert.equal(shouldPreserveExistingChannel(deferred, source('recheck'), true, NOW), false);
+  }
+});
+
 test('country rejected rows remain terminal even when old', () => {
   const channel = base({ country_status: 'REJECTED', trading_status: 'NON_TRADING', scan_status: 'SKIPPED_EXCLUDED', last_checked: '2026-01-01T00:00:00.000Z' });
   assert.equal(machineNonTradingRediscoveryEligible(channel, NOW), false);

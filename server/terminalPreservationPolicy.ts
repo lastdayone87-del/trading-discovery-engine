@@ -215,6 +215,16 @@ export function shouldPreserveExistingChannel(
       existing.scan_status === 'SKIPPED_EXCLUDED';
     if (hardTerminal) return true;
 
+    // Machine-owned evidence deferrals are waiting for a bounded enrichment
+    // retry, not for another stage-0 classification of the same sparse
+    // metadata. Ordinary rediscovery must not spend semantic work or create a
+    // new diagnostic on every sighting; the classification-resolution sweep
+    // owns the retry cadence and the cycle ceiling. Explicit operator scans stay
+    // outside this guard.
+    if (existing.scan_status === 'INTAKE_DEFERRED' || existing.scan_status === 'PROVIDER_DEFERRED') {
+      return !isManualScan;
+    }
+
     // Country uncertainty is explicitly non-terminal. Re-run Gate 1 so the
     // current creator evidence can resolve the country and apply exclusions.
     // A TRADING_CONFIRMED row with UNCERTAIN country is short-circuited above

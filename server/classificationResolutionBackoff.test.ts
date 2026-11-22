@@ -82,6 +82,76 @@ test('a non-materialized exhausted review writes a short-lived backoff event', a
   ]);
 });
 
+test('a deferred evidence row reopens and enqueues one bounded enrichment pass', async () => {
+  const updates: unknown[][] = [];
+  const db = {
+    query: async (sql: string, params: unknown[]) => {
+      if (sql.includes('FROM channels c')) {
+        return {
+          rows: [candidate({
+            scan_status: 'INTAKE_DEFERRED',
+            latest_job_status: 'COMPLETED',
+            terminal_failure_class: null,
+            latest_job_attempts: 1,
+            recovery_cycles: 0,
+          })],
+          rowCount: 1,
+        };
+      }
+      if (sql.includes("UPDATE channels SET scan_status='ENRICHMENT_PENDING'")) {
+        updates.push(params);
+        return { rows: [{ channel_id: 'UC1' }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release: () => undefined }),
+  };
+  let enqueuedChannel: any;
+  let enqueuedReasons: string[] | undefined;
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    deferredOnly: true,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => ({ materialized: false, reason: 'NOT_EXPECTED' }),
+    enqueueOperationalEnrichmentRecoveryJob: async (channel: any, reasons: string[]) => {
+      enqueuedChannel = channel;
+      enqueuedReasons = reasons;
+      return true;
+    },
+    channelRowToRecord: async () => ({ channel_id: 'UC1', scan_status: 'ENRICHMENT_PENDING' }) as any,
+  } as any);
+
+  assert.equal(result.enqueued, 1);
+  assert.equal(result.items[0].action, 'ENQUEUE_RECOVERY');
+  assert.deepEqual(result.items[0].reasonCodes, ['DEFERRED_EVIDENCE_RECOVERY']);
+  assert.deepEqual(updates[0], ['UC1', 'INTAKE_DEFERRED', '2026-01-01T00:00:00.000Z']);
+  assert.equal(enqueuedChannel.scan_status, 'ENRICHMENT_PENDING');
+  assert.deepEqual(enqueuedReasons, ['DEFERRED_EVIDENCE_RECOVERY']);
+});
+
+test('the deferred recovery cycle ceiling routes repeated exhaustion to review', async () => {
+  const { db } = fakeDb([candidate({ scan_status: 'INTAKE_DEFERRED', latest_job_status: 'COMPLETED', terminal_failure_class: null, recovery_cycles: 3 })]);
+  let reviewed = 0;
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    deferredOnly: true,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => { reviewed += 1; return { materialized: true }; },
+    enqueueOperationalEnrichmentRecoveryJob: async () => { throw new Error('must not enqueue after the cycle ceiling'); },
+    channelRowToRecord: async () => ({ channel_id: 'UC1' }) as any,
+  } as any);
+
+  assert.equal(result.exhaustedReviews, 1);
+  assert.equal(result.enqueued, 0);
+  assert.equal(reviewed, 1);
+});
+
 test('the exhausted-review branch backs off a non-materialized review', async () => {
   const { db, inserts } = fakeDb([candidate()]);
   const result = await reconcileClassificationResolutionGaps({
