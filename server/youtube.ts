@@ -68,7 +68,7 @@ import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
 import { youtubeProviderCooldown, YouTubeProvidersCoolingDownError } from './youtubeProviderCooldown';
-import { clearYouTubeProjectSuspension, isYouTubeProjectSuspended, suspendYouTubeProject } from './youtubeProjectSuspension';
+import { earliestYouTubeProjectRetryAt, isYouTubeProjectSuspended, suspendYouTubeProject } from './youtubeProjectSuspension';
 import { bumpInvalidApiKeyQuarantine } from './operationsTelemetry';
 import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type FeaturedChannelProviderResult } from './featuredChannelAdapter';
 export type { SearchOrdering } from './searchOrdering';
@@ -382,7 +382,12 @@ export async function availableKeyIndexes(
     youtubeProviderCooldown.eligible(keys[index])
     && !isYouTubeProjectSuspended(getYouTubeQuotaGroupForKey(keys[index])),
   );
-  if (!indexes.length) { throwIfAllProvidersCoolingDown(keys); return []; }
+  if (!indexes.length) {
+    const projectRetryAt = earliestYouTubeProjectRetryAt(keys.map(key => getYouTubeQuotaGroupForKey(key)));
+    if (projectRetryAt !== null) throw new YouTubeProvidersCoolingDownError(projectRetryAt);
+    throwIfAllProvidersCoolingDown(keys);
+    return [];
+  }
   let enforcement = false;
   try {
     enforcement = await (deps.resolveEnforcement ?? (() => resolveKeyCapEnforcement(getAppSetting)))();
@@ -531,6 +536,11 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
     // Serialized with gated clears (arrival order): a re-suspension issued
     // after an in-flight clear executes after it, so the fresh row survives.
     const quotaGroup = configured?.quotaGroup || getYouTubeQuotaGroupForKey(providerKey) || '';
+    // A deleted/mistyped key is key-scoped and must not sideline healthy
+    // siblings. Only a confirmed consumer/project suspension fans out.
+    if (quotaGroup && reason === 'CONSUMER_SUSPENDED') {
+      suspendYouTubeProject(quotaGroup, Date.now() + YOUTUBE_SUSPENSION_RETRY_AFTER_MS);
+    }
     await serializeYouTubeSuspensionWrite(() => recordYouTubeProviderSuspension({
       keyFingerprint: fingerprintYouTubeKey(providerKey),
       keyIndex: index >= 0 ? index + 1 : 0,
@@ -540,7 +550,6 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
       retryAfterMs: YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
       reason,
     }));
-    if (quotaGroup) suspendYouTubeProject(quotaGroup, Date.now() + YOUTUBE_SUSPENSION_RETRY_AFTER_MS);
   } catch {
     // Durable suspension is telemetry-grade hardening; a write failure must
     // never mask the original provider error.
@@ -670,6 +679,15 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
   // readiness, so without this wait a restart could reprobe an already-dead
   // key before its cooldown is restored. Resolves immediately once hydrated.
   await ensureYouTubeSuspensionHydration();
+  // Re-check the project at dispatch, not only when the claim list was built:
+  // a sibling request may have suspended the group while this request queued.
+  if (providerKey) {
+    const quotaGroup = getYouTubeQuotaGroupForKey(providerKey);
+    if (isYouTubeProjectSuspended(quotaGroup)) {
+      const retryAt = earliestYouTubeProjectRetryAt([quotaGroup]);
+      throw new YouTubeProvidersCoolingDownError(retryAt ?? Date.now() + 60_000);
+    }
+  }
   trace('entered youtubeFetch; before timeout-setting-read at server/youtube.ts:119');
   const configuredTimeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
   trace('after timeout-setting-read at server/youtube.ts:119');
@@ -1004,7 +1022,6 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
         // following eligible key so healthy keys share the workload instead
         // of one key absorbing everything until it fails.
         if(validatedIndex>=0)activeKeyIndex=advanceYouTubeRotation(validatedPool.length,validatedIndex);
-        clearYouTubeProjectSuspension(getYouTubeQuotaGroupForKey(context.providerKey));
       }
       if (shouldClearYouTubeSuspension(providerSuccessIsCurrent, wasSuspended)) {
         // Generation-gated, awaited clear: another request may have

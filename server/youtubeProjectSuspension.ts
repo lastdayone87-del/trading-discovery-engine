@@ -26,6 +26,20 @@ export function isYouTubeProjectSuspended(quotaGroup: string | null | undefined,
   return true;
 }
 
+export function earliestYouTubeProjectRetryAt(
+  quotaGroups: Array<string | null | undefined>,
+  nowMs: number = Date.now(),
+): number | null {
+  let earliest: number | null = null;
+  for (const group of quotaGroups) {
+    if (!group) continue;
+    if (!isYouTubeProjectSuspended(group, nowMs)) continue;
+    const retryAt = projectSuspensions.get(group);
+    if (retryAt != null) earliest = earliest == null ? retryAt : Math.min(earliest, retryAt);
+  }
+  return earliest;
+}
+
 export function clearYouTubeProjectSuspension(quotaGroup: string | null | undefined): void {
   if (quotaGroup) projectSuspensions.delete(quotaGroup);
 }

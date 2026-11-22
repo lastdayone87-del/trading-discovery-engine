@@ -3,6 +3,7 @@ import { clearYouTubeProviderSuspension, getYouTubeKeyPool, loadActiveYouTubePro
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { youtubeRequestSignatureFromUrl } from './youtubeQuarantineSignature';
+import { getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
 import { suspendYouTubeProject } from './youtubeProjectSuspension';
 
 /** Invalid inputs stay quarantined for 7 days: long enough to break daily
@@ -360,15 +361,19 @@ export async function hydrateYouTubeProviderSuspensions(
   const nowMs = Date.now();
   for (const row of rows) {
     const key = byFingerprint.get(row.keyFingerprint);
+    const retryAfterMs = row.retryAfter ? Date.parse(row.retryAfter) : NaN;
+    const observedAtMs = row.observedAt ? Date.parse(row.observedAt) : NaN;
+    const horizon = suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs });
+    // Restore the group even when the originally denied key was removed from
+    // the pool: its sibling keys still share the project denial. If the row
+    // predates labels, resolve the current key's configured group.
+    const quotaGroup = row.quotaGroup || (key ? getYouTubeQuotaGroupForKey(key) : '');
+    if (quotaGroup) suspendYouTubeProject(quotaGroup, horizon, nowMs);
     if (!key) {
       summary.skipped += 1;
       continue;
     }
-    const retryAfterMs = row.retryAfter ? Date.parse(row.retryAfter) : NaN;
-    const observedAtMs = row.observedAt ? Date.parse(row.observedAt) : NaN;
-    const horizon = suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs });
     youtubeProviderCooldown.restoreSuspended(key, horizon, { allowDue: true });
-    if (row.quotaGroup) suspendYouTubeProject(row.quotaGroup, horizon, nowMs);
     summary.restored += 1;
   }
   return summary;
