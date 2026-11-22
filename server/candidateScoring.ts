@@ -16,6 +16,8 @@ export const ASSERTION_LABELS=['TRADING','NON_TRADING','AMBIGUOUS','SPAM','BRAND
  * Bound each run and continue from a durable cursor.
  */
 export const SCORING_BATCH_GROUPS=50;
+/** Hard evidence bound for pathological single-token spans. */
+export const MAX_OCCURRENCES_PER_SPAN=1000;
 export type AssertionLabel=typeof ASSERTION_LABELS[number];
 const sha=(v:string)=>createHash('sha256').update(v).digest('hex');
 const generic=new Set(['the','and','for','with','from','this','that','video','channel','official','new','live','today','finance','money','market']);
@@ -158,7 +160,17 @@ export async function processCandidateScoringJob(job:{id:string;payload:any;atte
   const spans=await db.query(`SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1 AND ($2::text IS NULL OR normalized_span>$2) ORDER BY normalized_span LIMIT $3`,[p.documentId,cursor,batchSize]);
   if(!spans.rowCount){await complete(job.id);return;}
   const spanList=spans.rows.map((row:any)=>String(row.normalized_span));
-  const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span=ANY($1::text[]) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[spanList]);
+  const values=await db.query(`WITH occurrences AS (
+      SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset,
+             row_number() OVER (PARTITION BY o.normalized_span ORDER BY a.observed_at,o.occurrence_key) AS occurrence_rank
+        FROM corpus_candidate_occurrences o
+        JOIN corpus_documents d ON d.id=o.document_id
+        JOIN corpus_source_artifacts a ON a.id=d.artifact_id
+       WHERE o.normalized_span=ANY($1::text[])
+    )
+    SELECT normalized_span,literal_span,document_id,entity_cluster_key,source_type,observed_at,language,start_offset,end_offset
+      FROM occurrences WHERE occurrence_rank <= $2
+     ORDER BY normalized_span,observed_at,occurrence_rank`,[spanList,MAX_OCCURRENCES_PER_SPAN]);
   const groups=new Map<string,CandidateEvidence[]>();
   for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
   if(groups.size>remaining)throw new Error('Candidate scoring batch exceeds the remaining daily budget.');

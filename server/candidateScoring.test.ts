@@ -28,6 +28,8 @@ test('scoring continues through a durable bounded cursor without consuming attem
   assert.match(source,/SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences WHERE document_id=\$1/);
   assert.match(source,/normalized_span>\$2/);
   assert.match(source,/ANY\(\$1::text\[\]\)/);
+  assert.match(source,/row_number\(\) OVER \(PARTITION BY o\.normalized_span/);
+  assert.match(source,/occurrence_rank <= \$2/);
   assert.match(source,/SCORING_BATCH_CONTINUE/);
   assert.match(source,/cursor:lastSpan/);
   assert.match(source,/SCORING_DAILY_BUDGET_EXHAUSTED/);
@@ -49,7 +51,7 @@ function scoringFakeDb() {
       if (text.includes('SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences')) {
         return { rows: [{ normalized_span: 'order flow' }], rowCount: 1 };
       }
-      if (text.includes('SELECT o.normalized_span')) {
+      if (text.includes('WITH occurrences AS')) {
         return { rows: [{ normalized_span: 'order flow', literal_span: 'order flow', document_id: 'doc-1', entity_cluster_key: 'c1', source_type: 'CHANNEL_METADATA', observed_at: '2026-07-01T00:00:00Z', language: 'en', start_offset: 0, end_offset: 10 }], rowCount: 1 };
       }
       if (text.includes('FROM candidate_adjudication_results')) return { rows: [{ n: 0, cost: 0 }], rowCount: 1 };
@@ -99,27 +101,42 @@ test('a lost continuation claim is not reported as completed progress', async ()
 });
 
 test('the scoring claim guard admits the next slice, not the whole document', async () => {
-  const sliceCalls: any[] = [];
+  const inFlightCalls: any[] = [];
   const client = {
     query: async (sql: string, params: any[] = []) => {
       const text = String(sql);
       if (text.includes('FROM candidate_scoring_controls')) return { rows: [{ paused: false, budget: 100 }] };
       if (text.includes('FROM candidate_feature_snapshots')) return { rows: [{ n: 94 }] };
-      if (text.includes('COALESCE(sum(g.n)')) return { rows: [{ u: 0 }] };
-      if (text.includes('LIMIT $3) bounded')) {
-        sliceCalls.push(params);
-        return { rows: [{ n: 50 }] };
+      if (text.includes('COALESCE(sum(g.n)')) {
+        inFlightCalls.push(params);
+        return { rows: [{ u: 0 }] };
       }
       throw new Error(`unexpected guard SQL: ${text.slice(0, 120)}`);
     },
   };
   const verdict = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-3', payload: { documentId: 'doc-1' } });
   assert.deepEqual(verdict, { admitted: true, exhausted: false });
-  assert.deepEqual(sliceCalls[0], ['doc-1', null, SCORING_BATCH_GROUPS]);
 
   const continued = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-4', payload: { documentId: 'doc-1', cursor: 'order flow' } });
   assert.deepEqual(continued, { admitted: true, exhausted: false });
-  assert.deepEqual(sliceCalls[1], ['doc-1', 'order flow', SCORING_BATCH_GROUPS]);
+  assert.deepEqual(inFlightCalls[0], [SCORING_BATCH_GROUPS]);
+  assert.deepEqual(inFlightCalls[1], [SCORING_BATCH_GROUPS]);
+});
+
+test('the scoring claim guard allows an empty document to reach completion', async () => {
+  const client = {
+    query: async (sql: string) => {
+      const text = String(sql);
+      if (text.includes('FROM candidate_scoring_controls')) return { rows: [{ paused: false, budget: 100 }] };
+      if (text.includes('FROM candidate_feature_snapshots')) return { rows: [{ n: 0 }] };
+      if (text.includes('COALESCE(sum(g.n)')) return { rows: [{ u: 0 }] };
+      throw new Error(`unexpected guard SQL: ${text.slice(0, 120)}`);
+    },
+  };
+  assert.deepEqual(
+    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'empty-job', payload: { documentId: 'empty-doc' } }),
+    { admitted: true, exhausted: false },
+  );
 });
 
 test('the scoring claim guard stops only when no daily snapshot budget remains', async () => {

@@ -1233,14 +1233,10 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
     );
     const remaining = budget - Number(spent.rows[0]?.n || 0) - Number(inFlight.rows[0]?.u || 0);
     if (remaining < 1) return { admitted: false, exhausted: true };
-    const slice = await client.query(
-      `SELECT count(*)::int AS n FROM
-         (SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences
-           WHERE document_id=$1::uuid AND ($2::text IS NULL OR normalized_span>$2)
-           ORDER BY normalized_span LIMIT $3) bounded`,
-      [documentId, cursor, SCORING_BATCH_GROUPS],
-    );
-    return { admitted: Number(slice.rows[0]?.n || 0) > 0, exhausted: false };
+    // Admit even when this cursor slice is empty: harvest can enqueue a
+    // document with no occurrences, and the processor must reach its
+    // empty-job completion path instead of remaining pending forever.
+    return { admitted: true, exhausted: false };
   },
 };
 export const CORPUS_CLAIM_BUDGET_GUARDS: ClaimBudgetGuard[] = [TERM_HARVEST_BUDGET_GUARD, SCORE_CANDIDATES_BUDGET_GUARD];
