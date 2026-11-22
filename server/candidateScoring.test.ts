@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { aiAdjudicationAdmitted, scoreCandidate, validateBoundedAssertion } from './candidateScoring';
+import { aiAdjudicationAdmitted, aiAdjudicationCapacity, scoreCandidate, validateBoundedAssertion } from './candidateScoring';
 
 const evidence=(span:string,cluster='c1',day='2026-07-01')=>({normalizedSpan:span,literalSpan:span,documentId:`d-${cluster}-${day}`,clusterKey:cluster,sourceType:'CHANNEL_METADATA',observedAt:`${day}T00:00:00.000Z`,language:'en',startOffset:0,endOffset:Array.from(span).length});
 
@@ -15,9 +15,29 @@ test('AI adjudication jobs are only admitted when the paid control is enabled an
 
 test('ambiguous scoring only enqueues AI work through the paid-control gate',()=>{
   const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
-  assert.match(source,/const aiAdmitted=aiAdjudicationAdmitted\(control\.rows\[0\]\)/);
-  assert.match(source,/if\(aiAdmitted\) await enqueueJob\('AI_ADJUDICATE_CANDIDATE'/);
+  assert.match(source,/const aiAdmitted=aiCapacity>0/);
+  assert.match(source,/if\(aiAdmitted&&aiEnqueued<aiCapacity\)\{/);
   assert.match(source,/candidate_ai_adjudication_deferred/);
+});
+
+test('AI enqueue capacity is bounded by today\'s remaining assertion and cost headroom',()=>{
+  const control={ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:1000};
+  assert.equal(aiAdjudicationCapacity(control,0,0,10),10);
+  assert.equal(aiAdjudicationCapacity(control,9,0,10),1);
+  assert.equal(aiAdjudicationCapacity(control,0,950,10),5);
+  assert.equal(aiAdjudicationCapacity(control,10,0,10),0);
+  assert.equal(aiAdjudicationCapacity(control,0,1000,10),0);
+  assert.equal(aiAdjudicationCapacity({...control,ai_paused:true},0,0,10),0);
+});
+
+test('deferred ambiguous candidates have a bounded, funded backfill worker',()=>{
+  const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
+  assert.match(source,/export async function enqueueDeferredAiAdjudications/);
+  assert.match(source,/classification_assertions a WHERE a\.candidate_key=f\.candidate_key AND a\.assertion_source='AI'/);
+  assert.match(source,/candidate_adjudication_results r WHERE r\.candidate_key=f\.candidate_key/);
+  assert.match(source,/j\.status IN \('PENDING','PROCESSING'\)/);
+  const worker=readFileSync(new URL('./operationalMaintenanceWorkers.ts',import.meta.url),'utf8');
+  assert.match(worker,/enqueueDeferredAiAdjudications\(50\)/);
 });
 
 test('phase 9 migration is additive, immutable, separately paused and has hard budgets',()=>{

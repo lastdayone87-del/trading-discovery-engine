@@ -69,27 +69,87 @@ export function aiAdjudicationAdmitted(control:{
     && cost > 0;
 }
 
+/**
+ * Remaining paid AI capacity for today's scoring pass. The configured caps are
+ * not enough: the adjudicator itself counts today's completed results, so an
+ * enqueue burst must be bounded by the same remaining assertion/cost headroom.
+ */
+export function aiAdjudicationCapacity(
+  control: {
+    ai_paused?: boolean;
+    daily_ai_assertions?: number | string | null;
+    max_ai_cost_microunits?: number | string | null;
+  } | null | undefined,
+  todayAssertions: number,
+  todayCostMicrounits: number,
+  reservedCostMicrounits: number,
+): number {
+  if (!aiAdjudicationAdmitted(control)) return 0;
+  const assertionRemaining = Math.max(0, Number(control!.daily_ai_assertions) - Math.max(0, todayAssertions));
+  const costRemaining = Math.max(0, Number(control!.max_ai_cost_microunits) - Math.max(0, todayCostMicrounits));
+  const reserved = Math.max(0, reservedCostMicrounits);
+  const costSlots = reserved > 0 ? Math.floor(costRemaining / reserved) : assertionRemaining;
+  return Math.max(0, Math.min(assertionRemaining, costSlots));
+}
+
 export async function enqueueCandidateScoring(documentId:string):Promise<void>{await enqueueJob('SCORE_CANDIDATES',{payloadSchemaVersion:1,documentId,featureSetVersion:FEATURE_SET_VERSION},{priority:4,maxAttempts:3,idempotencyKey:`candidate-score:${documentId}:${FEATURE_SET_VERSION}`});}
 
 export async function processCandidateScoringJob(job:{id:string;payload:any}):Promise<void>{
   const p=job.payload;if(p.payloadSchemaVersion!==1||p.featureSetVersion!==FEATURE_SET_VERSION)throw new Error('Unsupported SCORE_CANDIDATES payload version.');const db=await getDb();
   const control=await db.query('SELECT * FROM candidate_scoring_controls WHERE singleton=true');if(!control.rowCount||control.rows[0].scoring_paused)throw new Error('Candidate scoring is paused.');
   const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);if(spent.rows[0].n>=control.rows[0].daily_scoring_candidates)throw new Error('Candidate scoring daily budget is exhausted.');
+  const aiUsage=await db.query(`SELECT count(*)::int n,COALESCE(sum(cost_microunits),0)::bigint cost FROM candidate_adjudication_results WHERE completed_at>=date_trunc('day',now())`);
+  const aiReservedCost=Math.max(0,Number(process.env.CANDIDATE_AI_COST_MICROUNITS||0));
+  const aiCapacity=aiAdjudicationCapacity(control.rows[0],Number(aiUsage.rows[0]?.n||0),Number(aiUsage.rows[0]?.cost||0),aiReservedCost);
   const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span IN(SELECT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[p.documentId]);
   const groups=new Map<string,CandidateEvidence[]>();for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
   if(groups.size>Number(control.rows[0].daily_scoring_candidates)-Number(spent.rows[0].n))throw new Error('Candidate scoring job exceeds the remaining daily budget.');
-  const aiAdmitted=aiAdjudicationAdmitted(control.rows[0]);
+  const aiAdmitted=aiCapacity>0;
   let deferredAi=0;
+  let aiEnqueued=0;
   for(const [normalized,rows] of groups){const result=scoreCandidate(rows);const inserted=await db.query(`INSERT INTO candidate_feature_snapshots(candidate_key,normalized_span,feature_set_version,features,decision,reason_codes,evidence_checksum) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(candidate_key,feature_set_version,evidence_checksum) DO NOTHING RETURNING id`,[result.candidateKey,normalized,FEATURE_SET_VERSION,JSON.stringify(result.features),result.decision,JSON.stringify(result.reasonCodes),result.evidenceChecksum]);if(!inserted.rowCount)continue;
     const snapshotId=inserted.rows[0].id;await db.query(`INSERT INTO classification_assertions(candidate_key,feature_snapshot_id,assertion_source,label,confidence,abstained,reason_codes,literal_span,classifier_version,schema_version,assertion_key) VALUES($1,$2,'DETERMINISTIC',$3,$4,false,$5,$6,$7,$8,$9)`,[result.candidateKey,snapshotId,result.label,result.confidence,JSON.stringify(result.reasonCodes),rows[0].literalSpan,FEATURE_SET_VERSION,ASSERTION_SCHEMA_VERSION,`deterministic:${snapshotId}:${FEATURE_SET_VERSION}`]);
     const flags:Array<{flag:string;severity:number;evidence:Record<string,number>}>=[];if(result.reasonCodes.includes('PROMPT_INJECTION_PATTERN'))flags.push({flag:'PROMPT_INJECTION',severity:1,evidence:{patternMatch:1}});const correlation=1-result.features.independentClusters/result.features.frequency;if(correlation>=.5)flags.push({flag:'CORRELATED_SOURCES',severity:correlation,evidence:{frequency:result.features.frequency,independentClusters:result.features.independentClusters}});if(result.features.frequency>=3&&result.features.burstScore>=.8)flags.push({flag:'TEMPORAL_BURST',severity:result.features.burstScore,evidence:{frequency:result.features.frequency,activeDays:result.features.activeDays}});for(const flag of flags)await db.query(`INSERT INTO candidate_anomaly_flags(candidate_key,feature_snapshot_id,flag,severity,evidence,flag_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(flag_key) DO NOTHING`,[result.candidateKey,snapshotId,flag.flag,flag.severity,JSON.stringify(flag.evidence),`anomaly:${snapshotId}:${flag.flag}`]);
     if(result.decision==='AMBIGUOUS'){
-      if(aiAdmitted) await enqueueJob('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:result.candidateKey,featureSnapshotId:snapshotId,literalSpan:rows[0].literalSpan,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${result.candidateKey}:${CLASSIFIER_VERSION}:${result.evidenceChecksum}`});
-      else deferredAi+=1;
+      if(aiAdmitted&&aiEnqueued<aiCapacity){
+        await enqueueJob('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:result.candidateKey,featureSnapshotId:snapshotId,literalSpan:rows[0].literalSpan,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${result.candidateKey}:${CLASSIFIER_VERSION}:${result.evidenceChecksum}`});
+        aiEnqueued+=1;
+      } else deferredAi+=1;
     }
   }
   if(deferredAi>0)console.info(JSON.stringify({event:'candidate_ai_adjudication_deferred',count:deferredAi,reason:control.rows[0]?.ai_paused?'AI_PAUSED':'AI_BUDGET_UNAVAILABLE',timestamp:new Date().toISOString()}));
   await completeJob(job.id);
+}
+
+/** Enqueue bounded ambiguous candidates that were deferred while AI was
+ * paused or out of budget. Runs only when the control is enabled and funded. */
+export async function enqueueDeferredAiAdjudications(limit=50):Promise<number>{
+  const db=await getDb();
+  const control=await db.query('SELECT * FROM candidate_scoring_controls WHERE singleton=true');
+  if(!control.rowCount)return 0;
+  const usage=await db.query(`SELECT count(*)::int n,COALESCE(sum(cost_microunits),0)::bigint cost FROM candidate_adjudication_results WHERE completed_at>=date_trunc('day',now())`);
+  const reservedCost=Math.max(0,Number(process.env.CANDIDATE_AI_COST_MICROUNITS||0));
+  const capacity=aiAdjudicationCapacity(control.rows[0],Number(usage.rows[0]?.n||0),Number(usage.rows[0]?.cost||0),reservedCost);
+  if(capacity<=0)return 0;
+  const bounded=Math.min(capacity,Math.max(1,Math.trunc(Number(limit))||50));
+  const rows=await db.query(`
+    SELECT f.candidate_key,f.id::text feature_snapshot_id,f.normalized_span,f.evidence_checksum,
+           (SELECT o.literal_span FROM corpus_candidate_occurrences o WHERE o.normalized_span=f.normalized_span ORDER BY o.created_at DESC LIMIT 1) literal_span
+      FROM candidate_feature_snapshots f
+     WHERE f.decision='AMBIGUOUS'
+       AND NOT EXISTS (SELECT 1 FROM classification_assertions a WHERE a.candidate_key=f.candidate_key AND a.assertion_source='AI')
+       AND NOT EXISTS (SELECT 1 FROM candidate_adjudication_results r WHERE r.candidate_key=f.candidate_key)
+       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type='AI_ADJUDICATE_CANDIDATE' AND j.payload->>'candidateKey'=f.candidate_key AND j.status IN ('PENDING','PROCESSING'))
+     ORDER BY f.computed_at,f.id
+     LIMIT $1`,[bounded]);
+  let enqueued=0;
+  for(const row of rows.rows){
+    const literal=String(row.literal_span||row.normalized_span||'');
+    if(!literal)continue;
+    await enqueueJob('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:row.candidate_key,featureSnapshotId:row.feature_snapshot_id,literalSpan:literal,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${row.candidate_key}:${CLASSIFIER_VERSION}:${row.evidence_checksum}`});
+    enqueued+=1;
+  }
+  return enqueued;
 }
 
 export async function processAiAdjudicationJob(job:{id:string;payload:any;attempts?:number}):Promise<void>{
