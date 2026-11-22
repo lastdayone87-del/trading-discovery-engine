@@ -14,7 +14,7 @@ test('semantic cooldown still allows a bounded evidence-acquisition probe', () =
 test('classification remains gated while enrichment gets only the probe', () => {
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   assert.match(source, /enrichmentFullyClaimable \|\| enrichmentProbe/);
-  assert.match(source, /if \(enrichmentFullyClaimable && \(!claimableOverride/);
+  assert.match(source, /enrichmentFullyClaimable && claimableOverride\?\.includes\(CLASSIFICATION_JOB_TYPE\)/);
   assert.match(source, /stage-1\/2 evidence is persisted before the semantic attempt/);
 });
 

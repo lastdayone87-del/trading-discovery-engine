@@ -53,10 +53,12 @@ test('a hung evidence loader resolves to a retryable partial at the deadline', a
 test('runtime wiring uses the dedicated heartbeat pool and avoids per-tick stale scans', () => {
   const db = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(db, /heartbeatPool \?\?= new Pool\(/);
+  assert.match(db, /heartbeatPool = logPoolErrors\(new Pool\(/);
   assert.match(db, /runtimePoolConfig\(requireDatabaseUrl\(\), 2, 'trading-discovery-heartbeat'\)/);
   assert.match(db, /export async function heartbeatJob[\s\S]{0,400}getHeartbeatDb\(\)/);
   assert.match(db, /idle_in_transaction_session_timeout=/);
+  assert.match(db, /read_only_pool_error/);
+  assert.match(db, /if \(!heartbeatPool\) \{\s*heartbeatPool = logPoolErrors/);
   assert.match(db, /databasePoolMax\(\)/);
   assert.match(queue, /const CLAIM_STALE_RECOVERY_INTERVAL_MS =/);
   assert.match(queue, /claimStaleRecoveryInFlight/);

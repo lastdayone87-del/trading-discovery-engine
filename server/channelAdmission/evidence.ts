@@ -201,7 +201,10 @@ export async function fetchAdmissionEvidence(
   input: AdmissionEvidenceInput,
   options: { timeoutMs?: number } = {},
 ): Promise<AdmissionEvidence> {
-  const timeoutMs = Math.max(1, options.timeoutMs ?? admissionEvidenceTimeoutMs());
+  const requestedTimeoutMs = Number(options.timeoutMs ?? admissionEvidenceTimeoutMs());
+  const timeoutMs = Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+    ? Math.min(600_000, Math.max(1, Math.floor(requestedTimeoutMs)))
+    : admissionEvidenceTimeoutMs();
   const deadlineAtMs = Date.now() + timeoutMs;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<AdmissionEvidence>((resolve) => {
@@ -255,6 +258,7 @@ async function fetchAdmissionEvidenceUnbounded(input: AdmissionEvidenceInput, de
       acquisitionFailure: enriched.evidenceAcquisitionFailure,
       videoSampleFailure: enriched.videoSampleFailure,
     });
+    if (Date.now() >= deadlineAtMs) return evidenceTimeoutResult(input);
     return {
       ...base,
       channelName: enriched.channelName || base.channelName,
@@ -315,6 +319,7 @@ async function fetchAdmissionEvidenceUnbounded(input: AdmissionEvidenceInput, de
           acquisitionFailure: failureReason,
           videoSampleFailure,
         });
+        if (Date.now() >= deadlineAtMs) return evidenceTimeoutResult(input);
         return {
           ...base,
           description: fallback.description,

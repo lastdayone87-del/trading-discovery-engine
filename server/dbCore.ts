@@ -182,20 +182,26 @@ function runtimePoolConfig(connectionString: string, max: number, applicationNam
   };
 }
 
-function getHeartbeatDb(): InstanceType<typeof Pool> {
-  heartbeatPool ??= new Pool({
-    ...runtimePoolConfig(requireDatabaseUrl(), 2, 'trading-discovery-heartbeat'),
-    connectionTimeoutMillis: 5_000,
-  });
+function logPoolErrors(pool: InstanceType<typeof Pool>, event: string): InstanceType<typeof Pool> {
   // Idle-client failures are emitted on the pool, not the query promise.
-  // Without a listener node treats them as unhandled events.
-  (heartbeatPool as any).on('error', (error: unknown) => {
+  // Attach exactly once per pool, not once per heartbeat call.
+  (pool as any).on('error', (error: unknown) => {
     console.error(JSON.stringify({
-      event: 'heartbeat_pool_error',
+      event,
       error: error instanceof Error ? error.message : String(error),
       timestamp: new Date().toISOString(),
     }));
   });
+  return pool;
+}
+
+function getHeartbeatDb(): InstanceType<typeof Pool> {
+  if (!heartbeatPool) {
+    heartbeatPool = logPoolErrors(new Pool({
+      ...runtimePoolConfig(requireDatabaseUrl(), 2, 'trading-discovery-heartbeat'),
+      connectionTimeoutMillis: 5_000,
+    }), 'heartbeat_pool_error');
+  }
   return heartbeatPool;
 }
 
@@ -208,14 +214,7 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
   if (pool) return pool;
   initPromise = (async () => {
     const connectionString = requireDatabaseUrl();
-    pool = new Pool(runtimePoolConfig(connectionString, databasePoolMax(), 'trading-discovery-engine'));
-    (pool as any).on('error', (error: unknown) => {
-      console.error(JSON.stringify({
-        event: 'database_pool_error',
-        error: error instanceof Error ? error.message : String(error),
-        timestamp: new Date().toISOString(),
-      }));
-    });
+    pool = logPoolErrors(new Pool(runtimePoolConfig(connectionString, databasePoolMax(), 'trading-discovery-engine')), 'database_pool_error');
     try {
       await waitForPostgresReady(pool);
       await runMigrations();
@@ -242,10 +241,10 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
 export function createReadOnlyDbPool(
   applicationName = 'phase0-url-work-ledger-report',
 ): InstanceType<typeof Pool> {
-  return new Pool({
+  return logPoolErrors(new Pool({
     ...runtimePoolConfig(requireDatabaseUrl(), 1, applicationName),
     options: `-c default_transaction_read_only=on -c idle_in_transaction_session_timeout=${databaseIdleInTransactionTimeoutMs()}`,
-  });
+  }), 'read_only_pool_error');
 }
 
 /**
@@ -257,7 +256,7 @@ export function createReadOnlyDbPool(
 export function createOperatorWriteDbPool(
   applicationName = 'phase0-operator-write',
 ): InstanceType<typeof Pool> {
-  return new Pool(runtimePoolConfig(requireDatabaseUrl(), 1, applicationName));
+  return logPoolErrors(new Pool(runtimePoolConfig(requireDatabaseUrl(), 1, applicationName)), 'operator_write_pool_error');
 }
 
 export function saveDb(): void {
