@@ -100,6 +100,9 @@ maybe('classification-only upserts never overwrite a newer Discord projection', 
     await resetClient.query(`SET LOCAL app.force_review_rescan='on'`);
     await resetClient.query(`UPDATE channels SET trading_status='UNCERTAIN' WHERE channel_id=$1`, [channelId]);
     await resetClient.query('COMMIT');
+  } catch (error) {
+    await resetClient.query('ROLLBACK').catch(() => undefined);
+    throw error;
   } finally {
     resetClient.release();
   }

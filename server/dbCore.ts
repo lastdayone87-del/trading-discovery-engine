@@ -23,7 +23,7 @@ import { invalidateProviderCooldownCache, providerCooldownReadCache } from './co
 import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
-import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, isConfirmedTradingDowngrade, type CountryPolicySnapshot } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, isConfirmedTradingDowngrade, isConfirmedTradingProtectionError, type CountryPolicySnapshot } from './terminalPreservationPolicy';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { admitBulkEnqueue, commitBulkEnqueue, releaseBulkEnqueue, BulkEnqueueGuardError } from './acquisitionBulkEnqueueGuard';
 import { sanitizeAcquisitionAttribution, type AcquisitionAttribution } from './acquisitionLaneTaxonomy';
@@ -1763,7 +1763,19 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
     if (preserveDiscord && locked) {
       channel = overlayLockedDiscordProjection(channel, locked);
     }
-    await writeChannelUpsert(client, channel, { preserveDiscordOnUpdate: preserveDiscord });
+    try {
+      await writeChannelUpsert(client, channel, { preserveDiscordOnUpdate: preserveDiscord });
+    } catch (error) {
+      // The initial SELECT cannot lock a row that does not exist. If another
+      // worker inserts a confirmed row before this conflict update, the DB
+      // trigger refuses the downgrade. Treat that expected race as a preserved
+      // write so callers can return the authoritative confirmed row.
+      if (isConfirmedTradingProtectionError(error)) {
+        await client.query('ROLLBACK');
+        return false;
+      }
+      throw error;
+    }
     if (prior.rowCount) {
       const before = isQualityCreator(prior.rows[0].trading_status, Number(prior.rows[0].quality_score || 0));
       const after = isQualityCreator(channel.trading_status || 'UNCERTAIN', Number(channel.quality_score || 0));

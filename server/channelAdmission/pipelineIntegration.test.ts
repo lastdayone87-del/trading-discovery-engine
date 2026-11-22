@@ -337,13 +337,34 @@ test('confirmed semantic admission with only title citations stays reviewable', 
       admissionConfirmedTrading: true,
       admissionTradingConfidence: 91,
       admissionCitations: [
-        { field: 'channel_title', quote: 'Title Only Trader', supports: 'TRADING' },
+        { field: 'channel_name', quote: 'Title Only Trader', supports: 'TRADING' },
       ],
     },
   );
   assert.equal(built.result.status, 'UNCERTAIN');
   assert.equal(built.decision.deterministicRouting?.humanReview, true);
   assert.match(built.decision.deterministicRouting?.fallbackReason || '', /TITLE_ONLY/);
+  // The production handoff emits `channel_name`, not `channel_title`; both
+  // title forms must remain review-only.
+  const legacyTitle = buildAdmissionConfirmedClassification(
+    { channel_name: 'Legacy Title Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-confirmed-title-legacy',
+      channelName: 'Legacy Title Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-confirmed-title-legacy',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-semantic-title-legacy',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 91,
+      admissionCitations: [
+        { field: 'channel_title', quote: 'Legacy Title Trader', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(legacyTitle.result.status, 'UNCERTAIN');
 });
 
 test('a low-confidence confirmed semantic admission still requires review', () => {

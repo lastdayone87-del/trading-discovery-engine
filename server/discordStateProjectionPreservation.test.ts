@@ -487,7 +487,7 @@ test('pipeline and queue delegate Discord preservation to the shared guards', ()
   // Gate 2 is a fresh terminal classification, not a stale snapshot: it must
   // explicitly bypass the locked-row retention guard or a rejected channel
   // would keep serving its old invite.
-  assert.match(pipeline, /await upsertChannel\(nonTradingChannel, \{ allowDiscordClear: true \}\);/);
+  assert.match(pipeline, /await upsertChannelWithResult\(nonTradingChannel, \{ allowDiscordClear: true \}\);/);
 
   assert.match(queue, /const shouldProjectValidation=canProjectDiscordValidation\(channel,selected,selectedCandidate\);/);
   assert.match(queue, /const currentCandidateRejected=currentCandidateNonTrading\s*\|\|terminalInvalid\.some\(entry=>isSameSelectedDiscordCandidate\(channel,entry\.candidate\)\);/);
@@ -636,7 +636,7 @@ test('classification-only upserts take the locked row Discord projection instead
 
   const pipeline = readFileSync(fileURLToPath(new URL('./ingestionPipeline.ts', import.meta.url)), 'utf8');
   assert.equal(
-    (pipeline.match(/upsertChannel\((?:withheldChannel|uncertainChannel),\{preserveDiscordOnUpdate:true\}\)/g) || []).length,
+    (pipeline.match(/upsertChannelWithResult\((?:withheldChannel|uncertainChannel),\{preserveDiscordOnUpdate:true\}\)/g) || []).length,
     2,
     'both classification-only branches opt into the locked-row projection',
   );

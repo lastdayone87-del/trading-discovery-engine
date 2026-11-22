@@ -40,6 +40,9 @@ test('Phase 12 PostgreSQL: persisted lineage, late outcomes, concurrency, window
       await reclassClient.query(`SET LOCAL app.force_review_rescan='on'`);
       reclassified=await reclassClient.query(`UPDATE channels SET trading_status='UNCERTAIN',quality_score=0 WHERE channel_id=$1 RETURNING trading_status,quality_score`,[channelId]);
       await reclassClient.query('COMMIT');
+    } catch (error) {
+      await reclassClient.query('ROLLBACK').catch(() => undefined);
+      throw error;
     } finally {
       reclassClient.release();
     }

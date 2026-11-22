@@ -8,7 +8,7 @@ async function reconcileMachineOwnedReview(client:any,channelId:string,evaluatio
   const pending=await client.query(`SELECT evidence_snapshot FROM channel_reviews WHERE channel_id=$1 AND state='PENDING' FOR UPDATE`,[channelId]);
   if(pending.rows[0]?.evidence_snapshot?.reasonFamily==='EVIDENCE_EXHAUSTED')return;
   await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',pending_since=NULL,updated_at=now() WHERE channel_id=$1 AND state='PENDING'`,[channelId]);
-  await client.query(`UPDATE channels SET trading_status=CASE WHEN trading_status='NEEDS_REVIEW' THEN 'UNCERTAIN' ELSE trading_status END,scan_status=CASE WHEN scan_status='NEEDS_REVIEW' THEN 'ENRICHMENT_PENDING' ELSE scan_status END,last_checked=now() WHERE channel_id=$1 AND trading_status <> 'TRADING_CONFIRMED'`,[channelId]);
+  await client.query(`UPDATE channels SET trading_status=CASE WHEN trading_status='NEEDS_REVIEW' THEN 'UNCERTAIN' ELSE trading_status END,scan_status=CASE WHEN scan_status='NEEDS_REVIEW' THEN 'ENRICHMENT_PENDING' ELSE scan_status END,last_checked=now() WHERE channel_id=$1`,[channelId]);
   const linked = await client.query(`SELECT id, policy_version FROM investigations WHERE subject_type='CHANNEL' AND subject_id=$1 AND state='NEEDS_REVIEW' FOR UPDATE`,[channelId]);
   for (const inv of linked.rows) {
     const nextState = evaluationStatus === 'DEFERRED' ? 'ACTIVE' : 'COMPLETED';

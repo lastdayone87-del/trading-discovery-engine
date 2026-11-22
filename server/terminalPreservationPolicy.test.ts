@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import type { ChannelRecord, DiscoverySource } from '../src/types';
-import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, isConfirmedTradingDowngrade, machineNonTradingRediscoveryEligible, shouldPreserveResolvedCountry, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, isConfirmedTradingDowngrade, isConfirmedTradingProtectionError, machineNonTradingRediscoveryEligible, shouldPreserveResolvedCountry, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, shouldShortCircuitConfirmedRediscovery, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 
 const NOW = Date.parse('2026-08-16T04:00:00.000Z');
 
@@ -105,13 +105,19 @@ test('confirmed trading is protected from every non-confirmed write', () => {
   assert.equal(isConfirmedTradingDowngrade({ lockedTradingStatus: null, incomingTradingStatus: 'UNCERTAIN' }), false);
 });
 
+test('the database refusal is recognized as a preserved write race', () => {
+  assert.equal(isConfirmedTradingProtectionError({ code: '23514', message: 'confirmed trading channel requires an audited review rescan' }), true);
+  assert.equal(isConfirmedTradingProtectionError({ code: '23514', message: 'other check violation' }), false);
+  assert.equal(isConfirmedTradingProtectionError({ code: '23505', message: 'confirmed trading channel requires an audited review rescan' }), false);
+  assert.equal(isConfirmedTradingProtectionError(new Error('confirmed trading channel requires an audited review rescan')), false);
+  assert.equal(isConfirmedTradingProtectionError(null), false);
+});
+
 test('the confirmed-trading database trigger is installed with an audited escape only', () => {
   const migration = readFileSync(new URL('./db/migrations/204_protect_confirmed_trading.sql', import.meta.url), 'utf8');
   assert.match(migration, /CREATE OR REPLACE FUNCTION protect_trading_confirmation/);
   assert.match(migration, /CREATE TRIGGER channels_protect_trading_confirmation/);
-  assert.match(migration, /OLD\.trading_status = 'TRADING_CONFIRMED'/);
-  assert.match(migration, /NEW\.trading_status <> 'TRADING_CONFIRMED'/);
-  assert.match(migration, /app\.force_review_rescan/);
+  assert.match(migration, /IF OLD\.trading_status = 'TRADING_CONFIRMED'[\s\S]*?AND NEW\.trading_status <> 'TRADING_CONFIRMED'[\s\S]*?AND COALESCE\(current_setting\('app\.force_review_rescan', true\), ''\) <> 'on' THEN/);
   assert.match(migration, /ERRCODE = '23514'/);
 });
 

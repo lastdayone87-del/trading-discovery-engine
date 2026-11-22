@@ -39,8 +39,24 @@ export function buildAdmissionConfirmedClassification(
   // confirmed admission with only a title citation is not enough to stand on
   // its own; it stays reviewable. Missing provider provenance alone is not a
   // downgrade: the admission decision is recorded as the honest source.
+  const creatorOwnedCitationFields = new Set([
+    'bio',
+    'channel_bio',
+    'link',
+    'video_title',
+    'video_description',
+    'external_link',
+    'external_link_label',
+    'external_link_domain',
+    'playlist_name',
+    'playlist_description',
+    'transcript_excerpt',
+    'visual_evidence',
+    'discord_invite',
+    'pinned_comment',
+  ]);
   const semanticCreatorCitations = citations.filter(citation =>
-    citation.field !== 'channel_title' && citation.field !== 'search_match_context');
+    creatorOwnedCitationFields.has(String(citation.field || '').trim().toLowerCase()));
   const usableCitations = nonSemantic ? citations : semanticCreatorCitations;
   const hasTradingCitation = usableCitations.some(citation => citation.supports === 'TRADING');
   const evidenceProvider = nonSemantic

@@ -16,7 +16,7 @@ test('post-approval failures preserve provider taxonomy instead of erasing it', 
   // retryAt, turning quota/transient deferrals into attempt-consuming failures
   // and stranding approved enrichment. The worker must carry the taxonomy
   // forward so failJob can defer attempt-free with the provider schedule.
-  assert.match(queueManager, /triggerManualRecheck\(channelId, true, true\)/);
+  assert.match(queueManager, /triggerManualRecheck\(channelId, true, true, \{/);
   assert.match(queueManager, /errorClass:typedTransient\?result\.errorClass:undefined/);
   assert.match(queueManager, /retryAt:typedTransient\?result\.retryAt:undefined/);
   assert.match(queueManager, /retryAfterMs:typedTransient\?result\.retryAfterMs:undefined/);

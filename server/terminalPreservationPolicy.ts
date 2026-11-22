@@ -32,6 +32,14 @@ export function isConfirmedTradingDowngrade(input: {
     && String(input.incomingTradingStatus || 'UNCERTAIN') !== 'TRADING_CONFIRMED';
 }
 
+/** Recognize the database backstop's refusal so an insert race can be treated
+ * as a preserved write instead of a job failure. */
+export function isConfirmedTradingProtectionError(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown } | null | undefined;
+  return String(candidate?.code || '') === '23514'
+    && /confirmed trading channel requires an audited review rescan/i.test(String(candidate?.message || ''));
+}
+
 /**
  * Ordinary discovery must not classify, enrich, or downgrade a channel whose
  * trading classification was already confirmed. Explicit operator rechecks /

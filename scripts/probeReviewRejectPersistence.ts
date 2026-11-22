@@ -41,6 +41,10 @@ try {
   const idempotencyKey = `rollback-probe:${row.channel_id}:${randomUUID()}`;
 
   await client.query('BEGIN'); began = true;
+  // This probe intentionally exercises the audited rejection projection. Mark
+  // the transaction so the confirmed-trading guard permits the rollback-only
+  // write instead of failing the probe.
+  await client.query(`SET LOCAL app.force_review_rescan='on'`);
   const run = async (step: string, fn: () => Promise<unknown>) => {
     try { await fn(); report.steps.push({step,ok:true}); }
     catch (error:any) {
