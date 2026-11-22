@@ -58,6 +58,8 @@ test('provisional low-value stops wait for page admission settlement but hard st
   assert.match(pageStore, /deferred_reason='ADMISSION'/);
   assert.match(queue, /if \(observation\?\.deferredReason === 'ADMISSION'\)/);
   assert.match(queue, /PERSISTED_PAGE_ADMISSION_REVIEW/);
+  assert.match(queue, /PERSISTED_PAGE_ADMISSION_PENDING/);
+  assert.match(queue, /observation\.shouldContinue === false/);
 });
 
 test('resume re-evaluates a settled provisional page before continuing or finalizing', () => {
@@ -67,6 +69,8 @@ test('resume re-evaluates a settled provisional page before continuing or finali
   assert.ok(end > start, 'resume branch has a bounded body');
   const body = queue.slice(start, end);
   assert.match(body, /getAutonomousPageMarginalMetrics\(run\.runId, run\.pagesCompleted\)/);
+  assert.match(body, /const lowNoveltyStop =/);
+  assert.match(body, /!lowNoveltyStop && Number\(settledMarginal\.marginalNewCreators/);
   assert.match(body, /const settledProductive =/);
   assert.match(body, /settleAutonomousPageAdmissionDeferral\(run\.runId, run\.pagesCompleted, true, null, \[\], true\)/);
   assert.match(body, /lastObservation\.stoppingReason \|\| lastObservation\.primaryReason/);

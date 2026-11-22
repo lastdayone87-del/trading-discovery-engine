@@ -421,7 +421,7 @@ test('a malformed token cursor fails instead of silently rewalking page 1', asyn
         cursor: 'it1.50.not-valid-base64!!',
         ordering: 'RELEVANCE',
       } as any),
-      (error: any) => error?.code === INNERTUBE_CONTINUATION_UNAVAILABLE_CODE && error?.retryable === true,
+      (error: any) => error?.code === INNERTUBE_CONTINUATION_UNAVAILABLE_CODE && error?.retryable === false,
     );
   } finally {
     setInnertubeEmitSinkForTests(null);

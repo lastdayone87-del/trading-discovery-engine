@@ -763,7 +763,8 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     if (rawCursor.startsWith(INNERTUBE_TOKEN_CURSOR_PREFIX) && !cursor.continuationToken) {
       throw Object.assign(
         new Error('InnerTube token cursor is malformed; refusing to rewalk page 1.'),
-        { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+        // Deterministic input defect: retrying the same cursor cannot heal it.
+        { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: false },
       );
     }
     // Exactly one pacing slot per actual outbound request: the initial search
