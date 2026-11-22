@@ -37,7 +37,8 @@ test('deferred ambiguous candidates have a bounded, funded backfill worker',()=>
   assert.match(source,/export async function enqueueDeferredAiAdjudications/);
   assert.match(source,/classification_assertions a WHERE a\.candidate_key=f\.candidate_key AND a\.assertion_source='AI'/);
   assert.match(source,/candidate_adjudication_results r WHERE r\.candidate_key=f\.candidate_key/);
-  assert.match(source,/j\.status IN \('PENDING','PROCESSING'\)/);
+  assert.match(source,/j\.status IN \('PENDING','PROCESSING','FAILED'\)/);
+  assert.match(source,/SELECT DISTINCT ON \(f\.candidate_key\)/);
   const worker=readFileSync(new URL('./operationalMaintenanceWorkers.ts',import.meta.url),'utf8');
   assert.match(worker,/enqueueDeferredAiAdjudications\(50\)/);
 });

@@ -344,11 +344,9 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
 }
 
 /**
- * Dedicated corpus-pipeline consumer: harvest, scoring, and concept
- * resolution, through the existing processNextSearchJob path and its existing
- * control/budget gates. Concurrency is intentionally 1 (single consumer);
- * this work is DB-local and must never compete with provider-bound pools by
- * scaling here.
+ * Bounded backfill for ambiguous candidates whose AI enqueue was deferred
+ * while adjudication was paused or unfunded. The enqueue helper rechecks the
+ * same control and capacity gates, so this worker is inert until AI is ready.
  */
 function startDeferredAiAdjudicationWorker(workerId: string): void {
   const tick = async () => {
@@ -371,6 +369,13 @@ function startDeferredAiAdjudicationWorker(workerId: string): void {
   void tick();
 }
 
+/**
+ * Dedicated corpus-pipeline consumer: harvest, scoring, and concept
+ * resolution, through the existing processNextSearchJob path and its existing
+ * control/budget gates. Concurrency is intentionally 1 (single consumer);
+ * this work is DB-local and must never compete with provider-bound pools by
+ * scaling here.
+ */
 function startCorpusPipelineWorker(workerId: string): void {
   corpusPipelineHealth.started = true;
   corpusPipelineHealth.startedAt ??= new Date().toISOString();

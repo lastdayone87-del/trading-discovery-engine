@@ -143,14 +143,15 @@ export async function enqueueDeferredAiAdjudications(limit=50):Promise<number>{
   if(capacity<=0)return 0;
   const bounded=Math.min(capacity,Math.max(1,Math.trunc(Number(limit))||50));
   const rows=await db.query(`
-    SELECT f.candidate_key,f.id::text feature_snapshot_id,f.normalized_span,f.evidence_checksum,
+    SELECT DISTINCT ON (f.candidate_key)
+           f.candidate_key,f.id::text feature_snapshot_id,f.normalized_span,f.evidence_checksum,
            (SELECT o.literal_span FROM corpus_candidate_occurrences o WHERE o.normalized_span=f.normalized_span ORDER BY o.created_at DESC LIMIT 1) literal_span
       FROM candidate_feature_snapshots f
      WHERE f.decision='AMBIGUOUS'
        AND NOT EXISTS (SELECT 1 FROM classification_assertions a WHERE a.candidate_key=f.candidate_key AND a.assertion_source='AI')
        AND NOT EXISTS (SELECT 1 FROM candidate_adjudication_results r WHERE r.candidate_key=f.candidate_key)
-       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type='AI_ADJUDICATE_CANDIDATE' AND j.payload->>'candidateKey'=f.candidate_key AND j.status IN ('PENDING','PROCESSING'))
-     ORDER BY f.computed_at,f.id
+       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type='AI_ADJUDICATE_CANDIDATE' AND j.payload->>'candidateKey'=f.candidate_key AND j.status IN ('PENDING','PROCESSING','FAILED'))
+     ORDER BY f.candidate_key,f.computed_at DESC
      LIMIT $1`,[bounded]);
   let enqueued=0;
   for(const row of rows.rows){
