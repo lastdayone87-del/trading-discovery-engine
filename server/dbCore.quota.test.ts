@@ -268,10 +268,18 @@ test('quota reservation transactions keep the tracker lock off the reservation s
   assert.match(reserve, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(topUp, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(reserve, /SELECT status,units FROM quota_reservations[\s\S]*AND status='RESERVED' AND expires_at>now\(\)[\s\S]*FOR UPDATE/);
+  assert.match(reserve, /lockAndRollYouTubeQuotaTracker\(client, args\.dailyBudget\)/);
+  assert.match(topUp, /lockAndRollYouTubeQuotaTracker\(client, args\.dailyBudget\)/);
   assert.match(reserve, /probeQuotaAdvisoryLockName\(quotaDay\)/);
   assert.match(topUp, /probeQuotaAdvisoryLockName\(quotaDay\)/);
   assert.match(reserve, /activeProbeLeaseUnitsExpression\(client\)/);
   assert.match(topUp, /activeProbeLeaseUnitsExpression\(client\)/);
+  const reservationTrackerHelperStart = dbCore.indexOf('async function lockAndRollYouTubeQuotaTracker');
+  const reservationTrackerHelper = dbCore.slice(reservationTrackerHelperStart, dbCore.indexOf('/**\n * SQL expression for live PROBE-origin leases', reservationTrackerHelperStart));
+  const reservationLockIndex = reservationTrackerHelper.indexOf('FOR UPDATE');
+  const reservationDayIndex = reservationTrackerHelper.indexOf('const quotaDay=getYouTubeQuotaDay();');
+  assert.ok(reservationLockIndex >= 0 && reservationDayIndex > reservationLockIndex,
+    'reservation tracker day must be sampled after the row lock wait');
   assert.match(dbCore, /idx_quota_reservations_reserved_expiry/);
   assert.match(dbCore, /quotaReservationIndexMigration\.rowCount\) await ensureQuotaReservationActiveIndex/);
 });

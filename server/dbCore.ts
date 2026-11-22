@@ -2340,6 +2340,25 @@ async function incrementYouTubeKeyQuota(db:QueryExecutor, quotaDay:string, keyFi
 }
 
 /**
+ * Lock the singleton tracker first, then sample the Pacific day. A reservation
+ * that waited on the tracker across midnight must roll over to the new day, not
+ * write the prior day back and erase usage recorded by the newer-day writer.
+ */
+async function lockAndRollYouTubeQuotaTracker(db:QueryExecutor, dailyBudget:number):Promise<string>{
+  await db.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
+    VALUES('youtube',0,$1,$2)
+    ON CONFLICT(id) DO NOTHING`,[dailyBudget,getYouTubeQuotaDay()]);
+  const locked=await db.query(`SELECT last_reset FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
+  const quotaDay=getYouTubeQuotaDay();
+  if (String(locked.rows[0]?.last_reset||'')!==quotaDay) {
+    await db.query(`UPDATE quota_tracker SET units_used=0,daily_limit=$1,last_reset=$2 WHERE id='youtube'`,[dailyBudget,quotaDay]);
+  } else {
+    await db.query(`UPDATE quota_tracker SET daily_limit=$1 WHERE id='youtube'`,[dailyBudget]);
+  }
+  return quotaDay;
+}
+
+/**
  * SQL expression for live PROBE-origin leases. It is embedded in the same
  * statement as the tracker/reservation totals so all three share one snapshot;
  * the per-day advisory lock separately serializes probe lease insertion.
@@ -6460,16 +6479,10 @@ export async function tryReserveQuota(args: {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const quotaDay = getYouTubeQuotaDay();
-    // Rollover belongs to admission so the first worker after the YouTube Pacific quota-day rollover can
-    // recover without relying on a dashboard/read request. This upsert owns the
-    // tracker row lock for the rest of this reservation transaction.
-    await client.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
-      VALUES('youtube',0,$1,$2)
-      ON CONFLICT(id) DO UPDATE SET
-        units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
-        daily_limit=excluded.daily_limit,
-        last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
+    // Lock the tracker before sampling the day; rollover belongs to admission
+    // so the first worker after the YouTube Pacific quota-day rollover can
+    // recover without relying on a dashboard/read request.
+    const quotaDay = await lockAndRollYouTubeQuotaTracker(client, args.dailyBudget);
     // Serialize with probe lease insertion, then read tracker, reservations and
     // live probe leases in one statement so the capacity snapshot is consistent.
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [probeQuotaAdvisoryLockName(quotaDay)]);
@@ -6555,15 +6568,9 @@ export async function topUpQuotaReservation(args: {
   const client = await db.connect();
   try {
     await client.query('BEGIN');
-    const quotaDay = getYouTubeQuotaDay();
     // Use the same tracker lock as initial admission so reservations, top-ups,
     // actual usage, and Pacific quota-day rollover share one serialization point.
-    await client.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
-      VALUES('youtube',0,$1,$2)
-      ON CONFLICT(id) DO UPDATE SET
-        units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
-        daily_limit=excluded.daily_limit,
-        last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
+    const quotaDay = await lockAndRollYouTubeQuotaTracker(client, args.dailyBudget);
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [probeQuotaAdvisoryLockName(quotaDay)]);
     const probeUnitsExpression = await activeProbeLeaseUnitsExpression(client);
 
