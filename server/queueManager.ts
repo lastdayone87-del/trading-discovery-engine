@@ -4033,6 +4033,11 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
     outcome.isNew = true;
     outcome.wasKnown = false;
   }
+  // An audited review rejection can cancel this job while the pipeline is
+  // running. Do not reconcile or complete work whose durable owner is gone.
+  const liveJob = await (await getDb()).query(`SELECT status FROM jobs WHERE id=$1`, [job.id]).catch(() => null);
+  const liveStatus = liveJob?.rows[0]?.status ? String(liveJob.rows[0].status) : '';
+  if (liveStatus && liveStatus !== 'PROCESSING') return;
   // The pipeline's returned record can predate a confirmation that committed
   // while it was running. Reconciliation must use the durable row.
   const channel = await getChannelById(channelId) || outcome.channelRecord;
