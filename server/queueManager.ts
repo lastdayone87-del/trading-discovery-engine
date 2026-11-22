@@ -5718,6 +5718,18 @@ export async function triggerManualRecheck(
     freshCandidate.enrichmentStage = Math.max(1, freshCandidate.enrichmentStage || 0);
     freshCandidate.matchedDocument = { type: 'MANUAL', locator: `recheck:${channelId}` };
 
+    // The YouTube fetch can take a long time. Re-read immediately before
+    // choosing the preservation path so an audited review that committed
+    // during the fetch is never overwritten by this worker's stale snapshot.
+    const currentChannel = await getChannelById(channelId);
+    if (!currentChannel) {
+      return { success: false, message: 'Channel no longer exists.', code: 'MANUAL_RESCAN_CHANNEL_NOT_FOUND', retryable: false, errorClass: 'PERMANENT_INPUT', channel };
+    }
+    Object.assign(channel, currentChannel);
+    if (String(channel.trading_status) === 'HUMAN_REJECTED') {
+      return { success: false, message: 'Human-rejected channels require the authenticated, audited force-rescan review action.', code: 'MANUAL_RESCAN_POLICY_INELIGIBLE', retryable: false, channel };
+    }
+
     // A confirmed trading decision may refresh country/community evidence, but
     // automatic work must never re-litigate it. Only a direct operator manual
     // recheck (no job attribution) is the audited correction lane; it first
