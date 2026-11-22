@@ -190,7 +190,7 @@ maybe('concurrent budget-guarded claims admit at most remaining headroom', async
   }
 });
 
-maybe('oversized scoring job does not block a smaller admittable job', async t => {
+maybe('oversized scoring job claims a bounded slice instead of being denied', async t => {
   const { enqueueJob, claimNextJob } = await import('./dbCore');
   const { SCORE_CANDIDATES_BUDGET_GUARD } = await import('./queueManager');
   const { FEATURE_SET_VERSION } = await import('./candidateScoring');
@@ -208,8 +208,9 @@ maybe('oversized scoring job does not block a smaller admittable job', async t =
     const bigDoc = await fixtureScoringDocument(database, `${tag}:big`, 5);
     const smallDoc = await fixtureScoringDocument(database, `${tag}:small`, 1);
     const before = await spentToday(database);
-    // Exactly one unit of headroom: the 5-group job cannot fit, the 1-group
-    // job can. Higher priority first proves scanning continues past denial.
+    // Exactly one unit of headroom. The old guard denied the 5-group document;
+    // the bounded processor must admit its first one-group slice. The smaller
+    // lower-priority job stays queued for the next claim.
     await database.query(
       `UPDATE candidate_scoring_controls SET scoring_paused=false, daily_scoring_candidates=$1 WHERE singleton=true`,
       [before.snapshots + 1]
@@ -228,13 +229,18 @@ maybe('oversized scoring job does not block a smaller admittable job', async t =
     const claimed = await claimNextJob(`test-oversized`, ['SCORE_CANDIDATES'], undefined, undefined, [
       SCORE_CANDIDATES_BUDGET_GUARD,
     ]);
-    assert.ok(claimed, 'the smaller job must claim despite the oversized higher-priority job');
-    assert.equal(claimed?.id, small.id);
+    assert.ok(claimed, 'the oversized job must claim its bounded slice');
+    assert.equal(claimed?.id, big.id);
     const bigState = (
       await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [big.id])
     ).rows[0] as { status: string; attempts: number };
-    assert.equal(bigState.status, 'PENDING');
-    assert.equal(Number(bigState.attempts), 0);
+    assert.equal(bigState.status, 'PROCESSING');
+    assert.equal(Number(bigState.attempts), 1);
+    const smallState = (
+      await database.query('SELECT status, attempts FROM jobs WHERE id=$1::uuid', [small.id])
+    ).rows[0] as { status: string; attempts: number };
+    assert.equal(smallState.status, 'PENDING');
+    assert.equal(Number(smallState.attempts), 0);
   } finally {
     if (jobIds.length > 0) {
       await database.query('DELETE FROM jobs WHERE id = ANY($1::uuid[])', [jobIds]);
