@@ -724,6 +724,22 @@ async function ensureCdlHotTableIndexes(client: { query: (text: string, values?:
 }
 
 /**
+ * Corpus candidate scoring joins occurrences by `normalized_span`. Without an
+ * index that predicate is a full scan of the multi-million-row occurrence
+ * table, which made a single SCORE_CANDIDATES job run for tens of minutes and
+ * blocked the single corpus worker. Build it concurrently; migration 206 only
+ * adopts a valid index or verifies an empty table.
+ */
+async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  await ensureConcurrentIndex(
+    client,
+    'idx_corpus_occurrences_normalized',
+    'corpus_candidate_occurrences',
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_corpus_occurrences_normalized ON public.corpus_candidate_occurrences(normalized_span, document_id, start_offset)`,
+  );
+}
+
+/**
  * Migration 168 indexes the maintenance sweep's pending-classification
  * predicate. `channel_sightings` is a populated hot table, so the runner
  * builds the index concurrently before the transactional migration, which
@@ -827,6 +843,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration170.rowCount) await ensurePhase4ScaleIndexes(client);
     const migration185 = await client.query('SELECT 1 FROM schema_migrations WHERE version=185');
     if (!migration185.rowCount) await ensureQuerySaturationIndexes(client);
+    const migration206 = await client.query('SELECT 1 FROM schema_migrations WHERE version=206');
+    if (!migration206.rowCount) await ensureCorpusOccurrenceIndexes(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
