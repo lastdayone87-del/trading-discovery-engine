@@ -1,9 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { scoreCandidate, validateBoundedAssertion } from './candidateScoring';
+import { aiAdjudicationAdmitted, scoreCandidate, validateBoundedAssertion } from './candidateScoring';
 
 const evidence=(span:string,cluster='c1',day='2026-07-01')=>({normalizedSpan:span,literalSpan:span,documentId:`d-${cluster}-${day}`,clusterKey:cluster,sourceType:'CHANNEL_METADATA',observedAt:`${day}T00:00:00.000Z`,language:'en',startOffset:0,endOffset:Array.from(span).length});
+
+test('AI adjudication jobs are only admitted when the paid control is enabled and funded',()=>{
+  assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:1000}),true);
+  assert.equal(aiAdjudicationAdmitted({ai_paused:true,daily_ai_assertions:10,max_ai_cost_microunits:1000}),false);
+  assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:0,max_ai_cost_microunits:1000}),false);
+  assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:0}),false);
+  assert.equal(aiAdjudicationAdmitted(null),false);
+});
+
+test('ambiguous scoring only enqueues AI work through the paid-control gate',()=>{
+  const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
+  assert.match(source,/const aiAdmitted=aiAdjudicationAdmitted\(control\.rows\[0\]\)/);
+  assert.match(source,/if\(aiAdmitted\) await enqueueJob\('AI_ADJUDICATE_CANDIDATE'/);
+  assert.match(source,/candidate_ai_adjudication_deferred/);
+});
 
 test('phase 9 migration is additive, immutable, separately paused and has hard budgets',()=>{
   const sql=readFileSync(new URL('./db/migrations/024_deterministic_candidate_scoring.sql',import.meta.url),'utf8');

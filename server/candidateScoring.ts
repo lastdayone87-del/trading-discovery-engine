@@ -48,6 +48,27 @@ export function validateBoundedAssertion(raw:unknown,literal:string):{label:Asse
   if(o.abstained&&o.label!=='AMBIGUOUS')throw new Error('AI_ABSTENTION_INVALID');return {label:o.label as AssertionLabel,confidence:o.confidence,abstained:o.abstained,reasonCodes:o.reasonCodes as string[]};
 }
 
+/**
+ * AI adjudication is optional paid work. Do not create durable AI jobs while
+ * the control plane says it is paused or has no assertion/cost budget: those
+ * jobs can never run and grow the backlog indefinitely. Existing queued jobs
+ * are preserved and remain claimable once the control is re-enabled.
+ */
+export function aiAdjudicationAdmitted(control:{
+  ai_paused?: boolean;
+  daily_ai_assertions?: number | string | null;
+  max_ai_cost_microunits?: number | string | null;
+} | null | undefined): boolean {
+  if (!control) return false;
+  const assertions = Number(control.daily_ai_assertions);
+  const cost = Number(control.max_ai_cost_microunits);
+  return control.ai_paused !== true
+    && Number.isFinite(assertions)
+    && assertions > 0
+    && Number.isFinite(cost)
+    && cost > 0;
+}
+
 export async function enqueueCandidateScoring(documentId:string):Promise<void>{await enqueueJob('SCORE_CANDIDATES',{payloadSchemaVersion:1,documentId,featureSetVersion:FEATURE_SET_VERSION},{priority:4,maxAttempts:3,idempotencyKey:`candidate-score:${documentId}:${FEATURE_SET_VERSION}`});}
 
 export async function processCandidateScoringJob(job:{id:string;payload:any}):Promise<void>{
@@ -57,11 +78,18 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
   const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span IN(SELECT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[p.documentId]);
   const groups=new Map<string,CandidateEvidence[]>();for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
   if(groups.size>Number(control.rows[0].daily_scoring_candidates)-Number(spent.rows[0].n))throw new Error('Candidate scoring job exceeds the remaining daily budget.');
+  const aiAdmitted=aiAdjudicationAdmitted(control.rows[0]);
+  let deferredAi=0;
   for(const [normalized,rows] of groups){const result=scoreCandidate(rows);const inserted=await db.query(`INSERT INTO candidate_feature_snapshots(candidate_key,normalized_span,feature_set_version,features,decision,reason_codes,evidence_checksum) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(candidate_key,feature_set_version,evidence_checksum) DO NOTHING RETURNING id`,[result.candidateKey,normalized,FEATURE_SET_VERSION,JSON.stringify(result.features),result.decision,JSON.stringify(result.reasonCodes),result.evidenceChecksum]);if(!inserted.rowCount)continue;
     const snapshotId=inserted.rows[0].id;await db.query(`INSERT INTO classification_assertions(candidate_key,feature_snapshot_id,assertion_source,label,confidence,abstained,reason_codes,literal_span,classifier_version,schema_version,assertion_key) VALUES($1,$2,'DETERMINISTIC',$3,$4,false,$5,$6,$7,$8,$9)`,[result.candidateKey,snapshotId,result.label,result.confidence,JSON.stringify(result.reasonCodes),rows[0].literalSpan,FEATURE_SET_VERSION,ASSERTION_SCHEMA_VERSION,`deterministic:${snapshotId}:${FEATURE_SET_VERSION}`]);
     const flags:Array<{flag:string;severity:number;evidence:Record<string,number>}>=[];if(result.reasonCodes.includes('PROMPT_INJECTION_PATTERN'))flags.push({flag:'PROMPT_INJECTION',severity:1,evidence:{patternMatch:1}});const correlation=1-result.features.independentClusters/result.features.frequency;if(correlation>=.5)flags.push({flag:'CORRELATED_SOURCES',severity:correlation,evidence:{frequency:result.features.frequency,independentClusters:result.features.independentClusters}});if(result.features.frequency>=3&&result.features.burstScore>=.8)flags.push({flag:'TEMPORAL_BURST',severity:result.features.burstScore,evidence:{frequency:result.features.frequency,activeDays:result.features.activeDays}});for(const flag of flags)await db.query(`INSERT INTO candidate_anomaly_flags(candidate_key,feature_snapshot_id,flag,severity,evidence,flag_key) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(flag_key) DO NOTHING`,[result.candidateKey,snapshotId,flag.flag,flag.severity,JSON.stringify(flag.evidence),`anomaly:${snapshotId}:${flag.flag}`]);
-    if(result.decision==='AMBIGUOUS')await enqueueJob('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:result.candidateKey,featureSnapshotId:snapshotId,literalSpan:rows[0].literalSpan,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${result.candidateKey}:${CLASSIFIER_VERSION}:${result.evidenceChecksum}`});
-  }await completeJob(job.id);
+    if(result.decision==='AMBIGUOUS'){
+      if(aiAdmitted) await enqueueJob('AI_ADJUDICATE_CANDIDATE',{payloadSchemaVersion:1,candidateKey:result.candidateKey,featureSnapshotId:snapshotId,literalSpan:rows[0].literalSpan,classifierVersion:CLASSIFIER_VERSION},{priority:3,maxAttempts:2,idempotencyKey:`candidate-ai:${result.candidateKey}:${CLASSIFIER_VERSION}:${result.evidenceChecksum}`});
+      else deferredAi+=1;
+    }
+  }
+  if(deferredAi>0)console.info(JSON.stringify({event:'candidate_ai_adjudication_deferred',count:deferredAi,reason:control.rows[0]?.ai_paused?'AI_PAUSED':'AI_BUDGET_UNAVAILABLE',timestamp:new Date().toISOString()}));
+  await completeJob(job.id);
 }
 
 export async function processAiAdjudicationJob(job:{id:string;payload:any;attempts?:number}):Promise<void>{
