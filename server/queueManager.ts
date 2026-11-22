@@ -1225,7 +1225,7 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
     const spent = await client.query(`SELECT count(*)::int AS n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
     const inFlight = await client.query(
       `SELECT COALESCE(sum(g.n),0)::int AS u FROM jobs p LEFT JOIN LATERAL
-       (SELECT LEAST(count(DISTINCT o.normalized_span)::int,$2::int) AS n FROM corpus_candidate_occurrences o
+       (SELECT LEAST(count(DISTINCT o.normalized_span)::int,$1::int) AS n FROM corpus_candidate_occurrences o
         WHERE o.document_id::text=(p.payload->>'documentId')
           AND (COALESCE(p.payload->>'cursor','')='' OR o.normalized_span>(p.payload->>'cursor'))) g ON true
        WHERE p.type='SCORE_CANDIDATES' AND p.status='PROCESSING' AND p.locked_at>=date_trunc('day',now())`,
