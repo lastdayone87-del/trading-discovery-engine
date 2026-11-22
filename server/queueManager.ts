@@ -142,6 +142,7 @@ import {
   getAutonomousPageSettledGuardMetrics,
   getPageNoveltyMetrics,
   getAutonomousRunMetrics,
+  getAutonomousRunSettledYield,
   listPendingAutonomousRuns,
   markAutonomousPageDeferredForAdmission,
   markAutonomousPageDeferredForAdmissionReview,
@@ -3114,7 +3115,7 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      const [admissionOutcomes, admissionPageOutcomes] = await Promise.all([
+      const [admissionOutcomes, admissionPageOutcomes, admissionRunYield] = await Promise.all([
         getAdmissionRunOutcomes(queryRunId).catch(error => {
           if (isMissingAdmissionSchemaError(error)) return null;
           throw error;
@@ -3123,16 +3124,28 @@ export async function processNextSearchJob(
           if (isMissingAdmissionSchemaError(error)) return null;
           throw error;
         }),
+        getAutonomousRunSettledYield(queryRunId).catch(() => null),
       ]);
       const admissionGuard = admissionOutcomes && admissionPageOutcomes
         ? evaluateQueryAdmissionGuard({
             pageNumber,
-            outcomes: admissionOutcomes,
+            // Page-level admission evidence drives page-level stops. Run-level
+            // cumulative outcomes are intentionally not used here.
+            outcomes: admissionPageOutcomes,
             tradingPrecision: metrics.tradingPrecision,
             qualityChannels: metrics.qualityChannels,
             tradingConfirmed: metrics.tradingConfirmed,
+            freshConfirmedCreators: marginal.marginalFreshConfirmedCreators,
+            productiveContinuation: decision.shouldContinue === true && decision.primaryReason === 'CONTINUE_PRODUCTIVE',
+            runQualityChannels: admissionRunYield?.qualityChannels,
+            runTradingConfirmed: admissionRunYield?.tradingConfirmed,
+            runClassificationPending: admissionRunYield?.classificationPending,
+            runYieldAvailable: admissionRunYield !== null,
             classificationPending: metrics.classificationPending,
             priorZeroQualityPages: prior.v2Streaks.lowValue,
+            priorQueryRuns: Number(queryRecord.times_executed || 0),
+            priorQueryQualityChannels: Number(queryRecord.quality_channels_found || 0),
+            priorQueryUniqueChannels: Number(queryRecord.unique_channels_found || 0),
           })
         : { stop: false, quarantine: false, reasonCodes: [] as string[] };
       // Pending admission verdicts are a temporary evidence wait. Hard
@@ -3701,19 +3714,30 @@ export async function resumeOrphanedAutonomousPages(options: {
           continue;
         }
         await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted, true);
-        const [settledMetrics, priorState, settledMarginal] = await Promise.all([
+        const [settledMetrics, priorState, settledMarginal, settledRunYield] = await Promise.all([
           getAutonomousPageSettledGuardMetrics(run.runId, run.pagesCompleted),
           getAutonomousContinuationState(run.runId, run.pagesCompleted),
           getAutonomousPageMarginalMetrics(run.runId, run.pagesCompleted),
+          getAutonomousRunSettledYield(run.runId).catch(() => null),
         ]);
+        const settledQueryRecord = await getQueryById(run.queryId).catch(() => null);
         const settledGuard = evaluateQueryAdmissionGuard({
           pageNumber: run.pagesCompleted,
-          outcomes: runOutcomes,
+          outcomes: pageOutcomes,
           tradingPrecision: settledMetrics.tradingPrecision,
           qualityChannels: settledMetrics.qualityChannels,
           tradingConfirmed: settledMetrics.tradingConfirmed,
+          freshConfirmedCreators: settledMarginal.marginalFreshConfirmedCreators,
+          productiveContinuation: lastObservation.shouldContinue === true && String(lastObservation.primaryReason) === 'CONTINUE_PRODUCTIVE',
+          runQualityChannels: settledRunYield?.qualityChannels,
+          runTradingConfirmed: settledRunYield?.tradingConfirmed,
+          runClassificationPending: settledRunYield?.classificationPending,
+          runYieldAvailable: settledRunYield !== null,
           classificationPending: settledMetrics.classificationPending,
           priorZeroQualityPages: priorState.v2Streaks.lowValue,
+          priorQueryRuns: Number(settledQueryRecord?.times_executed || 0),
+          priorQueryQualityChannels: Number(settledQueryRecord?.quality_channels_found || 0),
+          priorQueryUniqueChannels: Number(settledQueryRecord?.unique_channels_found || 0),
         });
         if (settledGuard.stop && !settledGuard.defer) {
           await settleAutonomousPageAdmissionDeferral(

@@ -372,6 +372,43 @@ export async function getAutonomousPageSettledGuardMetrics(
   };
 }
 
+/**
+ * Current run-wide yield for the admission guard. Page snapshots are written
+ * before late admission/classification verdicts settle, so they can remain
+ * zero even after an earlier page produced confirmed or quality creators. Read
+ * the live channel state instead, and expose pending classifications so the
+ * guard can refuse permanent query rejection until that evidence settles.
+ */
+export async function getAutonomousRunSettledYield(
+  runId: string,
+  clientOverride?: PageStoreRunner,
+): Promise<{ qualityChannels: number; tradingConfirmed: number; classificationPending: number }> {
+  const db = clientOverride || await getDb();
+  const result = await db.query(
+    `SELECT
+       COUNT(DISTINCT cs.channel_id) FILTER (
+         WHERE c.trading_status='TRADING_CONFIRMED'
+       )::int AS trading_confirmed,
+       COUNT(DISTINCT cs.channel_id) FILTER (
+         WHERE c.trading_status='TRADING_CONFIRMED'
+           AND COALESCE(c.quality_score,0)>=${QUALITY_CREATOR_SCORE_THRESHOLD}
+       )::int AS quality_channels,
+       COUNT(DISTINCT cs.channel_id) FILTER (
+         WHERE cs.funnel_outcome='CLASSIFICATION_PENDING'
+       )::int AS classification_pending
+     FROM channel_sightings cs
+     LEFT JOIN channels c ON c.channel_id=cs.channel_id
+     WHERE cs.query_run_id=$1`,
+    [runId],
+  );
+  const row = result.rows[0] || {};
+  return {
+    qualityChannels: Math.max(0, Number(row.quality_channels || 0)),
+    tradingConfirmed: Math.max(0, Number(row.trading_confirmed || 0)),
+    classificationPending: Math.max(0, Number(row.classification_pending || 0)),
+  };
+}
+
 export async function getAutonomousRunMetrics(runId: string, clientOverride?: PageStoreRunner): Promise<QueryFunnelMetrics> {
   const db = clientOverride || await getDb();
   // Page metrics count distinct creators per page. Summing them overcounts a

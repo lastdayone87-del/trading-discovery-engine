@@ -19,6 +19,7 @@
     "test": "find server tests scripts -name '*.test.ts' -exec node --import tsx --test {} +",
     "migrate": "tsx scripts/runMigrations.ts",
     "migrate:sqljs": "tsx scripts/migrateSqljsToPostgres.ts",
+    "quarantine:release": "tsx scripts/releaseAdmissionQuarantine.ts",
     "queue:smoke": "tsx scripts/queueSmokeTest.ts",
     "youtube-key-cap:monitor": "tsx scripts/youtubeKeyCapStopMonitor.ts",
     "phase0:url-ledger-report": "tsx scripts/phase0UrlWorkLedgerReport.ts",

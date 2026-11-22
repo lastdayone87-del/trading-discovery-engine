@@ -1,4 +1,4 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs'; import { dirname, join } from 'node:path'; import { fileURLToPath } from 'node:url'; import { aggregatePageMetrics, getAutonomousRunMetrics } from './autonomousPageStore';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs'; import { dirname, join } from 'node:path'; import { fileURLToPath } from 'node:url'; import { aggregatePageMetrics, getAutonomousRunMetrics, getAutonomousRunSettledYield } from './autonomousPageStore';
 test('aggregates pages into one final learning measurement without counting review states as quality',()=>{const page=(overrides:any)=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60,...overrides});const total=aggregatePageMetrics([page({}),page({qualityChannels:1,tradingConfirmed:2,needsReview:3})]);assert.equal(total.rawResults,20);assert.equal(total.qualityChannels,3);assert.equal(total.tradingConfirmed,6);assert.equal(total.needsReview,4);});
 test('scope weighting survives page aggregation; legacy pages stay neutral',()=>{
   const scoped=(inScopeNewChannels:number)=>({rawResults:10,distinctResults:8,duplicateResults:2,knownChannels:1,newChannels:7,inScopeNewChannels,countryRejected:1,nonTrading:1,uncertain:1,needsReview:1,tradingConfirmed:4,qualityChannels:2,communitiesDiscovered:1,averageQualityScore:60,noveltyRatio:.875,countryPrecision:.875,tradingPrecision:.57,performanceScore:60});
@@ -160,4 +160,24 @@ test('legacy page metrics leave freshTradingConfirmed unknown instead of inventi
     2,
     'a measured page still contributes; legacy pages add no invented zero',
   );
+});
+
+test('run-settled yield reads current channel state and reports pending classification', async () => {
+  const calls: Array<{ sql: string; params: unknown[] }> = [];
+  const result = await getAutonomousRunSettledYield('run-settled', {
+    query: async (sql: string, params: unknown[] = []) => {
+      calls.push({ sql, params });
+      return { rows: [{ quality_channels: 3, trading_confirmed: 5, classification_pending: 2 }] };
+    },
+  });
+  assert.deepEqual(result, { qualityChannels: 3, tradingConfirmed: 5, classificationPending: 2 });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /FROM channel_sightings cs/);
+  assert.match(calls[0].sql, /LEFT JOIN channels c ON c\.channel_id=cs\.channel_id/);
+  assert.match(calls[0].sql, /COUNT\(DISTINCT cs\.channel_id\)/g);
+  assert.match(calls[0].sql, /WHERE cs\.query_run_id=\$1/);
+  assert.match(calls[0].sql, /c\.trading_status='TRADING_CONFIRMED'/);
+  assert.match(calls[0].sql, /c\.quality_score,0\)>=/);
+  assert.match(calls[0].sql, /cs\.funnel_outcome='CLASSIFICATION_PENDING'/);
+  assert.deepEqual(calls[0].params, ['run-settled']);
 });

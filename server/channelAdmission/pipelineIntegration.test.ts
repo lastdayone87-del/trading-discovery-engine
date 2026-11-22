@@ -149,6 +149,41 @@ test('search-worker admission path stores the sighting and never falls through t
   assert.match(queue, /matchedDocument: raw\.matchedDocument \|\| null/);
   assert.match(queue, /getAdmissionPageOutcomes/);
   assert.match(queue, /evaluateQueryAdmissionGuard/);
+  const pageGuardBlock = queue.slice(
+    queue.indexOf('const [admissionOutcomes'),
+    queue.indexOf('// Pending admission verdicts'),
+  );
+  assert.ok(pageGuardBlock.length > 0, 'normal-page admission guard block must exist');
+  for (const expected of [
+    'getAutonomousRunSettledYield(',
+    'outcomes: admissionPageOutcomes,',
+    'runQualityChannels: admissionRunYield?.qualityChannels,',
+    'runTradingConfirmed: admissionRunYield?.tradingConfirmed,',
+    'runClassificationPending: admissionRunYield?.classificationPending,',
+    'runYieldAvailable: admissionRunYield !== null,',
+    'priorQueryRuns:',
+    'priorQueryQualityChannels:',
+    'priorQueryUniqueChannels:',
+  ]) {
+    assert.ok(pageGuardBlock.includes(expected), `normal-page guard must include ${expected}`);
+  }
+  const settledGuardBlock = queue.slice(
+    queue.indexOf('const [settledMetrics'),
+    queue.indexOf('if (settledGuard.stop'),
+  );
+  assert.ok(settledGuardBlock.length > 0, 'orphan-recovery admission guard block must exist');
+  for (const expected of [
+    'getAutonomousRunSettledYield(',
+    'outcomes: pageOutcomes,',
+    'runQualityChannels: settledRunYield?.qualityChannels,',
+    'runTradingConfirmed: settledRunYield?.tradingConfirmed,',
+    'runClassificationPending: settledRunYield?.classificationPending,',
+    'runYieldAvailable: settledRunYield !== null,',
+    'priorQueryQualityChannels:',
+    'priorQueryUniqueChannels:',
+  ]) {
+    assert.ok(settledGuardBlock.includes(expected), `orphan guard must include ${expected}`);
+  }
   assert.match(queue, /quarantineQuery\(queryId, admissionGuard\.reasonCodes\)/);
 });
 

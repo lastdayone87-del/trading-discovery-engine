@@ -376,8 +376,70 @@ test('query contamination guard stops 711-like pages on admission rejects', () =
     priorZeroQualityPages: 1,
   });
   assert.equal(decision.stop, true);
-  assert.equal(decision.quarantine, true);
+  assert.equal(decision.quarantine, false, 'one page can stop the run but must not permanently reject the query');
   assert.ok(decision.reasonCodes.includes('ADMISSION_REJECTED_SHARE_HIGH'));
+});
+
+test('each productive-page signal independently bypasses rejection share', () => {
+  for (const signal of [
+    { qualityChannels: 1, tradingConfirmed: 0, freshConfirmedCreators: 0, productiveContinuation: false },
+    { qualityChannels: 0, tradingConfirmed: 1, freshConfirmedCreators: 0, productiveContinuation: false },
+    { qualityChannels: 0, tradingConfirmed: 0, freshConfirmedCreators: 1, productiveContinuation: false },
+    { qualityChannels: 0, tradingConfirmed: 0, freshConfirmedCreators: 0, productiveContinuation: true },
+  ]) {
+    const decision = evaluateQueryAdmissionGuard({
+      pageNumber: 4,
+      outcomes: { admitted: 0, ambiguous: 0, rejected: 8, held: 0, total: 10 },
+      tradingPrecision: 0.05,
+      ...signal,
+    });
+    assert.equal(decision.stop, false);
+    assert.equal(decision.quarantine, false);
+  }
+});
+
+test('query quarantine requires repeated no-yield runs, not one page', () => {
+  const base = {
+    pageNumber: 3,
+    outcomes: { admitted: 0, ambiguous: 0, rejected: 8, held: 0, total: 10 },
+    tradingPrecision: 0.05,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    freshConfirmedCreators: 0,
+    productiveContinuation: false,
+    runYieldAvailable: true,
+    runClassificationPending: 0,
+  };
+  assert.equal(evaluateQueryAdmissionGuard({ ...base, priorQueryRuns: 1, priorQueryQualityChannels: 0, priorQueryUniqueChannels: 0 }).quarantine, false);
+  assert.equal(evaluateQueryAdmissionGuard({ ...base, priorQueryRuns: 2, priorQueryQualityChannels: 0, priorQueryUniqueChannels: 0 }).quarantine, true);
+  for (const history of [
+    { priorQueryQualityChannels: 1, priorQueryUniqueChannels: 0 },
+    { priorQueryQualityChannels: 0, priorQueryUniqueChannels: 1 },
+    { priorQueryQualityChannels: 77, priorQueryUniqueChannels: 44 },
+  ]) {
+    assert.equal(evaluateQueryAdmissionGuard({ ...base, ...history, priorQueryRuns: 5 }).quarantine, false,
+      'either historical quality or unique yield must prevent rejection');
+  }
+  for (const evidence of [
+    { runQualityChannels: 1 },
+    { runTradingConfirmed: 1 },
+  ]) {
+    const yieldedRun = evaluateQueryAdmissionGuard({
+      ...base,
+      ...evidence,
+      priorQueryRuns: 2,
+      priorQueryQualityChannels: 0,
+      priorQueryUniqueChannels: 0,
+    });
+    assert.equal(yieldedRun.stop, true, 'the contaminated page still stops the run');
+    assert.equal(yieldedRun.quarantine, false, 'yield from this run must prevent query rejection');
+  }
+  assert.equal(evaluateQueryAdmissionGuard({
+    ...base, runYieldAvailable: false, priorQueryRuns: 2,
+  }).quarantine, false, 'unavailable run evidence must fail closed');
+  assert.equal(evaluateQueryAdmissionGuard({
+    ...base, runClassificationPending: 1, priorQueryRuns: 2,
+  }).quarantine, false, 'pending classification evidence must prevent rejection');
 });
 
 test('ambiguous-admit rate is measured separately', () => {

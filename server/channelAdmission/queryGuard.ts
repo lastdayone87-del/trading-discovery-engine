@@ -17,9 +17,24 @@ export interface QueryAdmissionGuardInput {
   tradingPrecision: number;
   qualityChannels: number;
   tradingConfirmed: number;
+  /** Fresh confirmed creators found on this page/run. */
+  freshConfirmedCreators?: number;
+  /** The normal continuation policy already considers this page productive. */
+  productiveContinuation?: boolean;
+  /** Live run-wide yield from the current channel state. */
+  runQualityChannels?: number;
+  runTradingConfirmed?: number;
+  /** Classifications still pending in this run; rejection must wait. */
+  runClassificationPending?: number;
+  /** True only when run-wide yield evidence loaded successfully. */
+  runYieldAvailable?: boolean;
   /** Admission-created channels whose downstream classification is still running. */
   classificationPending?: number;
   priorZeroQualityPages?: number;
+  /** Query-level history used only for the separate quarantine decision. */
+  priorQueryRuns?: number;
+  priorQueryQualityChannels?: number;
+  priorQueryUniqueChannels?: number;
 }
 
 export interface QueryAdmissionGuardDecision {
@@ -59,7 +74,32 @@ export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): Qu
   const reasonCodes: string[] = [];
   if (rejectedShare >= 0.6) {
     reasonCodes.push('ADMISSION_REJECTED_SHARE_HIGH');
-    return { stop: true, quarantine: true, reasonCodes };
+    // Rejection share is measured over uncertain admission candidates only.
+    // A page/run that still produced confirmed, quality or fresh creators —
+    // or that the normal policy already marks productive — must not be
+    // overridden by that subset.
+    const productivePage = input.qualityChannels > 0
+      || input.tradingConfirmed > 0
+      || Number(input.freshConfirmedCreators || 0) > 0
+      || input.productiveContinuation === true;
+    if (productivePage) return { stop: false, quarantine: false, reasonCodes };
+    // Run stop is separate from query rejection. Earlier pages of this run may
+    // already have produced quality/confirmed creators even though the query
+    // stats are only updated when the run completes; such a run is productive
+    // and must never be rejected from one later bad page.
+    const productiveRun = Number(input.runQualityChannels || 0) > 0
+      || Number(input.runTradingConfirmed || 0) > 0;
+    // Permanent rejection requires successfully loaded, settled run evidence.
+    // A transient metrics failure or a pending classification must never be
+    // read as zero yield.
+    const runEvidenceSettled = input.runYieldAvailable === true
+      && Number(input.runClassificationPending || 0) === 0;
+    const queryEvidenceSufficient = runEvidenceSettled
+      && !productiveRun
+      && Number(input.priorQueryRuns || 0) >= 2
+      && Number(input.priorQueryQualityChannels || 0) === 0
+      && Number(input.priorQueryUniqueChannels || 0) === 0;
+    return { stop: true, quarantine: queryEvidenceSufficient, reasonCodes };
   }
   if (unresolvedShare >= 0.5 && input.tradingPrecision < 0.15) {
     reasonCodes.push('ADMISSION_UNRESOLVED_SHARE_HIGH', 'TRADING_PRECISION_LOW');

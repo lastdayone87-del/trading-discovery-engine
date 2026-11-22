@@ -1,0 +1,46 @@
+name: Admission quarantine policy
+
+on:
+  pull_request:
+    paths:
+      - 'server/channelAdmission/queryGuard.ts'
+      - 'server/channelAdmission/admission.test.ts'
+      - 'server/channelAdmission/pipelineIntegration.test.ts'
+      - 'server/channelAdmission/sightingReconciliation.test.ts'
+      - 'server/queryAdmissionQuarantineRecovery.ts'
+      - 'server/queryAdmissionQuarantineRecovery.test.ts'
+      - 'server/autonomousPageStore.ts'
+      - 'server/autonomousPageStore.test.ts'
+      - 'server/channelAdmission/store.ts'
+      - 'server/queueManager.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'scripts/releaseAdmissionQuarantine.ts'
+      - '.github/workflows/admission-quarantine-policy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Quarantine guard and recovery policy
+        run: >-
+          node --import tsx --test
+          server/channelAdmission/admission.test.ts
+          server/channelAdmission/pipelineIntegration.test.ts
+          server/channelAdmission/sightingReconciliation.test.ts
+          server/queryAdmissionQuarantineRecovery.test.ts
+          server/autonomousPageStore.test.ts
+      - name: TypeScript validation
+        run: npm run lint
