@@ -27,9 +27,11 @@ async function main(): Promise<void> {
     uniqueChannelsFound: Number(row.unique_channels_found || 0),
     timesExecuted: Number(row.times_executed || 0),
   }));
+  let restorable = 0;
   let restored = 0;
   for (const row of rows) {
     const decision = evaluateAdmissionQuarantineRecovery(row);
+    if (decision.restore) restorable++;
     console.log(JSON.stringify({
       event: 'admission_quarantine_review',
       apply,
@@ -52,8 +54,9 @@ async function main(): Promise<void> {
     event: 'admission_quarantine_recovery_complete',
     apply,
     reviewed: rows.length,
+    restorable,
     restored,
-    skipped: rows.length - restored,
+    skipped: rows.length - restorable,
     timestamp: new Date().toISOString(),
   }));
 }
