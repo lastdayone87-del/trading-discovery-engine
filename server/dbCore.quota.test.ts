@@ -234,6 +234,8 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   const trackerChargeIndex = charge.indexOf('incrementYouTubeQuotaTracker(');
   const chargeCommitIndex = charge.indexOf("await client.query('COMMIT')", trackerChargeIndex);
   assert.ok(keyChargeIndex > 0 && trackerChargeIndex > keyChargeIndex, 'per-key row must be charged before the tracker');
+  assert.ok(trackerChargeIndex > beginIndex && trackerChargeIndex > probeSettleIndex,
+    'tracker update must follow BEGIN and probe settlement');
   assert.ok(chargeCommitIndex > trackerChargeIndex, 'tracker update must commit after it is charged');
   const trackerHelperStart = dbCore.indexOf('async function incrementYouTubeQuotaTracker');
   const trackerHelper = dbCore.slice(trackerHelperStart, dbCore.indexOf('export async function getQuota', trackerHelperStart));
@@ -270,6 +272,12 @@ test('quota reservation transactions keep the tracker lock off the reservation s
   assert.match(reserve, /SELECT status,units FROM quota_reservations[\s\S]*AND status='RESERVED' AND expires_at>now\(\)[\s\S]*FOR UPDATE/);
   assert.match(reserve, /lockAndRollYouTubeQuotaTracker\(client, args\.dailyBudget\)/);
   assert.match(topUp, /lockAndRollYouTubeQuotaTracker\(client, args\.dailyBudget\)/);
+  const reserveBeginIndex = reserve.indexOf("await client.query('BEGIN')");
+  const topUpBeginIndex = topUp.indexOf("await client.query('BEGIN')");
+  assert.ok(reserveBeginIndex >= 0 && reserveBeginIndex < reserve.indexOf('lockAndRollYouTubeQuotaTracker('),
+    'reservation tracker lock must be acquired inside the reservation transaction');
+  assert.ok(topUpBeginIndex >= 0 && topUpBeginIndex < topUp.indexOf('lockAndRollYouTubeQuotaTracker('),
+    'top-up tracker lock must be acquired inside the transaction');
   assert.match(reserve, /probeQuotaAdvisoryLockName\(quotaDay\)/);
   assert.match(topUp, /probeQuotaAdvisoryLockName\(quotaDay\)/);
   assert.match(reserve, /activeProbeLeaseUnitsExpression\(client\)/);
