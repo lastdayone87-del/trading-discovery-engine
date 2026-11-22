@@ -331,6 +331,11 @@ function isGroqContentFailure(error: unknown): boolean {
   return reasons.includes('GROQ_JSON_VALIDATION_FAILED') || reasons.includes('GROQ_SEMANTIC_CONTENT_INVALID');
 }
 
+class GroqRouteCachedUnauthorizedError extends Error {
+  readonly groqRouteCachedUnauthorized = true;
+  constructor() { super('Groq route credential is already cached as unauthorized.'); }
+}
+
 function groqFailoverCancelled(signal?: AbortSignal): ProviderCallError {
   return new ProviderCallError('Groq route failover cancelled by caller.', 'CANCELLED', true, { cause: signal?.reason });
 }
@@ -386,6 +391,12 @@ export async function runGroqRouteFailover<T>(
     try {
       return await call(route);
     } catch (error) {
+      if ((error as { groqRouteCachedUnauthorized?: unknown } | null)?.groqRouteCachedUnauthorized === true) {
+        // A queued call found the credential rejected while it waited for the
+        // org pacing slot. Skip it without renewing the cache or counting a
+        // second failure.
+        continue;
+      }
       lastError = error;
       // Caller cancellation is terminal: keep retries for provider timeouts,
       // but never spend another org's quota on an abandoned evaluation.
@@ -703,10 +714,7 @@ export async function runGroqTextCompletion(
         // Another call may have rejected this credential while this one waited
         // for the org pacing slot; recheck before spending a fetch.
         if (groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route)) > 0) {
-          throw new ProviderCallError('Groq route credential is cooling down.', 'CREDENTIALS_EXHAUSTED', true, {
-            routeScoped: true,
-            providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
-          });
+          throw new GroqRouteCachedUnauthorizedError();
         }
         const recooledMs = groqOrgCooldownRemainingMs(orgId);
         if (recooledMs > 0) throw groqCooldownDeferredError(recooledMs);
