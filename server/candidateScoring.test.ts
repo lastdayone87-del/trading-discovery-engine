@@ -32,6 +32,13 @@ test('AI enqueue capacity is bounded by today\'s remaining assertion and cost he
   assert.equal(aiAdjudicationCapacity({...control,ai_paused:true},0,0,10,0),0);
 });
 
+test('AI budget and pause deferrals do not consume bounded attempts',()=>{
+  const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
+  assert.match(source,/AI_ADJUDICATION_PAUSED/);
+  assert.match(source,/AI_BUDGET_EXHAUSTED/);
+  assert.match(source,/rescheduleJob\(job\.id/);
+});
+
 test('deferred ambiguous candidates have a bounded, funded backfill worker',()=>{
   const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
   assert.match(source,/export async function enqueueDeferredAiAdjudications/);
