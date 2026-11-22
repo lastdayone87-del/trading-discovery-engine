@@ -281,7 +281,9 @@ test('quota reservation transactions keep the tracker lock off the reservation s
   assert.ok(reservationLockIndex >= 0 && reservationDayIndex > reservationLockIndex,
     'reservation tracker day must be sampled after the row lock wait');
   assert.match(dbCore, /idx_quota_reservations_reserved_expiry/);
+  assert.match(dbCore, /idx_quota_reservations_consumed_recent/);
   assert.match(dbCore, /quotaReservationIndexMigration\.rowCount\) await ensureQuotaReservationActiveIndex/);
+  assert.match(dbCore, /quotaReservationConsumedIndexMigration\.rowCount\) await ensureQuotaReservationConsumedIndex/);
 });
 
 test('probe allocation and per-key cap exhaustion defer without consuming an attempt', async () => {

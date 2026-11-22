@@ -889,6 +889,44 @@ async function ensureQuotaReservationActiveIndex(client: { query: (text: string,
 }
 
 /**
+ * Migration 208 indexes the seven-day consumed-quota aggregate used by
+ * autonomous admission. Without it every reservation scans the full
+ * historical reservation table before taking the tracker lock.
+ */
+async function ensureQuotaReservationConsumedIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const name = 'idx_quota_reservations_consumed_recent';
+  const existing = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready, i.indisunique,
+           i.indpred IS NOT NULL AS has_predicate, i.indnatts, i.indnkeyatts,
+           CASE WHEN to_regclass('public.quota_reservations') IS NULL THEN false
+                ELSE i.indrelid = to_regclass('public.quota_reservations') END AS correct_table,
+           pg_get_expr(i.indpred, i.indrelid) AS predicate,
+           pg_get_indexdef(i.indexrelid) AS definition
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.${name}')
+  `);
+  const row = existing.rows[0];
+  const definition = String(row?.definition || '');
+  const predicate = String(row?.predicate || '').replace(/[()]/g, '').replace(/\s+/g, ' ').trim();
+  const correct = row?.correct_table === true
+    && row?.indisunique === false
+    && row?.has_predicate === true
+    && Number(row?.indnatts) === 3
+    && Number(row?.indnkeyatts) === 1
+    && definition.includes('USING btree (reserved_at)')
+    && definition.includes('INCLUDE (allocation, units)')
+    && predicate === "status = 'CONSUMED'::text";
+  if (row?.indisvalid && row?.indisready && correct) return;
+  if (row?.oid) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+  }
+  const target = await client.query(`SELECT to_regclass('public.quota_reservations') AS oid`);
+  if (!target.rows[0]?.oid) return;
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.quota_reservations (reserved_at) INCLUDE (allocation, units) WHERE status='CONSUMED'`);
+}
+
+/**
  * Migration 185 indexes the mature saturation sweep. Build both indexes
  * concurrently before the transactional migration loop; migration 185 only
  * adopts a valid index or verifies an empty table.
@@ -972,6 +1010,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration206.rowCount) await ensureCorpusOccurrenceIndexes(client);
     const migration207 = await client.query('SELECT 1 FROM schema_migrations WHERE version=207');
     if (!migration207.rowCount) await ensureQuotaReservationActiveIndex(client);
+    const migration208 = await client.query('SELECT 1 FROM schema_migrations WHERE version=208');
+    if (!migration208.rowCount) await ensureQuotaReservationConsumedIndex(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
@@ -999,6 +1039,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     // historical-row scan that the tracker lock used to serialize behind.
     const quotaReservationIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=207');
     if (quotaReservationIndexMigration.rowCount) await ensureQuotaReservationActiveIndex(client);
+    const quotaReservationConsumedIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=208');
+    if (quotaReservationConsumedIndexMigration.rowCount) await ensureQuotaReservationConsumedIndex(client);
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
     const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');

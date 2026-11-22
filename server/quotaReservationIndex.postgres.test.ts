@@ -42,11 +42,11 @@ function planNodes(value: unknown, nodes: Array<Record<string, unknown>> = []): 
   return nodes;
 }
 
-function assertUsesReservationIndex(plan: unknown): void {
+function assertUsesReservationIndex(plan: unknown, indexName = 'idx_quota_reservations_reserved_expiry'): void {
   const nodes = planNodes(plan);
   assert.ok(
-    nodes.some(node => String(node['Index Name'] || '') === 'idx_quota_reservations_reserved_expiry'),
-    'plan must use the partial active-reservation index',
+    nodes.some(node => String(node['Index Name'] || '') === indexName),
+    `plan must use ${indexName}`,
   );
   assert.equal(
     nodes.some(node => node['Node Type'] === 'Seq Scan' && node['Relation Name'] === 'quota_reservations'),
@@ -101,11 +101,14 @@ async function resetSchema(): Promise<void> {
       expires_at timestamptz NOT NULL,
       allocation text NOT NULL
     );
-    INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, expires_at)
-    SELECT 'HISTORICAL', 'h-' || g, 'AUTONOMOUS', 1, 'CONSUMED', now() - interval '1 day'
+    INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, reserved_at, expires_at)
+    SELECT 'HISTORICAL', 'h-' || g, 'AUTONOMOUS', 1, 'CONSUMED', now() - interval '30 days', now() - interval '30 days'
     FROM generate_series(1, 100000) g;
-    INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, expires_at)
-    SELECT 'ACTIVE', 'a-' || g, 'AUTONOMOUS', 7, 'RESERVED', now() + interval '20 minutes'
+    INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, reserved_at, expires_at)
+    SELECT 'RECENT_CONSUMED', 'r-' || g, 'AUTONOMOUS', 3, 'CONSUMED', now() - interval '1 day', now() - interval '1 day'
+    FROM generate_series(1, 5) g;
+    INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, reserved_at, expires_at)
+    SELECT 'ACTIVE', 'a-' || g, 'AUTONOMOUS', 7, 'RESERVED', now(), now() + interval '20 minutes'
     FROM generate_series(1, 120) g;
     ANALYZE quota_reservations;
   `);
@@ -115,20 +118,26 @@ async function resetSchema(): Promise<void> {
   );
 }
 
-async function buildIndex(): Promise<void> {
+async function buildIndexes(): Promise<void> {
   await requirePool().query(`
     CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_quota_reservations_reserved_expiry
       ON public.quota_reservations (expires_at)
       INCLUDE (units, operation_type, operation_id)
       WHERE status='RESERVED'
   `);
+  await requirePool().query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_quota_reservations_consumed_recent
+      ON public.quota_reservations (reserved_at)
+      INCLUDE (allocation, units)
+      WHERE status='CONSUMED'
+  `);
   await requirePool().query(`ANALYZE quota_reservations`);
 }
 
-maybe('migration 207 adopts the partial index and the hot aggregate stays off a sequential scan', async () => {
+maybe('migrations 207/208 adopt the partial indexes and the hot aggregates stay off a sequential scan', async () => {
   pool = new pg.Pool({ connectionString: dedicatedUrl, max: 6 });
   await resetSchema();
-  await buildIndex();
+  await buildIndexes();
 
   // The migration must accept the concurrently-built index. If the definition
   // drifted, its DO block raises and this test fails.
@@ -137,6 +146,11 @@ maybe('migration 207 adopts the partial index and the hot aggregate stays off a 
     'utf8',
   );
   await requirePool().query(migration207);
+  const migration208 = readFileSync(
+    new URL('./db/migrations/208_quota_reservation_consumed_index.sql', import.meta.url),
+    'utf8',
+  );
+  await requirePool().query(migration208);
 
   const totalsPlan = await requirePool().query(`
     EXPLAIN (FORMAT JSON)
@@ -154,6 +168,15 @@ maybe('migration 207 adopts the partial index and the hot aggregate stays off a 
      WHERE status='RESERVED' AND expires_at<=now()
   `);
   assertUsesReservationIndex(expiryPlan.rows[0]['QUERY PLAN']);
+
+  const consumedPlan = await requirePool().query(`
+    EXPLAIN (FORMAT JSON)
+    SELECT allocation,COALESCE(SUM(units),0)::int AS units
+      FROM quota_reservations
+     WHERE status='CONSUMED' AND reserved_at>=now()-interval '7 days'
+     GROUP BY allocation
+  `);
+  assertUsesReservationIndex(consumedPlan.rows[0]['QUERY PLAN'], 'idx_quota_reservations_consumed_recent');
 });
 
 maybe('a held per-key charge row cannot block the production reservation path', async () => {
