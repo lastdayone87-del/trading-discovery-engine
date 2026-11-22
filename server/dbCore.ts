@@ -6928,7 +6928,7 @@ export async function getQuotaFallbackRunState(runId: string): Promise<QuotaFall
  * First-page official quota fallback. A run with zero completed pages has not
  * spent official units, so moving its provider identity to InnerTube is safe
  * and keeps a single-provider run (no mixed official/InnerTube accounting).
- * The migration 200 trigger permits only this marker-gated transition.
+ * The migration 201 trigger permits only this marker-gated transition.
  */
 export async function retargetQuotaBlockedRunToInnertube(args: {
   runId: string;

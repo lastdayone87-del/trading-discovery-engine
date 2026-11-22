@@ -90,7 +90,7 @@ test('worker wires the fallback before the quota deferral and keeps the existing
 
 test('first-page retarget is marker-gated and restricted to zero completed pages', () => {
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
-  const migration = readFileSync(new URL('./db/migrations/200_innertube_quota_fallback.sql', import.meta.url), 'utf8');
+  const migration = readFileSync(new URL('./db/migrations/201_innertube_quota_fallback.sql', import.meta.url), 'utf8');
   const start = dbCore.indexOf('export async function retargetQuotaBlockedRunToInnertube');
   const body = dbCore.slice(start, start + 5000);
   assert.match(body, /pages_completed \|\| 0\) !== 0/);
