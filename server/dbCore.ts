@@ -4446,11 +4446,8 @@ export async function scheduleAutonomousQueryRuns(
             [String(providerCooldownObservationWindowSecs())]
           ).catch(() => ({ rows: [] as any[] }));
           const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
-          const quarantinedRes = await client.query(
-            `SELECT provider FROM query_provider_quarantine WHERE query_id=$1 AND until>now()`,
-            [candidate.query.id],
-          ).catch(() => ({ rows: [] as any[] }));
-          const quarantinedProviders = new Set((quarantinedRes.rows || []).map((row: any) => String(row.provider)));
+          const quarantinedProviders = await getQuarantinedQueryProviders(candidate.query.id, client)
+            .catch(() => new Set<string>());
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
             // A quota-free exploration decision must be served by quota-free
             // capacity. Filtering here prevents the stable rotation key from
@@ -5942,7 +5939,8 @@ export async function coolQueryForProviderQuarantine(
 ): Promise<void> {
   if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
   if (inputKind !== 'searchQuery') return;
-  const provider = ledgerProviderToRegistryKey(String(identity?.provider || ''));
+  const rawProvider = String(identity?.provider || '');
+  const provider = ledgerProviderToRegistryKey(rawProvider);
   const operation = String(identity?.operation || '');
   const signature = String(identity?.signature || '');
   if (!provider || !operation || !signature) return;
@@ -5951,7 +5949,7 @@ export async function coolQueryForProviderQuarantine(
     `SELECT expires_at FROM youtube_invalid_input_quarantine
       WHERE provider=$1 AND input_kind=$2 AND input_value=$3 AND operation=$4 AND request_signature=$5
         AND expires_at>now() LIMIT 1`,
-    [provider, inputKind, inputValue, operation, signature],
+    [rawProvider, inputKind, inputValue, operation, signature],
   );
   if (!quarantine.rows[0]?.expires_at) return;
   // Scope the cooldown to this query/provider pair. The scheduler filters the
