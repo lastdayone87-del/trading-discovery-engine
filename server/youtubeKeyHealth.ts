@@ -34,10 +34,6 @@ export function normalizeYouTubeQuarantineInput(kind: YouTubeQuarantineInputKind
   return createHash('sha256').update(candidate).digest('hex');
 }
 
-/** Derives the quarantinable input for an operation from its dispatched URL.
- * Channel-scoped operations attribute to the channel; query operations
- * attribute to the normalized query text. Returns null when the URL carries
- * neither (nothing to remember). */
 export interface YouTubeQuarantineInput {
   provider: 'youtube';
   kind: YouTubeQuarantineInputKind;
@@ -46,6 +42,10 @@ export interface YouTubeQuarantineInput {
   signature: string;
 }
 
+/** Derives the quarantinable input and request signature for an operation from
+ * its dispatched URL. Channel-scoped operations attribute to the channel;
+ * query operations attribute to the normalized query text. Returns null when
+ * the URL carries neither (nothing to remember). */
 export function extractYouTubeQuarantineInput(operation: string, url: string): YouTubeQuarantineInput | null {
   let params: URLSearchParams;
   try {

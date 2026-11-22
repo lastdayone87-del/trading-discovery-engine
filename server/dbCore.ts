@@ -5899,35 +5899,13 @@ export async function coolQueryForProviderQuarantine(
   inputValue: string,
   runner?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
 ): Promise<void> {
-  if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
-  const db = runner || await getDb();
-  // A query-level cooldown blocks every provider and retrieval shape. When a
-  // second search provider is active, keep the query eligible so the healthy
-  // surface can serve it; the exact pre-dispatch signature gate still blocks
-  // the failed request shape.
-  const alternatives = await db.query(
-    `SELECT COUNT(*)::int AS n FROM discovery_provider_registry
-      WHERE mode IN ('ACTIVE','ACTIVE_GLOBAL') AND capabilities ? 'SEARCH_YOUTUBE'`,
-  );
-  if (Number(alternatives.rows[0]?.n || 0) > 1) return;
-  const quarantine = await db.query(
-    `SELECT MAX(expires_at) AS expires_at FROM youtube_invalid_input_quarantine
-      WHERE input_kind=$1 AND input_value=$2`,
-    [inputKind, inputValue],
-  );
-  const parsed = quarantine.rows[0]?.expires_at ? new Date(quarantine.rows[0].expires_at) : null;
-  // If the row expired or disappeared between the dispatch gate and failure
-  // handling, the quarantine is no longer active. Use a short cooldown instead
-  // of extending a stale seven-day quarantine.
-  const until = parsed && Number.isFinite(parsed.getTime()) && parsed.getTime() > Date.now()
-    ? parsed
-    : new Date(Date.now() + 60 * 60_000);
-  await db.query(
-    `UPDATE query_library
-        SET next_eligible_at=GREATEST(COALESCE(next_eligible_at,now()),$2::timestamptz)
-      WHERE id=$1`,
-    [queryId, until.toISOString()],
-  );
+  void queryId; void inputValue; void runner;
+  // A request-scoped quarantine must not become a query-wide cooldown: that
+  // field blocks every provider and retrieval shape. The exact pre-dispatch
+  // signature gate rejects only the failed request; healthy providers and
+  // parameter sets stay eligible. Kept as a compatibility no-op for callers
+  // that still report the event.
+  if (inputKind === 'searchQuery') return;
 }
 
 export async function failQueryRun(runId: string, error: unknown, terminal: boolean): Promise<void> {

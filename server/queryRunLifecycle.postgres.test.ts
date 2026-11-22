@@ -81,7 +81,7 @@ test('Stage 4 PostgreSQL: provider-linked completion is success-gated and termin
 });
 
 
-test('Stage 4 PostgreSQL: a quarantined search input cools the query without shortening a later cooldown', { skip: databaseUrl ? false : 'PHASE4_POSTGRES_URL is required' }, async () => {
+test('Stage 4 PostgreSQL: a request-scoped quarantine never cools the whole query', { skip: databaseUrl ? false : 'PHASE4_POSTGRES_URL is required' }, async () => {
   process.env.DATABASE_URL = databaseUrl!;
   process.env.PGSSL = 'disable';
   const db = await getDb();
@@ -100,31 +100,9 @@ test('Stage 4 PostgreSQL: a quarantined search input cools the query without sho
        DO UPDATE SET expires_at=EXCLUDED.expires_at`,
       [value]
     );
-    const singleProviderDb = {
-      query: (text: string, params?: unknown[]) => text.includes('discovery_provider_registry')
-        ? Promise.resolve({ rows: [{ n: 1 }] })
-        : db.query(text, params),
-    };
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, singleProviderDb);
-    let row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    let days = (new Date(row.next_eligible_at).getTime() - Date.now()) / 86_400_000;
-    assert.ok(days > 1.9 && days < 2.1, `expected the quarantine expiry, got ${days} days`);
-
-    await db.query(`UPDATE query_library SET next_eligible_at=now()+interval '10 days' WHERE id=$1`, [queryId]);
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, singleProviderDb);
-    row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    days = (new Date(row.next_eligible_at).getTime() - Date.now()) / 86_400_000;
-    assert.ok(days > 9.9, `expected the later cooldown to win, got ${days} days`);
-
-    await db.query('UPDATE query_library SET next_eligible_at=NULL WHERE id=$1', [queryId]);
-    const alternateProviderDb = {
-      query: (text: string, params?: unknown[]) => text.includes('discovery_provider_registry')
-        ? Promise.resolve({ rows: [{ n: 2 }] })
-        : db.query(text, params),
-    };
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, alternateProviderDb);
-    row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    assert.equal(row.next_eligible_at, null, 'a second healthy provider must keep the query eligible');
+    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
+    const row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
+    assert.equal(row.next_eligible_at, null, 'a scoped request failure must not block healthy providers');
     await db.query('DELETE FROM youtube_invalid_input_quarantine WHERE input_value=$1', [value]);
   } finally {
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
