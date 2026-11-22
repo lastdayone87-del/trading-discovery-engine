@@ -222,7 +222,7 @@ export function shouldPreserveExistingChannel(
     // owns the retry cadence and the cycle ceiling. Explicit operator scans stay
     // outside this guard.
     if (existing.scan_status === 'INTAKE_DEFERRED' || existing.scan_status === 'PROVIDER_DEFERRED') {
-      return !isManualScan;
+      return !isManualScan && source !== 'manual_search';
     }
 
     // Country uncertainty is explicitly non-terminal. Re-run Gate 1 so the

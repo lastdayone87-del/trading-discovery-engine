@@ -61,6 +61,7 @@ test('machine-deferred evidence states wait for the bounded recovery sweep', () 
     assert.equal(shouldPreserveExistingChannel(deferred, source('automated_query'), false, NOW), true);
     assert.equal(shouldPreserveExistingChannel(deferred, source('autonomous'), false, NOW), true);
     assert.equal(shouldPreserveExistingChannel(deferred, source('manual_search'), true, NOW), false, 'operator scan may retry immediately');
+    assert.equal(shouldPreserveExistingChannel(deferred, source('manual_search'), false, NOW), false, 'manual-search source is enough to retry');
     assert.equal(shouldPreserveExistingChannel(deferred, source('recheck'), true, NOW), false);
   }
 });

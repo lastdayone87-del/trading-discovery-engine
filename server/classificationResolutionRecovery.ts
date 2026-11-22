@@ -98,11 +98,39 @@ export async function ensureClassificationResolutionCutoff(): Promise<string> {
   return new Date(inserted.rows[0].created_at).toISOString();
 }
 
+export const DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS = 10 * 60_000;
+
+/**
+ * Cross-replica lease for the deferred-only backfill. The in-memory scheduler
+ * throttle is per process; this row makes the two-channel budget shared.
+ */
+export async function acquireDeferredEnrichmentBackfillLease(
+  db: { query: (sql: string, params: unknown[]) => Promise<{ rowCount?: number | null }> },
+  windowMs = DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS,
+): Promise<boolean> {
+  if (!(windowMs > 0)) return true;
+  const name = 'deferred_enrichment_backfill';
+  await db.query(
+    `INSERT INTO scheduler_state(name,is_enabled,is_running,last_run_at,updated_at)
+     VALUES($1,true,false,now()-interval '1 hour',now()) ON CONFLICT(name) DO NOTHING`,
+    [name],
+  );
+  const lease = await db.query(
+    `UPDATE scheduler_state SET last_run_at=now(),updated_at=now()
+      WHERE name=$1 AND (last_run_at IS NULL OR last_run_at < now()-($2::int*interval '1 millisecond'))
+      RETURNING name`,
+    [name, windowMs],
+  );
+  return Number(lease.rowCount || 0) > 0;
+}
+
 export interface ClassificationResolutionRecoveryOptions {
   dryRun?: boolean;
   includeLegacy?: boolean;
   /** Restrict the sweep to machine-deferred evidence states. */
   deferredOnly?: boolean;
+  /** Shared lease window for deferred-only apply; 0 disables it in tests. */
+  leaseWindowMs?: number;
   limit?: number;
   cutoff?: string;
   now?: number;
@@ -188,6 +216,12 @@ export async function reconcileClassificationResolutionGaps(
   const loadChannel = options.channelRowToRecord || channelRowToRecord;
   const dryRun = options.dryRun !== false;
   const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
+  if (!dryRun && options.deferredOnly) {
+    const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs);
+    if (!leased) {
+      return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: 0, failures: 0, items: [] };
+    }
+  }
   const limit = Math.min(200, Math.max(1, options.limit || 50));
   const result = await db.query(
     `SELECT c.channel_id,c.channel_name,c.trading_status,c.scan_status,c.last_checked,
@@ -222,7 +256,7 @@ export async function reconcileClassificationResolutionGaps(
        ) latest ON true
       WHERE c.trading_status='UNCERTAIN'
         AND c.scan_status IN('ENRICHMENT_PENDING','FAILED','INTAKE_DEFERRED','PROVIDER_DEFERRED')
-        AND ($5::boolean OR c.scan_status IN('INTAKE_DEFERRED','PROVIDER_DEFERRED'))
+        AND (NOT $5::boolean OR c.scan_status IN('INTAKE_DEFERRED','PROVIDER_DEFERRED'))
         AND ($1::boolean OR COALESCE(c.last_checked,c.created_at) >= $2::timestamptz)
         AND COALESCE(c.country_status,'') <> 'REJECTED'
         AND NOT EXISTS(
@@ -301,7 +335,7 @@ export async function reconcileClassificationResolutionGaps(
         continue;
       }
       if (decision.action === 'PROJECT_PERMANENT_FAILURE') {
-        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING') AND date_trunc('milliseconds', last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds', $2::timestamptz) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
+        const projected = await db.query(`UPDATE channels SET scan_status='FAILED_PERMANENT',updated_at=now() WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status IN('FAILED','ENRICHMENT_PENDING','INTAKE_DEFERRED','PROVIDER_DEFERRED') AND date_trunc('milliseconds', last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds', $2::timestamptz) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.payload->>'channelId'=$1 AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION') AND j.status IN('PENDING','PROCESSING'))`, [item.channelId, item.lastChecked]);
         if (projected.rowCount) permanentFailures += 1;
         else skipped += 1;
         continue;
@@ -320,19 +354,6 @@ export async function reconcileClassificationResolutionGaps(
         }
         continue;
       }
-      if (item.scanStatus === 'INTAKE_DEFERRED' || item.scanStatus === 'PROVIDER_DEFERRED') {
-        // The enrichment worker refuses INTAKE_DEFERRED rows. Reopen the exact
-        // observed row atomically; a concurrent write means another owner has
-        // already changed the state.
-        const reopened = await db.query(
-          `UPDATE channels SET scan_status='ENRICHMENT_PENDING',updated_at=now()
-            WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status=$2
-              AND date_trunc('milliseconds',last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds',$3::timestamptz)
-            RETURNING channel_id`,
-          [item.channelId, item.scanStatus, item.lastChecked],
-        );
-        if (!reopened.rowCount) { skipped += 1; continue; }
-      }
       const channel = await loadChannel(db, item.channelId);
       if (!channel) { skipped += 1; continue; }
       const cycle = item.recoveryCycles + 1;
@@ -340,6 +361,30 @@ export async function reconcileClassificationResolutionGaps(
       const client = await db.connect();
       try {
         await client.query('BEGIN');
+        if (item.scanStatus === 'INTAKE_DEFERRED' || item.scanStatus === 'PROVIDER_DEFERRED') {
+          // The enrichment worker refuses deferred rows. Reopen the exact
+          // observed row inside the enqueue transaction, with an ownership
+          // guard, so any enqueue/ledger failure rolls the reopen back too.
+          const reopened = await client.query(
+            `UPDATE channels SET scan_status='ENRICHMENT_PENDING',updated_at=now()
+              WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status=$2
+                AND date_trunc('milliseconds',last_checked) IS NOT DISTINCT FROM date_trunc('milliseconds',$3::timestamptz)
+                AND NOT EXISTS(
+                  SELECT 1 FROM jobs j
+                   WHERE j.payload->>'channelId'=$1
+                     AND j.type IN('ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','PROCESS_DISCOVERED_CHANNEL','POST_APPROVAL_ENRICH','FORCE_REVIEW_RESCAN','RETRY_COMMUNITY_ACQUISITION')
+                     AND j.status IN('PENDING','PROCESSING')
+                )
+              RETURNING channel_id`,
+            [item.channelId, item.scanStatus, item.lastChecked],
+          );
+          if (!reopened.rowCount) {
+            await client.query('ROLLBACK');
+            skipped += 1;
+            continue;
+          }
+          channel.scan_status = 'ENRICHMENT_PENDING';
+        }
         accepted = await enqueueRecovery(channel, decision.reasonCodes, client);
         if (accepted) {
           await client.query(
@@ -354,8 +399,12 @@ export async function reconcileClassificationResolutionGaps(
               CLASSIFICATION_RESOLUTION_RECOVERY_POLICY_VERSION,
             ],
           );
+          await client.query('COMMIT');
+        } else {
+          // Roll back the reopen; a blocked enqueue must leave the channel in
+          // the state the bounded sweep selected, not ownerless PENDING work.
+          await client.query('ROLLBACK');
         }
-        await client.query('COMMIT');
       } catch (error) {
         await client.query('ROLLBACK').catch(() => undefined);
         throw error;
@@ -371,16 +420,6 @@ export async function reconcileClassificationResolutionGaps(
         });
         if (review.materialized) exhaustedReviews += 1;
         else {
-          if (item.scanStatus === 'INTAKE_DEFERRED' || item.scanStatus === 'PROVIDER_DEFERRED') {
-            // The reopen was only a precondition for the enqueue. If no job
-            // and no review now owns the row, restore the exact deferred state
-            // so the next bounded sweep can retry it.
-            await db.query(
-              `UPDATE channels SET scan_status=$2,updated_at=now()
-                WHERE channel_id=$1 AND trading_status='UNCERTAIN' AND scan_status='ENRICHMENT_PENDING'`,
-              [item.channelId, item.scanStatus],
-            );
-          }
           skipped += 1;
           await recordClassificationResolutionBackoff(db, item, ['EXHAUSTED_REVIEW_NOT_MATERIALIZED', review.reason || 'UNKNOWN']);
         }
