@@ -55,6 +55,7 @@ import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNati
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, isQuotaFreeSearchProviderRow, quotaFreeSearchProviderRows, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
+import { schedulingErrorDiagnostics } from './discoverySchedulingDiagnostics';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { COMPLETED_JOB_FINALIZATION_GRACE_MINUTES, decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 import { createBriefCache } from './briefCache';
@@ -4393,13 +4394,15 @@ export async function scheduleAutonomousQueryRuns(
   const flushDiagnostic = (patch: DiscoveryCandidateDiagnosticPatch = {}) => diagnosticContext?.onDiagnostic({ ...candidateDiagnostic, ...patch });
   const failStep = async (operation: string, error: unknown): Promise<never> => {
     const sanitized = sanitizeSchedulingError(error);
-    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: operation, sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+    const details = schedulingErrorDiagnostics(error);
+    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: operation, sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
     throw error;
   };
   try {
     await client.query('BEGIN');
     for (const candidate of candidates) {
       candidateDiagnostic = {};
+      if (candidate.frontierDecisionId) setDiagnostic({ frontierDecisionId: candidate.frontierDecisionId });
       activeOperation = 'provider_lineage_lookup';
       let allocatedProvider=providerSnapshot(candidate.provider||YOUTUBE_SEARCH_PROVIDER);
       if (!candidate.provider && !candidate.frontierDecisionId) {
@@ -4539,6 +4542,14 @@ export async function scheduleAutonomousQueryRuns(
         : requestedOrdering === 'DATE' || requestedOrdering === 'RELEVANCE'
           ? requestedOrdering as SearchOrdering
           : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+
+      setDiagnostic({
+        lineageBound: Boolean(allocatedDimensions),
+        allocatedLane: allocatedDimensions?.retrievalLane,
+        allocatedOrdering: allocatedDimensions?.searchOrdering,
+        controlLane: controlRetrievalLane,
+        controlOrdering: controlSearchOrdering,
+      });
 
       const controlConfig = buildRetrievalConfiguration({
         searchOrdering: controlSearchOrdering,
@@ -4986,7 +4997,8 @@ export async function scheduleAutonomousQueryRuns(
     return scheduled;
   } catch (error) {
     const sanitized = sanitizeSchedulingError(error);
-    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: activeOperation, sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+    const details = schedulingErrorDiagnostics(error);
+    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: activeOperation, sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
     await client.query('ROLLBACK');
     throw error;
   } finally {

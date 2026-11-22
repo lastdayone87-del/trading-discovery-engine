@@ -49,6 +49,7 @@ import { materializeAdaptiveDiscoveryPilotProposals } from './adaptiveDiscoveryP
 import { materializeStoredExternalOsintProposals } from './externalOsint';
 import { randomUUID } from 'node:crypto';
 import { createDiscoveryCycleDiagnostics, recordDiscoveryCandidateDiagnostic, sanitizeSchedulingError, type DiscoveryCandidateDiagnostic, type DiscoveryCandidateDiagnosticPatch, type DiscoveryCycleDiagnostics } from './discoveryTelemetry';
+import { schedulingErrorDiagnostics } from './discoverySchedulingDiagnostics';
 
 export type DiscoveryScopeMode = 'GLOBAL' | 'SELECTED_COUNTRIES';
 
@@ -936,7 +937,20 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           frontierAllocationInfo.authorized = false;
         }
         const sanitized = sanitizeSchedulingError(error);
-        recordCandidateDiagnostic({ ...candidateDiagnostic, schedulingOutcome: 'FAILED', schedulingOperation: 'scheduling_transaction', sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+        const details = schedulingErrorDiagnostics(error);
+        console.warn('[Autonomous Producer] Candidate scheduling failed:', JSON.stringify({
+          cycleId,
+          legacyCountry,
+          attempt: attempts,
+          queryId: selected.queryRecord?.id,
+          frontierDecisionId: frontierAllocationInfo?.decision?.decisionId,
+          errorClass: sanitized.errorClass,
+          reasonCode: sanitized.reasonCode,
+          errorCode: details.errorCode,
+          errorMessageCode: details.errorMessageCode,
+          errorMessage: details.logMessage,
+        }));
+        recordCandidateDiagnostic({ ...candidateDiagnostic, schedulingOutcome: 'FAILED', schedulingOperation: 'scheduling_transaction', sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
         return [];
       });
 

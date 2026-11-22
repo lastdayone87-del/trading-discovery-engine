@@ -6,6 +6,7 @@ import {
   sanitizeSchedulingError,
   type DiscoveryCandidateDiagnostic
 } from './discoveryTelemetry';
+import { schedulingErrorDiagnostics } from './discoverySchedulingDiagnostics';
 
 function candidate(overrides: Partial<DiscoveryCandidateDiagnostic> = {}): DiscoveryCandidateDiagnostic {
   return {
@@ -50,6 +51,24 @@ test('sanitized scheduling errors map only to stable reason classes and never re
     assert.equal(sanitized.reasonCode, expected);
     assert.doesNotMatch(JSON.stringify(sanitized), /super-secret-token|buy EURUSD|query text/i);
   }
+});
+
+test('scheduler error diagnostics preserve structural detail while redacting credentials', () => {
+  const error = Object.assign(
+    new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD key=abc123 Bearer super-secret-token'),
+    { code: '23505' },
+  );
+  const details = schedulingErrorDiagnostics(error);
+  assert.equal(details.errorCode, '23505');
+  assert.equal(details.errorMessageCode, 'PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+  assert.match(details.logMessage || '', /PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD/);
+  assert.doesNotMatch(details.logMessage || '', /abc123|super-secret-token/);
+});
+
+test('scheduler error diagnostics bound long messages', () => {
+  const details = schedulingErrorDiagnostics(new Error(`FAILED ${'x'.repeat(2000)}`));
+  assert.equal(details.logMessage?.length, 400);
+  assert.equal(details.errorMessageCode, 'FAILED');
 });
 
 test('provider-registry, reservation, authority, and phase8 reason codes remain distinct', () => {
