@@ -83,8 +83,16 @@ test('scheduler error diagnostics mask Authorization bearer pairs as a unit', ()
   const details = schedulingErrorDiagnostics(new Error(
     'request failed Authorization: Bearer super-secret-token',
   ));
-  assert.doesNotMatch(details.logMessage || '', /super-secret-token/);
-  assert.match(details.logMessage || '', /Authorization:\s+(Bearer\s+)?\*\*\*|\[REDACTED\]/);
+  assert.equal(details.logMessage, 'request failed Authorization: [REDACTED] ***');
+});
+
+test('scheduler error diagnostics mask GitHub and AWS token formats', () => {
+  const details = schedulingErrorDiagnostics(new Error(
+    'failed ghp_abcdefghijklmnopqrstuvwxyz123456 AKIAABCDEFGHIJKLMNOP',
+  ));
+  assert.doesNotMatch(details.logMessage || '', /ghp_|AKIAABCDEFGHIJKLMNOP/);
+  assert.match(details.logMessage || '', /\[REDACTED_TOKEN\]/);
+  assert.match(details.logMessage || '', /\[REDACTED_AWS_KEY\]/);
 });
 
 test('scheduler error diagnostics do not promote arbitrary leading words', () => {

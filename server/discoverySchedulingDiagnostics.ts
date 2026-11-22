@@ -2,6 +2,8 @@ import { redactCauseSnippet } from './crawlerTelemetry';
 
 const SCHEDULING_ERROR_MESSAGE_LIMIT = 400;
 const GOOGLE_API_KEY = /AIza[0-9A-Za-z_-]{10,}/g;
+const GITHUB_TOKEN = /\bgh[pousr]_[A-Za-z0-9]{16,}\b/g;
+const AWS_ACCESS_KEY = /\bAKIA[0-9A-Z]{16}\b/g;
 const CREDENTIAL_ASSIGNMENT = /((?:^|[\s"'?&;])(?:key|token|secret|password|authorization|bearer)\s*[=:]\s*)[^&\s,;}]+/gi;
 const STRUCTURAL_MESSAGE_CODE = /^[A-Z][A-Z0-9_]{2,}$/;
 
@@ -35,7 +37,10 @@ export function schedulingErrorDiagnostics(error: unknown): SchedulingErrorDiagn
   // the shared helper does not recognize. Reversing this order leaves the
   // token after "Authorization: Bearer" exposed.
   const sharedRedacted = redactCauseSnippet(
-    rawMessage.replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]'),
+    rawMessage
+      .replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]')
+      .replace(GITHUB_TOKEN, '[REDACTED_TOKEN]')
+      .replace(AWS_ACCESS_KEY, '[REDACTED_AWS_KEY]'),
     SCHEDULING_ERROR_MESSAGE_LIMIT,
   );
   const redacted = sharedRedacted
