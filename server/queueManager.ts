@@ -3224,6 +3224,12 @@ export async function processNextSearchJob(
           quarantineQueryId,
           inputKind,
           String((err as { inputValue?: unknown }).inputValue || ''),
+          undefined,
+          {
+            provider: String((err as { provider?: unknown }).provider || 'youtube'),
+            operation: String((err as { operation?: unknown }).operation || ''),
+            signature: String((err as { signature?: unknown }).signature || ''),
+          },
         ).catch(error => {
           console.warn('[YouTubeQuarantine] Failed to cool the query:', error instanceof Error ? error.message : String(error));
         });

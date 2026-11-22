@@ -482,6 +482,8 @@ export class YouTubeQuarantinedInputError extends Error {
     readonly inputKind: YouTubeQuarantineInputKind,
     readonly inputValue: string,
     readonly operation: string,
+    readonly provider: string = 'youtube',
+    readonly signature: string = '',
   ) {
     super(`YouTube ${operation} withheld: ${inputKind} is quarantined after repeated invalid-input responses.`);
     this.name = 'YouTubeQuarantinedInputError';
@@ -510,7 +512,7 @@ export async function throwIfYouTubeInputQuarantined(
   });
   if (!value || !signature) return;
   if (await isYouTubeInputQuarantined(provider, kind, value, operation, signature)) {
-    throw new YouTubeQuarantinedInputError(kind, value, operation);
+    throw new YouTubeQuarantinedInputError(kind, value, operation, provider, signature);
   }
 }
 
@@ -2086,8 +2088,6 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   const checkedAt = new Date().toISOString();
   const keys = getYouTubeKeyPool();
   if (!keys.length) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
-  let acquisition; try { acquisition=youtubePoolBackoff.beginAcquisition(); }
-  catch { return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt }; }
   // A quarantined channel degrades to the fallback. Ordinary provider
   // failures also degrade to the fallback; probe quota refusals below are
   // policy signals and propagate to the caller's normal failure lifecycle.
@@ -2101,6 +2101,8 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   } catch (error) {
     if (isYouTubeQuarantinedInput(error)) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   }
+  let acquisition; try { acquisition=youtubePoolBackoff.beginAcquisition(); }
+  catch { return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt }; }
   let quotaExceededCount = 0;
   try {
     // The keyless public About source is a valid fallback for this optional
