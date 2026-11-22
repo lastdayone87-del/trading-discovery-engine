@@ -34,7 +34,7 @@ import { acquisitionJobClockV2Enabled, claimOrderByClause, isCapacityLeaseFailur
 import { STALE_CHANNEL_LOCK_AFTER_MINUTES, STALE_CHANNEL_LOCK_RECOVERY_BATCH_SIZE } from './staleChannelLockRecovery';
 import { assertMinimalPayload, compareMetrics, replayFunnel, REPLAY_FEATURE_VERSION, REPLAY_POLICY_VERSION, type FunnelMetrics, type OutcomeEventType, type VerificationStatus } from './replayMeasurement';
 import { mapQueryRunToNeighborhood, createNeighborhoodKey, type DiscoveryNeighborhoodDimensions } from './discoveryNeighborhood';
-import { laneAgnosticGeneratedLineage, lineageBaseDimensionsMatch, lineageBoundDimensions } from './frontierLineage';
+import { laneAgnosticGeneratedLineage, lineageBaseDimensionsMatch, lineageBoundDimensions, shouldConsumeFrontierProposal } from './frontierLineage';
 import { deriveNeighborhoodObservationMetrics } from './neighborhoodAnalytics';
 import { buildRetrievalConfiguration } from './retrievalConfiguration';
 import { evaluateShadowRetrievalRecommendation } from './retrievalPolicyShadow';
@@ -4905,13 +4905,16 @@ export async function scheduleAutonomousQueryRuns(
              AND allocation_origin = 'FRONTIER_CANARY'
              AND decision_status = 'RESERVED'
              AND (query_run_id IS NULL OR query_run_id = $2::uuid)
-           RETURNING id`,
+           RETURNING id, proposal_id`,
           [candidate.frontierDecisionId, runId]
         );
         if (!commitRes.rowCount) {
           throw new Error(`FRONTIER_ALLOCATION_COMMIT_FAILED: Decision ${candidate.frontierDecisionId} is not an active RESERVED canary decision.`);
         }
-        if (nativeLineage.targetNeighborhoodKey) {
+        if (shouldConsumeFrontierProposal({
+          hasNeighborhoodLineage: Boolean(nativeLineage.targetNeighborhoodKey),
+          proposalId: commitRes.rows[0]?.proposal_id,
+        })) {
           const consumed = await client.query(
             `UPDATE frontier_discovery_proposals p SET trial_status='TRIED'
              FROM frontier_allocation_decisions d

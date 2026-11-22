@@ -25,6 +25,20 @@ export function lineageBoundDimensions(
   return targetDimensions;
 }
 
+/**
+ * A materialized-generated query carries neighborhood lineage but no governed
+ * frontier proposal (its allocation row has `proposal_id = NULL`). Consuming a
+ * proposal is only meaningful when the committed decision actually references
+ * one; otherwise there is no row to transition to TRIED and the scheduler must
+ * not fail the run.
+ */
+export function shouldConsumeFrontierProposal(input: {
+  hasNeighborhoodLineage: boolean;
+  proposalId?: string | null;
+}): boolean {
+  return input.hasNeighborhoodLineage && Boolean(input.proposalId);
+}
+
 
 /**
  * A preserved library row that carries frontier-only neighborhood lineage
