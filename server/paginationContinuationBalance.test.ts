@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
 const pageStore = readFileSync(new URL('./autonomousPageStore.ts', import.meta.url), 'utf8');
 const provider = readFileSync(new URL('./youtubeInnertubeProvider.ts', import.meta.url), 'utf8');
-const migration = readFileSync(new URL('./db/migrations/204_pagination_continuation_balance.sql', import.meta.url), 'utf8');
+const migration = readFileSync(new URL('./db/migrations/205_pagination_continuation_balance.sql', import.meta.url), 'utf8');
 const arms = readFileSync(new URL('./queryDiscoveryArms.ts', import.meta.url), 'utf8');
 
 test('InnerTube has no provider page cap and real continuation survives the safety ceiling', () => {

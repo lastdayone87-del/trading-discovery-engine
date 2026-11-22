@@ -22,8 +22,8 @@ override it; the `core_kill_switches` health check reports a `WARN` naming the d
 conflict explicitly (either accept the intentional kill switch or re-enable it) as part of deployment.
 
 `autonomous_pagination_max_pages` is the single run-level safety ceiling and is `50` after migration
-`204_pagination_continuation_balance.sql`. The production deployment inspected for this change still had
-the migration-096 seeded `10`; migration 204 raises that exact value to the approved `50`. The schema has no
+`205_pagination_continuation_balance.sql`. The production deployment inspected for this change still had
+the migration-096 seeded `10`; migration 205 raises that exact value to the approved `50`. The schema has no
 provenance column, so a deliberate operator `10` cannot be distinguished; an operator who intentionally
 wants `10` must reapply it after deploy. Any existing value other than `10` is untouched. At the ceiling, a
 real continuation becomes a linked child segment rather than a `PROVIDER_EXHAUSTED` stop. InnerTube
