@@ -7,6 +7,7 @@ import { normalizeSemanticJudgment } from './policy';
 import { admissionEvidenceExpired, isPreCatalogProviderDeferredDecision, nextAdmissionEvidenceAttempt, parseAdmissionReviewAction } from './index';
 import { classificationStageForCandidate } from '../youtube';
 import { admissionShortcutEligible } from '../ingestionPipeline';
+import { hasAiLedTradingConfirmation } from '../evidenceEngine/decisionPolicy';
 
 const pipeline = readFileSync(new URL('../ingestionPipeline.ts', import.meta.url), 'utf8');
 const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
@@ -268,6 +269,127 @@ test('confirmed semantic admission without provider metadata stays confirmed', (
   assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
   assert.equal(built.decision.evidenceCollection.providers[0]?.provider, 'admission_decision');
   assert.ok(built.decision.positiveEvidence.some(item => item.source === 'admission_decision'));
+});
+
+test('legacy semantic probability boundary normalizes to 100 for a confirmed admission', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Legacy Probability Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-legacy-probability',
+      channelName: 'Legacy Probability Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-legacy-probability',
+      description: '',
+      videoTitles: ['Gold analysis'],
+      admissionDecisionId: 'decision-legacy-probability',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 1,
+      admissionCitations: [
+        { field: 'bio', quote: 'market sentiment and options strategies', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.confidenceScore, 100);
+  assert.equal(built.decision.deterministicRouting?.humanReview, false);
+  assert.equal(built.decision.positiveEvidence[0]?.provenance?.fields?.[0]?.field, 'channel_bio');
+});
+
+test('finance-adjacent admission citations do not become AI-led trading evidence', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Finance Adjacent', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-finance-adjacent',
+      channelName: 'Finance Adjacent',
+      youtubeUrl: 'https://youtube.com/channel/UC-finance-adjacent',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-finance-adjacent',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionProvider: 'gemini_semantic',
+      admissionCitations: [
+        { field: 'bio', quote: 'personal finance and investing', supports: 'FINANCE_ADJACENT' },
+      ],
+    },
+  );
+  assert.equal(built.decision.positiveEvidence[0]?.provenance?.semantic?.taxonomyLabel, 'FINANCE_ADJACENT');
+  assert.equal(hasAiLedTradingConfirmation(built.decision.positiveEvidence), false);
+});
+
+test('admission evidence with a real provider exposes the AI-led trading label', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Provider Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-provider-trader',
+      channelName: 'Provider Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-provider-trader',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-provider-trader',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionProvider: 'gemini_semantic',
+      admissionCitations: [
+        { field: 'bio', quote: 'price action and risk management', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.decision.positiveEvidence[0]?.provenance?.semantic?.taxonomyLabel, 'ACTIVE_TRADING');
+  assert.equal(hasAiLedTradingConfirmation(built.decision.positiveEvidence), true);
+});
+
+test('legacy probability normalization does not fire without a usable trading citation', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Title Only Legacy', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-legacy-title-only',
+      channelName: 'Title Only Legacy',
+      youtubeUrl: 'https://youtube.com/channel/UC-legacy-title-only',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-legacy-title-only',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 1,
+      admissionCitations: [
+        { field: 'channel_name', quote: 'Title Only Legacy', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.confidenceScore, 1);
+});
+
+test('a genuinely low confirmed semantic admission remains reviewable', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Low Focus Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-low-focus',
+      channelName: 'Low Focus Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-low-focus',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-low-focus',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 5,
+      admissionCitations: [
+        { field: 'bio', quote: 'some trading content', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.confidenceScore, 5);
+  assert.equal(built.decision.deterministicRouting?.humanReview, true);
 });
 
 test('production-shaped semantic admission with bio citations survives missing provider', () => {

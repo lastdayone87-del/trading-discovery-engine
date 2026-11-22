@@ -8,7 +8,7 @@ import {
 } from './operationalMaintenanceScheduler';
 import { STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS } from './staleChannelLockRecovery';
 
-const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'novelty', 'phaseb', 'resume', 'classification'];
+const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'novelty', 'supersede', 'phaseb', 'resume', 'classification'];
 
 function createDeps(failAt?: string) {
   const calls: string[] = [];
@@ -26,6 +26,7 @@ function createDeps(failAt?: string) {
     reconcileOperationalEnrichmentRecovery: make('enrichment'),
     reconcileClassificationResolutionGaps: make('resolution'),
     reconcileQueryArmOutcomes: make('novelty'),
+    supersedeConfirmedReviewDebt: make('supersede'),
     triggerPhaseBObservationReconciliation: make('phaseb'),
     resumeOrphanedAutonomousPages: make('resume'),
     reconcileStaleClassificationSightings: make('classification')
@@ -93,6 +94,27 @@ test('query arm reconciliation is throttled by the scheduler clock', async () =>
   clock += 30_000;
   await scheduler.run();
   assert.equal(noveltyCalls(), 2, 'the sweep runs once the interval elapses');
+});
+
+test('confirmed review debt cleanup is throttled by the scheduler clock', async () => {
+  const { calls, dependencies } = createDeps();
+  let clock = 1_000_000;
+  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
+    now: () => clock,
+    confirmedReviewDebtSweepIntervalMs: 60_000,
+  });
+  const sweeps = () => calls.filter(call => call === 'supersede').length;
+
+  await scheduler.run();
+  assert.equal(sweeps(), 1, 'the first tick retires stale confirmed review rows');
+
+  clock += 30_000;
+  await scheduler.run();
+  assert.equal(sweeps(), 1, 'a tick inside the interval does not sweep');
+
+  clock += 30_000;
+  await scheduler.run();
+  assert.equal(sweeps(), 2, 'the sweep runs once the interval elapses');
 });
 
 test('query arm reconciliation is optional and its failure is isolated', async () => {

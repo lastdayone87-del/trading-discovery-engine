@@ -1,7 +1,56 @@
-import type { EvidenceItem, RawChannelInput, VerificationDecision } from '../evidenceEngine';
+import type { EvidenceFieldType, EvidenceItem, RawChannelInput, VerificationDecision } from '../evidenceEngine';
 import type { TradingClassificationResult } from '../../src/types';
 import type { DiscoveredChannelRaw } from '../youtube';
 import { ADMISSION_CONFIRMATION_MIN_CONFIDENCE, normalizeTradingFocus } from './confidence';
+
+/**
+ * Map admission citation labels to the canonical creator-owned field names
+ * used by the decision policy. Admission citations use the model-facing
+ * `bio`/`link` labels; classification evidence uses `channel_bio` and
+ * `external_link_domain`.
+ */
+function admissionCitationField(field: string): EvidenceFieldType | null {
+  const normalized = String(field || '').trim().toLowerCase();
+  const mapping: Record<string, EvidenceFieldType> = {
+    bio: 'channel_bio',
+    channel_bio: 'channel_bio',
+    channel_name: 'channel_title',
+    channel_title: 'channel_title',
+    link: 'external_link_domain',
+    external_link: 'external_link_domain',
+    external_link_label: 'external_link_label',
+    external_link_domain: 'external_link_domain',
+    video_title: 'video_title',
+    video_description: 'video_description',
+    playlist_name: 'playlist_name',
+    playlist_description: 'playlist_description',
+    transcript_excerpt: 'transcript_excerpt',
+    visual_evidence: 'visual_evidence',
+    discord_invite: 'discord_invite',
+    pinned_comment: 'pinned_comment',
+  };
+  return mapping[normalized] || null;
+}
+
+/**
+ * Legacy semantic judges returned `trading_focus` on a 0–1 probability scale.
+ * The generic normalizer treats an exact `1` as 1% because it cannot know the
+ * scale. An already-confirmed semantic admission with citations is different:
+ * `1` is the probability upper bound, so it is the 100% confirmation the
+ * admission already recorded. This compatibility rule is intentionally scoped
+ * to confirmed semantic admissions; generic 1% values and low-confidence
+ * admissions remain reviewable.
+ */
+function confirmedAdmissionConfidence(candidate: DiscoveredChannelRaw, hasUsableTradingCitation: boolean): number {
+  const raw = Number(candidate.admissionTradingConfidence);
+  if (candidate.admissionConfirmedTrading === true
+    && candidate.admissionDecisionSource === 'SEMANTIC'
+    && raw === 1
+    && hasUsableTradingCitation) {
+    return 100;
+  }
+  return normalizeAdmissionTradingConfidence(candidate.admissionTradingConfidence);
+}
 
 /**
  * Legacy admission rows can still carry a 0–1 semantic confidence. Confirmed
@@ -24,7 +73,6 @@ export function buildAdmissionConfirmedClassification(
   input: RawChannelInput,
   candidate: DiscoveredChannelRaw,
 ): { result: TradingClassificationResult; decision: VerificationDecision; input: RawChannelInput } {
-  const confidence = normalizeAdmissionTradingConfidence(candidate.admissionTradingConfidence);
   const category = candidate.admissionCategory || 'General Trading';
   const citations = (candidate.admissionCitations || []).filter(citation =>
     citation.supports === 'TRADING' || citation.supports === 'FINANCE_ADJACENT');
@@ -59,43 +107,48 @@ export function buildAdmissionConfirmedClassification(
     creatorOwnedCitationFields.has(String(citation.field || '').trim().toLowerCase()));
   const usableCitations = nonSemantic ? citations : semanticCreatorCitations;
   const hasTradingCitation = usableCitations.some(citation => citation.supports === 'TRADING');
+  const confidence = confirmedAdmissionConfidence(candidate, hasTradingCitation);
   const evidenceProvider = nonSemantic
     ? 'channel_metadata' as const
     : (candidate.admissionProvider || (admissionConfirmed && usableCitations.length > 0 ? 'admission_decision' as const : undefined));
   const timestamp = new Date().toISOString();
-  const positiveEvidence: EvidenceItem[] = evidenceProvider ? usableCitations.map((citation, index) => ({
-    id: `${human ? 'human-review' : deterministic ? 'deterministic' : 'semantic'}-admission-${index + 1}`,
-    source: evidenceProvider,
-    polarity: 'POSITIVE',
-    category: 'METHODOLOGY_CONCEPT',
-    fact: `${human ? 'Human review admission' : deterministic ? 'Deterministic admission' : 'Semantic admission'} citation: ${citation.quote}`,
-    rawMatches: [citation.quote],
-    confidence,
-    reliability: 'HIGH',
-    reliabilityMultiplier: 1,
-    rawWeight: 1,
-    finalWeight: confidence / 100,
-    provenance: {
-      provider: evidenceProvider,
-      type: human ? 'human_review_admission_citation' : deterministic ? 'deterministic_admission_citation' : 'semantic_admission_citation',
-      matchedTerm: citation.quote,
-      sourceRef: `${citation.field}${citation.index == null ? '' : `:${citation.index}`}`,
-      ...(nonSemantic ? {} : {
-        semantic: {
-          modelVersion: candidate.admissionModel || 'semantic-admission-v1',
-          promptVersion: 'semantic-admission-v1',
-          featureVersion: 'semantic-admission-v1',
-          calibrationVersion: 'semantic-admission-v1',
-          taxonomyLabel: 'TRADING',
-          rawConfidence: confidence,
-          calibratedConfidence: confidence,
-          detectedLanguages: [],
-          reasonCodes: ['SEMANTIC_ADMISSION'],
-        },
-      }),
-    },
-    timestamp,
-  })) : [];
+  const positiveEvidence: EvidenceItem[] = evidenceProvider ? usableCitations.map((citation, index) => {
+    const mappedField = admissionCitationField(citation.field);
+    return {
+      id: `${human ? 'human-review' : deterministic ? 'deterministic' : 'semantic'}-admission-${index + 1}`,
+      source: evidenceProvider,
+      polarity: 'POSITIVE',
+      category: 'METHODOLOGY_CONCEPT',
+      fact: `${human ? 'Human review admission' : deterministic ? 'Deterministic admission' : 'Semantic admission'} citation: ${citation.quote}`,
+      rawMatches: [citation.quote],
+      confidence,
+      reliability: 'HIGH',
+      reliabilityMultiplier: 1,
+      rawWeight: 1,
+      finalWeight: confidence / 100,
+      provenance: {
+        provider: evidenceProvider,
+        type: human ? 'human_review_admission_citation' : deterministic ? 'deterministic_admission_citation' : 'semantic_admission_citation',
+        matchedTerm: citation.quote,
+        sourceRef: `${citation.field}${citation.index == null ? '' : `:${citation.index}`}`,
+        ...(mappedField ? { fields: [{ field: mappedField, index: citation.index }] } : {}),
+        ...(nonSemantic ? {} : {
+          semantic: {
+            modelVersion: candidate.admissionModel || 'semantic-admission-v1',
+            promptVersion: 'semantic-admission-v1',
+            featureVersion: 'semantic-admission-v1',
+            calibrationVersion: 'semantic-admission-v1',
+            taxonomyLabel: citation.supports === 'TRADING' ? 'ACTIVE_TRADING' : 'FINANCE_ADJACENT',
+            rawConfidence: confidence,
+            calibratedConfidence: confidence,
+            detectedLanguages: [],
+            reasonCodes: ['SEMANTIC_ADMISSION'],
+          },
+        }),
+      },
+      timestamp,
+    };
+  }) : [];
   if (nonSemantic && admissionConfirmed && positiveEvidence.length === 0) {
     // Deterministic and human admissions are not AI confirmations. Their
     // durable decision is a first-class evidence source even when a legacy

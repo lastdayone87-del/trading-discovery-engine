@@ -17,6 +17,7 @@ import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbo
 import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
 import { runQuerySaturationSweep } from './querySaturationSweep';
 import { reconcileQueryArmOutcomes } from './queryDiscoveryArms';
+import { supersedeConfirmedReviewDebt } from './reviewStore';
 
 /**
  * Non-claim-critical maintenance cadence. Worker pools still tick every second
@@ -27,6 +28,7 @@ export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
 export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
 export const QUERY_SATURATION_SWEEP_INTERVAL_MS = 15 * 60_000;
 export const QUERY_ARM_RECONCILE_INTERVAL_MS = 5 * 60_000;
+export const CONFIRMED_REVIEW_DEBT_SWEEP_INTERVAL_MS = 15 * 60_000;
 
 /**
  * The resolution sweep mutates channel/job state. It stays read-only unless an
@@ -53,6 +55,8 @@ export interface OperationalMaintenanceDependencies {
   sweepQuerySaturation?(): Promise<unknown>;
   /** Refresh arm novelty contributions for runs whose classifications resolved later. */
   reconcileQueryArmOutcomes?(): Promise<unknown>;
+  /** Retire PENDING review rows whose channel is already TRADING_CONFIRMED. */
+  supersedeConfirmedReviewDebt?(): Promise<unknown>;
 }
 
 export interface OperationalMaintenanceSnapshot {
@@ -87,6 +91,8 @@ export interface OperationalMaintenanceSchedulerOptions {
   querySaturationSweepIntervalMs?: number;
   /** Interval for refreshing delayed query-arm contributions. */
   queryArmReconcileIntervalMs?: number;
+  /** Interval for retiring stale review rows on confirmed channels. */
+  confirmedReviewDebtSweepIntervalMs?: number;
   /** Warn when a single sweep remains in flight longer than this. */
   watchdogMs?: number;
   setWatchdog?: (callback: () => void, delayMs: number) => unknown;
@@ -105,6 +111,7 @@ export function createOperationalMaintenanceScheduler(
   const classificationResolutionSweepIntervalMs = options.classificationResolutionSweepIntervalMs ?? CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS;
   const querySaturationSweepIntervalMs = options.querySaturationSweepIntervalMs ?? QUERY_SATURATION_SWEEP_INTERVAL_MS;
   const queryArmReconcileIntervalMs = options.queryArmReconcileIntervalMs ?? QUERY_ARM_RECONCILE_INTERVAL_MS;
+  const confirmedReviewDebtSweepIntervalMs = options.confirmedReviewDebtSweepIntervalMs ?? CONFIRMED_REVIEW_DEBT_SWEEP_INTERVAL_MS;
   const classificationSightingSweepIntervalMs = options.classificationSightingSweepIntervalMs ?? 60_000;
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback: () => void, delayMs: number) => {
@@ -131,6 +138,7 @@ export function createOperationalMaintenanceScheduler(
   let lastClassificationResolutionSweepMs: number | null = null;
   let lastQuerySaturationSweepMs: number | null = null;
   let lastQueryArmReconcileMs: number | null = null;
+  let lastConfirmedReviewDebtSweepMs: number | null = null;
   let ticks = 0;
   let failures = 0;
   let lastTickAt: string | null = null;
@@ -237,6 +245,17 @@ export function createOperationalMaintenanceScheduler(
         || nowMs - lastQueryArmReconcileMs >= queryArmReconcileIntervalMs)) {
       lastQueryArmReconcileMs = nowMs;
       await isolate('query_arm_outcome_reconciliation', () => dependencies.reconcileQueryArmOutcomes!());
+    }
+    if (dependencies.supersedeConfirmedReviewDebt
+      && (lastConfirmedReviewDebtSweepMs === null
+        || nowMs - lastConfirmedReviewDebtSweepMs >= confirmedReviewDebtSweepIntervalMs)) {
+      lastConfirmedReviewDebtSweepMs = nowMs;
+      await isolate('confirmed_review_debt_supersede', async () => {
+        const superseded = Number(await dependencies.supersedeConfirmedReviewDebt!() || 0);
+        if (superseded > 0) {
+          console.info(`[Operational Maintenance] superseded ${superseded} pending review row(s) for confirmed channels.`);
+        }
+      });
     }
     await isolate('phase_b_observation_reconciliation', () => dependencies.triggerPhaseBObservationReconciliation());
     // The reconciler defaults its enqueue limit to the configured queue
@@ -381,7 +400,8 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       }
       return result;
     },
-    reconcileQueryArmOutcomes: () => reconcileQueryArmOutcomes(50)
+    reconcileQueryArmOutcomes: () => reconcileQueryArmOutcomes(50),
+    supersedeConfirmedReviewDebt: () => supersedeConfirmedReviewDebt(500),
   };
 }
 

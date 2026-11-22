@@ -129,3 +129,44 @@ export async function decideReview(input:DecideInput) {
     return {decision:inserted.rows[0],review:{state:updatedReview.rows[0].state,reviewVersion:updatedReview.rows[0].review_version},channel:{channelId:channel.channel_id,tradingStatus:channel.trading_status,scanStatus:channel.scan_status,discordStatus:channel.discord_status},queuePending:updatedReview.rows[0].state==='PENDING',idempotent:false};
   } catch(e){await client.query('ROLLBACK'); throw e;} finally {client.release();}
 }
+
+/**
+ * Retire review-queue debt for creators whose trading decision is already
+ * TRADING_CONFIRMED. The channel is authoritative; a stale PENDING review row
+ * must not keep a confirmed creator in the human queue or invite another
+ * classification loop. Review history is preserved: only the queue state and
+ * audit snapshot are updated.
+ */
+export async function supersedeConfirmedReviewDebt(
+  limit = 500,
+  runner?: { query: (text: string, params?: unknown[]) => Promise<{ rowCount?: number | null }> },
+): Promise<number> {
+  const db = runner || await getDb();
+  const bounded = Math.max(1, Math.min(2000, Math.trunc(Number(limit)) || 500));
+  const result = await db.query(
+    `WITH stale AS (
+       SELECT r.channel_id, r.review_version, r.updated_at
+         FROM channel_reviews r
+         JOIN channels c USING(channel_id)
+        WHERE r.state='PENDING' AND c.trading_status='TRADING_CONFIRMED'
+        ORDER BY r.pending_since ASC NULLS LAST, r.channel_id
+        LIMIT $1
+     )
+     UPDATE channel_reviews r
+        SET state='SUPERSEDED',
+            pending_since=NULL,
+            updated_at=now(),
+            evidence_snapshot=COALESCE(r.evidence_snapshot,'{}'::jsonb)
+              || jsonb_build_object('supersededBy','CONFIRMED_TRADING','supersededAt',now())
+       FROM stale s
+       JOIN channels c ON c.channel_id=s.channel_id
+      WHERE r.channel_id=s.channel_id
+        AND r.state='PENDING'
+        AND r.review_version=s.review_version
+        AND r.updated_at=s.updated_at
+        AND c.trading_status='TRADING_CONFIRMED'
+      RETURNING r.channel_id`,
+    [bounded],
+  );
+  return result.rowCount || 0;
+}
