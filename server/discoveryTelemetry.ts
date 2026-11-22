@@ -38,6 +38,19 @@ export interface DiscoveryCandidateDiagnostic {
   selectedQueryId?: number;
   queryRunId?: string;
   jobId?: string;
+  /** Frontier allocation under test; retained even when scheduling fails. */
+  frontierDecisionId?: string;
+  /** Dimensions the allocation requires; compare with the control pair below. */
+  allocatedLane?: string;
+  allocatedOrdering?: string;
+  /** Dimensions the scheduler actually chose for the control run. */
+  controlLane?: string;
+  controlOrdering?: string;
+  /** True when Phase 8/9 lineage fixes the lane/order for this candidate. */
+  lineageBound?: boolean;
+  /** Stable SQLSTATE/error code and structural message label, never request text. */
+  errorCode?: string;
+  errorMessageCode?: string;
   authorityOutcome?: 'ELIGIBLE' | 'REJECTED';
   authorityReasonCodes?: string[];
   provider?: DiscoveryProviderDiagnostic;

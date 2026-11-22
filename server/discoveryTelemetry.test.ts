@@ -6,6 +6,7 @@ import {
   sanitizeSchedulingError,
   type DiscoveryCandidateDiagnostic
 } from './discoveryTelemetry';
+import { schedulingErrorDiagnostics } from './discoverySchedulingDiagnostics';
 
 function candidate(overrides: Partial<DiscoveryCandidateDiagnostic> = {}): DiscoveryCandidateDiagnostic {
   return {
@@ -50,6 +51,55 @@ test('sanitized scheduling errors map only to stable reason classes and never re
     assert.equal(sanitized.reasonCode, expected);
     assert.doesNotMatch(JSON.stringify(sanitized), /super-secret-token|buy EURUSD|query text/i);
   }
+});
+
+test('scheduler error diagnostics preserve structural detail while redacting credentials', () => {
+  const error = Object.assign(
+    new Error('PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD key=abc123 Bearer super-secret-token'),
+    { code: '23505' },
+  );
+  const details = schedulingErrorDiagnostics(error);
+  assert.equal(details.errorCode, '23505');
+  assert.equal(details.errorMessageCode, 'PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD');
+  assert.match(details.logMessage || '', /PHASE9_TREATMENT_CHANGED_PHASE8_NEIGHBORHOOD/);
+  assert.doesNotMatch(details.logMessage || '', /abc123|super-secret-token/);
+});
+
+test('scheduler error diagnostics bound long messages', () => {
+  const details = schedulingErrorDiagnostics(new Error(`FAILED ${'x'.repeat(2000)}`));
+  assert.equal(details.logMessage?.length, 400);
+  assert.equal(details.errorMessageCode, 'FAILED');
+});
+
+test('scheduler error diagnostics redact URL credentials and quoted options', () => {
+  const details = schedulingErrorDiagnostics(new Error(
+    'scheduler failed https://user:s3cret@proxy:8080 {"password":"hunter2","headless":true} token:abc123 authorization:def456',
+  ));
+  assert.doesNotMatch(details.logMessage || '', /s3cret|hunter2|abc123|def456/);
+  assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');
+});
+
+test('scheduler error diagnostics mask Authorization bearer pairs as a unit', () => {
+  const details = schedulingErrorDiagnostics(new Error(
+    'request failed Authorization: Bearer super-secret-token',
+  ));
+  assert.equal(details.logMessage, 'request failed Authorization: [REDACTED] ***');
+});
+
+test('scheduler error diagnostics mask GitHub and AWS token formats', () => {
+  const details = schedulingErrorDiagnostics(new Error(
+    'failed ghp_abcdefghijklmnopqrstuvwxyz123456 AKIAABCDEFGHIJKLMNOP',
+  ));
+  assert.doesNotMatch(details.logMessage || '', /ghp_|AKIAABCDEFGHIJKLMNOP/);
+  assert.match(details.logMessage || '', /\[REDACTED_TOKEN\]/);
+  assert.match(details.logMessage || '', /\[REDACTED_AWS_KEY\]/);
+});
+
+test('scheduler error diagnostics do not promote arbitrary leading words', () => {
+  const details = schedulingErrorDiagnostics(new Error('failed to schedule candidate'));
+  assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');
+  const credentialLike = schedulingErrorDiagnostics(new Error('ghp_abcdefghijklmnop failed'));
+  assert.equal(credentialLike.errorMessageCode, 'UNSTRUCTURED_ERROR');
 });
 
 test('provider-registry, reservation, authority, and phase8 reason codes remain distinct', () => {

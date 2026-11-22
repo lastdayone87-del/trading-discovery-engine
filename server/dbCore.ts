@@ -55,6 +55,7 @@ import type { NativeEvidenceStatus, SourceProvenanceFamily } from './countryNati
 import { YOUTUBE_SEARCH_PROVIDER, providerSnapshot, providerSnapshotFromRegistryRow, isShadowBraveCanaryAllowed, isQuotaFreeSearchProviderRow, quotaFreeSearchProviderRows, rotateActiveProviderRow, applyDateOrderingProviderGuard, ledgerProviderToRegistryKey, providerCooldownObservationWindowSecs, type ProviderAllocation } from './providerAwareRetrieval';
 import { fingerprintYouTubeKey, projectYouTubeQuotaUsage } from './youtubeQuotaAttribution';
 import { sanitizeSchedulingError, type DiscoveryCandidateDiagnosticPatch } from './discoveryTelemetry';
+import { schedulingErrorDiagnostics } from './discoverySchedulingDiagnostics';
 import { classifyProviderCapacityFailure, classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { COMPLETED_JOB_FINALIZATION_GRACE_MINUTES, decideQueryRunJobLifecycle, type QueryJobLifecycleStatus, type QueryRunLifecycleStatus } from './queryRunJobLifecycle';
 import { createBriefCache } from './briefCache';
@@ -4387,19 +4388,24 @@ export async function scheduleAutonomousQueryRuns(
   const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 10));
   const client = await db.connect();
   const scheduled: ScheduledAutonomousRun[] = [];
+  // Success diagnostics are emitted only after COMMIT: a commit failure must
+  // replace any tentative success in the one-shot candidate report.
+  const committedDiagnostics: DiscoveryCandidateDiagnosticPatch[] = [];
   let candidateDiagnostic: DiscoveryCandidateDiagnosticPatch = {};
   let activeOperation = 'scheduling_transaction';
   const setDiagnostic = (patch: DiscoveryCandidateDiagnosticPatch) => { candidateDiagnostic = { ...candidateDiagnostic, ...patch }; };
   const flushDiagnostic = (patch: DiscoveryCandidateDiagnosticPatch = {}) => diagnosticContext?.onDiagnostic({ ...candidateDiagnostic, ...patch });
   const failStep = async (operation: string, error: unknown): Promise<never> => {
     const sanitized = sanitizeSchedulingError(error);
-    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: operation, sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+    const details = schedulingErrorDiagnostics(error);
+    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: operation, sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
     throw error;
   };
   try {
     await client.query('BEGIN');
     for (const candidate of candidates) {
       candidateDiagnostic = {};
+      if (candidate.frontierDecisionId) setDiagnostic({ frontierDecisionId: candidate.frontierDecisionId });
       activeOperation = 'provider_lineage_lookup';
       let allocatedProvider=providerSnapshot(candidate.provider||YOUTUBE_SEARCH_PROVIDER);
       if (!candidate.provider && !candidate.frontierDecisionId) {
@@ -4539,6 +4545,14 @@ export async function scheduleAutonomousQueryRuns(
         : requestedOrdering === 'DATE' || requestedOrdering === 'RELEVANCE'
           ? requestedOrdering as SearchOrdering
           : allocateSearchOrdering(controlRetrievalLane, orderingCounts.rows[0]?.date || 0, orderingCounts.rows[0]?.total || 0, datePercent);
+
+      setDiagnostic({
+        lineageBound: Boolean(allocatedDimensions),
+        allocatedLane: allocatedDimensions?.retrievalLane,
+        allocatedOrdering: allocatedDimensions?.searchOrdering,
+        controlLane: controlRetrievalLane,
+        controlOrdering: controlSearchOrdering,
+      });
 
       const controlConfig = buildRetrievalConfiguration({
         searchOrdering: controlSearchOrdering,
@@ -4954,11 +4968,27 @@ export async function scheduleAutonomousQueryRuns(
       try {
         await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:scheduledProviderUnits,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}});
       } catch (error) { await failStep('decision_event_persistence', error); }
-      flushDiagnostic({ selectedQueryId: candidate.query.id, queryRunId: runId, jobId, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'QUERY_LIBRARY_RESERVED', schedulingOutcome: 'SCHEDULED', schedulingOperation: 'query_run_job_and_selection_commit', disposition: 'SCHEDULED', reasonCode: 'SCHEDULED' });
+      committedDiagnostics.push({
+        ...candidateDiagnostic,
+        selectedQueryId: candidate.query.id,
+        queryRunId: runId,
+        jobId,
+        provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain },
+        reservationOutcome: 'RESERVED',
+        reservationReasonCode: 'QUERY_LIBRARY_RESERVED',
+        schedulingOutcome: 'SCHEDULED',
+        schedulingOperation: 'query_run_job_and_selection_commit',
+        disposition: 'SCHEDULED',
+        reasonCode: 'SCHEDULED',
+      });
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     activeOperation = 'scheduling_commit';
     await client.query('COMMIT');
+    for (const diagnostic of committedDiagnostics) {
+      try { diagnosticContext?.onDiagnostic(diagnostic); }
+      catch { /* diagnostics must never break committed scheduling */ }
+    }
 
     // Observation persistence runs AFTER scheduling transaction commit.
     // Failures here cannot abort or roll back scheduled query runs or jobs.
@@ -4986,7 +5016,8 @@ export async function scheduleAutonomousQueryRuns(
     return scheduled;
   } catch (error) {
     const sanitized = sanitizeSchedulingError(error);
-    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: activeOperation, sanitizedErrorClass: sanitized.errorClass, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+    const details = schedulingErrorDiagnostics(error);
+    flushDiagnostic({ schedulingOutcome: 'FAILED', schedulingOperation: activeOperation, sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
     await client.query('ROLLBACK');
     throw error;
   } finally {
