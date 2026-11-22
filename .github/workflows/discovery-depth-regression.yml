@@ -10,7 +10,15 @@ on:
       - 'server/searchOrdering.ts'
       - 'server/continuationPolicy.ts'
       - 'server/continuationPolicy.test.ts'
+      - 'server/autonomousPageStore.ts'
+      - 'server/queryDiscoveryArms.ts'
+      - 'server/queryDiscoveryArms.test.ts'
+      - 'server/youtubeInnertubeProvider.ts'
+      - 'server/youtubeInnertubeProvider.test.ts'
+      - 'server/paginationContinuationBalance.test.ts'
+      - 'server/queryFailureLifecycle.test.ts'
       - 'server/db/migrations/096_autonomous_pagination_depth.sql'
+      - 'server/db/migrations/204_pagination_continuation_balance.sql'
       - 'server/discoveryDepthRegression.test.ts'
       - 'src/types/index.ts'
       - '.github/workflows/discovery-depth-regression.yml'
@@ -26,7 +34,7 @@ jobs:
           cache: npm
       - run: npm install
       - name: Discovery depth regression tests
-        run: node --import tsx --test server/discoveryDepthRegression.test.ts server/continuationPolicy.test.ts
+        run: node --import tsx --test server/discoveryDepthRegression.test.ts server/continuationPolicy.test.ts server/paginationContinuationBalance.test.ts server/youtubeInnertubeProvider.test.ts server/queryDiscoveryArms.test.ts server/queryFailureLifecycle.test.ts
       - name: Validate autonomous pagination migration contract
         run: |
           node <<'NODE'
