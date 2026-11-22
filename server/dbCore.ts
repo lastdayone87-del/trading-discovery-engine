@@ -2017,8 +2017,23 @@ export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(
  * per-key sum when no groups are configured, preserving deterministic replay
  * for existing deployments. Per-key unit value remains E (pilot, not frozen).
  */
-export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');const providers=getConfiguredYouTubeProviders();const map=describeQuotaProjectMap(providers);if(map.projectCount===0)return calculateYouTubeDailyBudget(getYouTubeKeyPool().length,perKey);return calculateEffectiveYouTubeBudget(providers,perKey);}
-export function describeYouTubeQuotaProjectMap(){const providers=getConfiguredYouTubeProviders();const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'));const map=describeQuotaProjectMap(providers);return {...map,perKey,effectiveBudget:calculateEffectiveYouTubeBudget(providers,perKey),legacyKeySumBudget:calculateYouTubeDailyBudget(providers.length,perKey)};}
+/**
+ * Configured keys that can actually spend official quota. Suspended and
+ * daily-exhausted keys contribute zero; temporary cooling keys are retained so
+ * a short rate-limit window does not collapse the daily planning budget to 0.
+ */
+export function usableYouTubeProviders(){
+  const configured=getConfiguredYouTubeProviders();
+  const usable=configured.filter(provider=>{
+    // Suspended keys have zero usable capacity. Daily-exhausted keys remain in
+    // the budget because quota_tracker.units_used still includes their spend;
+    // removing them would understate consumption and over-admit healthy keys.
+    return youtubeProviderCooldown.status(provider.key).status!=='Suspended';
+  });
+  return usable;
+}
+export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');const providers=usableYouTubeProviders();const map=describeQuotaProjectMap(providers);if(map.projectCount===0)return calculateYouTubeDailyBudget(providers.length,perKey);return calculateEffectiveYouTubeBudget(providers,perKey);}
+export function describeYouTubeQuotaProjectMap(){const providers=usableYouTubeProviders();const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'));const map=describeQuotaProjectMap(providers);return {...map,perKey,effectiveBudget:calculateEffectiveYouTubeBudget(providers,perKey),legacyKeySumBudget:calculateYouTubeDailyBudget(providers.length,perKey)};}
 export interface KeyQuotaUsage { keyIndex:number; maskedKey:string; unitsUsed:number; remaining:number; limit:number; isActive:boolean; status:YouTubeProviderOperationalStatus; retryAt:string|null; /** Quota project attribution; remaining is project-level capacity when set. */ quotaGroup?:string|null; projectUnitsUsed?:number; }
 
 export interface YouTubeInvalidInputQuarantine {

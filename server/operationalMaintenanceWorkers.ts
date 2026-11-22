@@ -4,6 +4,7 @@ import {
   completeJob,
   failJob,
   finishQuotaReservation,
+  getDb,
   getProductionBacklogDepth,
   getQueueStatusFresh,
   getYouTubeKeyPool,
@@ -27,6 +28,18 @@ const COUNTRY_BOUNDARY_RECOVERY_TYPES: ClaimableOverride = [COUNTRY_BOUNDARY_REC
  */
 export const CORPUS_PIPELINE_TYPES: ClaimableOverride = ['TERM_HARVEST', 'SCORE_CANDIDATES', 'PROPOSE_CONCEPT_RESOLUTION'];
 const QUOTA_BACKOFF_MS = 30_000;
+const IDLE_RECHECK_MS = 5_000;
+
+/** Cheap claimability check: never reserve a worst-case quota block when the
+ * worker's own queue is empty. The claim itself still re-checks under lock. */
+async function hasClaimableMaintenanceWork(types: readonly string[]): Promise<boolean> {
+  const db = await getDb();
+  const res = await db.query(
+    `SELECT 1 FROM jobs WHERE status='PENDING' AND run_after<=now() AND type=ANY($1::text[]) LIMIT 1`,
+    [types],
+  );
+  return (res.rowCount || 0) > 0;
+}
 const RECOVERY_MAX_PRODUCTION_BACKLOG = Math.max(
   0,
   Number(process.env.RECOVERY_MAX_PRODUCTION_BACKLOG || 2)
@@ -153,6 +166,15 @@ function startOfficialRecheckWorker(workerId: string): void {
     let reserved = false;
     let nextDelayMs = 1000;
     try {
+      const queue = await getQueueStatusFresh();
+      if (queue.channelProcessing.isPaused) {
+        nextDelayMs = IDLE_RECHECK_MS;
+        return;
+      }
+      if (!await hasClaimableMaintenanceWork(OFFICIAL_RECHECK_TYPES)) {
+        nextDelayMs = IDLE_RECHECK_MS;
+        return;
+      }
       reserved = await reserveOfficialRecheckQuota('OPERATIONAL_RECHECK', operationId);
       if (!reserved) {
         nextDelayMs = QUOTA_BACKOFF_MS;
@@ -183,6 +205,10 @@ function startFalseNegativeRecoveryWorker(workerId: string): void {
     try {
       if (!await isRecoveryAdmissionOpen()) {
         nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
+      if (!await hasClaimableMaintenanceWork([FALSE_NEGATIVE_RECOVERY_JOB])) {
+        nextDelayMs = IDLE_RECHECK_MS;
         return;
       }
 
@@ -256,6 +282,10 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
     try {
       if (!await isRecoveryAdmissionOpen()) {
         nextDelayMs = QUOTA_BACKOFF_MS;
+        return;
+      }
+      if (!await hasClaimableMaintenanceWork(COUNTRY_BOUNDARY_RECOVERY_TYPES)) {
+        nextDelayMs = IDLE_RECHECK_MS;
         return;
       }
       reserved = await reserveOfficialRecheckQuota('OPERATIONAL_RECHECK', operationId);
