@@ -234,8 +234,10 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   assert.doesNotMatch(charge, /SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE/);
   const keyChargeIndex = charge.indexOf('incrementYouTubeKeyQuota(');
   const trackerChargeIndex = charge.indexOf('incrementYouTubeQuotaTracker(');
+  const trackerDayIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
   const chargeCommitIndex = charge.indexOf("await client.query('COMMIT')", trackerChargeIndex);
   assert.ok(keyChargeIndex > 0 && trackerChargeIndex > keyChargeIndex, 'per-key row must be charged before the tracker');
+  assert.ok(trackerDayIndex > keyChargeIndex && trackerDayIndex > charge.indexOf('settleProbeQuotaReservation'), 'tracker day must be sampled after key/lease work');
   assert.ok(chargeCommitIndex > trackerChargeIndex, 'tracker update must commit after it is charged');
   // getQuota reports the same group-aware daily limit.
   const quotaStart = dbCore.indexOf('export async function getQuota');
@@ -263,6 +265,8 @@ test('quota reservation transactions keep the tracker lock off the reservation s
   assert.match(reserve, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(topUp, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(reserve, /SELECT status,units FROM quota_reservations[\s\S]*AND status='RESERVED' AND expires_at>now\(\)[\s\S]*FOR UPDATE/);
+  assert.match(reserve, /readLiveProbeQuotaLeaseUnits\(client\)/);
+  assert.match(topUp, /readLiveProbeQuotaLeaseUnits\(client\)/);
   assert.match(dbCore, /idx_quota_reservations_reserved_expiry/);
   assert.match(dbCore, /quotaReservationIndexMigration\.rowCount\) await ensureQuotaReservationActiveIndex/);
 });

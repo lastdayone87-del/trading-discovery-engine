@@ -858,8 +858,8 @@ async function ensureClassificationSightingIndex(client: { query: (text: string,
 async function ensureQuotaReservationActiveIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
   const name = 'idx_quota_reservations_reserved_expiry';
   const existing = await client.query(`
-    SELECT c.oid, i.indisvalid, i.indisready, i.indpred IS NOT NULL AS has_predicate,
-           i.indnatts, i.indnkeyatts,
+    SELECT c.oid, i.indisvalid, i.indisready, i.indisunique,
+           i.indpred IS NOT NULL AS has_predicate, i.indnatts, i.indnkeyatts,
            CASE WHEN to_regclass('public.quota_reservations') IS NULL THEN false
                 ELSE i.indrelid = to_regclass('public.quota_reservations') END AS correct_table,
            pg_get_expr(i.indpred, i.indrelid) AS predicate,
@@ -872,6 +872,7 @@ async function ensureQuotaReservationActiveIndex(client: { query: (text: string,
   const definition = String(row?.definition || '');
   const predicate = String(row?.predicate || '').replace(/[()]/g, '').replace(/\s+/g, ' ').trim();
   const correct = row?.correct_table === true
+    && row?.indisunique === false
     && row?.has_predicate === true
     && Number(row?.indnatts) === 4
     && Number(row?.indnkeyatts) === 1
@@ -2339,6 +2340,25 @@ async function incrementYouTubeKeyQuota(db:QueryExecutor, quotaDay:string, keyFi
 }
 
 /**
+ * In-flight PROBE-origin official requests are reserved in the key-cap lease
+ * table, not in quota_reservations. Count live probe leases as reserved global
+ * capacity so a probe response that has not yet committed its tracker charge
+ * cannot be double-admitted. The lease deletion and tracker increment commit
+ * together, so MVCC keeps the lease visible until both are durable.
+ */
+async function readLiveProbeQuotaLeaseUnits(db:QueryExecutor):Promise<number>{
+  try {
+    const result=await db.query(`SELECT COALESCE(SUM(reserved_units),0)::int AS units
+      FROM youtube_key_cap_shadow_leases
+      WHERE allocation='PROBE' AND expires_at>now()`);
+    return Number(result.rows[0]?.units)||0;
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
+    throw error;
+  }
+}
+
+/**
  * Atomic Pacific-day rollover plus charge for the singleton quota tracker.
  * Callers acquire this row lock last so it is held only for this statement and
  * the commit, never across per-key or lease settlement work.
@@ -2429,11 +2449,6 @@ export async function incrementQuota(
   const shadowConfig=(reservation||probeReservation)?null:await resolveShadowConfig(getAppSetting).catch(()=>null); const db=await getDb(); const client=await db.connect(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   try{
     await client.query('BEGIN');
-    // Read the aggregate tracker day after pool acquisition and BEGIN. A
-    // connection wait can cross Pacific midnight; using a pre-wait day would
-    // let ensureYouTubeQuotaDay reset the tracker backward and erase the new
-    // day's usage. The per-key reservation day remains the dispatch day.
-    const trackerDay=getYouTubeQuotaDay();
     if (operationId) {
       // Idempotency guard: one row per accounted provider response, written
       // in the same transaction as the charge. A retry after an unknown
@@ -2463,6 +2478,10 @@ export async function incrementQuota(
       // legacy unit-matched lease. Savepoint-guarded.
       await settleShadowLeaseWithSavepoint(client,{quotaDay:keyQuotaDay,keyFingerprint,units,operationId:shadowOperationId});
     }
+    // Sample the aggregate day immediately before the final upsert. A charge
+    // delayed across Pacific midnight must not write the prior day back over a
+    // newer-day tracker. The per-key reservation day remains the dispatch day.
+    const trackerDay=getYouTubeQuotaDay();
     // The tracker is the last lock acquired. Its critical section is just the
     // atomic rollover/increment and the commit, so a slow lease settlement can
     // never queue every other quota reservation behind it.
@@ -6481,6 +6500,7 @@ export async function tryReserveQuota(args: {
       [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
+    const probeReservedUnits = await readLiveProbeQuotaLeaseUnits(client);
     const protectedEnrichmentUnits = demand
       ? protectedEnrichmentUnitsForAutonomous(
           args.dailyBudget,
@@ -6492,7 +6512,7 @@ export async function tryReserveQuota(args: {
     // Allocation percentages are scheduling preferences, not hard partitions.
     // The dynamic reserve protects only the actual demand of the due enrichment
     // backlog; it is released as the backlog falls. Discovery keeps the rest.
-    if (row.actual_used + row.reserved_total + args.units + protectedEnrichmentUnits > args.dailyBudget) {
+    if (row.actual_used + row.reserved_total + probeReservedUnits + args.units + protectedEnrichmentUnits > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
     }
@@ -6569,6 +6589,7 @@ export async function topUpQuotaReservation(args: {
     );
     const currentUnits = Number(existing.rows[0].units);
     const { actual_used: actualUsed, other_reserved_total: otherReservedTotal } = totals.rows[0];
+    const probeReservedUnits = await readLiveProbeQuotaLeaseUnits(client);
     const protectedEnrichmentUnits = demand
       ? protectedEnrichmentUnitsForAutonomous(
           args.dailyBudget,
@@ -6577,7 +6598,7 @@ export async function topUpQuotaReservation(args: {
           demand,
         )
       : 0;
-    if (Number(actualUsed) + Number(otherReservedTotal) + currentUnits + args.additionalUnits + protectedEnrichmentUnits > args.dailyBudget) {
+    if (Number(actualUsed) + Number(otherReservedTotal) + probeReservedUnits + currentUnits + args.additionalUnits + protectedEnrichmentUnits > args.dailyBudget) {
       await client.query('ROLLBACK');
       return false;
     }

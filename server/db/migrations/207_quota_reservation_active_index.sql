@@ -38,6 +38,7 @@ BEGIN
          AND i.indnkeyatts = 1
          AND i.indpred IS NOT NULL
          AND i.indexprs IS NULL
+         AND NOT i.indisunique
          AND btrim(regexp_replace(pg_get_expr(i.indpred, i.indrelid), '[()]', '', 'g')) = 'status = ''RESERVED''::text'
     )
   ) THEN

@@ -4,6 +4,7 @@ import test, { after } from 'node:test';
 import pg from 'pg';
 import type { Pool } from 'pg';
 import { tryReserveQuota } from './dbCore';
+import { getYouTubeQuotaDay } from './youtubeQuotaDay';
 
 /**
  * Live-database regression coverage for the active quota-reservation index.
@@ -58,6 +59,8 @@ async function resetSchema(): Promise<void> {
   const db = requirePool();
   await db.query(`DROP TABLE IF EXISTS quota_reservations`);
   await db.query(`DROP TABLE IF EXISTS quota_tracker`);
+  await db.query(`DROP TABLE IF EXISTS youtube_key_quota_usage`);
+  await db.query(`DROP TABLE IF EXISTS youtube_key_cap_shadow_leases`);
   await db.query(`
     CREATE TABLE quota_tracker (
       id text PRIMARY KEY,
@@ -65,8 +68,6 @@ async function resetSchema(): Promise<void> {
       daily_limit integer NOT NULL DEFAULT 10000,
       last_reset text NOT NULL
     );
-    INSERT INTO quota_tracker(id, units_used, daily_limit, last_reset)
-    VALUES ('youtube', 1234, 10000, '2026-11-22');
     CREATE TABLE quota_reservations (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       operation_type text NOT NULL,
@@ -90,6 +91,16 @@ async function resetSchema(): Promise<void> {
       updated_at timestamptz NOT NULL DEFAULT now(),
       PRIMARY KEY (quota_day, key_fingerprint)
     );
+    CREATE TABLE youtube_key_cap_shadow_leases (
+      id bigserial PRIMARY KEY,
+      quota_day text NOT NULL,
+      operation_id text NOT NULL,
+      key_fingerprint text NOT NULL,
+      reserved_units integer NOT NULL,
+      reserved_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL,
+      allocation text NOT NULL
+    );
     INSERT INTO quota_reservations(operation_type, operation_id, allocation, units, status, expires_at)
     SELECT 'HISTORICAL', 'h-' || g, 'AUTONOMOUS', 1, 'CONSUMED', now() - interval '1 day'
     FROM generate_series(1, 100000) g;
@@ -98,6 +109,10 @@ async function resetSchema(): Promise<void> {
     FROM generate_series(1, 120) g;
     ANALYZE quota_reservations;
   `);
+  await db.query(
+    `INSERT INTO quota_tracker(id, units_used, daily_limit, last_reset) VALUES ('youtube', 1234, 10000, $1)`,
+    [getYouTubeQuotaDay()],
+  );
 }
 
 async function buildIndex(): Promise<void> {
@@ -148,8 +163,9 @@ maybe('a held per-key charge row cannot block the production reservation path', 
     await charge.query(`BEGIN`);
     await charge.query(
       `INSERT INTO youtube_key_quota_usage(quota_day,key_fingerprint,key_index,units_used,daily_limit)
-       VALUES('2026-11-22','fp-lock-test',1,100,10000)
+       VALUES($1,'fp-lock-test',1,100,10000)
        ON CONFLICT(quota_day,key_fingerprint) DO UPDATE SET units_used=youtube_key_quota_usage.units_used+excluded.units_used`,
+      [getYouTubeQuotaDay()],
     );
 
     const admitted = await Promise.race([
@@ -201,11 +217,49 @@ maybe('an expired existing lease cannot authorize a new reservation', async () =
   }
 });
 
+maybe('live PROBE leases count as reserved capacity and prevent double admission', async () => {
+  const db = requirePool();
+  await db.query(`UPDATE quota_tracker SET units_used=1234`);
+  await db.query(
+    `INSERT INTO youtube_key_cap_shadow_leases
+       (quota_day, operation_id, key_fingerprint, reserved_units, expires_at, allocation)
+     VALUES($1,'probe-visible-1','fp-probe',1000,now()+interval '1 hour','PROBE')`,
+    [getYouTubeQuotaDay()],
+  );
+  try {
+    const denied = await tryReserveQuota({
+      operationType: 'PROBE_VISIBILITY',
+      operationId: 'probe-visible-1',
+      allocation: 'MANUAL',
+      units: 100,
+      // 1234 actual + 840 live reservations + 1000 probe lease + 100 request
+      // exceeds this budget only when the probe lease is counted.
+      dailyBudget: 3000,
+      allocationPercent: 100,
+    }, db);
+    assert.equal(denied, false, 'a live probe lease must not be invisible to admission');
+
+    const admitted = await tryReserveQuota({
+      operationType: 'PROBE_VISIBILITY',
+      operationId: 'probe-visible-2',
+      allocation: 'MANUAL',
+      units: 100,
+      dailyBudget: 4000,
+      allocationPercent: 100,
+    }, db);
+    assert.equal(admitted, true, 'a larger budget remains admittable with the probe lease counted');
+  } finally {
+    await db.query(`DELETE FROM quota_reservations WHERE operation_type='PROBE_VISIBILITY'`).catch(() => undefined);
+    await db.query(`DELETE FROM youtube_key_cap_shadow_leases WHERE operation_id LIKE 'probe-visible-%'`).catch(() => undefined);
+  }
+});
+
 after(async () => {
   if (!pool) return;
   try {
     await pool.query(`DROP TABLE IF EXISTS quota_reservations`);
     await pool.query(`DROP TABLE IF EXISTS youtube_key_quota_usage`);
+    await pool.query(`DROP TABLE IF EXISTS youtube_key_cap_shadow_leases`);
     await pool.query(`DROP TABLE IF EXISTS quota_tracker`);
   } finally {
     await pool.end();
