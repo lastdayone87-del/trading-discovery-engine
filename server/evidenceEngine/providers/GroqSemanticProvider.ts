@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendProviderCallEvent, resolveGroqSemanticCooldownExpiryMs } from '../../db';
 import { MAX_CRAWL_RESPONSE_CHARS, readBoundedResponseText } from '../../crawlResponseBounds';
 import {
@@ -193,6 +193,27 @@ function armGroqOrgCooldown(orgId: string, nowMs: number = Date.now()): void {
  */
 export const DEFAULT_GROQ_RESTRICTED_ROUTE_TTL_MS = 60 * 60 * 1000;
 const groqOrgDisabledUntilMs = new Map<string, number>();
+/**
+ * Route-level credential rejection cache. A 401/403 is key-scoped, so it must
+ * not suppress healthy sibling keys, but it also must not be re-tried on every
+ * classification. Kept separate from the org quota cooldown.
+ */
+const groqRouteUnauthorizedUntilMs = new Map<string, number>();
+const GROQ_UNAUTHORIZED_COOLDOWN_MS = 15 * 60_000;
+function groqRouteCredentialKey(route: GroqRoute): string {
+  // Route ids are positional and can be reassigned when keys are added or
+  // removed; bind the credential cache to the key fingerprint instead.
+  return createHash('sha256').update(route.key).digest('hex').slice(0, 24);
+}
+function groqRouteUnauthorizedRemainingMs(routeId: string, nowMs: number = Date.now()): number {
+  const until = groqRouteUnauthorizedUntilMs.get(routeId);
+  return until && until > nowMs ? until - nowMs : 0;
+}
+function markGroqRouteUnauthorized(routeId: string, nowMs: number = Date.now()): number {
+  const until = nowMs + GROQ_UNAUTHORIZED_COOLDOWN_MS;
+  groqRouteUnauthorizedUntilMs.set(routeId, until);
+  return until;
+}
 
 export function groqRestrictedRouteTtlMs(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.GROQ_RESTRICTED_ROUTE_TTL_MS || DEFAULT_GROQ_RESTRICTED_ROUTE_TTL_MS);
@@ -213,9 +234,10 @@ function disableGroqOrg(orgId: string, nowMs: number = Date.now()): number {
 export interface GroqRouteHealth {
   route: string;
   org: string;
-  status: 'healthy'|'cooling'|'disabled';
+  status: 'healthy'|'cooling'|'disabled'|'unauthorized';
   cooldownRemainingMs: number;
   disabledRemainingMs: number;
+  unauthorizedRemainingMs?: number;
 }
 
 /** Credential-free route health for queue diagnostics and operator triage. */
@@ -227,9 +249,10 @@ export function getGroqRouteHealth(nowMs: number = Date.now()): GroqRouteHealth[
     return {
       route: route.id,
       org,
-      status: disabledRemainingMs > 0 ? 'disabled' : cooldownRemainingMs > 0 ? 'cooling' : 'healthy',
+      status: disabledRemainingMs > 0 ? 'disabled' : groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs) > 0 ? 'unauthorized' : cooldownRemainingMs > 0 ? 'cooling' : 'healthy',
       cooldownRemainingMs,
       disabledRemainingMs,
+      unauthorizedRemainingMs: groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs),
     };
   });
 }
@@ -249,12 +272,14 @@ function groqPoolDisabledError(remainingMs: number): ProviderCallError {
 /** Test-only reset for the in-process restricted-route quarantine. */
 export function resetGroqRouteHealthForTests(): void {
   groqOrgDisabledUntilMs.clear();
+  groqRouteUnauthorizedUntilMs.clear();
 }
 
 /** Test-only reset for the in-process cooldown. */
 export function resetGroqCooldownForTests(orgId?: string): void {
   if (orgId === undefined) {
     groqOrgCooldownUntilMs.clear();
+    groqRouteUnauthorizedUntilMs.clear();
     return;
   }
   groqOrgCooldownUntilMs.delete(orgId);
@@ -291,6 +316,12 @@ export interface GroqRouteFailoverOptions {
    * spending one paced request per remaining account.
    */
   maxContentFailures?: number;
+  /**
+   * Bounded cross-org spill for 401/403 credential rejections. One bad key
+   * may be isolated, but a systemic revocation must not fan out across every
+   * configured organization in one request.
+   */
+  maxUnauthorizedFailures?: number;
 }
 
 const DEFAULT_GROQ_MAX_CONTENT_FAILURES = 2;
@@ -298,6 +329,11 @@ function isGroqContentFailure(error: unknown): boolean {
   if (!(error instanceof ProviderCallError)) return false;
   const reasons = Array.isArray(error.providerReasons) ? error.providerReasons : [];
   return reasons.includes('GROQ_JSON_VALIDATION_FAILED') || reasons.includes('GROQ_SEMANTIC_CONTENT_INVALID');
+}
+
+class GroqRouteCachedUnauthorizedError extends Error {
+  readonly groqRouteCachedUnauthorized = true;
+  constructor() { super('Groq route credential is already cached as unauthorized.'); }
 }
 
 function groqFailoverCancelled(signal?: AbortSignal): ProviderCallError {
@@ -312,13 +348,25 @@ export async function runGroqRouteFailover<T>(
   const isCooling = opts?.isOrgCooling ?? (() => false);
   let lastError: unknown;
   let contentFailures = 0;
+  let unauthorizedFailures = 0;
   const maxContentFailures = Math.max(1, Math.floor(opts?.maxContentFailures ?? DEFAULT_GROQ_MAX_CONTENT_FAILURES));
+  const maxUnauthorizedFailures = Math.max(1, Math.floor(opts?.maxUnauthorizedFailures ?? 3));
   const tried = new Set<GroqRoute>();
   // Stable order, healthy orgs first: configured order is preserved within
   // each group, so single-org deployments behave exactly as before.
-  const ordered = [...routes].sort(
-    (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
-  );
+  const nowMs = opts?.nowMs ?? Date.now;
+  const ordered = routes
+    .filter(route => groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs()) <= 0)
+    .sort(
+      (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
+    );
+  if (!ordered.length) {
+    throw new ProviderCallError('Groq route credentials are cooling down.', 'CREDENTIALS_EXHAUSTED', true, {
+      routeScoped: true,
+      retryAfterMs: Math.min(...routes.map(route => groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs()))),
+      providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
+    });
+  }
   for (const route of ordered) {
     if (opts?.signal?.aborted) {
       if (abortedByDeadline(opts.signal)) {
@@ -343,6 +391,12 @@ export async function runGroqRouteFailover<T>(
     try {
       return await call(route);
     } catch (error) {
+      if ((error as { groqRouteCachedUnauthorized?: unknown } | null)?.groqRouteCachedUnauthorized === true) {
+        // A queued call found the credential rejected while it waited for the
+        // org pacing slot. Skip it without renewing the cache or counting a
+        // second failure.
+        continue;
+      }
       lastError = error;
       // Caller cancellation is terminal: keep retries for provider timeouts,
       // but never spend another org's quota on an abandoned evaluation.
@@ -377,6 +431,10 @@ export async function runGroqRouteFailover<T>(
           for (const candidate of ordered) {
             if (groqRouteOrg(candidate) === failedOrg) tried.add(candidate);
           }
+        } else if (reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) {
+          markGroqRouteUnauthorized(groqRouteCredentialKey(route), nowMs());
+          unauthorizedFailures++;
+          if (unauthorizedFailures >= maxUnauthorizedFailures) throw error;
         }
         if (!ordered.some(candidate => !tried.has(candidate))) throw error;
         continue;
@@ -653,6 +711,11 @@ export async function runGroqTextCompletion(
       // the gate re-checks both the cooldown (another caller may have armed
       // it while this call waited) and the budget before fetching.
       return await withGroqOrgPacingSlot(orgId, minIntervalMs, now, sleep, async () => {
+        // Another call may have rejected this credential while this one waited
+        // for the org pacing slot; recheck before spending a fetch.
+        if (groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route)) > 0) {
+          throw new GroqRouteCachedUnauthorizedError();
+        }
         const recooledMs = groqOrgCooldownRemainingMs(orgId);
         if (recooledMs > 0) throw groqCooldownDeferredError(recooledMs);
         if (Date.now() >= Math.min(deadlineAtMs, attemptDeadlineMs)) {

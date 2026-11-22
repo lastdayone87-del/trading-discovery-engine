@@ -1123,6 +1123,68 @@ test('a 401 for one groq key does not suppress a healthy sibling key', async () 
   assert.deepEqual(result, { route: 'groq-2' });
 });
 
+
+test('a 401 route is cached and not retried on the next request', async () => {
+  resetGroqCooldownForTests();
+  const routes = [
+    { id: 'groq-cache-1', key: 'k1', orgId: 'org-a' },
+    { id: 'groq-cache-2', key: 'k2', orgId: 'org-b' },
+  ];
+  const first: string[] = [];
+  await assert.rejects(runGroqRouteFailover(routes, async (route) => {
+    first.push(route.id);
+    throw classifyGroqHttpError(401, '{"error":{"message":"invalid api key"}}');
+  }, { maxUnauthorizedFailures: 1 }));
+  assert.deepEqual(first, ['groq-cache-1']);
+
+  const second: string[] = [];
+  const result = await runGroqRouteFailover(routes, async (route) => {
+    second.push(route.id);
+    return route.id;
+  });
+  assert.deepEqual(second, ['groq-cache-2']);
+  assert.equal(result, 'groq-cache-2');
+  resetGroqCooldownForTests();
+});
+
+
+test('credential cache survives route-id reassignment and covers 403', async () => {
+  resetGroqCooldownForTests();
+  const rejected = classifyGroqHttpError(403, '{"error":{"message":"invalid api key"}}');
+  await assert.rejects(runGroqRouteFailover(
+    [{ id: 'groq-old-1', key: 'same-key', orgId: 'org-a' }],
+    async () => { throw rejected; },
+    { maxUnauthorizedFailures: 1 },
+  ));
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-new-1', key: 'same-key', orgId: 'org-a' },
+      { id: 'groq-new-2', key: 'healthy-key', orgId: 'org-b' },
+    ],
+    async route => { order.push(route.id); return route.id; },
+  );
+  assert.deepEqual(order, ['groq-new-2']);
+  assert.equal(result, 'groq-new-2');
+  resetGroqCooldownForTests();
+});
+
+test('systemic 401s stop after a bounded number of organizations', async () => {
+  resetGroqCooldownForTests();
+  const routes = Array.from({ length: 6 }, (_, index) => ({
+    id: `groq-bound-${index + 1}`,
+    key: `key-${index + 1}`,
+    orgId: `org-${index + 1}`,
+  }));
+  let calls = 0;
+  await assert.rejects(runGroqRouteFailover(routes, async () => {
+    calls++;
+    throw classifyGroqHttpError(401, '{"error":{"message":"invalid api key"}}');
+  }, { maxUnauthorizedFailures: 2 }));
+  assert.equal(calls, 2);
+  resetGroqCooldownForTests();
+});
+
 test('JSON-validation content failures cap route attempts instead of burning the pool', async () => {
   let calls = 0;
   await assert.rejects(runGroqRouteFailover(

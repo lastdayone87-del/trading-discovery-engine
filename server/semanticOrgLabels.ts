@@ -16,8 +16,8 @@ export function validateSemanticOrgLabels(env: NodeJS.ProcessEnv = process.env):
   if (missing.length > 0) {
     console.warn(
       `[SemanticOrgLabels] No explicit org label for key slot(s): ${missing.join(', ')}. ` +
-      'Each is treated as an independent account/quota pool. ' +
-      'If any of these keys share an account, set matching GEMINI_ORG_ID[_N] / GROQ_ORG_ID[_N] labels so they share cooldown fate.'
+      'Each is treated as an independent account/quota pool. No action is required when each slot is a separate account. ' +
+      'Only if several keys intentionally share one account, set matching GEMINI_ORG_ID[_N] / GROQ_ORG_ID[_N] labels so they share cooldown fate.'
     );
   }
 }
