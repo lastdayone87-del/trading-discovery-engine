@@ -160,6 +160,7 @@ export interface PersistedAutonomousPage {
   nextPageToken: string | null;
   shouldContinue: boolean;
   primaryReason: string;
+  stoppingReason: string | null;
   continuationDecisionV2: ContinuationDecisionV2 | null;
   pageMetrics: QueryFunnelMetrics;
   resumeMode: 'TOKEN' | 'REWALK' | 'OFFSET' | 'NONE';
@@ -179,7 +180,7 @@ export interface PersistedAutonomousPage {
 export async function getAutonomousPageObservation(runId: string, pageNumber: number): Promise<PersistedAutonomousPage | null> {
   const db = await getDb();
   const r = await db.query(
-    `SELECT page_number,next_page_token,should_continue,primary_reason,continuation_decision_v2,
+    `SELECT page_number,next_page_token,should_continue,primary_reason,stopping_reason,continuation_decision_v2,
             page_metrics,resume_mode,deferred_reason,elapsed_ms,retrieval_ms,processing_ms,
             provider_page_cost_units,provider_page_cost_usd
      FROM autonomous_query_page_observations
@@ -198,6 +199,7 @@ export async function getAutonomousPageObservation(runId: string, pageNumber: nu
     nextPageToken: row.next_page_token ? String(row.next_page_token) : null,
     shouldContinue: row.should_continue === true,
     primaryReason: String(row.primary_reason || ''),
+    stoppingReason: row.stopping_reason ? String(row.stopping_reason) : null,
     continuationDecisionV2: parseContinuationDecisionV2(parse<unknown>(row.continuation_decision_v2, null)),
     pageMetrics: parse<QueryFunnelMetrics>(row.page_metrics, {} as QueryFunnelMetrics),
     resumeMode: String(row.resume_mode || 'NONE') as PersistedAutonomousPage['resumeMode'],
@@ -233,6 +235,30 @@ export async function markAutonomousPageDeferredForAdmission(runId: string, page
       WHERE query_run_id=$1 AND page_number=$2
         AND should_continue=true
         AND stopping_reason IS NULL`,
+    [runId, pageNumber],
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+/**
+ * A page that already looks low-value is still not terminal while its
+ * page-level admission verdicts are unresolved. Keep the recorded stop as a
+ * provisional decision and mark the page for review, without pretending the
+ * page is currently continuable. The resume boundary re-evaluates it after
+ * settlement.
+ */
+export async function markAutonomousPageDeferredForAdmissionReview(runId: string, pageNumber: number): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.query(
+    `UPDATE autonomous_query_page_observations
+        SET deferred_reason='ADMISSION',
+            decision_reason_codes=CASE
+              WHEN COALESCE(decision_reason_codes,'[]'::jsonb) @> '["ADMISSION_PENDING_WAIT"]'::jsonb
+                THEN COALESCE(decision_reason_codes,'[]'::jsonb)
+              ELSE COALESCE(decision_reason_codes,'[]'::jsonb)||'["ADMISSION_PENDING_WAIT"]'::jsonb
+            END
+      WHERE query_run_id=$1 AND page_number=$2
+        AND deferred_reason IS NULL`,
     [runId, pageNumber],
   );
   return (result.rowCount || 0) > 0;
@@ -617,10 +643,22 @@ export async function getAutonomousContinuationState(runId: string, pageNumber?:
   // retried and could stop the run before page+1 is queued.
   const [pagesRes, marginal] = await Promise.all([
     db.query(
-      `SELECT distinct_creator_count,marginal_utility,decision_reason_codes,continuation_decision_v2
-       FROM autonomous_query_page_observations
-       WHERE query_run_id=$1 AND page_number < $2
-       ORDER BY page_number DESC`,
+      `WITH RECURSIVE lineage AS (
+         SELECT qr.id, 0 AS depth
+           FROM query_runs qr
+          WHERE qr.id=$1::uuid
+         UNION ALL
+         SELECT parent.id, child.depth + 1
+           FROM lineage child
+           JOIN query_runs child_run ON child_run.id=child.id
+           JOIN query_runs parent ON parent.id::text=child_run.continued_from_run_id
+       )
+       SELECT o.distinct_creator_count,o.marginal_utility,o.decision_reason_codes,o.continuation_decision_v2
+         FROM autonomous_query_page_observations o
+         JOIN lineage l ON l.id=o.query_run_id
+        WHERE (l.depth=0 AND o.page_number < $2)
+           OR l.depth > 0
+        ORDER BY l.depth ASC, o.page_number DESC`,
       [runId, targetPage],
     ),
     getAutonomousPageMarginalMetrics(runId, targetPage, db),

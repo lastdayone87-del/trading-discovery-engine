@@ -19,10 +19,15 @@ Migration `161_country_discovery_loop.sql` seeds those settings to `true` with
 `ON CONFLICT(setting_key) DO NOTHING`. A pre-existing explicit operator value is therefore preserved. If an
 operator intentionally set a core kill switch to `false` before deploy, the migration does not silently
 override it; the `core_kill_switches` health check reports a `WARN` naming the disabled path. Resolve that
-conflict explicitly (either accept the intentional kill switch or re-enable it) as part of deployment. The
-same rule applies to `autonomous_pagination_max_pages`: migration 161 seeds `50` only when the setting is
-absent, because a persisted value has no provenance that could distinguish the old seeded default from an
-operator's deliberate ceiling. Raise an existing value explicitly if the higher bound is wanted.
+conflict explicitly (either accept the intentional kill switch or re-enable it) as part of deployment.
+
+`autonomous_pagination_max_pages` is the single run-level safety ceiling and is `50` after migration
+`204_pagination_continuation_balance.sql`. Migration 161 deliberately preserved the legacy `10` because it
+could not distinguish that seeded value from an operator choice; migration 204 now raises only the exact
+legacy `10` to the approved `50`, so a deliberate ceiling above or below `50` is untouched. At the ceiling,
+a real continuation becomes a linked child segment rather than a `PROVIDER_EXHAUSTED` stop. InnerTube
+children resume from a persisted continuation-token cursor in one request; the page number remains in the
+cursor for telemetry, and numeric cursors from older rows still work through a bounded rewalk.
 
 Only the paid demand adapter remains off:
 
@@ -106,6 +111,21 @@ use priority 25 versus priority 20 for new queries. Both sweep paths are bounded
 headroom, and the reconciler stays active when `autonomous_pagination_v2_enabled=false`; that setting only
 switches the decision policy, it does not strand legacy pages. Disabling `autonomous_pagination_enabled` or
 the CDL master switch is what stops continuation enqueue.
+
+A page that looks low-value, wrong-country, or novelty-poor is provisional while its own admission
+verdicts are still pending. The worker records the provisional stop, defers the run, and re-evaluates after
+settlement; it continues if any settled creator is newly persisted or freshly confirmed/quality. Hard
+stops (page/provider/creator ceilings, run/time budget, quota, no next page, and duplicate-heavy) never
+wait. Duplicate-heavy is measured from actual channel IDs on the page, and the production audit found zero
+unseen and zero confirmed traders on those pages, so its stop is immediate.
+
+Discovery-arm cooldowns are evidence-gated too. An empty arm is authoritative immediately, but a
+low-novelty arm is cooled only after the configured number of probes (`query_arm_min_probe_runs`, default
+2) or completed pages (`query_arm_min_probe_pages`, default 5). Until then the selector tries the other
+planned arms and gives the least recently probed shallow arm a bounded second probe instead of cooling the
+whole query surface. Provider outages and capacity failures never consume the query-quality failure
+backoff; they are owned by provider quarantine and durable suspension, and a successful run clears any
+query failure streak.
 
 If `orphan_pending_pages` reports `FAIL` (the route returns 503):
 

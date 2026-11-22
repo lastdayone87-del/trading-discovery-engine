@@ -524,12 +524,16 @@ export function computeEffectivePageBudget(input: EffectivePageBudgetInput): Eff
   };
 }
 
-/** Resumption capability per provider. InnerTube has no serializable token. */
+/**
+ * Resumption capability per provider. InnerTube cursors carry the parsed
+ * body-continuation token (with a numeric page fallback), so a linked segment
+ * resumes directly instead of re-walking from page 1.
+ */
 export function resumeModeForProvider(providerKey: string | null | undefined): ContinuationResumeMode {
   switch (String(providerKey || '')) {
     case 'youtube-search': return 'TOKEN';
     case 'brave-search': return 'OFFSET';
-    case 'youtube-innertube': return 'REWALK';
+    case 'youtube-innertube': return 'TOKEN';
     default: return 'NONE';
   }
 }

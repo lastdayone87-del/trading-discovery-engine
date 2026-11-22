@@ -7,12 +7,16 @@ import {
   YOUTUBE_INNERTUBE_CAPABILITY,
   YOUTUBE_INNERTUBE_COST_DOMAIN,
   YOUTUBE_INNERTUBE_MAX_PAGES,
+  YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES,
   INNERTUBE_RATE_LIMITED_CODE,
   INNERTUBE_TIMEOUT_CODE,
   INNERTUBE_CONTINUATION_UNAVAILABLE_CODE,
   mapInnertubeChannelsToRaw,
   mapInnertubeVideosToRaw,
   parseInnertubeCursor,
+  parseInnertubeCursorState,
+  encodeInnertubeCursor,
+  innertubeContinuationToken,
   innertubeTimeoutMs,
   innertubeCooldownMs,
   innertubeCooldownRemainingMs,
@@ -166,6 +170,39 @@ test('rawResultCount counts raw results before mapping drops nodes', async () =>
   }
 });
 
+test('a real continuation at the old page-10 boundary is not suppressed or called exhaustion', async () => {
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  const feed: any = {
+    videos: [{ video_id: 'vid10', title: { text: 't10' }, author: { id: UC } }],
+    has_continuation: true,
+  };
+  feed.getContinuation = async () => feed;
+  setInnertubeSessionFactoryForTests(async () => ({ search: async () => feed }));
+  try {
+    const page = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: '10',
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(page.nextPageToken, '11', 'real continuation must remain visible at page 10');
+    assert.equal(parseInnertubeCursor('11'), 11);
+  } finally {
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+  }
+});
+
 test('continuation 429 keeps its classification and arms the cooldown', async () => {
   resetInnertubeCooldownForTests();
   const firstFeed = {
@@ -291,12 +328,104 @@ test('continuation requests pass through pacing like the initial search', async 
   }
 });
 
-test('cursor parsing is bounded to the page cap', () => {
+test('cursor parsing is bounded only by the rewalk safety ceiling', () => {
+  assert.equal(YOUTUBE_INNERTUBE_MAX_PAGES, 50);
   assert.equal(parseInnertubeCursor(null), 1);
   assert.equal(parseInnertubeCursor(''), 1);
   assert.equal(parseInnertubeCursor('2'), 2);
-  assert.equal(parseInnertubeCursor('99'), YOUTUBE_INNERTUBE_MAX_PAGES);
+  assert.equal(parseInnertubeCursor('99'), 99);
+  assert.equal(parseInnertubeCursor(String(YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES + 1)), YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES);
   assert.equal(parseInnertubeCursor('junk'), 1);
+});
+
+test('token cursors round-trip page and continuation token without exposing raw provider text', () => {
+  const cursor = encodeInnertubeCursor(51, 'opaque-token-value');
+  const parsed = parseInnertubeCursorState(cursor);
+  assert.equal(parsed.pageNumber, 51);
+  assert.equal(parsed.continuationToken, 'opaque-token-value');
+  assert.equal(parseInnertubeCursor(cursor), 51);
+  assert.equal(parseInnertubeCursorState('12').continuationToken, null);
+  assert.equal(parseInnertubeCursorState('it1.not-a-page.bad').pageNumber, 1);
+  assert.equal(encodeInnertubeCursor(51, null), '51');
+  assert.equal(
+    parseInnertubeCursorState(encodeInnertubeCursor(YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES + 100, 'x')).pageNumber,
+    YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES,
+  );
+});
+
+test('a deep token cursor resumes with ONE request instead of walking from page 1', async () => {
+  const previousInterval = process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+  process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = '0';
+  resetInnertubeCooldownForTests();
+  resetInnertubePacingForTests();
+  setInnertubeEmitSinkForTests(async () => undefined);
+  const resumedFeed = {
+    videos: [{ video_id: 'vid50', title: { text: 't50' }, author: { id: UC } }],
+    has_continuation: true,
+    memo: {
+      getType: () => [{ endpoint: { payload: { token: 'page-51-token' } } }],
+    },
+  };
+  let searches = 0;
+  let resumes = 0;
+  let seenToken = '';
+  setInnertubeSessionFactoryForTests(async () => ({
+    search: async () => {
+      searches += 1;
+      throw new Error('deep token cursor must not re-run the search');
+    },
+    resumeSearch: async (token: string) => {
+      resumes += 1;
+      seenToken = token;
+      return resumedFeed;
+    },
+  }));
+  try {
+    const started = Date.now();
+    const page = await executeInnertubeRetrievalPage({
+      provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+      query: 'trading',
+      country: 'US',
+      lane: 'VIDEO',
+      cursor: encodeInnertubeCursor(50, 'page-50-token'),
+      ordering: 'RELEVANCE',
+    } as any);
+    assert.equal(searches, 0);
+    assert.equal(resumes, 1);
+    assert.equal(seenToken, 'page-50-token');
+    assert.equal(page.channels.length, 1);
+    const next = parseInnertubeCursorState(page.nextPageToken);
+    assert.equal(next.pageNumber, 51);
+    assert.equal(next.continuationToken, 'page-51-token');
+    assert.ok(Date.now() - started < 2000, 'one token request must not consume a 50-page rewalk');
+    assert.equal(innertubeContinuationToken(resumedFeed as any), 'page-51-token');
+  } finally {
+    if (previousInterval === undefined) delete process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS;
+    else process.env.YOUTUBE_INNERTUBE_MIN_INTERVAL_MS = previousInterval;
+    setInnertubeSessionFactoryForTests(null);
+    setInnertubeEmitSinkForTests(null);
+    resetInnertubeCooldownForTests();
+    resetInnertubePacingForTests();
+  }
+});
+
+test('a malformed token cursor fails instead of silently rewalking page 1', async () => {
+  setInnertubeEmitSinkForTests(async () => undefined);
+  try {
+    await assert.rejects(
+      executeInnertubeRetrievalPage({
+        provider: { ...YOUTUBE_INNERTUBE_PROVIDER },
+        query: 'trading',
+        country: 'US',
+        lane: 'VIDEO',
+        cursor: 'it1.50.not-valid-base64!!',
+        ordering: 'RELEVANCE',
+      } as any),
+      (error: any) => error?.code === INNERTUBE_CONTINUATION_UNAVAILABLE_CODE && error?.retryable === true,
+    );
+  } finally {
+    setInnertubeEmitSinkForTests(null);
+  }
 });
 
 test('timeout and cooldown env parsing mirrors provider conventions', () => {

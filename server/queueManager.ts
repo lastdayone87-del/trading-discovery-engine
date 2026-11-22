@@ -121,7 +121,7 @@ import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromoted
 import { recordQueryArmOutcome } from './queryDiscoveryArms';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
-import { YOUTUBE_INNERTUBE_MAX_PAGES, YOUTUBE_INNERTUBE_PROVIDER, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
+import { YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES, YOUTUBE_INNERTUBE_PROVIDER, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
 import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
 import {
   evaluateInnertubeQuotaFallback,
@@ -143,6 +143,7 @@ import {
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
   markAutonomousPageDeferredForAdmission,
+  markAutonomousPageDeferredForAdmissionReview,
   recordAutonomousPage,
   settleAutonomousPageAdmissionDeferral,
 } from './autonomousPageStore';
@@ -1059,6 +1060,42 @@ async function deferAutonomousRunForAdmission(runId: string, pageNumber: number,
   }));
 }
 
+const ADMISSION_REVIEW_HARD_STOP_REASONS = new Set([
+  'PAGE_CEILING',
+  'RUN_BUDGET_EXHAUSTED',
+  'PROVIDER_EXHAUSTED',
+  'NO_NEXT_PAGE',
+  'TIME_BUDGET_EXHAUSTED',
+  'QUOTA_DEFERRED',
+  'CREATOR_CEILING',
+  // Duplicate-heavy is already measured from real channel IDs on this page:
+  // the production audit found zero unseen and zero confirmed traders on 220
+  // InnerTube and 49 official duplicate-heavy pages. Waiting for unrelated
+  // admission verdicts cannot turn a fully repeated page into fresh yield, so
+  // this stop stays immediate while low-value/novelty/country stops wait.
+  'DUPLICATE_HEAVY',
+]);
+
+/**
+ * A page that already looks low-value/duplicate/novelty-poor is not terminal
+ * while its own admission verdicts are unresolved. Keep the provisional stop
+ * recorded and defer the run; the resume boundary re-evaluates the page after
+ * settlement. Hard ceilings and budget stops never use this path.
+ */
+async function deferAutonomousRunForAdmissionReview(runId: string, pageNumber: number, reason: string): Promise<void> {
+  await markAutonomousPageDeferredForAdmissionReview(runId, pageNumber);
+  const deferredUntil = new Date(Date.now() + AUTONOMOUS_TIME_DEFER_MS).toISOString();
+  await markQueryRunDeferred(runId, 'DEFERRED_TIME', deferredUntil);
+  console.log(JSON.stringify({
+    event: 'autonomous_run_deferred_admission_review',
+    runId,
+    pageNumber,
+    deferredUntil,
+    reason: reason.slice(0, 300),
+    timestamp: new Date().toISOString(),
+  }));
+}
+
 /**
  * Normalized keys for the configured active autonomous sweep scope. The
  * reconciler uses this to enforce report §6.7: it never resumes a run whose
@@ -1091,7 +1128,10 @@ async function countActiveAutonomousCountries(): Promise<number> {
 
 /** Page cap imposed by the provider itself, independent of the safety ceiling. */
 export function providerPageCap(providerKey: string, _safetyMaxPages: number): number {
-  if (providerKey === 'youtube-innertube') return YOUTUBE_INNERTUBE_MAX_PAGES;
+  // InnerTube has no provider page ceiling. The configurable run safety
+  // ceiling owns the bound, and a real continuation at that bound becomes a
+  // linked TOKEN segment instead of a false PROVIDER_EXHAUSTED stop.
+  if (providerKey === 'youtube-innertube') return Number.MAX_SAFE_INTEGER;
   if (providerKey === 'brave-search') return Math.max(1, Number(process.env.BRAVE_MAX_OFFSET || 9) + 1);
   // Official YouTube token pagination (and any provider without a real
   // cursor/offset ceiling) has no separate provider page cap. Returning the
@@ -2513,7 +2553,7 @@ export async function processNextSearchJob(
             : { eligible: false, reasonCodes: ['RUN_STATE_UNAVAILABLE'] };
           if (fallbackDecision.eligible
             && !fallbackState!.continuedToRunId
-            && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_MAX_PAGES
+            && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES
             && await isInnertubeQuotaFallbackAvailable().catch(() => false)) {
             if (!requiresContinuationHandoff(fallbackState!.pagesCompleted)) {
               // Zero completed pages: no official units were spent, so the
@@ -2631,8 +2671,9 @@ export async function processNextSearchJob(
           // after the short time deferral instead of failing the whole run.
           // APPROVED LIMITATION (P14): youtubei.js exposes no partial feed, so
           // a timed-out page-N cannot be persisted; earlier pages remain
-          // durable and the run resumes via REWALK. Never write a fabricated
-          // empty observation for the timed-out page.
+          // durable and the run resumes from its stored page token (numeric
+          // legacy fallback only). Never write a fabricated empty observation
+          // for the timed-out page.
           if (!braveProvider && !quotaFreeInnertubeProvider) {
             await finishQuotaReservation('AUTONOMOUS_QUERY_PAGE', autonomousOperationId, false);
           }
@@ -2897,9 +2938,12 @@ export async function processNextSearchJob(
         effectiveMaxPages,
         ceilingBound: bindingBound,
         hasNextPage: !!searchPage?.nextPageToken,
+        // A missing continuation is the provider's own end signal. The old
+        // `pageNumber >= providerMaxPages` guard turned the fixed page-10 cap
+        // into a false PROVIDER_EXHAUSTED verdict; InnerTube now has no
+        // provider page cap, so only an actually absent next page qualifies.
         providerExhausted: (providerKey === 'youtube-innertube' || providerKey === 'brave-search')
-          && !searchPage?.nextPageToken
-          && pageNumber >= providerMaxPages,
+          && !searchPage?.nextPageToken,
         distinctCreators: metrics.distinctResults,
         cumulativeDistinctCreators: marginal.cumulativeUniqueCreators,
         newCreators: marginal.marginalNewCreators,
@@ -3017,19 +3061,38 @@ export async function processNextSearchJob(
             priorZeroQualityPages: prior.v2Streaks.lowValue,
           })
         : { stop: false, quarantine: false, reasonCodes: [] as string[] };
-      // Pending admission verdicts are a temporary evidence wait, but they can
-      // never override a real continuation stop (ceiling, run budget, low
-      // novelty, duplicate-heavy, wrong country) or an operator hold. Defer
-      // only when this page still needs more discovery and its own admission
-      // set is unresolved; run-level pending outcomes from an earlier page
-      // must not reopen a later page.
-      const admissionDeferEligible = admissionGuard.defer === true
-        && Number(admissionPageOutcomes?.pending || 0) > 0
+      // Pending admission verdicts are a temporary evidence wait. Hard
+      // ceilings/budgets/no-next-page remain terminal; a low-value,
+      // wrong-country or low-novelty stop is provisional and must wait for
+      // this page's own admission verdicts before finalizing. Duplicate-heavy
+      // stays terminal because page-local channel IDs already prove the page
+      // repeated what the catalog knows. Run-level pending outcomes from an
+      // earlier page must not reopen a later page.
+      // Page-level pending count, independent of the query-contamination guard
+      // (which deliberately does not judge page 1). A page-1 LOW_NOVELTY_PROBE
+      // is exactly the case where a pending verdict can change the stop.
+      const admissionPagePending = Number(admissionPageOutcomes?.pending || 0) > 0
         && !queryResultHold
-        && continuationEnabled
+        && continuationEnabled;
+      const admissionDeferEligible = admissionPagePending
+        && admissionGuard.defer === true
         && decision.shouldContinue === true;
       if (admissionDeferEligible) {
         await deferAutonomousRunForAdmission(queryRunId, pageNumber, admissionGuard.reasonCodes.join(','));
+        await completeJob(job.id);
+        return true;
+      }
+      // A low-value/wrong-country/novelty stop is provisional while this
+      // page's own admissions are unresolved. Do not finalize it on incomplete
+      // evidence; defer and re-evaluate after settlement. Real ceilings,
+      // budget exhaustion, no-next-page, provider exhaustion and
+      // duplicate-heavy stay terminal.
+      const admissionReviewEligible = admissionPagePending
+        && decision.shouldContinue === false
+        && Boolean(searchPage?.nextPageToken)
+        && !ADMISSION_REVIEW_HARD_STOP_REASONS.has(String(decision.primaryReason));
+      if (admissionReviewEligible) {
+        await deferAutonomousRunForAdmissionReview(queryRunId, pageNumber, admissionGuard.reasonCodes.join(','));
         await completeJob(job.id);
         return true;
       }
@@ -3548,14 +3611,19 @@ export async function resumeOrphanedAutonomousPages(options: {
           getAdmissionRunOutcomes(run.runId),
         ]);
         if (Number(pageOutcomes.pending || 0) > 0) {
-          await deferAutonomousRunForAdmission(run.runId, run.pagesCompleted, 'ADMISSION_PENDING_WAIT');
+          if (lastObservation.shouldContinue === false) {
+            await deferAutonomousRunForAdmissionReview(run.runId, run.pagesCompleted, 'ADMISSION_PENDING_WAIT');
+          } else {
+            await deferAutonomousRunForAdmission(run.runId, run.pagesCompleted, 'ADMISSION_PENDING_WAIT');
+          }
           skipped++;
           continue;
         }
         await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted, true);
-        const [settledMetrics, priorState] = await Promise.all([
+        const [settledMetrics, priorState, settledMarginal] = await Promise.all([
           getAutonomousPageSettledGuardMetrics(run.runId, run.pagesCompleted),
           getAutonomousContinuationState(run.runId, run.pagesCompleted),
+          getAutonomousPageMarginalMetrics(run.runId, run.pagesCompleted),
         ]);
         const settledGuard = evaluateQueryAdmissionGuard({
           pageNumber: run.pagesCompleted,
@@ -3584,16 +3652,42 @@ export async function resumeOrphanedAutonomousPages(options: {
           continue;
         }
         const hasCursor = Boolean(run.nextPageToken) && run.resumeMode !== 'NONE';
-        await settleAutonomousPageAdmissionDeferral(
-          run.runId,
-          run.pagesCompleted,
-          hasCursor,
-          hasCursor ? null : 'NO_NEXT_PAGE',
-        );
-        if (!hasCursor) {
-          await finalizeLinkedAutonomousParent(run);
-          skipped++;
-          continue;
+        const settledProductive = Number(settledMarginal.marginalNewCreators || 0) > 0
+          || Number(settledMarginal.marginalFreshConfirmedCreators || 0) > 0
+          || Number(settledMarginal.marginalFreshQualityCreators || 0) > 0;
+        if (lastObservation.shouldContinue === false) {
+          if (settledProductive) {
+            await settleAutonomousPageAdmissionDeferral(run.runId, run.pagesCompleted, true, null);
+            lastObservation.shouldContinue = true;
+            lastObservation.stoppingReason = null;
+            if (!hasCursor) {
+              await finalizeLinkedAutonomousParent(run);
+              skipped++;
+              continue;
+            }
+          } else {
+            await settleAutonomousPageAdmissionDeferral(
+              run.runId,
+              run.pagesCompleted,
+              false,
+              lastObservation.stoppingReason || lastObservation.primaryReason,
+            );
+            await finalizeLinkedAutonomousParent(run);
+            skipped++;
+            continue;
+          }
+        } else {
+          await settleAutonomousPageAdmissionDeferral(
+            run.runId,
+            run.pagesCompleted,
+            hasCursor,
+            hasCursor ? null : 'NO_NEXT_PAGE',
+          );
+          if (!hasCursor) {
+            await finalizeLinkedAutonomousParent(run);
+            skipped++;
+            continue;
+          }
         }
       }
       if (lastObservation && lastObservation.shouldContinue === false) {

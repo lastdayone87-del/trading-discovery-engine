@@ -27,7 +27,7 @@
  * page is never returned as fresh successful data.
  */
 import { randomUUID } from 'node:crypto';
-import { Innertube } from 'youtubei.js';
+import { Innertube, YT, YTNodes } from 'youtubei.js';
 import { appendProviderCallEvent } from './db';
 import {
   registerRetrievalExecutor,
@@ -51,9 +51,25 @@ export const YOUTUBE_INNERTUBE_PROVIDER: ProviderAllocation = Object.freeze({
 });
 
 /** InnerTube channel/video search never needs an API key; sessions are quota-free. */
-export const YOUTUBE_INNERTUBE_MAX_PAGES = 10;
+export const YOUTUBE_INNERTUBE_DEFAULT_MAX_PAGES = 50;
+/**
+ * Backwards-compatible default used by older callers/tests. Runtime page
+ * bounding is owned by `autonomous_pagination_max_pages`; this constant must
+ * never become a provider exhaustion signal again.
+ */
+export const YOUTUBE_INNERTUBE_MAX_PAGES = YOUTUBE_INNERTUBE_DEFAULT_MAX_PAGES;
+/** Absolute cursor sanity ceiling, deliberately above the per-run safety cap. */
+export const YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES = 1000;
 /** First-page result count is provider-determined (~20); official pages request up to 25. */
 export const YOUTUBE_INNERTUBE_PAGE_SIZE = 20;
+
+/** Re-walk cursors can exceed the per-run ceiling in linked segments. */
+export function innertubeCursorMaxPages(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES || String(YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES));
+  return Number.isFinite(parsed) && parsed >= 1
+    ? Math.min(YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES, Math.floor(parsed))
+    : YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES;
+}
 
 export const INNERTUBE_RATE_LIMITED_CODE = 'INNERTUBE_API_RATE_LIMIT_429';
 export const INNERTUBE_TIMEOUT_CODE = 'INNERTUBE_API_TIMEOUT';
@@ -69,9 +85,10 @@ const CHANNEL_ID_PATTERN = /^UC[A-Za-z0-9_-]{22}$/;
  * initial search, and every continuation walk step share ONE absolute
  * deadline established when executeInnertubeRetrievalPage starts. It is NOT
  * a per-request budget: a page can never consume N x timeout no matter how
- * many provider operations it performs. This bounds worker hold time on the
- * unofficial endpoint, where stalls (hung session/search/continuation) would
- * otherwise stack per-operation timeouts severalfold.
+ * many provider operations it performs. Token cursors make the normal case
+ * one request; only legacy numeric cursors re-walk. This bounds worker hold
+ * time on the unofficial endpoint, where stalls (hung session/search/
+ * continuation) would otherwise stack per-operation timeouts severalfold.
  */
 export function innertubeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.YOUTUBE_INNERTUBE_TIMEOUT_MS || '30000');
@@ -157,6 +174,54 @@ async function pacedContinuation(
 ): Promise<unknown> {
   await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
   return withInnertubeRemaining(feed.getContinuation!(), deadlineAtMs);
+}
+
+async function pacedTokenContinuation(
+  session: InnertubeSession,
+  continuationToken: string,
+  deadlineAtMs: number,
+): Promise<InnertubeFeedLike> {
+  await withInnertubeRemaining(paceInnertubeRequest(innertubeMinIntervalMs()), deadlineAtMs);
+  if (typeof session.resumeSearch !== 'function') {
+    throw Object.assign(
+      new Error('InnerTube session cannot resume a persisted continuation token.'),
+      { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+    );
+  }
+  const resumed = await withInnertubeRemaining(
+    session.resumeSearch(continuationToken),
+    deadlineAtMs,
+  );
+  if (!resumed) {
+    throw Object.assign(
+      new Error('InnerTube token continuation returned no feed.'),
+      { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+    );
+  }
+  return resumed;
+}
+
+/**
+ * Extract the body continuation token from a parsed search feed. youtubei.js
+ * does not expose this as a public cursor, but the parsed ContinuationItem
+ * carries the same token its own getContinuation() would send. Persisting it
+ * is what makes deep pagination one request per page instead of an N-page
+ * re-walk. Any shape mismatch degrades to the numeric REWALK cursor, never to
+ * a fabricated continuation.
+ */
+export function innertubeContinuationToken(feed: InnertubeFeedLike | null | undefined): string | null {
+  const memo = feed?.memo;
+  if (!memo || typeof memo.getType !== 'function') return null;
+  try {
+    const items = memo.getType(YTNodes.ContinuationItem, YTNodes.ContinuationItemView) || [];
+    for (const item of items) {
+      const token = item?.endpoint?.payload?.token;
+      if (typeof token === 'string' && token.trim()) return token;
+    }
+  } catch {
+    // A parser-version change must not turn a successful page into a failure.
+  }
+  return null;
 }
 
 /**
@@ -358,10 +423,75 @@ export function mapInnertubeVideosToRaw(nodes: InnertubeVideoLike[]): Discovered
   return [...byChannel.values()];
 }
 
-export function parseInnertubeCursor(cursor: string | null | undefined): number {
-  if (!cursor) return 1;
-  const page = Math.floor(Number(cursor));
-  return Number.isInteger(page) && page >= 1 ? Math.min(page, YOUTUBE_INNERTUBE_MAX_PAGES) : 1;
+/**
+ * Opaque continuation-token cursor. The page number stays in the cursor for
+ * telemetry and sanity bounding; the token is what actually resumes the feed.
+ * Legacy numeric cursors remain valid and re-walk from page 1 for one page
+ * (for example an in-flight row written before token cursors existed).
+ */
+export const INNERTUBE_TOKEN_CURSOR_PREFIX = 'it1.';
+
+export interface InnertubeCursorState {
+  pageNumber: number;
+  continuationToken: string | null;
+}
+
+function boundedInnertubePage(page: number, maxPages: number): number {
+  return Math.min(Math.max(1, page), Math.max(1, maxPages));
+}
+
+export function encodeInnertubeCursor(
+  pageNumber: number,
+  continuationToken?: string | null,
+  maxPages = innertubeCursorMaxPages(),
+): string {
+  const page = boundedInnertubePage(
+    Number.isFinite(pageNumber) ? Math.floor(pageNumber) : 1,
+    maxPages,
+  );
+  const token = typeof continuationToken === 'string' ? continuationToken.trim() : '';
+  if (!token) return String(page);
+  return `${INNERTUBE_TOKEN_CURSOR_PREFIX}${page}.${Buffer.from(token, 'utf8').toString('base64url')}`;
+}
+
+export function parseInnertubeCursorState(
+  cursor: string | null | undefined,
+  maxPages = innertubeCursorMaxPages(),
+): InnertubeCursorState {
+  if (!cursor) return { pageNumber: 1, continuationToken: null };
+  const text = String(cursor);
+  if (text.startsWith(INNERTUBE_TOKEN_CURSOR_PREFIX)) {
+    const rest = text.slice(INNERTUBE_TOKEN_CURSOR_PREFIX.length);
+    const separator = rest.indexOf('.');
+    if (separator > 0) {
+      const page = Math.floor(Number(rest.slice(0, separator)));
+      const encoded = rest.slice(separator + 1);
+      if (Number.isInteger(page) && page >= 1 && encoded) {
+        try {
+          const token = Buffer.from(encoded, 'base64url').toString('utf8');
+          // Reject malformed base64 instead of handing a garbage token to the
+          // provider. Round-tripping is cheap and keeps the read path total.
+          if (token && Buffer.from(token, 'utf8').toString('base64url') === encoded) {
+            return { pageNumber: boundedInnertubePage(page, maxPages), continuationToken: token };
+          }
+        } catch {
+          // Fall through to the safe page-1 numeric cursor.
+        }
+      }
+    }
+    return { pageNumber: 1, continuationToken: null };
+  }
+  const page = Math.floor(Number(text));
+  return {
+    pageNumber: Number.isInteger(page) && page >= 1
+      ? boundedInnertubePage(page, maxPages)
+      : 1,
+    continuationToken: null,
+  };
+}
+
+export function parseInnertubeCursor(cursor: string | null | undefined, maxPages = innertubeCursorMaxPages()): number {
+  return parseInnertubeCursorState(cursor, maxPages).pageNumber;
 }
 
 type InnertubeFeedLike = {
@@ -369,10 +499,22 @@ type InnertubeFeedLike = {
   videos?: unknown;
   has_continuation?: boolean;
   getContinuation?: () => Promise<unknown>;
+  memo?: {
+    getType: (...types: unknown[]) => Array<{
+      endpoint?: { payload?: { token?: unknown } };
+    }>;
+  };
 };
 
 type InnertubeSession = {
   search: (query: string, filters?: Record<string, unknown>) => Promise<InnertubeFeedLike>;
+  /**
+   * Resume search results directly from a persisted continuation token. This
+   * is the production path for page N; it costs one provider request instead
+   * of re-running the search and walking N-1 continuations under a single
+   * page deadline. Absent only on legacy/test stubs.
+   */
+  resumeSearch?: (continuationToken: string) => Promise<InnertubeFeedLike>;
   getChannel?: (channelId: string) => Promise<{
     getVideos?: () => Promise<{ videos?: unknown }>;
     getAbout?: () => Promise<unknown>;
@@ -426,11 +568,24 @@ async function emit(event: Parameters<typeof appendProviderCallEvent>[0]): Promi
  * attempt. An `async` wrapper would hand out a fresh promise per call and
  * silently defeat that check.
  */
+function wrapInnertubeSession(session: Innertube): InnertubeSession {
+  const wrapped = session as unknown as InnertubeSession;
+  wrapped.resumeSearch = async (continuationToken: string): Promise<InnertubeFeedLike> => {
+    const raw = await session.actions.execute('search', {
+      continuation: continuationToken,
+      parse: true,
+    });
+    if (!raw) throw new Error('InnerTube continuation returned no response payload.');
+    return new YT.Search(session.actions, raw, true) as unknown as InnertubeFeedLike;
+  };
+  return wrapped;
+}
+
 function getInnertubeSession(): Promise<InnertubeSession> {
   if (!sessionPromise) {
     const attempt: Promise<InnertubeSession> = (sessionFactory
       ? sessionFactory()
-      : Innertube.create().then((session) => session as unknown as InnertubeSession)
+      : Innertube.create().then((session) => wrapInnertubeSession(session))
     ).then(
       (session) => {
         settledSessionAttempts.add(attempt);
@@ -568,7 +723,9 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
   // InnerTube search has no sort-by-date: relevance is the only available
   // order. Recorded truthfully; never misreported as DATE downstream.
   const actualOrdering = 'RELEVANCE';
-  const pageNumber = parseInnertubeCursor(request.cursor);
+  const rawCursor = request.cursor == null ? '' : String(request.cursor);
+  const cursor = parseInnertubeCursorState(request.cursor);
+  const pageNumber = cursor.pageNumber;
   const started = Date.now();
   // Telemetry identity: provider_call_events.id is UUID PRIMARY KEY, so it
   // must always be a valid UUID. The semantic request attribution lives in
@@ -592,6 +749,14 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     policyVersion: 'provider-resilience-v1',
   };
   try {
+    // A cursor that claims to be a token cursor but cannot be decoded must
+    // never silently rewalk page 1 and persist its results as page N.
+    if (rawCursor.startsWith(INNERTUBE_TOKEN_CURSOR_PREFIX) && !cursor.continuationToken) {
+      throw Object.assign(
+        new Error('InnerTube token cursor is malformed; refusing to rewalk page 1.'),
+        { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+      );
+    }
     // Exactly one pacing slot per actual outbound request: the initial search
     // is paced inside pacedSearch and each continuation inside
     // pacedContinuation. No pacing here — a second admission would halve
@@ -609,52 +774,48 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
       invalidateStuckSessionAttempt(sessionAttempt);
       throw error;
     }
-    // Page walk: InnerTube continuations belong to a live feed object, so page
-    // N is reached by re-running the search and advancing N-1 continuations.
-    // Bounded to YOUTUBE_INNERTUBE_MAX_PAGES (10 pages; the autonomous safety
-    // ceiling is higher, so the provider cap is the binding bound here).
-    // NOTE on durability: youtubei.js exposes no serializable continuation
-    // token, so cross-job pages re-run the search and walk live continuations
-    // rather than resuming an opaque cursor. Result churn between jobs can
-    // duplicate (absorbed downstream: per-page channelId dedupe, duplicate-
-    // ratio stop, idempotent page records) or skip (bounded by the provider's
-    // page cap) results; within one call the walk uses live continuations with
-    // no drift.
-    // A cursor is therefore a page number, not an equivalent server cursor.
+    // Page N resumes directly from the persisted continuation token: ONE
+    // provider request, independent of depth. Re-walking from page 1 would
+    // spend (N-1) x 500ms of pacing alone before network time and cannot
+    // reach deep pages inside the 30s page deadline (page 50 needs 24.5s of
+    // pacing plus 50 responses). Numeric cursors are legacy/fallback only and
+    // still walk live continuations for one page.
     //
-    // APPROVED LIMITATION (P14): youtubei.js 18.0.0 resolves a whole feed and
-    // exposes no AbortSignal, cancellation, or partial-feed API. If the 30s
-    // page deadline fires before the requested feed resolves, there are no
-    // page-N results to persist. The provider therefore propagates
-    // INNERTUBE_API_TIMEOUT; the worker keeps every earlier page observation,
-    // marks the run DEFERRED_TIME / TIME_BUDGET_EXHAUSTED, and resumes via
-    // REWALK. It must not fabricate an empty/partial page observation for the
-    // timed-out page.
+    // APPROVED LIMITATION (P14): youtubei.js exposes no partial feed,
+    // AbortSignal, or cancellation API. If the page deadline fires before the
+    // one page-N request resolves, no page-N results exist to persist; the
+    // provider must propagate INNERTUBE_API_TIMEOUT and the worker resumes
+    // from the durable cursor instead of fabricating an empty page.
     const searchType = lane === 'VIDEO' ? 'video' : 'channel';
-    let feed = await pacedSearch(session, request.query, searchType, deadlineAtMs);
-    for (let walked = 1; walked < pageNumber; walked++) {
-      if (!feed?.has_continuation || typeof feed.getContinuation !== 'function') {
-        throw Object.assign(
-          new Error(`YouTube.js InnerTube continuation unavailable for page ${pageNumber} (walk stopped at ${walked}).`),
-          { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
-        );
+    let feed: InnertubeFeedLike | null;
+    if (cursor.continuationToken) {
+      feed = await pacedTokenContinuation(session, cursor.continuationToken, deadlineAtMs);
+    } else {
+      feed = await pacedSearch(session, request.query, searchType, deadlineAtMs);
+      for (let walked = 1; walked < pageNumber; walked++) {
+        if (!feed?.has_continuation || typeof feed.getContinuation !== 'function') {
+          throw Object.assign(
+            new Error(`YouTube.js InnerTube continuation unavailable for page ${pageNumber} (walk stopped at ${walked}).`),
+            { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+          );
+        }
+        // Rejections propagate with their original classification (429s arm
+        // the cooldown, network errors stay network errors); only a genuinely
+        // empty (null/undefined) continuation becomes CONTINUATION_UNAVAILABLE.
+        // The walk shares the page deadline, so a stalled continuation cannot
+        // stack another full timeout on top of the search that preceded it.
+        const next = (await withInnertubeRemaining(
+          pacedContinuation(feed, deadlineAtMs),
+          deadlineAtMs,
+        )) as InnertubeFeedLike | null;
+        if (!next) {
+          throw Object.assign(
+            new Error(`YouTube.js InnerTube continuation returned no feed for page ${pageNumber}.`),
+            { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
+          );
+        }
+        feed = next;
       }
-      // Rejections propagate with their original classification (429s arm the
-      // cooldown, network errors stay network errors); only a genuinely empty
-      // (null/undefined) continuation becomes CONTINUATION_UNAVAILABLE. The
-      // walk shares the page deadline, so a stalled continuation cannot stack
-      // another full timeout on top of the search that preceded it.
-      const next = (await withInnertubeRemaining(
-        pacedContinuation(feed, deadlineAtMs),
-        deadlineAtMs,
-      )) as InnertubeFeedLike | null;
-      if (!next) {
-        throw Object.assign(
-          new Error(`YouTube.js InnerTube continuation returned no feed for page ${pageNumber}.`),
-          { code: INNERTUBE_CONTINUATION_UNAVAILABLE_CODE, retryable: true },
-        );
-      }
-      feed = next;
     }
     const rawNodes = (lane === 'VIDEO' ? feed?.videos : feed?.channels) ?? [];
     const nodes: Array<InnertubeChannelLike & InnertubeVideoLike> = Array.isArray(rawNodes) ? rawNodes : [];
@@ -665,7 +826,12 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     const channels = lane === 'VIDEO'
       ? mapInnertubeVideosToRaw(nodes)
       : mapInnertubeChannelsToRaw(nodes, request.country);
-    const hasMore = feed?.has_continuation === true && pageNumber < YOUTUBE_INNERTUBE_MAX_PAGES;
+    // Never suppress a real continuation at the safety ceiling. The queue
+    // policy turns the ceiling into PAGE_CEILING and hands the token cursor to
+    // a linked TOKEN segment; only an actually absent continuation is
+    // PROVIDER_EXHAUSTED.
+    const hasMore = feed?.has_continuation === true;
+    const continuationToken = hasMore ? innertubeContinuationToken(feed) : null;
     await emit({
       ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
       actualCost: 0, occurredAt: new Date().toISOString(),
@@ -673,7 +839,12 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     return {
       channels,
       rawResultCount,
-      nextPageToken: hasMore ? String(pageNumber + 1) : null,
+      // Token cursors make every page a single request. The numeric fallback
+      // preserves legacy behavior if youtubei.js stops exposing the parsed
+      // continuation item; it is never misreported as provider exhaustion.
+      nextPageToken: hasMore
+        ? encodeInnertubeCursor(pageNumber + 1, continuationToken)
+        : null,
       providerCostUsd: 0,
       providerRequestId: request.queryRunId ? `${request.queryRunId}:youtube-innertube:${lane.toLowerCase()}:p${pageNumber}` : undefined,
     };
