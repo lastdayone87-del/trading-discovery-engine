@@ -15,6 +15,16 @@ export function usesNeighborhoodLineage(
  * Returns the dimensions that must be used for lineage validation. Callers
  * still validate that the returned key equals nativeLineage.targetNeighborhoodKey.
  */
+export function lineageBoundDimensions(
+  allocationOrigin: string,
+  nativeLineage: Record<string, unknown> | null | undefined,
+  targetDimensions: DiscoveryNeighborhoodDimensions | undefined,
+): DiscoveryNeighborhoodDimensions | undefined {
+  if (!usesNeighborhoodLineage(allocationOrigin, nativeLineage)) return undefined;
+  if (!nativeLineage?.targetNeighborhoodKey) return undefined;
+  return targetDimensions;
+}
+
 /**
  * A materialized-generated query carries neighborhood lineage but no governed
  * frontier proposal (its allocation row has `proposal_id = NULL`). Consuming a
@@ -27,16 +37,6 @@ export function shouldConsumeFrontierProposal(input: {
   proposalId?: string | null;
 }): boolean {
   return input.hasNeighborhoodLineage && Boolean(input.proposalId);
-}
-
-export function lineageBoundDimensions(
-  allocationOrigin: string,
-  nativeLineage: Record<string, unknown> | null | undefined,
-  targetDimensions: DiscoveryNeighborhoodDimensions | undefined,
-): DiscoveryNeighborhoodDimensions | undefined {
-  if (!usesNeighborhoodLineage(allocationOrigin, nativeLineage)) return undefined;
-  if (!nativeLineage?.targetNeighborhoodKey) return undefined;
-  return targetDimensions;
 }
 
 
