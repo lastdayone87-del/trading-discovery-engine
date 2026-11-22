@@ -11,7 +11,8 @@ async function main(): Promise<void> {
     `SELECT id, query, country, status, collection,
             COALESCE(quality_channels_found,0)::int AS quality_channels_found,
             COALESCE(unique_channels_found,0)::int AS unique_channels_found,
-            COALESCE(times_executed,0)::int AS times_executed
+            COALESCE(times_executed,0)::int AS times_executed,
+            generation_metadata->'queryHold' AS query_hold
        FROM query_library
       WHERE generation_metadata->'queryHold'->>'source'='semantic-admission'
         AND generation_metadata->'queryHold'->'reasonCodes' ? 'ADMISSION_REJECTED_SHARE_HIGH'
@@ -26,6 +27,7 @@ async function main(): Promise<void> {
     qualityChannelsFound: Number(row.quality_channels_found || 0),
     uniqueChannelsFound: Number(row.unique_channels_found || 0),
     timesExecuted: Number(row.times_executed || 0),
+    queryHold: row.query_hold || null,
   }));
   let restorable = 0;
   let restored = 0;
@@ -36,7 +38,9 @@ async function main(): Promise<void> {
       event: 'admission_quarantine_review',
       apply,
       ...row,
-      ...decision,
+      restore: decision.restore,
+      restoreCollection: decision.collection,
+      reason: decision.reason,
     }));
     if (!apply || !decision.restore || !decision.collection) continue;
     const update = await db.query(
@@ -45,8 +49,11 @@ async function main(): Promise<void> {
               collection=$2,
               generation_metadata=COALESCE(generation_metadata,'{}'::jsonb)-'queryHold'
         WHERE id=$1
-          AND generation_metadata->'queryHold'->>'source'='semantic-admission'`,
-      [row.id, decision.collection],
+          AND status='REJECTED'
+          AND generation_metadata->'queryHold'=$3::jsonb
+          AND generation_metadata->'queryHold'->>'source'='semantic-admission'
+          AND generation_metadata->'queryHold'->'reasonCodes' ? 'ADMISSION_REJECTED_SHARE_HIGH'`,
+      [row.id, decision.collection, JSON.stringify(row.queryHold)],
     );
     restored += update.rowCount || 0;
   }
@@ -56,7 +63,8 @@ async function main(): Promise<void> {
     reviewed: rows.length,
     restorable,
     restored,
-    skipped: rows.length - restorable,
+    skippedNoYield: rows.length - restorable,
+    skippedChanged: apply ? restorable - restored : 0,
     timestamp: new Date().toISOString(),
   }));
 }

@@ -21,9 +21,13 @@ export interface QueryAdmissionGuardInput {
   freshConfirmedCreators?: number;
   /** The normal continuation policy already considers this page productive. */
   productiveContinuation?: boolean;
-  /** Cumulative yield already established by earlier pages of this run. */
+  /** Live run-wide yield from the current channel state. */
   runQualityChannels?: number;
   runTradingConfirmed?: number;
+  /** Classifications still pending in this run; rejection must wait. */
+  runClassificationPending?: number;
+  /** True only when run-wide yield evidence loaded successfully. */
+  runYieldAvailable?: boolean;
   /** Admission-created channels whose downstream classification is still running. */
   classificationPending?: number;
   priorZeroQualityPages?: number;
@@ -85,7 +89,13 @@ export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): Qu
     // and must never be rejected from one later bad page.
     const productiveRun = Number(input.runQualityChannels || 0) > 0
       || Number(input.runTradingConfirmed || 0) > 0;
-    const queryEvidenceSufficient = !productiveRun
+    // Permanent rejection requires successfully loaded, settled run evidence.
+    // A transient metrics failure or a pending classification must never be
+    // read as zero yield.
+    const runEvidenceSettled = input.runYieldAvailable === true
+      && Number(input.runClassificationPending || 0) === 0;
+    const queryEvidenceSufficient = runEvidenceSettled
+      && !productiveRun
       && Number(input.priorQueryRuns || 0) >= 2
       && Number(input.priorQueryQualityChannels || 0) === 0
       && Number(input.priorQueryUniqueChannels || 0) === 0;

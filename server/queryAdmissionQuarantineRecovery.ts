@@ -7,6 +7,8 @@ export interface AdmissionQuarantineRecoveryRow {
   qualityChannelsFound: number;
   uniqueChannelsFound: number;
   timesExecuted: number;
+  /** Exact hold selected for review; the apply update must match it. */
+  queryHold: unknown;
 }
 
 export interface AdmissionQuarantineRecoveryDecision {
@@ -29,9 +31,8 @@ export function evaluateAdmissionQuarantineRecovery(
   if (quality <= 0 && unique <= 0) {
     return { restore: false, collection: null, reason: 'NO_HISTORICAL_YIELD' };
   }
-  return {
-    restore: true,
-    collection: quality >= 200 ? 'PROVEN' : 'EXPERIMENTAL',
-    reason: quality >= 200 ? 'HIGH_HISTORICAL_QUALITY' : 'HISTORICAL_YIELD',
-  };
+  // Restoring a held query must not bypass the normal promotion guard. Put it
+  // back into the experimental collection; ordinary promotion evidence can
+  // move it to PROVEN later.
+  return { restore: true, collection: 'EXPERIMENTAL', reason: 'HISTORICAL_YIELD' };
 }

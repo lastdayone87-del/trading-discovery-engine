@@ -9,7 +9,13 @@ on:
       - 'server/channelAdmission/sightingReconciliation.test.ts'
       - 'server/queryAdmissionQuarantineRecovery.ts'
       - 'server/queryAdmissionQuarantineRecovery.test.ts'
+      - 'server/autonomousPageStore.ts'
+      - 'server/autonomousPageStore.test.ts'
+      - 'server/channelAdmission/store.ts'
       - 'server/queueManager.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
       - 'scripts/releaseAdmissionQuarantine.ts'
       - '.github/workflows/admission-quarantine-policy.yml'
   workflow_dispatch:

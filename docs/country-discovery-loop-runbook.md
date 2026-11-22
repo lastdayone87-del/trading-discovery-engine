@@ -174,17 +174,28 @@ If `orphan_pending_pages` reports `FAIL` (the route returns 503):
 ### Admission rejection-share policy
 
 Admission rejection share is measured over the uncertain admission candidates
-on the current page, not over all page channels. A page/run that still produced
-confirmed, quality or fresh creators — or that the continuation policy marks
-productive — is never stopped by this rule.
+on the current page, not over all page channels. Current-page confirmed,
+quality or fresh creators — or a continuation decision marked productive —
+prevent this rule from stopping the run. Yield from earlier pages only prevents
+query quarantine; it does not prevent a later high-rejection page from stopping
+this run.
 
 A high rejection share stops the current run only. It does **not** permanently
-reject the query. Query rejection requires at least two prior completed runs
-with no quality or unique discoveries on the query history; the current run
-must also be non-productive. One page or one run is never enough. Use
-`npm run quarantine:release` (dry-run) to review existing admission quarantines,
-then `-- --apply` to restore queries with historical yield. Queries with no
-historical yield remain rejected for manual review.
+reject the query. Query rejection requires all of:
+
+- no current-page yield,
+- no live run-wide quality/confirmed yield,
+- no pending classification in the run,
+- successfully loaded run evidence (a read failure fails closed),
+- at least two prior completed runs, and
+- zero historical quality and unique discoveries.
+
+One page or one run is never enough. Use `npm run quarantine:release` (dry-run)
+to review existing admission quarantines, then `-- --apply` to restore queries
+with historical yield to `EXPERIMENTAL` (the normal promotion policy decides
+any later `PROVEN` move). Queries with no historical yield remain rejected for
+manual review. The apply update is fenced by the exact reviewed hold and
+`status='REJECTED'`, so a newer hold or operator pause is never overwritten.
 
 ## 5. Rollback
 

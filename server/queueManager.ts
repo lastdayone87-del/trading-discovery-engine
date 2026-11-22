@@ -142,6 +142,7 @@ import {
   getAutonomousPageSettledGuardMetrics,
   getPageNoveltyMetrics,
   getAutonomousRunMetrics,
+  getAutonomousRunSettledYield,
   listPendingAutonomousRuns,
   markAutonomousPageDeferredForAdmission,
   markAutonomousPageDeferredForAdmissionReview,
@@ -3114,7 +3115,7 @@ export async function processNextSearchJob(
         await completeJob(job.id);
         return true;
       }
-      const [admissionOutcomes, admissionPageOutcomes, admissionRunMetrics] = await Promise.all([
+      const [admissionOutcomes, admissionPageOutcomes, admissionRunYield] = await Promise.all([
         getAdmissionRunOutcomes(queryRunId).catch(error => {
           if (isMissingAdmissionSchemaError(error)) return null;
           throw error;
@@ -3123,7 +3124,7 @@ export async function processNextSearchJob(
           if (isMissingAdmissionSchemaError(error)) return null;
           throw error;
         }),
-        getAutonomousRunMetrics(queryRunId).catch(() => null),
+        getAutonomousRunSettledYield(queryRunId).catch(() => null),
       ]);
       const admissionGuard = admissionOutcomes && admissionPageOutcomes
         ? evaluateQueryAdmissionGuard({
@@ -3136,8 +3137,10 @@ export async function processNextSearchJob(
             tradingConfirmed: metrics.tradingConfirmed,
             freshConfirmedCreators: marginal.marginalFreshConfirmedCreators,
             productiveContinuation: decision.shouldContinue === true && decision.primaryReason === 'CONTINUE_PRODUCTIVE',
-            runQualityChannels: admissionRunMetrics?.qualityChannels,
-            runTradingConfirmed: admissionRunMetrics?.tradingConfirmed,
+            runQualityChannels: admissionRunYield?.qualityChannels,
+            runTradingConfirmed: admissionRunYield?.tradingConfirmed,
+            runClassificationPending: admissionRunYield?.classificationPending,
+            runYieldAvailable: admissionRunYield !== null,
             classificationPending: metrics.classificationPending,
             priorZeroQualityPages: prior.v2Streaks.lowValue,
             priorQueryRuns: Number(queryRecord.times_executed || 0),
@@ -3711,11 +3714,11 @@ export async function resumeOrphanedAutonomousPages(options: {
           continue;
         }
         await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted, true);
-        const [settledMetrics, priorState, settledMarginal, settledRunMetrics] = await Promise.all([
+        const [settledMetrics, priorState, settledMarginal, settledRunYield] = await Promise.all([
           getAutonomousPageSettledGuardMetrics(run.runId, run.pagesCompleted),
           getAutonomousContinuationState(run.runId, run.pagesCompleted),
           getAutonomousPageMarginalMetrics(run.runId, run.pagesCompleted),
-          getAutonomousRunMetrics(run.runId).catch(() => null),
+          getAutonomousRunSettledYield(run.runId).catch(() => null),
         ]);
         const settledQueryRecord = await getQueryById(run.queryId).catch(() => null);
         const settledGuard = evaluateQueryAdmissionGuard({
@@ -3726,8 +3729,10 @@ export async function resumeOrphanedAutonomousPages(options: {
           tradingConfirmed: settledMetrics.tradingConfirmed,
           freshConfirmedCreators: settledMarginal.marginalFreshConfirmedCreators,
           productiveContinuation: lastObservation.shouldContinue === true && String(lastObservation.primaryReason) === 'CONTINUE_PRODUCTIVE',
-          runQualityChannels: settledRunMetrics?.qualityChannels,
-          runTradingConfirmed: settledRunMetrics?.tradingConfirmed,
+          runQualityChannels: settledRunYield?.qualityChannels,
+          runTradingConfirmed: settledRunYield?.tradingConfirmed,
+          runClassificationPending: settledRunYield?.classificationPending,
+          runYieldAvailable: settledRunYield !== null,
           classificationPending: settledMetrics.classificationPending,
           priorZeroQualityPages: priorState.v2Streaks.lowValue,
           priorQueryRuns: Number(settledQueryRecord?.times_executed || 0),
