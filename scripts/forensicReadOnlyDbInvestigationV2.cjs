@@ -1,6 +1,8 @@
 /**
- * Full-population low temporary-space READ-ONLY forensic investigation.
- * Keyset job scan + per-channel indexed lookups; correlation in Node.
+ * Read-only P3 production verification.
+ *
+ * This file intentionally replaces the forensic investigation script only on a
+ * short-lived diagnostic branch. It never writes to the production database.
  */
 const fs = require('node:fs');
 const { Client } = require('pg');
@@ -8,635 +10,245 @@ const { Client } = require('pg');
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) throw new Error('DATABASE_URL secret is required');
 
-const TARGET_REASONS = [
-  'COMMUNITY_REQUIRED_ACQUISITION_FAILURE',
-  'UPSTREAM_REQUIRED_ACQUISITION_FAILURE',
-];
-
-const JOB_BATCH = Math.max(1, Number(process.env.FORENSIC_JOB_BATCH || 5));
-const OBS_LIMIT = Math.max(1, Number(process.env.FORENSIC_OBS_LIMIT || 80));
-const MAX_CHANNELS = Math.max(1, Number(process.env.FORENSIC_MAX_CHANNELS || 100000));
-
-function parseJson(v) {
-  if (v == null) return null;
-  if (typeof v === 'object') return v;
-  try { return JSON.parse(v); } catch { return v; }
-}
-
-function sanitize(v) {
-  if (typeof v === 'string') {
-    return v.replace(/postgres(?:ql)?:\/\/[^\s:@]+:[^\s@]+@/gi, 'postgresql://[REDACTED]@');
-  }
-  if (Array.isArray(v)) return v.map(sanitize);
-  if (v && typeof v === 'object') {
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, sanitize(x)]));
-  }
-  return v;
-}
-
-async function q(client, label, sql, params = []) {
-  const started = Date.now();
-  try {
-    const res = await client.query(sql, params);
-    if (process.env.FORENSIC_VERBOSE === '1' || label.startsWith('probe') || label.startsWith('index') || label.startsWith('jobs_')) {
-      console.error(`[forensic] ok ${label} rows=${res.rowCount} ms=${Date.now() - started}`);
-    }
-    return res;
-  } catch (err) {
-    console.error(`[forensic] FAIL ${label} ms=${Date.now() - started}: ${err.message}`);
-    err.forensicLabel = label;
-    err.forensicSql = sql.replace(/\s+/g, ' ').trim().slice(0, 240);
-    throw err;
-  }
-}
-
-async function trySet(client, sql) {
-  try {
-    await client.query(sql);
-    return true;
-  } catch (e) {
-    console.error(`[forensic] optional SET skipped: ${e.message}`);
-    return false;
-  }
-}
-
-function surfaceOf(prov) {
-  return String(parseJson(prov)?.surface || '').toUpperCase();
-}
-
-function isYoutubeSurface(s) {
-  return s === 'YOUTUBE_ABOUT' || s === 'RECENT_VIDEO_DESCRIPTIONS';
-}
-
-function isCommunitySurface(s) {
-  return [
-    'CHANNEL_EXTERNAL_LINKS',
-    'CREATOR_WEBSITES',
-    'SOCIAL_PROFILES',
-    'CUSTOM_DOMAIN',
-    'COMMUNITY',
-  ].includes(s);
-}
-
-function classifyChannel(item) {
-  const reasons = item.projected_reasons || [];
-  const hasUpstream = reasons.includes('UPSTREAM_REQUIRED_ACQUISITION_FAILURE');
-  const hasCommunity = reasons.includes('COMMUNITY_REQUIRED_ACQUISITION_FAILURE');
-  const qf = item.qualifying_failures || [];
-  const communityQ = qf.filter((o) => isCommunitySurface(surfaceOf(o.provenance)));
-  const upstreamQ = qf.filter((o) => isYoutubeSurface(surfaceOf(o.provenance)));
-  const latestSurface = surfaceOf(item.latest_qualifying_failure?.provenance);
-  const latestIsCommunity = isCommunitySurface(latestSurface);
-  const latestIsUpstream = isYoutubeSurface(latestSurface);
-
-  const noQualifying = qf.length === 0;
-  const step4PartialOrBudget = item.step4_status === 'PARTIAL' || item.budget_expired;
-
-  // Priority order (specific first)
-  if (noQualifying && step4PartialOrBudget) {
-    return 'PARTIAL_OR_BUDGET_WITHOUT_QUALIFYING_FAILURE';
-  }
-  if (item.later_success_after_failure) {
-    return 'STALE_DURABLE_RETRY_METADATA';
-  }
-  if (noQualifying) {
-    return 'STALE_DURABLE_RETRY_METADATA';
-  }
-  if (hasUpstream && latestIsCommunity) {
-    return 'UPSTREAM_ON_COMMUNITY_SURFACE';
-  }
-  if (hasUpstream && upstreamQ.length > 0 && communityQ.length === 0) {
-    return 'LEGITIMATE_UPSTREAM_FAILURE';
-  }
-  if (hasUpstream && upstreamQ.length > 0) {
-    return 'LEGITIMATE_UPSTREAM_FAILURE';
-  }
-  if (hasCommunity && communityQ.length > 0 && upstreamQ.length === 0) {
-    return 'LEGITIMATE_COMMUNITY_FAILURE';
-  }
-  if (hasCommunity && communityQ.length > 0) {
-    return 'LEGITIMATE_COMMUNITY_FAILURE';
-  }
-  if (hasCommunity && upstreamQ.length > 0 && communityQ.length === 0) {
-    return 'OTHER/AMBIGUOUS';
-  }
-  if (qf.length > 0) {
-    return 'OTHER/AMBIGUOUS';
-  }
-  return 'OTHER/AMBIGUOUS';
-}
-
-function extractStep4Meta(trailItems) {
-  const step4 = trailItems.filter((x) =>
-    /step\s*4|linked websites|custom[_ ]domains|partial|budget|rendered/i.test(JSON.stringify(x))
-  );
-  const text = JSON.stringify(step4);
-  const step4Status = /\bPARTIAL\b/i.test(text) ? 'PARTIAL' : /\bCOMPLETE\b|\bDONE\b|\bSUCCESS\b/i.test(text) ? 'COMPLETE' : null;
-  const budgetExpired = /budget expired|Rendered acquisition budget|budgetExhausted/i.test(text);
-
-  let selectedUrlCount = null;
-  let attemptedUrlCount = null;
-  let completedUrlCount = null;
-  let failedUrlCount = null;
-  let unattemptedUrlCount = null;
-
-  for (const item of step4) {
-    const s = typeof item === 'object' && item ? item : {};
-    const candidates = [s, s.details, s.meta, s.telemetry, s.summary].filter(Boolean);
-    for (const c of candidates) {
-      if (!c || typeof c !== 'object') continue;
-      if (selectedUrlCount == null && c.selectedUrlCount != null) selectedUrlCount = Number(c.selectedUrlCount);
-      if (attemptedUrlCount == null && (c.attemptedUrlCount != null || c.urlsAttempted != null)) {
-        attemptedUrlCount = Number(c.attemptedUrlCount ?? c.urlsAttempted);
-      }
-      if (completedUrlCount == null && (c.completedUrlCount != null || c.urlsCompleted != null)) {
-        completedUrlCount = Number(c.completedUrlCount ?? c.urlsCompleted);
-      }
-      if (failedUrlCount == null && (c.failedUrlCount != null || c.urlsFailed != null)) {
-        failedUrlCount = Number(c.failedUrlCount ?? c.urlsFailed);
-      }
-      if (unattemptedUrlCount == null && (c.unattemptedUrlCount != null || c.urlsUnattempted != null || c.skippedUrlCount != null)) {
-        unattemptedUrlCount = Number(c.unattemptedUrlCount ?? c.urlsUnattempted ?? c.skippedUrlCount);
-      }
-    }
-  }
-
-  return {
-    step4,
-    step4Status,
-    budgetExpired,
-    selectedUrlCount,
-    attemptedUrlCount,
-    completedUrlCount,
-    failedUrlCount,
-    unattemptedUrlCount,
-  };
-}
+const report = { generatedAt: new Date().toISOString(), readOnly: true, queries: {} };
 
 async function main() {
-  const client = new Client({
-    connectionString: DATABASE_URL,
-    application_name: 'forensic-readonly-full-pop',
-    statement_timeout: 60000,
-  });
+  const client = new Client({ connectionString: DATABASE_URL, ssl: /railway|proxy|rlwy/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined });
   await client.connect();
-
-  const progress = {
-    phase: 'init',
-    minimal_query_ok: false,
-    jobs_scanned: 0,
-    channels_found: 0,
-    channels_processed: 0,
-  };
-
   try {
     await client.query('BEGIN TRANSACTION READ ONLY');
-    await trySet(client, "SET LOCAL statement_timeout = '60s'");
-    await trySet(client, "SET LOCAL lock_timeout = '5s'");
-    await trySet(client, "SET LOCAL work_mem = '1MB'");
-    await trySet(client, "SET LOCAL temp_file_limit = '32MB'");
+    await client.query("SET LOCAL statement_timeout = '300s'");
 
-    progress.phase = 'probe';
-    await q(client, 'probe_select_1', 'SELECT 1 AS ok');
-    progress.minimal_query_ok = true;
-
-    progress.phase = 'catalog';
-    const idx = await q(
-      client,
-      'index_probe',
-      `SELECT indexname FROM pg_indexes
-       WHERE schemaname = 'public'
-         AND tablename IN ('jobs','external_acquisition_observations','channels','job_attempts')
-       LIMIT 50`
-    );
-
-    progress.phase = 'scan_jobs';
-    const jobsByChannel = new Map();
-
-    for (const reason of TARGET_REASONS) {
-      let lastCreated = null;
-      let lastId = null;
-      let safetyLoops = 0;
-      while (safetyLoops < 20000) {
-        safetyLoops += 1;
-        let sql;
-        let params;
-        if (lastId == null) {
-          sql = `
-            SELECT id::text AS job_id, status, attempts, max_attempts,
-                   run_after, created_at, updated_at, last_error,
-                   payload->>'channelId' AS channel_id,
-                   payload->>'retryReason' AS retry_reason,
-                   payload->>'retryCode' AS retry_code,
-                   payload->>'retrySource' AS retry_source,
-                   payload->>'observedAt' AS retry_observed_at,
-                   payload->>'observationAt' AS observation_at,
-                   payload->>'reconciliationStatus' AS reconciliation_status,
-                   payload->>'reconciliationCode' AS reconciliation_code,
-                   payload->>'deferralCount' AS deferral_count
-            FROM jobs
-            WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
-              AND payload->>'retryReason' = $1
-            ORDER BY created_at ASC, id ASC
-            LIMIT $2`;
-          params = [reason, JOB_BATCH];
-        } else {
-          sql = `
-            SELECT id::text AS job_id, status, attempts, max_attempts,
-                   run_after, created_at, updated_at, last_error,
-                   payload->>'channelId' AS channel_id,
-                   payload->>'retryReason' AS retry_reason,
-                   payload->>'retryCode' AS retry_code,
-                   payload->>'retrySource' AS retry_source,
-                   payload->>'observedAt' AS retry_observed_at,
-                   payload->>'observationAt' AS observation_at,
-                   payload->>'reconciliationStatus' AS reconciliation_status,
-                   payload->>'reconciliationCode' AS reconciliation_code,
-                   payload->>'deferralCount' AS deferral_count
-            FROM jobs
-            WHERE type = 'RETRY_COMMUNITY_ACQUISITION'
-              AND payload->>'retryReason' = $1
-              AND (created_at, id) > ($2::timestamptz, $3::uuid)
-            ORDER BY created_at ASC, id ASC
-            LIMIT $4`;
-          params = [reason, lastCreated, lastId, JOB_BATCH];
-        }
-
-        const batch = await q(client, `jobs_${reason.slice(0, 16)}_${safetyLoops}`, sql, params);
-        progress.jobs_scanned += batch.rowCount;
-        if (batch.rowCount === 0) break;
-
-        for (const row of batch.rows) {
-          if (!row.channel_id) continue;
-          if (!jobsByChannel.has(row.channel_id)) {
-            if (jobsByChannel.size >= MAX_CHANNELS) continue;
-            jobsByChannel.set(row.channel_id, []);
-          }
-          jobsByChannel.get(row.channel_id).push(row);
-          lastCreated = row.created_at;
-          lastId = row.job_id;
-        }
-        if (batch.rowCount < JOB_BATCH) break;
-        if (safetyLoops % 50 === 0) {
-          console.error(`[forensic] progress jobs_scanned=${progress.jobs_scanned} channels=${jobsByChannel.size}`);
-        }
-      }
-    }
-
-    const channelIds = [...jobsByChannel.keys()];
-    progress.channels_found = channelIds.length;
-    progress.phase = 'per_channel';
-    console.error(`[forensic] scanning ${channelIds.length} channels (jobs=${progress.jobs_scanned})`);
-
-    const report = [];
-
-    for (let i = 0; i < channelIds.length; i++) {
-      const channelId = channelIds[i];
-      const retryJobs = jobsByChannel.get(channelId) || [];
-      // Prefer most recent job first for projection fields
-      retryJobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-      const chRes = await q(
-        client,
-        `channel_${i}`,
-        `SELECT channel_id, channel_name, discord_status, discord_validation_status,
-                scan_status, scan_attempts, last_checked, next_check,
-                inspection_trail, created_at, updated_at
-         FROM channels
-         WHERE channel_id = $1
-         LIMIT 1`,
-        [channelId]
-      );
-      const channel = chRes.rows[0] || null;
-
-      const obsRes = await q(
-        client,
-        `obs_${i}`,
-        `SELECT observation_key, channel_id, requested_url, final_url, outcome,
-                retryable, http_status, failure_class, detail, provenance,
-                policy_version, observed_at
-         FROM external_acquisition_observations
-         WHERE channel_id = $1
-         ORDER BY observed_at DESC
-         LIMIT $2`,
-        [channelId, OBS_LIMIT]
-      );
-
-      const obs = obsRes.rows.map((o) => ({ ...o, provenance: parseJson(o.provenance) }));
-
-      const qualifying = obs.filter(
-        (o) =>
-          o.outcome === 'ACQUISITION_FAILED' &&
-          o.retryable === true &&
-          parseJson(o.provenance)?.required !== false
-      );
-
-      const trail = parseJson(channel?.inspection_trail);
-      const trailItems = Array.isArray(trail) ? trail : trail ? [trail] : [];
-      const step4Meta = extractStep4Meta(trailItems);
-
-      const urlsAttempted = [...new Set(obs.map((o) => o.requested_url).filter(Boolean))];
-      const urlsFailed = [
-        ...new Set(
-          obs
-            .filter((o) => o.outcome === 'ACQUISITION_FAILED')
-            .map((o) => o.requested_url)
-            .filter(Boolean)
-        ),
-      ];
-      const urlsCompleted = [
-        ...new Set(
-          obs
-            .filter((o) => o.outcome === 'FOUND' || o.outcome === 'INSPECTED_NO_MATCH')
-            .map((o) => o.requested_url)
-            .filter(Boolean)
-        ),
-      ];
-
-      const latestQualifying = qualifying[0] || null;
-      const laterSuccess =
-        !!latestQualifying &&
-        obs.some(
-          (o) =>
-            new Date(o.observed_at) > new Date(latestQualifying.observed_at) &&
-            (o.outcome === 'FOUND' || o.outcome === 'INSPECTED_NO_MATCH')
-        );
-
-      let jobAttemptSummary = null;
+    const q = async (label, sql, params = []) => {
       try {
-        const jid = retryJobs[0]?.job_id;
-        if (jid) {
-          const att = await q(
-            client,
-            `attempts_${i}`,
-            `SELECT count(*)::int AS n,
-                    max(started_at) AS last_started_at,
-                    max(finished_at) AS last_finished_at
-             FROM job_attempts WHERE job_id = $1::uuid`,
-            [jid]
-          );
-          jobAttemptSummary = {
-            latest_job_id: jid,
-            attempt_rows: att.rows[0]?.n ?? 0,
-            last_started_at: att.rows[0]?.last_started_at || null,
-            last_finished_at: att.rows[0]?.last_finished_at || null,
-          };
-        }
-      } catch (_) {
-        jobAttemptSummary = null;
+        const result = await client.query(sql, params);
+        report.queries[label] = { rows: result.rows };
+        return result.rows;
+      } catch (error) {
+        report.queries[label] = { error: error.message };
+        return null;
       }
-
-      const item = {
-        channel_id: channelId,
-        channel_name: channel?.channel_name || null,
-        projected_reasons: [...new Set(retryJobs.map((j) => j.retry_reason).filter(Boolean))],
-        retry_codes: [...new Set(retryJobs.map((j) => j.retry_code).filter(Boolean))],
-        retry_sources: [...new Set(retryJobs.map((j) => j.retry_source).filter(Boolean))],
-        retry_jobs: sanitize(retryJobs),
-        latest_retry_job: sanitize(retryJobs[0] || null),
-        channel_state: sanitize({
-          channel_id: channel?.channel_id,
-          channel_name: channel?.channel_name,
-          discord_status: channel?.discord_status,
-          discord_validation_status: channel?.discord_validation_status,
-          scan_status: channel?.scan_status,
-          scan_attempts: channel?.scan_attempts,
-          last_checked: channel?.last_checked,
-          next_check: channel?.next_check,
-          updated_at: channel?.updated_at,
-        }),
-        step4_relevant_inspection_trail: sanitize(step4Meta.step4),
-        step4_status: step4Meta.step4Status,
-        budget_expired: step4Meta.budgetExpired,
-        step4_selected_url_count: step4Meta.selectedUrlCount,
-        step4_attempted_url_count: step4Meta.attemptedUrlCount,
-        step4_completed_url_count: step4Meta.completedUrlCount,
-        step4_failed_url_count: step4Meta.failedUrlCount,
-        step4_unattempted_url_count: step4Meta.unattemptedUrlCount,
-        urls_attempted_count: urlsAttempted.length,
-        urls_failed_count: urlsFailed.length,
-        urls_completed_count: urlsCompleted.length,
-        urls_attempted: urlsAttempted.slice(0, 40),
-        urls_failed: urlsFailed.slice(0, 40),
-        later_success_after_failure: laterSuccess,
-        qualifying_failures: sanitize(qualifying),
-        latest_qualifying_failure: sanitize(latestQualifying),
-        observation_summary: {
-          total_returned: obs.length,
-          acquisition_failed: obs.filter((o) => o.outcome === 'ACQUISITION_FAILED').length,
-          retryable_failures: obs.filter(
-            (o) => o.outcome === 'ACQUISITION_FAILED' && o.retryable === true
-          ).length,
-          required_retryable_failures: qualifying.length,
-          community_surface_required_retryable_failures: qualifying.filter((o) =>
-            isCommunitySurface(surfaceOf(o.provenance))
-          ).length,
-          youtube_about_or_recent_video_failures: obs.filter((o) =>
-            isYoutubeSurface(surfaceOf(o.provenance))
-          ).length,
-          found: obs.filter((o) => o.outcome === 'FOUND').length,
-          no_match: obs.filter((o) => o.outcome === 'INSPECTED_NO_MATCH').length,
-          partially_inspected: obs.filter((o) => o.outcome === 'PARTIALLY_INSPECTED').length,
-        },
-        acquisition_observations: sanitize(obs),
-        job_attempt_summary: jobAttemptSummary,
-      };
-      item.verdict = classifyChannel(item);
-      report.push(item);
-      progress.channels_processed = i + 1;
-
-      if ((i + 1) % 100 === 0) {
-        console.error(`[forensic] channels processed ${i + 1}/${channelIds.length}`);
-      }
-    }
-
-    const counts = {
-      matching_retry_jobs_scanned: progress.jobs_scanned,
-      distinct_affected_channels: report.length,
-      community_reason_jobs: [...jobsByChannel.values()]
-        .flat()
-        .filter((r) => r.retry_reason === TARGET_REASONS[0]).length,
-      upstream_reason_jobs: [...jobsByChannel.values()]
-        .flat()
-        .filter((r) => r.retry_reason === TARGET_REASONS[1]).length,
-      channels_with_community_reason: report.filter((r) =>
-        r.projected_reasons.includes(TARGET_REASONS[0])
-      ).length,
-      channels_with_upstream_reason: report.filter((r) =>
-        r.projected_reasons.includes(TARGET_REASONS[1])
-      ).length,
-      channels_with_required_retryable_failure: report.filter(
-        (r) => r.observation_summary.required_retryable_failures > 0
-      ).length,
-      channels_with_community_surface_required_retryable_failure: report.filter(
-        (r) => r.observation_summary.community_surface_required_retryable_failures > 0
-      ).length,
-      channels_with_no_qualifying_observation: report.filter(
-        (r) => r.observation_summary.required_retryable_failures === 0
-      ).length,
-      channels_with_step4_partial: report.filter((r) => r.step4_status === 'PARTIAL').length,
-      channels_with_budget_expired: report.filter((r) => r.budget_expired).length,
-      channels_with_later_success_after_failure: report.filter(
-        (r) => r.later_success_after_failure
-      ).length,
-      channels_with_completed_retry_job: report.filter(
-        (r) => r.latest_retry_job?.status === 'COMPLETED'
-      ).length,
-      channels_with_upstream_reason_latest_community_surface: report.filter(
-        (r) =>
-          r.projected_reasons.includes('UPSTREAM_REQUIRED_ACQUISITION_FAILURE') &&
-          isCommunitySurface(surfaceOf(r.latest_qualifying_failure?.provenance))
-      ).length,
-      verdict_counts: report.reduce((acc, r) => {
-        acc[r.verdict] = (acc[r.verdict] || 0) + 1;
-        return acc;
-      }, {}),
     };
 
-    const failureClassDist = {};
-    const surfaceDist = {};
-    for (const r of report) {
-      const fc = r.latest_qualifying_failure?.failure_class || '(none)';
-      failureClassDist[fc] = (failureClassDist[fc] || 0) + 1;
-      const s = surfaceOf(r.latest_qualifying_failure?.provenance) || '(none)';
-      surfaceDist[s] = (surfaceDist[s] || 0) + 1;
+    await q('basics', `SELECT current_database() AS database, inet_server_addr()::text AS server_addr,
+                             version() AS version, now() AS now`);
+    const schema = await q('schema', `SELECT max(version)::int AS schema_version, count(*)::int AS applied
+                                       FROM schema_migrations`);
+    const markerRows = await q('deploy_marker', `SELECT applied_at FROM schema_migrations WHERE version=206`);
+    const marker = markerRows?.[0]?.applied_at || null;
+
+    await q('controls', `SELECT * FROM candidate_scoring_controls WHERE singleton=true`);
+    await q('index', `SELECT i.indexrelid::regclass::text AS index_name, i.indisvalid, i.indisready,
+                             i.indnatts, pg_get_indexdef(i.indexrelid) AS definition,
+                             pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
+                        FROM pg_index i
+                       WHERE i.indexrelid = to_regclass('public.idx_corpus_occurrences_normalized')`);
+    await q('index_stats', `SELECT indexrelid::regclass::text AS index_name, idx_scan, idx_tup_read,
+                                   idx_tup_fetch, pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+                              FROM pg_stat_user_indexes
+                             WHERE relname='corpus_candidate_occurrences'
+                             ORDER BY indexrelid::regclass::text`);
+    await q('corpus_tables', `SELECT relname, n_live_tup, pg_size_pretty(pg_total_relation_size(oid)) AS total_size
+                                FROM pg_class
+                               WHERE relname IN ('corpus_candidate_occurrences','corpus_documents','candidate_feature_snapshots','candidate_adjudication_results')
+                               ORDER BY relname`);
+    await q('span_stats', `SELECT count(*)::bigint AS rows,
+                                  max(octet_length(normalized_span))::int AS max_span_bytes,
+                                  count(*) FILTER (WHERE octet_length(normalized_span)>2048)::int AS over_cap
+                             FROM corpus_candidate_occurrences`);
+
+    await q('jobs', `SELECT type, status, count(*)::int AS n
+                       FROM jobs
+                      WHERE type IN ('SCORE_CANDIDATES','TERM_HARVEST','AI_ADJUDICATE_CANDIDATE','ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','FORCE_REVIEW_RESCAN')
+                        AND status IN ('PENDING','PROCESSING','FAILED')
+                      GROUP BY type, status
+                      ORDER BY type, status`);
+    if (marker) {
+      await q('jobs_after_deploy', `SELECT type, status, count(*)::int AS n
+                                      FROM jobs
+                                     WHERE type IN ('SCORE_CANDIDATES','TERM_HARVEST','AI_ADJUDICATE_CANDIDATE','ENRICH_CHANNEL','CLASSIFY_DISCOVERED_CHANNEL','FORCE_REVIEW_RESCAN')
+                                       AND created_at >= $1
+                                     GROUP BY type, status
+                                     ORDER BY type, status`, [marker]);
+      await q('ai_jobs_after_deploy', `SELECT status, count(*)::int AS n,
+                                              count(*) FILTER (WHERE last_error IS NOT NULL)::int AS with_error,
+                                              max(last_error) AS sample_error
+                                         FROM jobs
+                                        WHERE type='AI_ADJUDICATE_CANDIDATE' AND created_at >= $1
+                                        GROUP BY status ORDER BY status`, [marker]);
+      await q('ai_deferrals', `SELECT status, count(*)::int AS n
+                                 FROM jobs
+                                WHERE type='AI_ADJUDICATE_CANDIDATE' AND created_at >= $1
+                                  AND (last_error LIKE 'AI_ADJUDICATION_PAUSED%' OR last_error LIKE 'AI_BUDGET_EXHAUSTED%')
+                                GROUP BY status ORDER BY status`, [marker]);
+      await q('scoring_duration', `WITH attempts AS (
+                                     SELECT a.started_at, a.finished_at,
+                                            EXTRACT(EPOCH FROM (a.finished_at-a.started_at)) AS secs,
+                                            a.started_at >= $1 AS after_deploy
+                                       FROM jobs j
+                                       JOIN LATERAL (
+                                         SELECT started_at, finished_at
+                                           FROM job_attempts
+                                          WHERE job_id=j.id AND finished_at IS NOT NULL
+                                          ORDER BY attempt_number DESC LIMIT 1
+                                       ) a ON true
+                                      WHERE j.type='SCORE_CANDIDATES'
+                                        AND a.finished_at > now()-interval '7 days'
+                                   )
+                                   SELECT after_deploy, count(*)::int AS n,
+                                          round(avg(secs)::numeric,1) AS avg_s,
+                                          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY secs)::numeric,1) AS p50_s,
+                                          round(percentile_cont(0.95) WITHIN GROUP (ORDER BY secs)::numeric,1) AS p95_s,
+                                          round(max(secs)::numeric,1) AS max_s
+                                     FROM attempts GROUP BY after_deploy ORDER BY after_deploy`, [marker]);
+      await q('scoring_duration_hourly', `SELECT date_trunc('hour', a.started_at) AS hour, count(*)::int AS n,
+                                                 round(avg(EXTRACT(EPOCH FROM (a.finished_at-a.started_at)))::numeric,1) AS avg_s,
+                                                 round(max(EXTRACT(EPOCH FROM (a.finished_at-a.started_at)))::numeric,1) AS max_s
+                                            FROM jobs j
+                                            JOIN LATERAL (
+                                              SELECT started_at, finished_at
+                                                FROM job_attempts
+                                               WHERE job_id=j.id AND finished_at IS NOT NULL
+                                               ORDER BY attempt_number DESC LIMIT 1
+                                            ) a ON true
+                                           WHERE j.type='SCORE_CANDIDATES'
+                                             AND a.started_at >= $1
+                                           GROUP BY 1 ORDER BY 1 DESC`, [marker]);
+      await q('scoring_stuck', `SELECT count(*) FILTER (WHERE status='PROCESSING')::int AS processing,
+                                       count(*) FILTER (WHERE status='PROCESSING' AND last_progress_at < now()-interval '5 minutes')::int AS stale
+                                  FROM jobs WHERE type='SCORE_CANDIDATES'`);
+      await q('scoring_latest', `SELECT id, status, attempts, created_at, last_progress_at, completed_at,
+                                        left(COALESCE(last_error,''),180) AS error
+                                   FROM jobs WHERE type='SCORE_CANDIDATES'
+                                  ORDER BY created_at DESC LIMIT 12`);
+      await q('scoring_docs_after_deploy', `SELECT id, status, payload->>'documentId' AS document_id, created_at
+                                              FROM jobs
+                                             WHERE type='SCORE_CANDIDATES' AND created_at >= $1
+                                             ORDER BY created_at DESC LIMIT 8`, [marker]);
     }
-    counts.failure_class_distribution = failureClassDist;
-    counts.surface_distribution = surfaceDist;
 
-    const forensicTable = report.map((r) => ({
-      Channel: r.channel_id,
-      Name: r.channel_name,
-      Reason: (r.projected_reasons || []).join('|'),
-      RetryCode: (r.retry_codes || []).join('|'),
-      RetrySource: (r.retry_sources || []).join('|'),
-      JobStatus: r.latest_retry_job?.status || null,
-      JobAttempts: r.latest_retry_job?.attempts ?? null,
-      Deferral: r.latest_retry_job?.deferral_count ?? null,
-      ScanStatus: r.channel_state?.scan_status || null,
-      DiscordStatus: r.channel_state?.discord_status || null,
-      LastChecked: r.channel_state?.last_checked || null,
-      Step4: r.step4_status || (r.budget_expired ? 'BUDGET' : 'n/a'),
-      URLs_attempted: r.urls_attempted_count,
-      URLs_completed: r.urls_completed_count,
-      Failed: r.urls_failed_count,
-      Qualifying_failure: r.observation_summary.required_retryable_failures > 0,
-      Required_retryable: r.observation_summary.required_retryable_failures,
-      Community_surface_q: r.observation_summary.community_surface_required_retryable_failures,
-      Later_success: r.later_success_after_failure,
-      Failure_class: r.latest_qualifying_failure?.failure_class || null,
-      Surface: surfaceOf(r.latest_qualifying_failure?.provenance) || null,
-      Verdict: r.verdict,
-    }));
+    await q('channel_status', `SELECT trading_status, count(*)::int AS n
+                                 FROM channels GROUP BY trading_status ORDER BY trading_status`);
+    await q('channel_funnel_24h', `SELECT count(*)::int AS total,
+                                          count(*) FILTER (WHERE created_at > now()-interval '24 hours')::int AS new_24h,
+                                          count(*) FILTER (WHERE trading_status='TRADING_CONFIRMED' AND updated_at > now()-interval '24 hours')::int AS confirmed_24h,
+                                          count(*) FILTER (WHERE scan_status='ENRICHMENT_PENDING')::int AS enrichment_pending
+                                     FROM channels`);
+    await q('confirmed_reviews', `SELECT r.state, count(*)::int AS n
+                                    FROM channel_reviews r JOIN channels c USING(channel_id)
+                                   WHERE c.trading_status='TRADING_CONFIRMED'
+                                   GROUP BY r.state ORDER BY r.state`);
+    await q('confirmed_no_review', `SELECT count(*)::int AS confirmed_without_pending_review
+                                      FROM channels c
+                                     WHERE c.trading_status='TRADING_CONFIRMED'
+                                       AND NOT EXISTS (SELECT 1 FROM channel_reviews r WHERE r.channel_id=c.channel_id AND r.state='PENDING')`);
+    if (marker) {
+      await q('review_cleanup_after_deploy', `SELECT count(*)::int AS superseded_after_deploy
+                                                FROM channel_reviews
+                                               WHERE state='SUPERSEDED' AND updated_at >= $1`, [marker]);
+      await q('diagnostics_after_deploy', `SELECT decision->>'status' AS status, count(*)::int AS n
+                                             FROM production_classification_diagnostics
+                                            WHERE created_at >= $1
+                                            GROUP BY 1 ORDER BY n DESC`, [marker]);
+      await q('semantic_confirmed_after_deploy', `SELECT decision->>'status' AS status, count(*)::int AS n
+                                                    FROM production_classification_diagnostics
+                                                   WHERE created_at >= $1
+                                                     AND decision->'policy_reasons' @> '["SEMANTIC_ADMISSION_CONFIRMED"]'::jsonb
+                                                   GROUP BY 1 ORDER BY n DESC`, [marker]);
+      await q('semantic_confirmed_recent', `SELECT decision->>'status' AS status, count(*)::int AS n
+                                              FROM production_classification_diagnostics
+                                             WHERE created_at >= now()-interval '24 hours'
+                                               AND decision->'policy_reasons' @> '["SEMANTIC_ADMISSION_CONFIRMED"]'::jsonb
+                                             GROUP BY 1 ORDER BY n DESC`);
+      await q('legacy_confidence', `SELECT COALESCE(decision->>'tradingFocus', decision->'classification'->>'tradingFocus') AS trading_focus,
+                                           count(*)::int AS n
+                                      FROM production_classification_diagnostics
+                                     WHERE created_at >= $1
+                                       AND decision->'policy_reasons' @> '["SEMANTIC_ADMISSION_CONFIRMED"]'::jsonb
+                                     GROUP BY 1 ORDER BY n DESC`, [marker]);
+      await q('ai_deferred_candidates', `SELECT count(*)::int AS deferred
+                                           FROM candidate_feature_snapshots f
+                                          WHERE f.decision='AMBIGUOUS'
+                                            AND NOT EXISTS (SELECT 1 FROM classification_assertions a WHERE a.candidate_key=f.candidate_key AND a.assertion_source='AI')
+                                            AND NOT EXISTS (SELECT 1 FROM candidate_adjudication_results r WHERE r.candidate_key=f.candidate_key)
+                                            AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type='AI_ADJUDICATE_CANDIDATE' AND j.payload->>'candidateKey'=f.candidate_key AND j.status IN ('PENDING','PROCESSING','FAILED'))`);
+      await q('ai_usage_today', `SELECT count(*)::int AS completed_today,
+                                        COALESCE(sum(cost_microunits),0)::bigint AS cost_today
+                                   FROM candidate_adjudication_results
+                                  WHERE completed_at >= date_trunc('day',now())`);
+    }
+    await q('scheduler', `SELECT name, is_enabled, is_running, locked_by, last_run_at, next_run_at,
+                                 left(COALESCE(last_report::text,''),2000) AS last_report
+                            FROM scheduler_state`);
+    await q('query_runs_24h', `SELECT status, count(*)::int AS n, max(completed_at) AS latest
+                                 FROM query_runs
+                                WHERE scheduled_at > now()-interval '24 hours'
+                                GROUP BY status ORDER BY n DESC`);
 
-    // Representative examples per verdict
-    const examples = {};
-    for (const r of report) {
-      if (!examples[r.verdict]) examples[r.verdict] = [];
-      if (examples[r.verdict].length < 8) {
-        examples[r.verdict].push({
-          channel_id: r.channel_id,
-          channel_name: r.channel_name,
-          reasons: r.projected_reasons,
-          step4_status: r.step4_status,
-          budget_expired: r.budget_expired,
-          later_success_after_failure: r.later_success_after_failure,
-          latest_qualifying: r.latest_qualifying_failure
-            ? {
-                outcome: r.latest_qualifying_failure.outcome,
-                retryable: r.latest_qualifying_failure.retryable,
-                failure_class: r.latest_qualifying_failure.failure_class,
-                surface: surfaceOf(r.latest_qualifying_failure.provenance),
-                required: parseJson(r.latest_qualifying_failure.provenance)?.required,
-                observed_at: r.latest_qualifying_failure.observed_at,
-                requested_url: r.latest_qualifying_failure.requested_url,
-              }
-            : null,
-          job_status: r.latest_retry_job?.status,
-          observation_summary: r.observation_summary,
-        });
+    const scoringDoc = report.queries.scoring_docs_after_deploy?.rows?.find(row => row.status === 'PENDING')
+      || report.queries.scoring_docs_after_deploy?.rows?.[0];
+    if (scoringDoc?.document_id) {
+      const explain = await q('scoring_explain', `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,
+               d.language,o.start_offset,o.end_offset
+          FROM corpus_candidate_occurrences o
+          JOIN corpus_documents d ON d.id=o.document_id
+          JOIN corpus_source_artifacts a ON a.id=d.artifact_id
+         WHERE o.normalized_span IN (SELECT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1)
+         ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`, [scoringDoc.document_id]);
+      const plan = explain?.[0]?.['QUERY PLAN']?.[0];
+      if (plan) {
+        report.scoringExplain = {
+          documentId: scoringDoc.document_id,
+          executionTimeMs: plan['Execution Time'],
+          planningTimeMs: plan['Planning Time'],
+          topNode: plan.Plan?.['Node Type'],
+          indexNames: JSON.stringify(plan.Plan).match(/"Index Name":"[^"]+"/g) || [],
+          sharedHitBlocks: plan.Plan?.['Shared Hit Blocks'],
+          sharedReadBlocks: plan.Plan?.['Shared Read Blocks'],
+        };
       }
     }
 
-    fs.mkdirSync('forensic-output', { recursive: true });
-    const payload = {
-      generated_at: new Date().toISOString(),
-      mode: 'READ_ONLY_POSTGRES_FORENSIC_FULL_POPULATION',
-      safety: {
-        transaction: 'READ ONLY',
-        statement_timeout: '60s',
-        work_mem: '1MB',
-        writes_performed: false,
-        production_mutations: false,
-        strategy: 'per-reason keyset job scan + per-channel indexed lookups; correlation in Node; no population cap',
-      },
-      progress,
-      indexes_seen: idx.rows.map((r) => r.indexname),
-      target_reasons: TARGET_REASONS,
-      counts,
-      examples_by_verdict: examples,
-      forensic_table: forensicTable,
-      affected_channels: report,
-    };
-    fs.writeFileSync('forensic-output/forensic-report.json', JSON.stringify(payload, null, 2) + '\n');
-
-    const md = [
-      '# Production Forensic DB Investigation (FULL POPULATION)',
-      '',
-      `Generated: ${payload.generated_at}`,
-      '',
-      '## Safety',
-      '- READ ONLY transaction',
-      '- Keyset + per-channel indexed lookups; no production writes',
-      '',
-      '## Counts',
-    ];
-    for (const [k, v] of Object.entries(counts)) {
-      md.push(`- **${k}**: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
-    }
-    md.push('', '## Examples by verdict');
-    for (const [verdict, list] of Object.entries(examples)) {
-      md.push('', `### ${verdict}`);
-      for (const ex of list) {
-        md.push(`- ${ex.channel_id} (${ex.channel_name || '?'}) reasons=${(ex.reasons || []).join('|')} job=${ex.job_status} later_success=${ex.later_success_after_failure}`);
-      }
-    }
-    md.push('', '## Forensic table', '', '```json', JSON.stringify(forensicTable, null, 2), '```');
-    fs.writeFileSync('forensic-output/forensic-report.md', md.join('\n') + '\n');
-
-    // Slim CSV-like table for quick review
-    fs.writeFileSync(
-      'forensic-output/forensic-table.json',
-      JSON.stringify({ generated_at: payload.generated_at, counts, forensic_table: forensicTable, examples_by_verdict: examples }, null, 2) + '\n'
-    );
-
-    await client.query('COMMIT');
-    console.log(JSON.stringify({ ok: true, counts, progress }, null, 2));
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    fs.mkdirSync('forensic-output', { recursive: true });
-    fs.writeFileSync(
-      'forensic-output/forensic-failure.json',
-      JSON.stringify(
-        {
-          generated_at: new Date().toISOString(),
-          progress,
-          failed_label: e.forensicLabel || null,
-          failed_sql_preview: e.forensicSql || null,
-          message: e.message,
-          note: 'Stopped without destructive cleanup.',
-        },
-        null,
-        2
-      ) + '\n'
-    );
-    throw e;
+    await client.query('ROLLBACK');
   } finally {
-    await client.end();
+    await client.end().catch(() => undefined);
   }
+
+  fs.mkdirSync('forensic-output', { recursive: true });
+  fs.writeFileSync('forensic-output/production-p3-verification.json', JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({
+    generatedAt: report.generatedAt,
+    schema: report.queries.schema?.rows?.[0],
+    deployMarker: report.queries.deploy_marker?.rows?.[0] || null,
+    index: report.queries.index?.rows?.[0] || report.queries.index,
+    indexStats: report.queries.index_stats?.rows,
+    spanStats: report.queries.span_stats?.rows?.[0],
+    controls: report.queries.controls?.rows?.[0],
+    jobs: report.queries.jobs?.rows,
+    jobsAfterDeploy: report.queries.jobs_after_deploy?.rows,
+    aiJobsAfterDeploy: report.queries.ai_jobs_after_deploy?.rows,
+    aiDeferrals: report.queries.ai_deferrals?.rows,
+    aiDeferredCandidates: report.queries.ai_deferred_candidates?.rows?.[0],
+    aiUsageToday: report.queries.ai_usage_today?.rows?.[0],
+    scoringDuration: report.queries.scoring_duration?.rows,
+    scoringDurationHourly: report.queries.scoring_duration_hourly?.rows,
+    scoringStuck: report.queries.scoring_stuck?.rows?.[0],
+    scoringExplain: report.scoringExplain,
+    channelStatus: report.queries.channel_status?.rows,
+    channelFunnel24h: report.queries.channel_funnel_24h?.rows?.[0],
+    confirmedReviews: report.queries.confirmed_reviews?.rows,
+    confirmedNoReview: report.queries.confirmed_no_review?.rows?.[0],
+    reviewCleanupAfterDeploy: report.queries.review_cleanup_after_deploy?.rows?.[0],
+    diagnosticsAfterDeploy: report.queries.diagnostics_after_deploy?.rows,
+    semanticConfirmedAfterDeploy: report.queries.semantic_confirmed_after_deploy?.rows,
+    legacyConfidence: report.queries.legacy_confidence?.rows,
+    scheduler: report.queries.scheduler?.rows,
+    queryRuns24h: report.queries.query_runs_24h?.rows,
+  }, null, 2));
 }
 
-main().catch((e) => {
-  console.error('[forensic-read-only-full] failed:', e.message);
+main().catch(error => {
+  console.error(error);
   process.exit(1);
 });
