@@ -5,6 +5,8 @@ import { enqueueCandidateScoring } from './candidateScoring';
 export const CORPUS_POLICY_VERSION='corpus-policy-v1';
 export const EXTRACTOR_VERSION='deterministic-ngram-v1';
 export const OFFSET_SCHEME='UNICODE_CODE_POINT_V1';
+/** Keep the normalized span within a safe B-tree entry size. */
+export const MAX_CANDIDATE_SPAN_BYTES=512;
 const word=/[\p{L}\p{N}][\p{L}\p{N}\p{M}'’.-]*/gu;
 const sha=(value:string)=>createHash('sha256').update(value).digest('hex');
 export interface CandidateSpan { literal:string; normalized:string; startOffset:number; endOffset:number; ngramSize:number; occurrenceKey:string }
@@ -45,6 +47,7 @@ export function extractCandidateSpans(text:string,documentHash=contentHash(text)
   for(let i=0;i<tokens.length;i++)for(let n=1;n<=5&&i+n<=tokens.length;n++){
     const selected=tokens.slice(i,i+n);const literal=points.slice(selected[0].start,selected.at(-1)!.end).join('');
     const canonical=literal.normalize('NFKC').toLocaleLowerCase('und').replace(/\s+/g,' ').trim();
+    if(Buffer.byteLength(canonical,'utf8')>MAX_CANDIDATE_SPAN_BYTES)continue;
     spans.push({literal,normalized:canonical,startOffset:selected[0].start,endOffset:selected.at(-1)!.end,ngramSize:n,occurrenceKey:sha(`${documentHash}|${EXTRACTOR_VERSION}|${selected[0].start}|${selected.at(-1)!.end}|${canonical}`)});
   } return spans;
 }

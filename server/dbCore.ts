@@ -731,12 +731,26 @@ async function ensureCdlHotTableIndexes(client: { query: (text: string, values?:
  * adopts a valid index or verifies an empty table.
  */
 async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
-  await ensureConcurrentIndex(
-    client,
-    'idx_corpus_occurrences_normalized',
-    'corpus_candidate_occurrences',
-    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_corpus_occurrences_normalized ON public.corpus_candidate_occurrences(normalized_span, document_id, start_offset)`,
-  );
+  const name = 'idx_corpus_occurrences_normalized';
+  const existing = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) AS definition
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.${name}')
+  `);
+  const row = existing.rows[0];
+  const definition = String(row?.definition || '');
+  const correct = definition.includes('corpus_candidate_occurrences')
+    && definition.includes('normalized_span')
+    && definition.includes('document_id')
+    && definition.includes('start_offset');
+  if (row?.indisvalid && row?.indisready && correct) return;
+  if (row?.oid) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+  }
+  const target = await client.query(`SELECT to_regclass('public.corpus_candidate_occurrences') AS oid`);
+  if (!target.rows[0]?.oid) return;
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.corpus_candidate_occurrences(normalized_span, document_id, start_offset)`);
 }
 
 /**
@@ -865,6 +879,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     }
     // The migration has committed by now, so CONCURRENTLY is legal. This is
     // idempotent and also repairs a build that failed on a previous boot.
+    const corpusIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=206');
+    if (corpusIndexMigration.rowCount) await ensureCorpusOccurrenceIndexes(client);
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
     const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');

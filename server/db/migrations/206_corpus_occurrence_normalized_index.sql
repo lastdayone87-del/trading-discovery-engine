@@ -25,6 +25,15 @@ BEGIN
     RAISE EXCEPTION 'idx_corpus_occurrences_normalized exists but is not valid/ready; rebuild it CONCURRENTLY out-of-band before applying migration 206';
   END IF;
 
+  IF index_oid IS NOT NULL AND (
+    pg_get_indexdef(index_oid) NOT LIKE '%corpus_candidate_occurrences%'
+    OR pg_get_indexdef(index_oid) NOT LIKE '%normalized_span%'
+    OR pg_get_indexdef(index_oid) NOT LIKE '%document_id%'
+    OR pg_get_indexdef(index_oid) NOT LIKE '%start_offset%'
+  ) THEN
+    RAISE EXCEPTION 'idx_corpus_occurrences_normalized exists with the wrong table/columns; rebuild it CONCURRENTLY before applying migration 206';
+  END IF;
+
   IF index_oid IS NULL THEN
     IF EXISTS (SELECT 1 FROM public.corpus_candidate_occurrences LIMIT 1) THEN
       RAISE EXCEPTION 'corpus_candidate_occurrences is populated and idx_corpus_occurrences_normalized is absent; create it CONCURRENTLY out-of-band before applying migration 206';
