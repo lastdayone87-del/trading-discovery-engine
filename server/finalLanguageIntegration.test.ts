@@ -72,7 +72,7 @@ test('final integration: invalid language evidence falls back without changing r
 });
 
 test('final integration: newly covered supported countries use stable region and primary language hints', () => {
-  assert.deepEqual(countrySearchHints('Luxembourg'), { regionCode: 'LU', relevanceLanguage: 'lb' });
+  assert.deepEqual(countrySearchHints('Luxembourg'), { regionCode: 'LU', relevanceLanguage: 'fr' });
   assert.deepEqual(countrySearchHints('United Arab Emirates'), { regionCode: 'AE', relevanceLanguage: 'ar' });
 });
 

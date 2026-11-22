@@ -9,6 +9,16 @@ test('provides YouTube retrieval hints across multiple markets', () => {
   assert.deepEqual(countrySearchHints('Switzerland'), { regionCode: 'CH', relevanceLanguage: 'de' });
 });
 
+test('provider hints never send languages YouTube rejects', () => {
+  // Verified against the live provider: lb, mi, and ga are valid ISO codes but
+  // return HTTP 400 INVALID_ARGUMENT for relevanceLanguage.
+  assert.deepEqual(countrySearchHints('Luxembourg'), { regionCode: 'LU', relevanceLanguage: 'fr' });
+  assert.deepEqual(countrySearchHints('Luxembourg', [], 'lb'), { regionCode: 'LU', relevanceLanguage: 'fr' });
+  assert.deepEqual(countrySearchHints('New Zealand', [], 'mi'), { regionCode: 'NZ', relevanceLanguage: 'en' });
+  assert.deepEqual(countrySearchHints('Ireland', [], 'ga'), { regionCode: 'IE', relevanceLanguage: 'en' });
+  assert.deepEqual(countrySearchHints('Luxembourg', [], 'de'), { regionCode: 'LU', relevanceLanguage: 'de' });
+});
+
 test('normalizes country spelling without inventing unsupported hints', () => {
   assert.deepEqual(countrySearchHints('  UNITED KINGDOM  '), { regionCode: 'GB', relevanceLanguage: 'en' });
   assert.deepEqual(countrySearchHints('Unsupported Market'), {});
