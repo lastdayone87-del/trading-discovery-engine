@@ -4388,6 +4388,9 @@ export async function scheduleAutonomousQueryRuns(
   const datePercent = Math.min(100, Math.max(0, Number.isFinite(configuredDatePercent) ? configuredDatePercent : 10));
   const client = await db.connect();
   const scheduled: ScheduledAutonomousRun[] = [];
+  // Success diagnostics are emitted only after COMMIT: a commit failure must
+  // replace any tentative success in the one-shot candidate report.
+  const committedDiagnostics: DiscoveryCandidateDiagnosticPatch[] = [];
   let candidateDiagnostic: DiscoveryCandidateDiagnosticPatch = {};
   let activeOperation = 'scheduling_transaction';
   const setDiagnostic = (patch: DiscoveryCandidateDiagnosticPatch) => { candidateDiagnostic = { ...candidateDiagnostic, ...patch }; };
@@ -4965,11 +4968,27 @@ export async function scheduleAutonomousQueryRuns(
       try {
         await appendDecisionWith(client,{eventKey:`query-run:${runId}:selected:v1`,subjectType:'QUERY_RUN',subjectId:runId,eventType:'QUERY_SELECTED',queryId:candidate.query.id,queryRunId:runId,jobId,country:candidate.query.country,retrievalLane,eventTime:new Date().toISOString(),payload:{query:candidate.query.query,selectionStrategy:candidate.strategy,selectionReason:candidate.reason,searchOrdering,quotaReserved:scheduledProviderUnits,provider:allocatedProvider,generationMode:candidate.query.generation_mode,...(candidate.allocationProvenance?{creatorIntelligenceAllocation:candidate.allocationProvenance}:{}),...experimentMetadata,...trialMetadata}});
       } catch (error) { await failStep('decision_event_persistence', error); }
-      flushDiagnostic({ selectedQueryId: candidate.query.id, queryRunId: runId, jobId, provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain }, reservationOutcome: 'RESERVED', reservationReasonCode: 'QUERY_LIBRARY_RESERVED', schedulingOutcome: 'SCHEDULED', schedulingOperation: 'query_run_job_and_selection_commit', disposition: 'SCHEDULED', reasonCode: 'SCHEDULED' });
+      committedDiagnostics.push({
+        ...candidateDiagnostic,
+        selectedQueryId: candidate.query.id,
+        queryRunId: runId,
+        jobId,
+        provider: { providerKey: allocatedProvider.providerKey, capability: allocatedProvider.capability, quotaDomain: allocatedProvider.costDomain },
+        reservationOutcome: 'RESERVED',
+        reservationReasonCode: 'QUERY_LIBRARY_RESERVED',
+        schedulingOutcome: 'SCHEDULED',
+        schedulingOperation: 'query_run_job_and_selection_commit',
+        disposition: 'SCHEDULED',
+        reasonCode: 'SCHEDULED',
+      });
       scheduled.push({ runId, jobId, query: rowToQuery(reserved.rows[0]), retrievalLane, searchOrdering });
     }
     activeOperation = 'scheduling_commit';
     await client.query('COMMIT');
+    for (const diagnostic of committedDiagnostics) {
+      try { diagnosticContext?.onDiagnostic(diagnostic); }
+      catch { /* diagnostics must never break committed scheduling */ }
+    }
 
     // Observation persistence runs AFTER scheduling transaction commit.
     // Failures here cannot abort or roll back scheduled query runs or jobs.

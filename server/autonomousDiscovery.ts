@@ -950,7 +950,7 @@ export async function runAutonomousDiscoveryCycle(targetCountry?: string, provid
           errorMessageCode: details.errorMessageCode,
           errorMessage: details.logMessage,
         }));
-        recordCandidateDiagnostic({ ...candidateDiagnostic, schedulingOutcome: 'FAILED', schedulingOperation: 'scheduling_transaction', sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
+        recordCandidateDiagnostic({ ...candidateDiagnostic, frontierDecisionId: frontierAllocationInfo?.decision?.decisionId, schedulingOutcome: 'FAILED', schedulingOperation: 'scheduling_transaction', sanitizedErrorClass: sanitized.errorClass, errorCode: details.errorCode, errorMessageCode: details.errorMessageCode, disposition: 'FAILED', reasonCode: sanitized.reasonCode });
         return [];
       });
 

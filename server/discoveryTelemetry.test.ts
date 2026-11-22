@@ -71,6 +71,21 @@ test('scheduler error diagnostics bound long messages', () => {
   assert.equal(details.errorMessageCode, 'FAILED');
 });
 
+test('scheduler error diagnostics redact URL credentials and quoted options', () => {
+  const details = schedulingErrorDiagnostics(new Error(
+    'scheduler failed https://user:s3cret@proxy:8080 {"password":"hunter2","headless":true}',
+  ));
+  assert.doesNotMatch(details.logMessage || '', /s3cret|hunter2/);
+  assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');
+});
+
+test('scheduler error diagnostics do not promote arbitrary leading words', () => {
+  const details = schedulingErrorDiagnostics(new Error('failed to schedule candidate'));
+  assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');
+  const credentialLike = schedulingErrorDiagnostics(new Error('ghp_abcdefghijklmnop failed'));
+  assert.equal(credentialLike.errorMessageCode, 'UNSTRUCTURED_ERROR');
+});
+
 test('provider-registry, reservation, authority, and phase8 reason codes remain distinct', () => {
   assert.equal(sanitizeSchedulingError(new Error('ALLOCATED_PROVIDER_NO_LONGER_ELIGIBLE')).reasonCode, 'PROVIDER_REGISTRY_NOT_ELIGIBLE');
   const diagnostics = createDiscoveryCycleDiagnostics({ cycleId: 'cycle-2', targetCountry: 'Belgium' });

@@ -1,7 +1,8 @@
+import { redactCauseSnippet } from './crawlerTelemetry';
+
 const SCHEDULING_ERROR_MESSAGE_LIMIT = 400;
-const CREDENTIAL_ASSIGNMENT = /((?:key|token|secret|password|authorization|bearer)\s*[=:]\s*)[^\s,;]+/gi;
-const BEARER_CREDENTIAL = /Bearer\s+[^\s,;]+/gi;
 const GOOGLE_API_KEY = /AIza[0-9A-Za-z_-]{10,}/g;
+const BARE_KEY_ASSIGNMENT = /((?:^|[\s?&])key=)[^&\s]+/gi;
 const STRUCTURAL_MESSAGE_CODE = /^[A-Z][A-Z0-9_]{2,}$/;
 
 export interface SchedulingErrorDiagnostics {
@@ -12,7 +13,9 @@ export interface SchedulingErrorDiagnostics {
 }
 
 function structuralMessageCode(message: string): string {
-  const first = message.trim().split(/[:\s]/, 1)[0]?.toUpperCase() || '';
+  // Validate the raw token: uppercasing first would turn any leading word or
+  // credential-like string into a "structural" label.
+  const first = message.trim().split(/[:\s]/, 1)[0] || '';
   return STRUCTURAL_MESSAGE_CODE.test(first) ? first.slice(0, 80) : 'UNSTRUCTURED_ERROR';
 }
 
@@ -27,13 +30,12 @@ export function schedulingErrorDiagnostics(error: unknown): SchedulingErrorDiagn
   const record = error as { code?: unknown; message?: unknown } | null;
   const rawMessage = typeof record?.message === 'string' ? record.message : '';
   const rawCode = typeof record?.code === 'string' ? record.code : '';
-  const redacted = rawMessage
-    .replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]')
-    .replace(BEARER_CREDENTIAL, 'Bearer [REDACTED]')
-    .replace(CREDENTIAL_ASSIGNMENT, '$1[REDACTED]')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, SCHEDULING_ERROR_MESSAGE_LIMIT);
+  const redacted = redactCauseSnippet(
+    rawMessage
+      .replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]')
+      .replace(BARE_KEY_ASSIGNMENT, '$1[REDACTED]'),
+    SCHEDULING_ERROR_MESSAGE_LIMIT,
+  );
   return {
     ...(rawCode ? { errorCode: rawCode.slice(0, 64) } : {}),
     ...(redacted ? { errorMessageCode: structuralMessageCode(redacted) } : {}),
