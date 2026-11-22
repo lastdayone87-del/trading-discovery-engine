@@ -733,16 +733,21 @@ async function ensureCdlHotTableIndexes(client: { query: (text: string, values?:
 async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
   const name = 'idx_corpus_occurrences_normalized';
   const existing = await client.query(`
-    SELECT c.oid, i.indisvalid, i.indisready, pg_get_indexdef(i.indexrelid) AS definition
+    SELECT c.oid, i.indisvalid, i.indisready, i.indnatts, i.indpred IS NULL AS no_predicate,
+           i.indexprs IS NULL AS no_expressions,
+           i.indrelid = 'public.corpus_candidate_occurrences'::regclass AS correct_table,
+           pg_get_indexdef(i.indexrelid) AS definition
       FROM pg_class c
       JOIN pg_index i ON i.indexrelid = c.oid
      WHERE c.oid = to_regclass('public.${name}')
   `);
   const row = existing.rows[0];
   const definition = String(row?.definition || '');
-  const correct = definition.includes('corpus_candidate_occurrences')
-    && definition.includes('USING btree (normalized_span, document_id, start_offset)')
-    && !definition.includes(' WHERE ');
+  const correct = row?.correct_table === true
+    && Number(row?.indnatts) === 3
+    && row?.no_predicate === true
+    && row?.no_expressions === true
+    && definition.includes('USING btree (normalized_span, document_id, start_offset)');
   if (row?.indisvalid && row?.indisready && correct) return;
   if (row?.oid) {
     await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
