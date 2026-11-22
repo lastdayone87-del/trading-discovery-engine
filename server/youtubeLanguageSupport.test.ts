@@ -3,7 +3,6 @@ import test from 'node:test';
 import {
   assertYouTubeRelevanceLanguage,
   resolveYouTubeRelevanceLanguage,
-  usesProviderLanguageFallback,
   YOUTUBE_RELEVANCE_LANGUAGE_FALLBACKS,
   YOUTUBE_SUPPORTED_RELEVANCE_LANGUAGES,
 } from './youtubeLanguageSupport';
@@ -26,15 +25,6 @@ test('every fallback target is itself supported and no fallback loops', () => {
     assert.equal(YOUTUBE_SUPPORTED_RELEVANCE_LANGUAGES.has(to), true, `${from} -> ${to}`);
     assert.notEqual(from, to);
   }
-});
-
-test('fallback-country detection is limited to countries with rejected languages', () => {
-  assert.equal(usesProviderLanguageFallback('Luxembourg'), true);
-  assert.equal(usesProviderLanguageFallback('New Zealand'), true);
-  assert.equal(usesProviderLanguageFallback('Ireland'), true);
-  assert.equal(usesProviderLanguageFallback('Germany'), false);
-  assert.equal(usesProviderLanguageFallback('France'), false);
-  assert.equal(usesProviderLanguageFallback('Unsupported Market'), false);
 });
 
 test('dispatch assertion rejects unsupported values before provider dispatch', () => {

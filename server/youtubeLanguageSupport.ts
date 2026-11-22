@@ -1,5 +1,4 @@
 import { normalizeLanguageCode } from './languageCodes';
-import { countryDiscoveryLanguageCandidates } from './countryDiscoveryProfile';
 
 /**
  * YouTube Data API `relevanceLanguage` values verified against the live
@@ -55,20 +54,6 @@ export function resolveYouTubeRelevanceLanguage(
     }
   }
   return {};
-}
-
-/**
- * Whether any language this country may generate requires a provider fallback.
- * Used only by the one-time quarantine-recovery audit: a country whose entire
- * language set is provider-safe must never be touched by that cleanup.
- */
-export function usesProviderLanguageFallback(country: string): boolean {
-  return countryDiscoveryLanguageCandidates(country).some((candidate) => {
-    const normalized = normalizeLanguageCode(candidate);
-    return Boolean(normalized)
-      && !YOUTUBE_SUPPORTED_RELEVANCE_LANGUAGES.has(normalized)
-      && Boolean(YOUTUBE_RELEVANCE_LANGUAGE_FALLBACKS[normalized]);
-  });
 }
 
 /** Fail closed at the dispatch boundary if a caller bypasses the resolver. */
