@@ -77,6 +77,16 @@ export function keyCapAdvisoryLockName(quotaDay: string, keyFingerprint: string)
   return `youtube-key-cap:${quotaDay}:${keyFingerprint}`;
 }
 
+/**
+ * Global per-day probe-allocation lock. Normal quota admission takes this lock
+ * before reading live probe leases, and probe reservations take it before
+ * inserting a lease, so an in-flight probe cannot slip between the read and
+ * the reservation commit.
+ */
+export function probeQuotaAdvisoryLockName(quotaDay: string): string {
+  return `youtube-probe-quota:${quotaDay}`;
+}
+
 export type ShadowEvent = 'WOULD_DEFER' | 'WOULD_REJECT';
 export type ShadowSettingReader = (key: string, fallback: string) => Promise<string>;
 export interface ShadowConfig {
@@ -1453,7 +1463,7 @@ export async function reserveProbeQuota(
     }
     try {
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
-        `youtube-probe-quota:${quotaDay}`,
+        probeQuotaAdvisoryLockName(quotaDay),
       ]);
     } catch (error) {
       throw new ProbeQuotaUnavailableError(

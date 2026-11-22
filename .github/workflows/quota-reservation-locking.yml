@@ -1,0 +1,69 @@
+name: Quota reservation locking
+
+on:
+  pull_request:
+    paths:
+      - 'server/dbCore.ts'
+      - 'server/dbCore.quota.test.ts'
+      - 'server/quotaKeyCapShadow.ts'
+      - 'server/queueManager.ts'
+      - 'server/manualSearchStore.ts'
+      - 'server/quotaReservationIndex.postgres.test.ts'
+      - 'server/db/migrations/207_quota_reservation_active_index.sql'
+      - 'server/db/migrations/208_quota_reservation_consumed_index.sql'
+      - '.github/workflows/quota-reservation-locking.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Quota lock-order and query-shape regression tests
+        run: >-
+          node --import tsx --test
+          server/dbCore.quota.test.ts
+      - name: TypeScript validation
+        run: npm run lint
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tde_quota_reservations
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tde_quota_reservations"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      QUOTA_RESERVATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_quota_reservations
+      PGSSL: disable
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Active-reservation index and lock-order PostgreSQL tests
+        run: >-
+          node --import tsx --test
+          server/quotaReservationIndex.postgres.test.ts
