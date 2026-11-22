@@ -52,10 +52,18 @@ test('direct operator manual recheck is the audited correction path for confirme
   assert.match(source, /SET LOCAL app\.force_review_rescan='on'/);
   assert.match(source, /trading_status='UNCERTAIN'/);
   assert.match(source, /scan_status='ENRICHMENT_PENDING'/);
+  assert.match(source, /WHERE channel_id=\$1 AND trading_status='TRADING_CONFIRMED'/);
+  assert.match(source, /restoreConfirmedDecisionAfterFailedRecheck/);
+  assert.match(source, /confirmedCorrectionSnapshot/);
 });
 
 test('operator admission rejection cannot silently no-op on a confirmed row', () => {
-  assert.match(channelAdmission, /CONFIRMED_TRADING_REVIEW_REQUIRED/);
+  const start = channelAdmission.indexOf("if (input.action === 'REJECT')");
+  const end = channelAdmission.indexOf('const recorded = await recordAdmissionOutcome', start);
+  const source = channelAdmission.slice(start, end);
+  assert.ok(start >= 0 && end > start, 'the admission REJECT branch must exist');
+  assert.match(source, /upsertChannelWithResult/);
+  assert.match(source, /CONFIRMED_TRADING_REVIEW_REQUIRED/);
 });
 
 test('audited review actions are the only direct-SQL escape from a confirmed row', () => {

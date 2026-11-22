@@ -5614,6 +5614,60 @@ export function classifyManualRecheckAcquisitionFailure(error: any): {
  * Runs 4-step inspection synchronously with force live YouTube scraping.
  * Does NOT schedule any automatic future rechecks.
  */
+/**
+ * Restore the pre-recheck confirmed decision when an audited manual recheck
+ * fails operationally after its reopen committed. The update is conditional on
+ * the row still being non-terminal so a genuine new rejection/non-trading
+ * verdict is never overwritten.
+ */
+async function restoreConfirmedDecisionAfterFailedRecheck(
+  channelId: string,
+  snapshot: ChannelRecord,
+  reason: string,
+): Promise<ChannelRecord | null> {
+  const client = await (await getDb()).connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL app.force_review_rescan='on'`);
+    const result = await client.query(
+      `UPDATE channels
+          SET trading_status='TRADING_CONFIRMED',
+              trading_confidence_score=$2,
+              trading_category=$3,
+              trading_relevance_breakdown=$4,
+              scan_status=$5,
+              last_checked=now(),
+              updated_at=now(),
+              inspection_trail=COALESCE(inspection_trail,'[]'::jsonb)||$6::jsonb
+        WHERE channel_id=$1
+          AND trading_status IN ('UNCERTAIN','ENRICHMENT_PENDING','FAILED','FAILED_PERMANENT','PENDING')
+        RETURNING channel_id`,
+      [
+        channelId,
+        Math.max(0, Math.min(100, Number(snapshot.trading_confidence_score) || 0)),
+        snapshot.trading_category || 'General Trading',
+        JSON.stringify(snapshot.trading_relevance_breakdown || {}),
+        snapshot.scan_status || 'COMPLETED',
+        JSON.stringify([{
+          step: 'BIO',
+          title: 'Confirmed decision restored after incomplete recheck',
+          status: 'PRESERVED',
+          details: reason.slice(0, 500),
+          timestamp: new Date().toISOString(),
+        }]),
+      ],
+    );
+    await client.query('COMMIT');
+    return result.rowCount ? await getChannelById(channelId) : null;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    console.warn(`[Manual Recheck] Failed to restore confirmed decision for ${channelId}:`, error instanceof Error ? error.message : error);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
 export async function triggerManualRecheck(
   channelId: string,
   enableDebug?: boolean,
@@ -5735,6 +5789,7 @@ export async function triggerManualRecheck(
     // recheck (no job attribution) is the audited correction lane; it first
     // reopens the row in a transaction that explicitly sets the review escape.
     // POST_APPROVAL_ENRICH and maintenance jobs stay community-only.
+    let confirmedCorrectionSnapshot: ChannelRecord | null = null;
     if (channel.trading_status === 'TRADING_CONFIRMED') {
       const explicitOperatorCorrection = !attribution?.jobType;
       if (!explicitOperatorCorrection) {
@@ -5785,18 +5840,20 @@ export async function triggerManualRecheck(
       // Explicit operator correction: audited, transaction-local reopen. The
       // subsequent pipeline pass starts from UNCERTAIN, so ordinary
       // preservation does not immediately short-circuit the requested recheck.
+      confirmedCorrectionSnapshot = { ...channel };
       const resetClient = await (await getDb()).connect();
+      let resetApplied = false;
       try {
         await resetClient.query('BEGIN');
         await resetClient.query(`SET LOCAL app.force_review_rescan='on'`);
-        await resetClient.query(
+        const reset = await resetClient.query(
           `UPDATE channels
               SET trading_status='UNCERTAIN',
                   scan_status='ENRICHMENT_PENDING',
                   last_checked=now(),
                   updated_at=now(),
                   inspection_trail=COALESCE(inspection_trail,'[]'::jsonb)||$2::jsonb
-            WHERE channel_id=$1`,
+            WHERE channel_id=$1 AND trading_status='TRADING_CONFIRMED'`,
           [channelId, JSON.stringify([{
             step: 'BIO',
             title: 'Audited confirmed reclassification',
@@ -5805,12 +5862,26 @@ export async function triggerManualRecheck(
             timestamp: new Date().toISOString(),
           }])],
         );
-        await resetClient.query('COMMIT');
+        if (reset.rowCount) {
+          await resetClient.query('COMMIT');
+          resetApplied = true;
+        } else {
+          await resetClient.query('ROLLBACK');
+        }
       } catch (error) {
         await resetClient.query('ROLLBACK').catch(() => undefined);
         throw error;
       } finally {
         resetClient.release();
+      }
+      if (!resetApplied) {
+        return {
+          success: false,
+          message: `The trading decision for ${channel.channel_name} changed while the recheck was being prepared. Refresh and retry.`,
+          code: 'MANUAL_RESCAN_STATUS_CHANGED',
+          retryable: false,
+          channel: await getChannelById(channelId) || channel
+        };
       }
       channel.trading_status = 'UNCERTAIN';
       channel.scan_status = 'ENRICHMENT_PENDING';
@@ -5835,6 +5906,10 @@ export async function triggerManualRecheck(
     } catch (error: any) {
       const detail = error instanceof Error ? error.message : String(error);
       const preserved = await getChannelById(channelId) || channel;
+      if (confirmedCorrectionSnapshot) {
+        const restored = await restoreConfirmedDecisionAfterFailedRecheck(channelId, confirmedCorrectionSnapshot, detail);
+        if (restored) Object.assign(preserved, restored);
+      }
       const code = String(error?.code || 'MANUAL_RESCAN_OPERATIONAL_FAILURE');
       const rawErrorClass = String(error?.errorClass || '').toUpperCase() as ManualRecheckErrorClass;
       const typedTransient = MANUAL_RECHECK_TRANSIENT_CLASSES.has(rawErrorClass) && error?.retryable === true;
