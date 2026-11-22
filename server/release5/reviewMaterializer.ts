@@ -18,6 +18,9 @@ export async function materializeEligibleReviewInTransaction(client:QueryClient,
   const channel=await client.query('SELECT * FROM channels WHERE channel_id=$1 FOR UPDATE',[input.channelId]);
   if(!channel.rowCount)throw new Error('CHANNEL_NOT_FOUND');
   if(confirmedTradingBlocksReviewMaterialization(channel.rows[0].trading_status)){
+    // A false positive remains correctable through the audited operator manual
+    // recheck, which first reopens the row as UNCERTAIN. Automatic eligibility
+    // projection must never resurrect a review on a confirmed row.
     return {materialized:false,reason:'CONFIRMED_TRADING_AUTHORITATIVE'};
   }
   const existing=await client.query('SELECT * FROM channel_reviews WHERE channel_id=$1 FOR UPDATE',[input.channelId]);

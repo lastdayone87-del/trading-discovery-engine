@@ -138,7 +138,7 @@ export function buildAdmissionConfirmedClassification(
             promptVersion: 'semantic-admission-v1',
             featureVersion: 'semantic-admission-v1',
             calibrationVersion: 'semantic-admission-v1',
-            taxonomyLabel: 'ACTIVE_TRADING',
+            taxonomyLabel: citation.supports === 'TRADING' ? 'ACTIVE_TRADING' : 'FINANCE_ADJACENT',
             rawConfidence: confidence,
             calibratedConfidence: confidence,
             detectedLanguages: [],

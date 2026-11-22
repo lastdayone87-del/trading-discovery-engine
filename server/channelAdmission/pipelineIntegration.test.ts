@@ -297,6 +297,30 @@ test('legacy semantic probability boundary normalizes to 100 for a confirmed adm
   assert.equal(built.decision.positiveEvidence[0]?.provenance?.fields?.[0]?.field, 'channel_bio');
 });
 
+test('finance-adjacent admission citations do not become AI-led trading evidence', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Finance Adjacent', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-finance-adjacent',
+      channelName: 'Finance Adjacent',
+      youtubeUrl: 'https://youtube.com/channel/UC-finance-adjacent',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-finance-adjacent',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionProvider: 'gemini_semantic',
+      admissionCitations: [
+        { field: 'bio', quote: 'personal finance and investing', supports: 'FINANCE_ADJACENT' },
+      ],
+    },
+  );
+  assert.equal(built.decision.positiveEvidence[0]?.provenance?.semantic?.taxonomyLabel, 'FINANCE_ADJACENT');
+  assert.equal(hasAiLedTradingConfirmation(built.decision.positiveEvidence), false);
+});
+
 test('admission evidence with a real provider exposes the AI-led trading label', () => {
   const built = buildAdmissionConfirmedClassification(
     { channel_name: 'Provider Trader', description: '', country: 'Unknown' },
