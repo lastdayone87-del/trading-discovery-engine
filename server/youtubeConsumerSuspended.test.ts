@@ -40,6 +40,23 @@ test('youtubeHttpError correctly extracts providerReasons from legacy and google
   assert.equal(isYouTubeRateLimited(error2), false);
 });
 
+test('403 ACCESS_DENIED is classified as credential suspension, not transient', async () => {
+  const response = new Response(JSON.stringify({
+    error: {
+      code: 403,
+      message: 'The request is missing a valid API key or the project is suspended.',
+      status: 'PERMISSION_DENIED',
+      errors: [{ reason: 'forbidden' }, { reason: 'ACCESS_DENIED' }],
+    },
+  }), { status: 403, headers: { 'content-type': 'application/json' } });
+  const error = await youtubeHttpError(response);
+  assert.equal((error as any).status, 403);
+  assert.deepEqual((error as any).providerReasons, ['forbidden', 'ACCESS_DENIED']);
+  assert.equal(isConsumerSuspended(error), true);
+  assert.equal(isYouTubeRateLimited(error), false);
+  assert.equal(isQuotaExceeded(error), false);
+});
+
 test('youtubeHttpError distinguishes quotaExceeded from consumerSuspended', async () => {
   const quotaResponse = new Response(JSON.stringify({
     error: {
