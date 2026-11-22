@@ -171,6 +171,21 @@ If `orphan_pending_pages` reports `FAIL` (the route returns 503):
    `RESUME_UNAVAILABLE` with `COUNTRY_INACTIVE`. Re-selecting the country does not resurrect that segment;
    the next producer cycle starts a new run.
 
+### Admission rejection-share policy
+
+Admission rejection share is measured over the uncertain admission candidates
+on the current page, not over all page channels. A page/run that still produced
+confirmed, quality or fresh creators — or that the continuation policy marks
+productive — is never stopped by this rule.
+
+A high rejection share stops the current run only. It does **not** permanently
+reject the query. Query rejection requires at least two prior completed runs
+with no quality or unique discoveries on the query history; the current run
+must also be non-productive. One page or one run is never enough. Use
+`npm run quarantine:release` (dry-run) to review existing admission quarantines,
+then `-- --apply` to restore queries with historical yield. Queries with no
+historical yield remain rejected for manual review.
+
 ## 5. Rollback
 
 Rollback is a deploy rollback, not a data deletion:

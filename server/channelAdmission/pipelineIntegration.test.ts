@@ -149,6 +149,11 @@ test('search-worker admission path stores the sighting and never falls through t
   assert.match(queue, /matchedDocument: raw\.matchedDocument \|\| null/);
   assert.match(queue, /getAdmissionPageOutcomes/);
   assert.match(queue, /evaluateQueryAdmissionGuard/);
+  assert.match(queue, /outcomes: admissionPageOutcomes,/);
+  assert.match(queue, /outcomes: pageOutcomes/);
+  assert.match(queue, /priorQueryQualityChannels/);
+  assert.match(queue, /runQualityChannels/);
+  assert.match(queue, /runTradingConfirmed/);
   assert.match(queue, /quarantineQuery\(queryId, admissionGuard\.reasonCodes\)/);
 });
 

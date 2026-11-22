@@ -151,7 +151,7 @@ test('a failed candidate lookup fails admission instead of silently skipping rec
 test('pending admission verdicts defer only continuable pages and never write contamination', () => {
   const queue = readFileSync(new URL('../queueManager.ts', import.meta.url), 'utf8');
   const pageStore = readFileSync(new URL('../autonomousPageStore.ts', import.meta.url), 'utf8');
-  const deferStart = queue.indexOf('const admissionDeferEligible');
+  const deferStart = queue.indexOf('const admissionPagePending');
   const deferReturn = queue.indexOf('return true;', deferStart);
   assert.ok(deferStart > -1 && deferReturn > deferStart, 'admission defer branch must exist');
   const deferBlock = queue.slice(deferStart, deferReturn);

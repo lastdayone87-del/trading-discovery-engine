@@ -376,8 +376,46 @@ test('query contamination guard stops 711-like pages on admission rejects', () =
     priorZeroQualityPages: 1,
   });
   assert.equal(decision.stop, true);
-  assert.equal(decision.quarantine, true);
+  assert.equal(decision.quarantine, false, 'one page can stop the run but must not permanently reject the query');
   assert.ok(decision.reasonCodes.includes('ADMISSION_REJECTED_SHARE_HIGH'));
+});
+
+test('a productive page is never overridden by rejection share', () => {
+  const decision = evaluateQueryAdmissionGuard({
+    pageNumber: 4,
+    outcomes: { admitted: 0, ambiguous: 0, rejected: 8, held: 0, total: 10 },
+    tradingPrecision: 0.05,
+    qualityChannels: 2,
+    tradingConfirmed: 8,
+    freshConfirmedCreators: 1,
+    productiveContinuation: true,
+  });
+  assert.equal(decision.stop, false);
+  assert.equal(decision.quarantine, false);
+});
+
+test('query quarantine requires repeated no-yield runs, not one page', () => {
+  const base = {
+    pageNumber: 3,
+    outcomes: { admitted: 0, ambiguous: 0, rejected: 8, held: 0, total: 10 },
+    tradingPrecision: 0.05,
+    qualityChannels: 0,
+    tradingConfirmed: 0,
+    freshConfirmedCreators: 0,
+    productiveContinuation: false,
+  };
+  assert.equal(evaluateQueryAdmissionGuard({ ...base, priorQueryRuns: 1, priorQueryQualityChannels: 0, priorQueryUniqueChannels: 0 }).quarantine, false);
+  assert.equal(evaluateQueryAdmissionGuard({ ...base, priorQueryRuns: 2, priorQueryQualityChannels: 0, priorQueryUniqueChannels: 0 }).quarantine, true);
+  assert.equal(evaluateQueryAdmissionGuard({ ...base, priorQueryRuns: 5, priorQueryQualityChannels: 77, priorQueryUniqueChannels: 44 }).quarantine, false);
+  const yieldedRun = evaluateQueryAdmissionGuard({
+    ...base,
+    runQualityChannels: 1,
+    priorQueryRuns: 2,
+    priorQueryQualityChannels: 0,
+    priorQueryUniqueChannels: 0,
+  });
+  assert.equal(yieldedRun.stop, true, 'the contaminated page still stops the run');
+  assert.equal(yieldedRun.quarantine, false, 'yield from an earlier page of this run must prevent query rejection');
 });
 
 test('ambiguous-admit rate is measured separately', () => {
