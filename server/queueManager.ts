@@ -5635,10 +5635,10 @@ async function restoreConfirmedDecisionAfterFailedRecheck(
               trading_confidence_score=$2,
               trading_category=$3,
               trading_relevance_breakdown=$4,
-              scan_status=$5,
+              scan_status=CASE WHEN scan_status='NEEDS_REVIEW' THEN 'ENRICHMENT_PENDING' ELSE scan_status END,
               last_checked=now(),
               updated_at=now(),
-              inspection_trail=COALESCE(inspection_trail,'[]'::jsonb)||$6::jsonb
+              inspection_trail=COALESCE(inspection_trail,'[]'::jsonb)||$5::jsonb
         WHERE channel_id=$1
           AND trading_status IN ('UNCERTAIN','ENRICHMENT_PENDING','FAILED','FAILED_PERMANENT','PENDING')
         RETURNING channel_id`,
@@ -5647,9 +5647,6 @@ async function restoreConfirmedDecisionAfterFailedRecheck(
         Math.max(0, Math.min(100, Number(snapshot.trading_confidence_score) || 0)),
         snapshot.trading_category || 'General Trading',
         JSON.stringify(snapshot.trading_relevance_breakdown || {}),
-        ['NEEDS_REVIEW', 'ENRICHMENT_PENDING', 'ENRICHING', 'PENDING'].includes(String(snapshot.scan_status || ''))
-          ? 'COMPLETED'
-          : snapshot.scan_status || 'COMPLETED',
         JSON.stringify([{
           step: 'BIO',
           title: 'Confirmed decision restored after incomplete recheck',
