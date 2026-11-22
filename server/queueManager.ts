@@ -1850,7 +1850,7 @@ export async function processNextSearchJob(
   let enrichProbeOnly = false;
   const admissionModeActive = (await getAdmissionMode()) === 'ACTIVE';
   const admissionSemanticClaimable = admissionModeActive;
-  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) {
+  if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL') || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION') || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL'))) {
     const groqSelected = shouldUseGroqSemantic();
     const geminiFreeSelected = !groqSelected && shouldUseGeminiFreeSemantic();
     const geminiRoutes = !groqSelected && !geminiFreeSelected ? configuredGeminiRoutes() : [];
@@ -1891,15 +1891,12 @@ export async function processNextSearchJob(
       // probe: stage-1/2 evidence is persisted before the semantic attempt, so
       // the next pass can resume without re-spending YouTube quota.
       if (enrichmentFullyClaimable && (!claimableOverride || claimableOverride.includes(CLASSIFICATION_JOB_TYPE))) claimableTypes.push(CLASSIFICATION_JOB_TYPE);
+      // Dedicated process lane: separate worker capacity removes classification
+      // starvation, while the semantic-availability gate prevents a defer storm.
+      if (enrichmentFullyClaimable && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
   if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
-  // Process-ingestion has its own lane. It must not be gated by semantic
-  // cooldowns or starved behind classification priority 21; the handler owns
-  // any provider-specific deferral.
-  if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
-    claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
-  }
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');

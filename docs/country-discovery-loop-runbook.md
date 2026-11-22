@@ -31,6 +31,33 @@ children resume from a persisted continuation-token cursor in one request when a
 page number remains in the cursor for telemetry, and numeric cursors from older rows (or a missing token)
 still work through a bounded rewalk.
 
+### Worker lanes and admission capacity
+
+Discovery-critical lanes are independently sized and are not clamped by the
+enrichment/classification scale gate:
+
+| Env | Default | Lane |
+|---|---:|---|
+| `ADMISSION_WORKER_CONCURRENCY` | 4 | admission verification |
+| `CLASSIFICATION_WORKER_CONCURRENCY` | 4 | classification |
+| `PROCESS_DISCOVERY_WORKER_CONCURRENCY` | 1 | process/ingestion |
+| `ENRICHMENT_ONLY_WORKER_CONCURRENCY` | 1 | generic ENRICH backfill |
+
+Provider pacing, semantic cooldowns, quota reservations and daily budgets still
+apply inside each job. The Phase 4 scale gate remains available for diagnostics
+and legacy backfill policy but no longer reduces startup capacity for the four
+lanes above. Raise lanes in production one step at a time while watching Gemini
+success, pacing, provider latency and heartbeat failures.
+
+`DATABASE_POOL_MAX` defaults to `25` and should be raised before adding many
+workers; the historical node-postgres default of 10 was below the combined lane
+count. Heartbeats use a dedicated two-connection pool, `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS`
+defaults to 60s, and claim-time stale recovery is throttled
+(`CLAIM_STALE_RECOVERY_INTERVAL_MS`, default 60s). `JOB_STALE_AFTER_MINUTES`
+defaults to 5 so a genuinely stalled lease cannot waste 15 minutes of a lane.
+`ADMISSION_EVIDENCE_TIMEOUT_MS` defaults to 120s and returns a retryable partial
+observation instead of holding an admission worker indefinitely.
+
 Only the paid demand adapter remains off:
 
 - `query_demand_signals_enabled=false` because paid credentials and legal review are external prerequisites.
