@@ -37,5 +37,6 @@ test('Stage 7: the queue uses existing query/evidence metadata as a language pre
   assert.match(retrieval, /preferredLanguage: request\.preferredLanguage/);
   assert.match(youtube, /countrySearchHints\(countryName, vocab\?\.languages \|\| \[\], lifecycle\?\.preferredLanguage\)/);
   assert.match(youtube, /regionCode: searchHints\.regionCode/);
-  assert.match(youtube, /relevanceLanguage: searchHints\.relevanceLanguage/);
+  assert.match(youtube, /const relevanceLanguage = assertYouTubeRelevanceLanguage\(searchHints\.relevanceLanguage\)/);
+  assert.match(youtube, /relevanceLanguage,/);
 });

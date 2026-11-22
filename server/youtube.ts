@@ -62,6 +62,7 @@ import { parseChannelTopicDetails } from './surfaceExtractors';
 import { fetchPublicAboutEvidence } from './youtubePublicAbout';
 import { hasMeaningfulCreatorText } from './evidenceEngine/creatorText';
 import { countrySearchHints, normalizeLanguageCode } from './countrySearchHints';
+import { assertYouTubeRelevanceLanguage } from './youtubeLanguageSupport';
 import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from './youtubePoolBackoff';
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
@@ -1182,6 +1183,10 @@ export async function searchYouTubeChannelPage(
   // Fail fast on a durably quarantined query before touching any key.
   await throwIfYouTubeInputQuarantined('search', { query: sanitizedQuery });
   const searchHints = countrySearchHints(countryName, vocab?.languages || [], lifecycle?.preferredLanguage);
+  // Invariant guard: countrySearchHints already resolves a provider-supported
+  // value, but a future profile or caller must fail before dispatch instead of
+  // sending a value YouTube rejects and quarantining the query.
+  const relevanceLanguage = assertYouTubeRelevanceLanguage(searchHints.relevanceLanguage);
 
   const keyPool = getYouTubeKeyPool();
   const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
@@ -1211,7 +1216,7 @@ export async function searchYouTubeChannelPage(
         const searchUrl = buildYouTubeApiUrl('search', apiKey, {
           part: 'snippet', type: searchType, order: youtubeOrder(ordering),
           q: sanitizedQuery, maxResults, pageToken: pageToken || undefined,
-          regionCode: searchHints.regionCode, relevanceLanguage: searchHints.relevanceLanguage,
+          regionCode: searchHints.regionCode, relevanceLanguage,
           ...(searchWindow?.publishedAfter ? { publishedAfter: searchWindow.publishedAfter } : {}),
           ...(searchWindow?.publishedBefore ? { publishedBefore: searchWindow.publishedBefore } : {})
         });

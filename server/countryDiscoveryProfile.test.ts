@@ -30,8 +30,8 @@ test('declared secondary languages are retained and routed to YouTube hl', () =>
   assert.deepEqual(countryDiscoveryLanguageCandidates('New Zealand'), ['en', 'mi']);
   assert.deepEqual(countryDiscoveryLanguageCandidates('Ireland'), ['en', 'ga']);
   assert.deepEqual(countryDiscoveryLanguageCandidates('Singapore'), ['en', 'ms', 'zh', 'ta']);
-  assert.deepEqual(countrySearchHints('New Zealand', [], 'Māori'), { regionCode: 'NZ', relevanceLanguage: 'mi' });
-  assert.deepEqual(countrySearchHints('Ireland', [], 'Irish'), { regionCode: 'IE', relevanceLanguage: 'ga' });
+  assert.deepEqual(countrySearchHints('New Zealand', [], 'Māori'), { regionCode: 'NZ', relevanceLanguage: 'en' });
+  assert.deepEqual(countrySearchHints('Ireland', [], 'Irish'), { regionCode: 'IE', relevanceLanguage: 'en' });
   assert.deepEqual(countrySearchHints('Singapore', [], 'Malay'), { regionCode: 'SG', relevanceLanguage: 'ms' });
 });
 
