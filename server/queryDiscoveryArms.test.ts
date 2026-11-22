@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  armCooldownEligible,
   chooseArmFromStates,
   classifyQueryShape,
   discoveryArmPlan,
@@ -108,4 +109,38 @@ test('a productive VIDEO/DATE arm cannot be selected for a quota-free recency qu
     chooseArmFromStates(1, 'day trading live', 'live_trading', [productiveDate], Date.now(), '', { quotaFreeRequired: true }),
     { lane: 'VIDEO', ordering: 'RELEVANCE' },
   );
+});
+
+test('a fully probed shallow surface gets one bounded retry instead of a query-wide cooldown', () => {
+  const arm = (lane: 'VIDEO' | 'CHANNEL', ordering: 'RELEVANCE' | 'DATE', hoursAgo: number): QueryDiscoveryArm => ({
+    queryId: 1, lane, ordering, status: 'LOW_NOVELTY',
+    probeRuns: 1, completedRuns: 1, freshCandidates: 0, freshConfirmed: 0,
+    quotaUnits: 100, lastGlobalSeenShare: 0.9, lastFreshShare: 0,
+    lastRunAt: new Date(Date.now() - hoursAgo * 60 * 60_000).toISOString(),
+    cooldownUntil: null, lastReason: 'LOW_NOVELTY',
+  });
+  const states = [
+    arm('CHANNEL', 'RELEVANCE', 1),
+    arm('VIDEO', 'RELEVANCE', 2),
+    arm('VIDEO', 'DATE', 3),
+  ];
+  assert.deepEqual(
+    chooseArmFromStates(1, 'nq futures strategy', 'futures', states),
+    { lane: 'VIDEO', ordering: 'DATE' },
+    'the least recently probed shallow arm gets the second probe',
+  );
+
+  const cooling = states.map(state => ({
+    ...state,
+    cooldownUntil: new Date(Date.now() + 60 * 60_000).toISOString(),
+  }));
+  assert.equal(chooseArmFromStates(1, 'nq futures strategy', 'futures', cooling), null);
+});
+
+test('a shallow low-novelty arm is not cooled until it has enough probe evidence', () => {
+  assert.equal(armCooldownEligible({ status: 'LOW_NOVELTY', runs: 1, pages: 2, minRuns: 2, minPages: 5 }), false);
+  assert.equal(armCooldownEligible({ status: 'LOW_NOVELTY', runs: 2, pages: 2, minRuns: 2, minPages: 5 }), true);
+  assert.equal(armCooldownEligible({ status: 'LOW_NOVELTY', runs: 1, pages: 5, minRuns: 2, minPages: 5 }), true);
+  assert.equal(armCooldownEligible({ status: 'EMPTY', runs: 1, pages: 0, minRuns: 2, minPages: 5 }), true);
+  assert.equal(armCooldownEligible({ status: 'PRODUCTIVE', runs: 1, pages: 1, minRuns: 2, minPages: 5 }), false);
 });

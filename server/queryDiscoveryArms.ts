@@ -174,6 +174,19 @@ export function chooseArmFromStates(
       && (!state.cooldownUntil || isCooling(state, now))) continue;
     return arm;
   }
+  // Every planned arm was probed and skipped. A LOW_NOVELTY arm without a
+  // cooldown was explicitly judged too shallow to penalize for two weeks, so
+  // give it another probe instead of cooling the whole query surface. The
+  // retry count is bounded by the configured minimum: each run increments the
+  // aggregate, and once the threshold is reached the arm receives a cooldown
+  // and this pass can no longer select it.
+  const retryable = planned
+    .map(arm => byKey.get(armKey(arm)))
+    .filter((state): state is QueryDiscoveryArm => Boolean(
+      state && !isCooling(state, now) && state.status === 'LOW_NOVELTY' && !state.cooldownUntil,
+    ))
+    .sort((a, b) => (Date.parse(a.lastRunAt || '') || 0) - (Date.parse(b.lastRunAt || '') || 0));
+  if (retryable[0]) return { lane: retryable[0].lane, ordering: retryable[0].ordering };
   return null;
 }
 
@@ -232,6 +245,24 @@ export async function selectQueryArm(
     }
   }
   return arm;
+}
+
+/**
+ * A single shallow low-novelty run is not enough evidence to cool an entire
+ * lane for two weeks. Empty remains authoritative immediately; LOW_NOVELTY
+ * needs either the configured number of probes or enough completed pages.
+ */
+export function armCooldownEligible(input: {
+  status: DiscoveryArmStatus;
+  runs: number;
+  pages: number;
+  minRuns: number;
+  minPages: number;
+}): boolean {
+  if (input.status === 'EMPTY') return true;
+  if (input.status !== 'LOW_NOVELTY') return false;
+  return input.runs >= Math.max(1, Math.trunc(input.minRuns) || 1)
+    || input.pages >= Math.max(1, Math.trunc(input.minPages) || 1);
 }
 
 function statusForRun(input: {
@@ -354,6 +385,7 @@ export async function recordQueryArmOutcome(runId: string, runner?: Runner, cool
             COALESCE(SUM(r.fresh_candidates),0)::int AS fresh_candidates,
             COALESCE(SUM(r.fresh_confirmed),0)::int AS fresh_confirmed,
             COALESCE(SUM(r.quota_units),0)::int AS quota_units,
+            COALESCE(SUM(qr.pages_completed),0)::int AS pages,
             MAX(COALESCE(qr.completed_at,qr.started_at,r.recorded_at)) AS last_run_at
        FROM query_discovery_arm_runs r
        LEFT JOIN query_runs qr ON qr.id=r.query_run_id
@@ -380,7 +412,15 @@ export async function recordQueryArmOutcome(runId: string, runner?: Runner, cool
   });
   const days = cooldownDaysOverride ?? Number(await getAppSetting('query_novelty_cooldown_days', '14'));
   const boundedDays = Math.min(90, Math.max(1, Number.isFinite(days) ? Math.trunc(days) : 14));
-  const cooldown = status === 'LOW_NOVELTY' || status === 'EMPTY' ? boundedDays : null;
+  const minProbeRuns = Math.max(1, Number(await getAppSetting('query_arm_min_probe_runs', '2')) || 2);
+  const minProbePages = Math.max(1, Number(await getAppSetting('query_arm_min_probe_pages', '5')) || 5);
+  const cooldown = armCooldownEligible({
+    status,
+    runs: Number(aggregate.runs || 0),
+    pages: Number(aggregate.pages || 0),
+    minRuns: minProbeRuns,
+    minPages: minProbePages,
+  }) ? boundedDays : null;
   await db.query(
     `INSERT INTO query_discovery_arms(
        query_id,retrieval_lane,search_ordering,status,probe_runs,completed_runs,

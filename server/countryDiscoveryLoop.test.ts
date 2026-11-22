@@ -1249,11 +1249,13 @@ test('P11: official YouTube resume uses the durable next-page token without a re
   assert.match(serverSource('providerAwareRetrieval.ts'), /request\.cursor/);
 });
 
-test('P12: InnerTube resume rewinds from page 1 and skips recorded pages without duplicate creators', () => {
-  assert.equal(resumeModeForProvider('youtube-innertube'), 'REWALK');
+test('P12: InnerTube resumes from a persisted token with a numeric legacy fallback', () => {
+  assert.equal(resumeModeForProvider('youtube-innertube'), 'TOKEN');
   const provider = serverSource('youtubeInnertubeProvider.ts');
+  assert.match(provider, /INNERTUBE_TOKEN_CURSOR_PREFIX/);
+  assert.match(provider, /pacedTokenContinuation\(session, cursor\.continuationToken, deadlineAtMs\)/);
+  // Legacy numeric cursors still walk live continuations for one page.
   assert.match(provider, /for \(let walked = 1; walked < pageNumber; walked\+\+\)/);
-  assert.match(provider, /walk uses live continuations/);
   const queue = serverSource('queueManager.ts');
   // A segment child's stored token is the absolute provider page ("11"), not
   // its run-local page number (1); prefer the token so a rewalk does not
@@ -1384,7 +1386,9 @@ test('P16: a creator seen on pages 1 and 2 is counted once with a cross-page rep
   const streakCall = runner.calls.find(call => call.text.includes('page_number < $2'));
   assert.ok(streakCall, 'continuation state reads persisted page observations');
   assert.deepEqual(streakCall.params, ['run-1', 3]);
-  assert.match(streakCall.text, /WHERE query_run_id=\$1 AND page_number < \$2/);
+  assert.match(streakCall.text, /WITH RECURSIVE lineage AS/);
+  assert.match(streakCall.text, /o\.page_number < \$2/);
+  assert.match(streakCall.text, /child_run\.continued_from_run_id/);
   // Run metrics must use the persisted cumulative unique count, not the sum
   // of overlapping per-page distinct populations.
   const pageStore = serverSource('autonomousPageStore.ts');
@@ -2279,16 +2283,16 @@ test('Q4: concurrent runs share the global hard cap; allocation percent is not a
 });
 
 test('Q5: InnerTube pages cost 0 YouTube units, official pages 100, and Brave uses its own ledger', () => {
+  assert.equal(providerPageCap('youtube-innertube', 50), Number.MAX_SAFE_INTEGER, 'InnerTube has no provider page cap');
   const innerTube = computeEffectivePageBudget({
-    safetyMaxPages: 50, providerMaxPages: 10, pageCostUnits: 0,
+    safetyMaxPages: 50, providerMaxPages: providerPageCap('youtube-innertube', 50), pageCostUnits: 0,
     remainingAutonomousQuota: 0, pendingCountries: 16,
   });
   // Zero page cost makes the quota bound unbounded: it must never tie (and
   // therefore mislabel) the safety ceiling or suppress a linked segment.
   assert.equal(innerTube.quotaPages, Number.MAX_SAFE_INTEGER);
-  assert.equal(innerTube.effectiveMaxPages, 10);
-  assert.equal(innerTube.bindingBound, 'PROVIDER');
-  assert.equal(providerPageCap('youtube-innertube', 50), 10, 'InnerTube keeps its real provider cap');
+  assert.equal(innerTube.effectiveMaxPages, 50);
+  assert.equal(innerTube.bindingBound, 'SAFETY');
 
   const providerTie = computeEffectivePageBudget({
     safetyMaxPages: 10, providerMaxPages: 10, pageCostUnits: 100,

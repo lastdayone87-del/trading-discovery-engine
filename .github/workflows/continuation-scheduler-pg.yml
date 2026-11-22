@@ -13,6 +13,7 @@ on:
       - 'server/queryRunLifecycle.postgres.test.ts'
       - 'server/continuationSegment.postgres.test.ts'
       - 'server/continuationResumeUtility.postgres.test.ts'
+      - 'server/paginationContinuation.postgres.test.ts'
       - 'server/autonomousPageStore.ts'
       - 'server/continuationPolicy.ts'
       - 'server/querySaturationSweep.postgres.test.ts'
@@ -69,5 +70,6 @@ jobs:
           server/queryRunLifecycle.postgres.test.ts
           server/continuationSegment.postgres.test.ts
           server/continuationResumeUtility.postgres.test.ts
+          server/paginationContinuation.postgres.test.ts
           server/querySaturationSweep.postgres.test.ts
           server/activeQueryRunIds.postgres.test.ts

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, type ContinuationDecisionV2 } from './continuationPolicy';
+import { countTrailingContinuationStreaks, evaluateContinuation, evaluateContinuationV2, planPersistedPageRecovery, type ContinuationDecisionV2 } from './continuationPolicy';
 
 const base = { pageNumber:1,maxPages:3,hasNextPage:true,distinctCreators:10,cumulativeDistinctCreators:10,newCreators:8,confirmedCreators:5,qualityConfirmedCreators:3,countryPrecision:.9,communityDiversity:.4,duplicateRatio:.1,consecutiveLowYieldPages:0,maxConsecutiveLowYieldPages:2 };
 test('continues a productive page with explainable utility',()=>{const d=evaluateContinuation(base);assert.equal(d.shouldContinue,true);assert.equal(d.lowYield,false);assert.equal(d.primaryReason,'CONTINUE_PRODUCTIVE');assert.ok(d.marginalUtility>.2);});
@@ -138,6 +138,25 @@ test('high actual channel overlap stops the first-page probe', () => {
   });
   assert.equal(decision.shouldContinue, false);
   assert.equal(decision.primaryReason, 'LOW_NOVELTY_PROBE');
+});
+
+test('a ceiling decision carries its low-value streak into the linked child', () => {
+  const ceiling = evaluateContinuationV2({
+    ...noveltyBase,
+    pageNumber: 50,
+    effectiveMaxPages: 50,
+    ceilingBound: 'SAFETY',
+    priorLowValueStreak: 1,
+  });
+  assert.equal(ceiling.shouldContinue, false);
+  assert.equal(ceiling.primaryReason, 'PAGE_CEILING');
+  assert.equal(ceiling.streaks.lowValue, 2);
+  const restored = countTrailingContinuationStreaks([{
+    marginalUtility: ceiling.marginalUtility,
+    reasonCodes: ceiling.reasonCodes,
+    continuationDecisionV2: ceiling,
+  }]);
+  assert.deepEqual(restored, { lowValue: 2, duplicateHeavy: 0, wrongCountry: 0 });
 });
 
 test('a complementary lane with unseen candidates continues', () => {

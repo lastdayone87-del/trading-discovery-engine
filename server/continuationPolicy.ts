@@ -392,14 +392,28 @@ export function evaluateContinuationV2(input: ContinuationV2Input): Continuation
 }
 
 /**
- * V2 streak reconstruction from persisted page rows (newest first). Deferred
- * pages are transparent. A page is low-value only when it has no productive
- * reason and carries a grace/low-value/zero-value signal; utility alone never
- * marks a page low-value.
+ * V2 streak reconstruction from persisted page rows (newest first). A valid
+ * v2 decision already stores the streaks *after* its page, so it is the
+ * authoritative answer for the next page — including a ceiling/deferred page
+ * whose reason codes alone would look neutral and otherwise reset the streak.
+ * Older rows without a v2 decision fall back to reason-code reconstruction.
+ * Deferred pages are transparent. A page is low-value only when it has no
+ * productive reason and carries a grace/low-value/zero-value signal; utility
+ * alone never marks a page low-value.
  */
 export function countTrailingContinuationStreaks(
   rows: Array<{ marginalUtility?: number; reasonCodes: string[]; continuationDecisionV2?: unknown }>,
 ): ContinuationStreaks {
+  const newestDecision = rows[0]
+    ? parseContinuationDecisionV2(rows[0].continuationDecisionV2)
+    : null;
+  if (newestDecision) {
+    return {
+      lowValue: Math.max(0, Math.trunc(newestDecision.streaks.lowValue) || 0),
+      duplicateHeavy: Math.max(0, Math.trunc(newestDecision.streaks.duplicateHeavy) || 0),
+      wrongCountry: Math.max(0, Math.trunc(newestDecision.streaks.wrongCountry) || 0),
+    };
+  }
   let lowValue = 0;
   let duplicateHeavy = 0;
   let wrongCountry = 0;
@@ -524,12 +538,16 @@ export function computeEffectivePageBudget(input: EffectivePageBudgetInput): Eff
   };
 }
 
-/** Resumption capability per provider. InnerTube has no serializable token. */
+/**
+ * Resumption capability per provider. InnerTube cursors carry the parsed
+ * body-continuation token (with a numeric page fallback), so a linked segment
+ * resumes directly instead of re-walking from page 1.
+ */
 export function resumeModeForProvider(providerKey: string | null | undefined): ContinuationResumeMode {
   switch (String(providerKey || '')) {
     case 'youtube-search': return 'TOKEN';
     case 'brave-search': return 'OFFSET';
-    case 'youtube-innertube': return 'REWALK';
+    case 'youtube-innertube': return 'TOKEN';
     default: return 'NONE';
   }
 }
