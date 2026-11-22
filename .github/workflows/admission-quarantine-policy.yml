@@ -41,5 +41,6 @@ jobs:
           server/channelAdmission/pipelineIntegration.test.ts
           server/channelAdmission/sightingReconciliation.test.ts
           server/queryAdmissionQuarantineRecovery.test.ts
+          server/autonomousPageStore.test.ts
       - name: TypeScript validation
         run: npm run lint

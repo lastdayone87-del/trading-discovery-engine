@@ -174,5 +174,10 @@ test('run-settled yield reads current channel state and reports pending classifi
   assert.equal(calls.length, 1);
   assert.match(calls[0].sql, /FROM channel_sightings cs/);
   assert.match(calls[0].sql, /LEFT JOIN channels c ON c\.channel_id=cs\.channel_id/);
+  assert.match(calls[0].sql, /COUNT\(DISTINCT cs\.channel_id\)/g);
+  assert.match(calls[0].sql, /WHERE cs\.query_run_id=\$1/);
+  assert.match(calls[0].sql, /c\.trading_status='TRADING_CONFIRMED'/);
+  assert.match(calls[0].sql, /c\.quality_score,0\)>=/);
+  assert.match(calls[0].sql, /cs\.funnel_outcome='CLASSIFICATION_PENDING'/);
   assert.deepEqual(calls[0].params, ['run-settled']);
 });
