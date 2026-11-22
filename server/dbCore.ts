@@ -724,6 +724,52 @@ async function ensureCdlHotTableIndexes(client: { query: (text: string, values?:
 }
 
 /**
+ * Corpus candidate scoring joins occurrences by `normalized_span`. Without an
+ * index that predicate is a full scan of the multi-million-row occurrence
+ * table, which made a single SCORE_CANDIDATES job run for tens of minutes and
+ * blocked the single corpus worker. Build it concurrently; migration 206 only
+ * adopts a valid index or verifies an empty table.
+ */
+async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const name = 'idx_corpus_occurrences_normalized';
+  const existing = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready, i.indnatts, i.indpred IS NULL AS no_predicate,
+           i.indexprs IS NULL AS no_expressions,
+           CASE WHEN to_regclass('public.corpus_candidate_occurrences') IS NULL THEN false
+                ELSE i.indrelid = to_regclass('public.corpus_candidate_occurrences') END AS correct_table,
+           pg_get_indexdef(i.indexrelid) AS definition
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.${name}')
+  `);
+  const row = existing.rows[0];
+  const definition = String(row?.definition || '');
+  const correct = row?.correct_table === true
+    && Number(row?.indnatts) === 3
+    && row?.no_predicate === true
+    && row?.no_expressions === true
+    && definition.includes('USING btree (normalized_span, document_id, start_offset)');
+  if (row?.indisvalid && row?.indisready && correct) return;
+  if (row?.oid) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+  }
+  const target = await client.query(`SELECT to_regclass('public.corpus_candidate_occurrences') AS oid`);
+  if (!target.rows[0]?.oid) return;
+  // A B-tree entry above ~2.7 KB cannot be built. New extraction is capped at
+  // 2048 bytes, but legacy rows must be checked before the concurrent build.
+  const oversized = await client.query(`SELECT 1 FROM corpus_candidate_occurrences WHERE octet_length(normalized_span)>2704 LIMIT 1`);
+  if (oversized.rowCount) {
+    console.warn(JSON.stringify({
+      event: 'corpus_scoring_index_blocked',
+      reason: 'OVERSIZED_NORMALIZED_SPAN',
+      timestamp: new Date().toISOString(),
+    }));
+    return;
+  }
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.corpus_candidate_occurrences(normalized_span, document_id, start_offset)`);
+}
+
+/**
  * Migration 168 indexes the maintenance sweep's pending-classification
  * predicate. `channel_sightings` is a populated hot table, so the runner
  * builds the index concurrently before the transactional migration, which
@@ -827,6 +873,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration170.rowCount) await ensurePhase4ScaleIndexes(client);
     const migration185 = await client.query('SELECT 1 FROM schema_migrations WHERE version=185');
     if (!migration185.rowCount) await ensureQuerySaturationIndexes(client);
+    const migration206 = await client.query('SELECT 1 FROM schema_migrations WHERE version=206');
+    if (!migration206.rowCount) await ensureCorpusOccurrenceIndexes(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
@@ -847,6 +895,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     }
     // The migration has committed by now, so CONCURRENTLY is legal. This is
     // idempotent and also repairs a build that failed on a previous boot.
+    const corpusIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=206');
+    if (corpusIndexMigration.rowCount) await ensureCorpusOccurrenceIndexes(client);
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
     const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');

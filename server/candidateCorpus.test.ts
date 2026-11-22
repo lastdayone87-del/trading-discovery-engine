@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { contentHash, extractCandidateSpans, OFFSET_SCHEME, retentionDisposition, sliceCodePoints } from './candidateCorpus';
+import { contentHash, extractCandidateSpans, MAX_CANDIDATE_SPAN_BYTES, OFFSET_SCHEME, retentionDisposition, sliceCodePoints } from './candidateCorpus';
 
 test('phase 8 migration is additive, shadow-only, source-bound and immutable',()=>{
   const sql=readFileSync(new URL('./db/migrations/023_immutable_candidate_corpus.sql',import.meta.url),'utf8');
@@ -9,6 +9,13 @@ test('phase 8 migration is additive, shadow-only, source-bound and immutable',()
   for(const table of ['corpus_source_artifacts','corpus_documents','corpus_extraction_runs','corpus_candidate_occurrences','corpus_qualification_decisions','corpus_controls'])assert.match(sql,new RegExp(table));
   assert.match(sql,/UNICODE_CODE_POINT_V1/);assert.match(sql,/paused BOOLEAN NOT NULL DEFAULT true/);assert.match(sql,/daily_compute_documents INTEGER NOT NULL DEFAULT 0/);
   assert.match(sql,/corpus_occurrences_immutable/);assert.match(sql,/No row grants Phase F or search eligibility/);
+});
+
+test('candidate extraction skips spans too large for the normalized-span index',()=>{
+  const longToken = 'a'.repeat(MAX_CANDIDATE_SPAN_BYTES + 1);
+  assert.equal(extractCandidateSpans(longToken).length, 0);
+  const normal = extractCandidateSpans('order flow trading');
+  assert.ok(normal.some(span => span.normalized === 'order flow'));
 });
 
 test('Unicode scalar offsets round trip multilingual and astral spans',()=>{
