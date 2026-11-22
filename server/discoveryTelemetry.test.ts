@@ -79,6 +79,14 @@ test('scheduler error diagnostics redact URL credentials and quoted options', ()
   assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');
 });
 
+test('scheduler error diagnostics mask Authorization bearer pairs as a unit', () => {
+  const details = schedulingErrorDiagnostics(new Error(
+    'request failed Authorization: Bearer super-secret-token',
+  ));
+  assert.doesNotMatch(details.logMessage || '', /super-secret-token/);
+  assert.match(details.logMessage || '', /Authorization:\s+(Bearer\s+)?\*\*\*|\[REDACTED\]/);
+});
+
 test('scheduler error diagnostics do not promote arbitrary leading words', () => {
   const details = schedulingErrorDiagnostics(new Error('failed to schedule candidate'));
   assert.equal(details.errorMessageCode, 'UNSTRUCTURED_ERROR');

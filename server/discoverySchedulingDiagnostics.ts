@@ -30,12 +30,20 @@ export function schedulingErrorDiagnostics(error: unknown): SchedulingErrorDiagn
   const record = error as { code?: unknown; message?: unknown } | null;
   const rawMessage = typeof record?.message === 'string' ? record.message : '';
   const rawCode = typeof record?.code === 'string' ? record.code : '';
-  const redacted = redactCauseSnippet(
-    rawMessage
-      .replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]')
-      .replace(CREDENTIAL_ASSIGNMENT, '$1[REDACTED]'),
+  // Run the shared redactor first so Authorization/Bearer pairs are masked as
+  // a unit; the local assignment pass then covers token:/authorization: forms
+  // the shared helper does not recognize. Reversing this order leaves the
+  // token after "Authorization: Bearer" exposed.
+  const sharedRedacted = redactCauseSnippet(
+    rawMessage.replace(GOOGLE_API_KEY, '[REDACTED_API_KEY]'),
     SCHEDULING_ERROR_MESSAGE_LIMIT,
   );
+  const redacted = sharedRedacted
+    ? redactCauseSnippet(
+      sharedRedacted.replace(CREDENTIAL_ASSIGNMENT, '$1[REDACTED]'),
+      SCHEDULING_ERROR_MESSAGE_LIMIT,
+    )
+    : undefined;
   return {
     ...(rawCode ? { errorCode: rawCode.slice(0, 64) } : {}),
     ...(redacted ? { errorMessageCode: structuralMessageCode(redacted) } : {}),
