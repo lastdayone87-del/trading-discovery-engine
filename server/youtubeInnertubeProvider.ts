@@ -60,6 +60,14 @@ export const YOUTUBE_INNERTUBE_DEFAULT_MAX_PAGES = 50;
 export const YOUTUBE_INNERTUBE_MAX_PAGES = YOUTUBE_INNERTUBE_DEFAULT_MAX_PAGES;
 /** Absolute cursor sanity ceiling, deliberately above the per-run safety cap. */
 export const YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES = 1000;
+/**
+ * Deepest numeric (no-token) rewalk that fits the 30s page deadline with 500ms
+ * pacing and real response latency. A live page-10 rewalk measured 16.8s;
+ * deeper walks are unsafe. This bound applies only to provider handoffs that
+ * have no InnerTube token (for example official-quota fallback), never to the
+ * token-resumed discovery ceiling.
+ */
+export const YOUTUBE_INNERTUBE_REWALK_SAFE_PAGES = 10;
 /** First-page result count is provider-determined (~20); official pages request up to 25. */
 export const YOUTUBE_INNERTUBE_PAGE_SIZE = 20;
 
@@ -561,13 +569,6 @@ async function emit(event: Parameters<typeof appendProviderCallEvent>[0]): Promi
   }
 }
 
-/**
- * Returns the shared session promise itself (NOT an async wrapper), so
- * callers can compare its identity — the stuck-attempt invalidation in
- * executeInnertubeRetrievalPage relies on object identity with the cached
- * attempt. An `async` wrapper would hand out a fresh promise per call and
- * silently defeat that check.
- */
 function wrapInnertubeSession(session: Innertube): InnertubeSession {
   const wrapped = session as unknown as InnertubeSession;
   wrapped.resumeSearch = async (continuationToken: string): Promise<InnertubeFeedLike> => {
@@ -581,6 +582,13 @@ function wrapInnertubeSession(session: Innertube): InnertubeSession {
   return wrapped;
 }
 
+/**
+ * Returns the shared session promise itself (NOT an async wrapper), so
+ * callers can compare its identity — the stuck-attempt invalidation in
+ * executeInnertubeRetrievalPage relies on object identity with the cached
+ * attempt. An `async` wrapper would hand out a fresh promise per call and
+ * silently defeat that check.
+ */
 function getInnertubeSession(): Promise<InnertubeSession> {
   if (!sessionPromise) {
     const attempt: Promise<InnertubeSession> = (sessionFactory
@@ -740,6 +748,7 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     requestMetadata: {
       innertubePage: String(pageNumber),
       innertubeLane: lane,
+      innertubeCursorMode: cursor.continuationToken ? 'TOKEN' : 'PAGE',
       requestedOrdering,
       innertubeOrdering: actualOrdering,
       ...(requestedOrdering === 'DATE' ? { orderingFallback: 'RELEVANCE_FALLBACK' } : {}),
@@ -832,6 +841,19 @@ export async function executeInnertubeRetrievalPage(request: RetrievalRequest): 
     // PROVIDER_EXHAUSTED.
     const hasMore = feed?.has_continuation === true;
     const continuationToken = hasMore ? innertubeContinuationToken(feed) : null;
+    if (hasMore && !continuationToken) {
+      // A parser change that hides the token must be visible: the numeric
+      // fallback rewalks and is safe only for shallow pages.
+      console.warn(JSON.stringify({
+        event: 'innertube_continuation_token_missing',
+        provider: 'youtube-innertube',
+        runId: request.queryRunId ?? null,
+        jobId: request.jobId ?? null,
+        pageNumber,
+        lane,
+        timestamp: new Date().toISOString(),
+      }));
+    }
     await emit({
       ...base, status: 'SUCCESS', latencyMs: Date.now() - started,
       actualCost: 0, occurredAt: new Date().toISOString(),

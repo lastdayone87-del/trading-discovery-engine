@@ -22,12 +22,14 @@ override it; the `core_kill_switches` health check reports a `WARN` naming the d
 conflict explicitly (either accept the intentional kill switch or re-enable it) as part of deployment.
 
 `autonomous_pagination_max_pages` is the single run-level safety ceiling and is `50` after migration
-`204_pagination_continuation_balance.sql`. Migration 161 deliberately preserved the legacy `10` because it
-could not distinguish that seeded value from an operator choice; migration 204 now raises only the exact
-legacy `10` to the approved `50`, so a deliberate ceiling above or below `50` is untouched. At the ceiling,
-a real continuation becomes a linked child segment rather than a `PROVIDER_EXHAUSTED` stop. InnerTube
-children resume from a persisted continuation-token cursor in one request; the page number remains in the
-cursor for telemetry, and numeric cursors from older rows still work through a bounded rewalk.
+`204_pagination_continuation_balance.sql`. The production deployment inspected for this change still had
+the migration-096 seeded `10`; migration 204 raises that exact value to the approved `50`. The schema has no
+provenance column, so a deliberate operator `10` cannot be distinguished; an operator who intentionally
+wants `10` must reapply it after deploy. Any existing value other than `10` is untouched. At the ceiling, a
+real continuation becomes a linked child segment rather than a `PROVIDER_EXHAUSTED` stop. InnerTube
+children resume from a persisted continuation-token cursor in one request when a token is available; the
+page number remains in the cursor for telemetry, and numeric cursors from older rows (or a missing token)
+still work through a bounded rewalk.
 
 Only the paid demand adapter remains off:
 
@@ -114,10 +116,13 @@ the CDL master switch is what stops continuation enqueue.
 
 A page that looks low-value, wrong-country, or novelty-poor is provisional while its own admission
 verdicts are still pending. The worker records the provisional stop, defers the run, and re-evaluates after
-settlement; it continues if any settled creator is newly persisted or freshly confirmed/quality. Hard
-stops (page/provider/creator ceilings, run/time budget, quota, no next page, and duplicate-heavy) never
-wait. Duplicate-heavy is measured from actual channel IDs on the page, and the production audit found zero
-unseen and zero confirmed traders on those pages, so its stop is immediate.
+settlement. It continues when settled yield is fresh confirmed/quality, or when a settled new creator
+overrides a non-novelty stop, provided the settled admission guard is not terminal. Low-novelty stops
+require confirmed/quality yield because a small new-creator share was already tolerated when the stop was
+chosen. Hard stops (page/provider/creator ceilings, run/time budget, quota, no next page, and
+duplicate-heavy) never wait. Duplicate-heavy is measured from actual channel IDs on the page; the 30-day
+production audit recorded in PR #690 found zero unseen and zero confirmed traders on those pages, so its
+stop is immediate.
 
 Discovery-arm cooldowns are evidence-gated too. An empty arm is authoritative immediately, but a
 low-novelty arm is cooled only after the configured number of probes (`query_arm_min_probe_runs`, default

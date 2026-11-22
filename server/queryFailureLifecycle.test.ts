@@ -44,6 +44,9 @@ test('failure recording classifies provider failure once and leaves the cooldown
   const body = source.slice(start, end);
   assert.match(body, /failureKind/);
   assert.match(body, /PROVIDER_CAPACITY/);
-  assert.doesNotMatch(body, /next_eligible_at=GREATEST/);
-  assert.match(source, /next_eligible_at=NULL/);
+  assert.doesNotMatch(body, /next_eligible_at/);
+  const completeStart = source.indexOf('export async function completeQueryRun');
+  const completeEnd = source.indexOf('\nexport ', completeStart + 10);
+  assert.ok(completeStart >= 0 && completeEnd > completeStart);
+  assert.match(source.slice(completeStart, completeEnd), /next_eligible_at=NULL/);
 });

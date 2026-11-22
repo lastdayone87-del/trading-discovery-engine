@@ -121,7 +121,7 @@ import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromoted
 import { recordQueryArmOutcome } from './queryDiscoveryArms';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
-import { YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES, YOUTUBE_INNERTUBE_PROVIDER, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
+import { INNERTUBE_TOKEN_CURSOR_PREFIX, YOUTUBE_INNERTUBE_PROVIDER, YOUTUBE_INNERTUBE_REWALK_SAFE_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
 import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
 import {
   evaluateInnertubeQuotaFallback,
@@ -912,6 +912,24 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
       'PERSISTED_PAGE_ADMISSION_REVIEW',
     );
     return;
+  }
+  // Close the crash window between recording the provisional stop and writing
+  // the review marker: an unmarked stop with pending admissions and a cursor is
+  // still provisional. Hard ceilings never use this path.
+  if (observation
+    && observation.shouldContinue === false
+    && observation.nextPageToken
+    && !ADMISSION_REVIEW_HARD_STOP_REASONS.has(observation.primaryReason)
+    && !ADMISSION_REVIEW_HARD_STOP_REASONS.has(String(observation.stoppingReason || ''))) {
+    const pageOutcomes = await getAdmissionPageOutcomes(args.queryRunId, args.pageNumber);
+    if (Number(pageOutcomes.pending || 0) > 0) {
+      await deferAutonomousRunForAdmissionReview(
+        args.queryRunId,
+        args.pageNumber,
+        'PERSISTED_PAGE_ADMISSION_PENDING',
+      );
+      return;
+    }
   }
   const [paginationSetting, cdlSetting] = await Promise.all([
     getAppSetting('autonomous_pagination_enabled', 'true'),
@@ -2562,9 +2580,13 @@ export async function processNextSearchJob(
                 isContinuationChild: Boolean(fallbackState.continuedFromRunId),
               })
             : { eligible: false, reasonCodes: ['RUN_STATE_UNAVAILABLE'] };
+          // The fallback cursor is numeric: it has no InnerTube token because
+          // the run started on the official provider. Only hand off while a
+          // page-1 rewalk still fits the InnerTube deadline; deeper official
+          // runs take the normal quota deferral instead of timing out forever.
           if (fallbackDecision.eligible
             && !fallbackState!.continuedToRunId
-            && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_CURSOR_MAX_PAGES
+            && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_REWALK_SAFE_PAGES
             && await isInnertubeQuotaFallbackAvailable().catch(() => false)) {
             if (!requiresContinuationHandoff(fallbackState!.pagesCompleted)) {
               // Zero completed pages: no official units were spent, so the
@@ -3228,6 +3250,13 @@ export async function processNextSearchJob(
           return true;
         }
       }
+      // Keep the rewalk signal truthful when the provider had to fall back to
+      // a numeric cursor because no continuation token was available.
+      const continuationResumeMode: ContinuationResumeMode = providerKey === 'youtube-innertube'
+        && Boolean(searchPage?.nextPageToken)
+        && !String(searchPage?.nextPageToken).startsWith(INNERTUBE_TOKEN_CURSOR_PREFIX)
+        ? 'REWALK'
+        : resumeModeForProvider(providerKey);
       await finalizeAutonomousSearchRun({
         job, workerId, queryRunId, queryId, query, country, pageNumber,
         retrievalLane, searchOrdering, retrievalConfigKey,
@@ -3250,7 +3279,7 @@ export async function processNextSearchJob(
           hasNextPage: Boolean(searchPage?.nextPageToken),
         }),
         continuationExplorationPagesRemaining: usingV2 ? decisionV2.explorationPagesRemaining : explorationPagesRemaining,
-        continuationResumeMode: resumeModeForProvider(providerKey),
+        continuationResumeMode,
         queryHold: queryResultConsistency,
       });
       if (queryResultHold) {
@@ -3663,12 +3692,18 @@ export async function resumeOrphanedAutonomousPages(options: {
           continue;
         }
         const hasCursor = Boolean(run.nextPageToken) && run.resumeMode !== 'NONE';
-        const settledProductive = Number(settledMarginal.marginalNewCreators || 0) > 0
-          || Number(settledMarginal.marginalFreshConfirmedCreators || 0) > 0
-          || Number(settledMarginal.marginalFreshQualityCreators || 0) > 0;
+        const stopReason = String(lastObservation.stoppingReason || lastObservation.primaryReason || '');
+        const lowNoveltyStop = stopReason === 'LOW_NOVELTY' || stopReason === 'LOW_NOVELTY_PROBE';
+        // LOW_NOVELTY deliberately tolerates a small new-creator share; a new
+        // creator alone was never enough to override that stop. Only settled
+        // confirmed/quality yield can reopen it. Other provisional stops keep
+        // the normal fresh-creator productivity rule.
+        const settledProductive = Number(settledMarginal.marginalFreshConfirmedCreators || 0) > 0
+          || Number(settledMarginal.marginalFreshQualityCreators || 0) > 0
+          || (!lowNoveltyStop && Number(settledMarginal.marginalNewCreators || 0) > 0);
         if (lastObservation.shouldContinue === false) {
           if (settledProductive) {
-            await settleAutonomousPageAdmissionDeferral(run.runId, run.pagesCompleted, true, null);
+            await settleAutonomousPageAdmissionDeferral(run.runId, run.pagesCompleted, true, null, [], true);
             lastObservation.shouldContinue = true;
             lastObservation.stoppingReason = null;
             if (!hasCursor) {

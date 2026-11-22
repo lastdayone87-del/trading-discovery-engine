@@ -176,9 +176,10 @@ export function chooseArmFromStates(
   }
   // Every planned arm was probed and skipped. A LOW_NOVELTY arm without a
   // cooldown was explicitly judged too shallow to penalize for two weeks, so
-  // give it the bounded second probe instead of cooling the whole query
-  // surface. Once the retry is recorded, the arm becomes cooldown-eligible and
-  // this pass can no longer select it.
+  // give it another probe instead of cooling the whole query surface. The
+  // retry count is bounded by the configured minimum: each run increments the
+  // aggregate, and once the threshold is reached the arm receives a cooldown
+  // and this pass can no longer select it.
   const retryable = planned
     .map(arm => byKey.get(armKey(arm)))
     .filter((state): state is QueryDiscoveryArm => Boolean(

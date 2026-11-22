@@ -1,6 +1,10 @@
 -- Align the global discovery safety ceiling with the approved CDL 50-page
 -- bound. Migration 161 intentionally preserved the legacy 10 while operators
--- decided; the approved pagination policy now raises that legacy value only.
+-- decided; the production deployment inspected for this change still had that
+-- seeded value. The schema has no provenance column, so a deliberate operator
+-- 10 cannot be distinguished; this migration follows the approved policy and
+-- raises only the exact value 10. An operator who intentionally wants 10 must
+-- reapply it after deploy. Any other value is untouched.
 UPDATE app_settings
    SET setting_value = '50'
  WHERE setting_key = 'autonomous_pagination_max_pages'

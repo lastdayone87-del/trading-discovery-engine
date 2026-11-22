@@ -277,8 +277,16 @@ export async function settleAutonomousPageAdmissionDeferral(
   shouldContinue: boolean,
   stoppingReason: string | null,
   reasonCodes: string[] = [],
+  resetStreaks = false,
 ): Promise<boolean> {
   const db = await getDb();
+  // A page that becomes productive only after settlement must not leave its
+  // provisional low-value streak behind for the next page. Append the
+  // productive marker for v1 reconstruction and patch the v2 decision when a
+  // real v2 payload exists.
+  const codes = resetStreaks
+    ? [...reasonCodes.filter(code => code !== 'CONTINUE_PRODUCTIVE'), 'CONTINUE_PRODUCTIVE']
+    : reasonCodes;
   const result = await db.query(
     `UPDATE autonomous_query_page_observations
         SET should_continue=$3,
@@ -287,9 +295,30 @@ export async function settleAutonomousPageAdmissionDeferral(
             decision_reason_codes=CASE
               WHEN $5::jsonb='[]'::jsonb THEN decision_reason_codes
               ELSE COALESCE(decision_reason_codes,'[]'::jsonb)||$5::jsonb
+            END,
+            continuation_decision_v2=CASE
+              WHEN $6::boolean
+                AND COALESCE(continuation_decision_v2,'{}'::jsonb) ? 'streaks'
+              THEN COALESCE(continuation_decision_v2,'{}'::jsonb)||jsonb_build_object(
+                'shouldContinue',true,
+                'defer',false,
+                'deferReason',NULL,
+                'lowValue',false,
+                'duplicateHeavy',false,
+                'wrongCountry',false,
+                'productive',true,
+                'primaryReason','CONTINUE_PRODUCTIVE',
+                'reasonCodes',jsonb_build_array('CONTINUE_PRODUCTIVE'),
+                'streaks',jsonb_build_object(
+                  'lowValue',0,
+                  'duplicateHeavy',0,
+                  'wrongCountry',0
+                )
+              )
+              ELSE continuation_decision_v2
             END
       WHERE query_run_id=$1 AND page_number=$2 AND deferred_reason='ADMISSION'`,
-    [runId, pageNumber, shouldContinue, stoppingReason, JSON.stringify(reasonCodes)],
+    [runId, pageNumber, shouldContinue, stoppingReason, JSON.stringify(codes), resetStreaks],
   );
   return (result.rowCount || 0) > 0;
 }
@@ -651,14 +680,24 @@ export async function getAutonomousContinuationState(runId: string, pageNumber?:
          SELECT parent.id, child.depth + 1
            FROM lineage child
            JOIN query_runs child_run ON child_run.id=child.id
-           JOIN query_runs parent ON parent.id::text=child_run.continued_from_run_id
+           JOIN query_runs parent
+             ON parent.id=NULLIF(child_run.continued_from_run_id,'')::uuid
+       ),
+       ranked AS (
+         SELECT o.distinct_creator_count,o.marginal_utility,o.decision_reason_codes,
+                o.continuation_decision_v2,l.depth,o.page_number,
+                ROW_NUMBER() OVER (
+                  PARTITION BY o.query_run_id ORDER BY o.page_number DESC
+                ) AS segment_rank
+           FROM autonomous_query_page_observations o
+           JOIN lineage l ON l.id=o.query_run_id
+          WHERE (l.depth=0 AND o.page_number < $2)
+             OR l.depth > 0
        )
-       SELECT o.distinct_creator_count,o.marginal_utility,o.decision_reason_codes,o.continuation_decision_v2
-         FROM autonomous_query_page_observations o
-         JOIN lineage l ON l.id=o.query_run_id
-        WHERE (l.depth=0 AND o.page_number < $2)
-           OR l.depth > 0
-        ORDER BY l.depth ASC, o.page_number DESC`,
+       SELECT distinct_creator_count,marginal_utility,decision_reason_codes,continuation_decision_v2
+         FROM ranked
+        WHERE depth=0 OR segment_rank=1
+        ORDER BY depth ASC, page_number DESC`,
       [runId, targetPage],
     ),
     getAutonomousPageMarginalMetrics(runId, targetPage, db),
