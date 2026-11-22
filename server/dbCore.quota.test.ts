@@ -215,30 +215,33 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   // singleton quota_tracker stays on the current Pacific day. A late prior-day
   // settlement must not rewind last_reset and zero current-day usage.
   assert.match(charge, /const keyQuotaDay=reservation\?\.quotaDay\|\|probeReservation\?\.quotaDay\|\|getYouTubeQuotaDay\(\);/);
-  assert.ok(charge.includes('const trackerDay=getYouTubeQuotaDay();'));
   // Probe allocation settlement is part of the same official-charge
   // transaction; it cannot be silently skipped or moved outside the charge.
   assert.ok(charge.includes('settleProbeQuotaReservation(client,probeReservation)'));
   const probeSettleIndex = charge.indexOf('settleProbeQuotaReservation');
   assert.ok(probeSettleIndex >= 0 && charge.indexOf("await client.query('COMMIT')", probeSettleIndex) > probeSettleIndex);
   const beginIndex = charge.indexOf("await client.query('BEGIN')");
-  const trackerIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
-  assert.ok(beginIndex >= 0 && trackerIndex > beginIndex, 'tracker day is sampled after pool acquisition/BEGIN');
+  assert.ok(beginIndex >= 0, 'charge runs inside a transaction');
   // The global tracker is the last lock acquired, and the charge touches only
   // the single per-key row. The old all-keys upsert followed by a tracker
   // update inverted that order and convoyed every worker behind one paused
   // settlement.
   assert.ok(charge.includes('incrementYouTubeKeyQuota(client,keyQuotaDay,keyFingerprint,keyIndex,units,perKey)'));
-  assert.ok(charge.includes('incrementYouTubeQuotaTracker(client,trackerDay,limit,units)'));
+  assert.ok(charge.includes('incrementYouTubeQuotaTracker(client,limit,units)'));
   assert.doesNotMatch(charge, /ensureYouTubeKeyRows\(client/);
   assert.doesNotMatch(charge, /SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE/);
   const keyChargeIndex = charge.indexOf('incrementYouTubeKeyQuota(');
   const trackerChargeIndex = charge.indexOf('incrementYouTubeQuotaTracker(');
-  const trackerDayIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
   const chargeCommitIndex = charge.indexOf("await client.query('COMMIT')", trackerChargeIndex);
   assert.ok(keyChargeIndex > 0 && trackerChargeIndex > keyChargeIndex, 'per-key row must be charged before the tracker');
-  assert.ok(trackerDayIndex > keyChargeIndex && trackerDayIndex > charge.indexOf('settleProbeQuotaReservation'), 'tracker day must be sampled after key/lease work');
   assert.ok(chargeCommitIndex > trackerChargeIndex, 'tracker update must commit after it is charged');
+  const trackerHelperStart = dbCore.indexOf('async function incrementYouTubeQuotaTracker');
+  const trackerHelper = dbCore.slice(trackerHelperStart, dbCore.indexOf('export async function getQuota', trackerHelperStart));
+  const trackerLockIndex = trackerHelper.indexOf("SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE");
+  const trackerDayIndex = trackerHelper.indexOf('const trackerDay=getYouTubeQuotaDay();');
+  const trackerUpdateIndex = trackerHelper.indexOf('UPDATE quota_tracker');
+  assert.ok(trackerLockIndex >= 0 && trackerDayIndex > trackerLockIndex && trackerUpdateIndex > trackerDayIndex,
+    'tracker day must be sampled after the row lock wait');
   // getQuota reports the same group-aware daily limit.
   const quotaStart = dbCore.indexOf('export async function getQuota');
   const quotaEnd = dbCore.indexOf('export async function incrementQuota', quotaStart);
@@ -265,8 +268,10 @@ test('quota reservation transactions keep the tracker lock off the reservation s
   assert.match(reserve, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(topUp, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
   assert.match(reserve, /SELECT status,units FROM quota_reservations[\s\S]*AND status='RESERVED' AND expires_at>now\(\)[\s\S]*FOR UPDATE/);
-  assert.match(reserve, /readLiveProbeQuotaLeaseUnits\(client\)/);
-  assert.match(topUp, /readLiveProbeQuotaLeaseUnits\(client\)/);
+  assert.match(reserve, /probeQuotaAdvisoryLockName\(quotaDay\)/);
+  assert.match(topUp, /probeQuotaAdvisoryLockName\(quotaDay\)/);
+  assert.match(reserve, /activeProbeLeaseUnitsExpression\(client\)/);
+  assert.match(topUp, /activeProbeLeaseUnitsExpression\(client\)/);
   assert.match(dbCore, /idx_quota_reservations_reserved_expiry/);
   assert.match(dbCore, /quotaReservationIndexMigration\.rowCount\) await ensureQuotaReservationActiveIndex/);
 });

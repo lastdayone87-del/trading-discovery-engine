@@ -16,7 +16,7 @@ import { youtubeProviderCooldown, type YouTubeProviderOperationalStatus } from '
 import type { AuditEvent } from './operatorAuth';
 import { providerCooldownExpiryMs, getGeminiOrgSemanticCooldownExpiry, getGeminiSemanticCooldownExpiry, type ProviderCallEvent } from './providerResilience';
 import { toWellFormedDeep, stringifyWellFormedJson } from './unicodeSafety';
-import { ProbeQuotaUnavailableError, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
+import { ProbeQuotaUnavailableError, probeQuotaAdvisoryLockName, resolveShadowConfig, settleKeyCapReservation, settleProbeQuotaReservation, settleShadowLeaseWithSavepoint, YouTubeKeyCapUnavailableError, type KeyCapReservationContext, type QuotaSettlementContext } from './quotaKeyCapShadow';
 import { isYouTubePermanentInputError } from './youtubeKeyHealth';
 import { canonicalCountry } from './countryInference';
 import { invalidateProviderCooldownCache, providerCooldownReadCache } from './cooldownReadCache';
@@ -2340,36 +2340,34 @@ async function incrementYouTubeKeyQuota(db:QueryExecutor, quotaDay:string, keyFi
 }
 
 /**
- * In-flight PROBE-origin official requests are reserved in the key-cap lease
- * table, not in quota_reservations. Count live probe leases as reserved global
- * capacity so a probe response that has not yet committed its tracker charge
- * cannot be double-admitted. The lease deletion and tracker increment commit
- * together, so MVCC keeps the lease visible until both are durable.
+ * SQL expression for live PROBE-origin leases. It is embedded in the same
+ * statement as the tracker/reservation totals so all three share one snapshot;
+ * the per-day advisory lock separately serializes probe lease insertion.
  */
-async function readLiveProbeQuotaLeaseUnits(db:QueryExecutor):Promise<number>{
-  try {
-    const result=await db.query(`SELECT COALESCE(SUM(reserved_units),0)::int AS units
-      FROM youtube_key_cap_shadow_leases
-      WHERE allocation='PROBE' AND expires_at>now()`);
-    return Number(result.rows[0]?.units)||0;
-  } catch (error) {
-    if ((error as { code?: unknown } | null)?.code === '42P01') return 0;
-    throw error;
-  }
+async function activeProbeLeaseUnitsExpression(db:QueryExecutor):Promise<string>{
+  const table=await db.query(`SELECT to_regclass('public.youtube_key_cap_shadow_leases') AS oid`);
+  return table.rows[0]?.oid
+    ? `COALESCE((SELECT SUM(reserved_units) FROM youtube_key_cap_shadow_leases WHERE allocation='PROBE' AND expires_at>now()),0)::int`
+    : `0::int`;
 }
 
 /**
  * Atomic Pacific-day rollover plus charge for the singleton quota tracker.
- * Callers acquire this row lock last so it is held only for this statement and
- * the commit, never across per-key or lease settlement work.
+ * The row lock is acquired before the day is sampled, so a lock wait that
+ * crosses Pacific midnight cannot write the prior day back over a newer-day
+ * tracker. The lock is held only for the final update and commit.
  */
-async function incrementYouTubeQuotaTracker(db:QueryExecutor, trackerDay:string, limit:number, units:number):Promise<void>{
+async function incrementYouTubeQuotaTracker(db:QueryExecutor, limit:number, units:number):Promise<void>{
   await db.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
-    VALUES('youtube',$1,$2,$3)
-    ON CONFLICT(id) DO UPDATE SET
-      units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN excluded.units_used ELSE quota_tracker.units_used+excluded.units_used END,
-      daily_limit=excluded.daily_limit,
-      last_reset=excluded.last_reset`,[units,limit,trackerDay]);
+    VALUES('youtube',0,$1,$2)
+    ON CONFLICT(id) DO NOTHING`,[limit,getYouTubeQuotaDay()]);
+  await db.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
+  const trackerDay=getYouTubeQuotaDay();
+  await db.query(`UPDATE quota_tracker
+    SET units_used=CASE WHEN last_reset<>$1 THEN $2 ELSE units_used+$2 END,
+        daily_limit=$3,
+        last_reset=$1
+    WHERE id='youtube'`,[trackerDay,units,limit]);
 }
 
 export async function getQuota():Promise<QuotaInfoExtended>{
@@ -2478,14 +2476,10 @@ export async function incrementQuota(
       // legacy unit-matched lease. Savepoint-guarded.
       await settleShadowLeaseWithSavepoint(client,{quotaDay:keyQuotaDay,keyFingerprint,units,operationId:shadowOperationId});
     }
-    // Sample the aggregate day immediately before the final upsert. A charge
-    // delayed across Pacific midnight must not write the prior day back over a
-    // newer-day tracker. The per-key reservation day remains the dispatch day.
-    const trackerDay=getYouTubeQuotaDay();
     // The tracker is the last lock acquired. Its critical section is just the
-    // atomic rollover/increment and the commit, so a slow lease settlement can
-    // never queue every other quota reservation behind it.
-    await incrementYouTubeQuotaTracker(client,trackerDay,limit,units);
+    // rollover/increment and the commit, so a slow lease settlement can never
+    // queue every other quota reservation behind it.
+    await incrementYouTubeQuotaTracker(client,limit,units);
     await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 
@@ -6476,6 +6470,10 @@ export async function tryReserveQuota(args: {
         units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
         daily_limit=excluded.daily_limit,
         last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
+    // Serialize with probe lease insertion, then read tracker, reservations and
+    // live probe leases in one statement so the capacity snapshot is consistent.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [probeQuotaAdvisoryLockName(quotaDay)]);
+    const probeUnitsExpression = await activeProbeLeaseUnitsExpression(client);
     const existing = await client.query(
       `SELECT status,units FROM quota_reservations
         WHERE operation_type=$1 AND operation_id=$2
@@ -6496,11 +6494,12 @@ export async function tryReserveQuota(args: {
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
          COALESCE((SELECT SUM(units) FROM quota_reservations
                     WHERE status='RESERVED' AND expires_at>now()
-                      AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS reserved_total`,
+                      AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS reserved_total,
+         ${probeUnitsExpression} AS probe_reserved_total`,
       [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
-    const probeReservedUnits = await readLiveProbeQuotaLeaseUnits(client);
+    const probeReservedUnits = Number(row.probe_reserved_total)||0;
     const protectedEnrichmentUnits = demand
       ? protectedEnrichmentUnitsForAutonomous(
           args.dailyBudget,
@@ -6565,6 +6564,8 @@ export async function topUpQuotaReservation(args: {
         units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
         daily_limit=excluded.daily_limit,
         last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [probeQuotaAdvisoryLockName(quotaDay)]);
+    const probeUnitsExpression = await activeProbeLeaseUnitsExpression(client);
 
     const existing = await client.query(
       `SELECT units
@@ -6584,12 +6585,13 @@ export async function topUpQuotaReservation(args: {
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
          COALESCE((SELECT SUM(units) FROM quota_reservations
                     WHERE status='RESERVED' AND expires_at>now()
-                      AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS other_reserved_total`,
+                      AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS other_reserved_total,
+         ${probeUnitsExpression} AS probe_reserved_total`,
       [args.operationType, args.operationId]
     );
     const currentUnits = Number(existing.rows[0].units);
-    const { actual_used: actualUsed, other_reserved_total: otherReservedTotal } = totals.rows[0];
-    const probeReservedUnits = await readLiveProbeQuotaLeaseUnits(client);
+    const { actual_used: actualUsed, other_reserved_total: otherReservedTotal, probe_reserved_total: probeReservedTotal } = totals.rows[0];
+    const probeReservedUnits = Number(probeReservedTotal)||0;
     const protectedEnrichmentUnits = demand
       ? protectedEnrichmentUnitsForAutonomous(
           args.dailyBudget,
