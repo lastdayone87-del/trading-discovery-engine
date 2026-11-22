@@ -433,24 +433,23 @@ test('suspended keys reprobe on a documented daily cadence (durable row is resta
   assert.match(migration, /hot-path authority/);
 });
 
-test('restart hydration preserves the probe cadence instead of extending to the durable horizon', () => {
+test('restart hydration honors the durable retry date', () => {
   const DAY = 24 * 60 * 60_000;
   const suspendedAt = 1_000_000_000;
-  // Suspended 23h ago, restarted now: reprobe lands on the original
-  // schedule (T+24h), not seven days out.
+  // Suspended 23h ago, restarted now: the explicit durable date wins.
   assert.equal(
     suspensionRestoreHorizonMs({ retryAfterMs: suspendedAt + 7 * DAY, observedAtMs: suspendedAt, nowMs: suspendedAt + 23 * 3_600_000, probeIntervalMs: DAY }),
-    suspendedAt + DAY,
+    suspendedAt + 7 * DAY,
   );
   // Durable horizon still wins when it arrives first (short custom horizon).
   assert.equal(
     suspensionRestoreHorizonMs({ retryAfterMs: suspendedAt + 3_600_000, observedAtMs: suspendedAt, nowMs: suspendedAt, probeIntervalMs: DAY }),
     suspendedAt + 3_600_000,
   );
-  // Unknown suspension start falls back to one probe interval from restart.
+  // Unknown suspension start still honors the explicit durable date.
   assert.equal(
     suspensionRestoreHorizonMs({ retryAfterMs: suspendedAt + 7 * DAY, observedAtMs: NaN, nowMs: suspendedAt, probeIntervalMs: DAY }),
-    suspendedAt + DAY,
+    suspendedAt + 7 * DAY,
   );
   // Missing durable horizon restores the cadence cap alone.
   assert.equal(
@@ -459,7 +458,7 @@ test('restart hydration preserves the probe cadence instead of extending to the 
   );
 });
 
-test('hydration restores a pre-restart suspension on its original probe schedule', async () => {
+test('hydration restores a pre-restart suspension until the durable retry date', async () => {
   const { youtubeProviderCooldown } = await import('./youtubeProviderCooldown');
   const { fingerprintYouTubeKey } = await import('./youtubeQuotaAttribution');
   const DAY = 24 * 60 * 60_000;
@@ -474,10 +473,10 @@ test('hydration restores a pre-restart suspension on its original probe schedule
     assert.deepEqual(summary, { restored: 1, skipped: 0 });
     const status = youtubeProviderCooldown.status(key);
     assert.equal(status.status, 'Suspended');
-    const expected = Date.parse(observedAt) + DAY;
+    const expected = Date.parse(retryAfter);
     assert.ok(
       status.retryAt !== null && Math.abs(status.retryAt - expected) < 5_000,
-      `hydrated retryAt must track the original probe schedule, got ${status.retryAt} want ~${expected}`,
+      `hydrated retryAt must honor the durable retry date, got ${status.retryAt} want ~${expected}`,
     );
   } finally {
     delete process.env.YOUTUBE_API_KEY;

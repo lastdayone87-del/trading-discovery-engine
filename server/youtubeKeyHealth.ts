@@ -3,6 +3,8 @@ import { clearYouTubeProviderSuspension, getYouTubeKeyPool, loadActiveYouTubePro
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { youtubeRequestSignatureFromUrl } from './youtubeQuarantineSignature';
+import { getYouTubeQuotaGroupForKey } from './youtubeKeyPool';
+import { suspendYouTubeProject } from './youtubeProjectSuspension';
 
 /** Invalid inputs stay quarantined for 7 days: long enough to break daily
  * rescan loops, short enough that a fixed upstream input recovers on its own. */
@@ -317,17 +319,18 @@ export function ensureYouTubeSuspensionHydration(): Promise<YouTubeSuspensionHyd
   return sharedSuspensionHydration;
 }
 
-/** In-memory restoration horizon for one durable suspension row. A restart
- * must preserve the normal probe cadence, not extend it: a suspension
- * observed at T reprobes at T + probe interval with or without a restart,
- * so the restored horizon is the durable retry_after capped at
- * observed_at + probe interval (unknown start falls back to now +
- * interval). The durable 7-day row itself is untouched — it survives for
- * success-clearing and analytics. Pure and deterministic for tests. */
+/** In-memory restoration horizon for one durable suspension row. An explicit
+ * durable `retry_after` is honored across restarts; only a missing horizon
+ * falls back to the probe interval from the observation (or from now when the
+ * observation is unknown). The durable row itself is untouched — it survives
+ * for success-clearing and analytics. Pure and deterministic for tests. */
 export function suspensionRestoreHorizonMs(input: { retryAfterMs: number; observedAtMs: number; nowMs: number; probeIntervalMs: number }): number {
   const interval = Number.isFinite(input.probeIntervalMs) && input.probeIntervalMs > 0 ? Math.trunc(input.probeIntervalMs) : 24 * 60 * 60_000;
-  const cap = Number.isFinite(input.observedAtMs) ? input.observedAtMs + interval : input.nowMs + interval;
-  return Number.isFinite(input.retryAfterMs) ? Math.min(input.retryAfterMs, cap) : cap;
+  const fallback = Number.isFinite(input.observedAtMs) ? input.observedAtMs + interval : input.nowMs + interval;
+  // An explicit durable retry date is authoritative across restarts. The
+  // previous cadence cap re-probed keys already marked suspended and produced
+  // fresh 403s every day; only a missing/unknown horizon uses the fallback.
+  return Number.isFinite(input.retryAfterMs) ? input.retryAfterMs : fallback;
 }
 
 /** Restores durable suspensions into the in-memory cooldown after a
@@ -341,7 +344,7 @@ export function suspensionRestoreHorizonMs(input: { retryAfterMs: number; observ
  * instead of caching the zero-count fallback; callers that need a
  * non-rejecting gate must use ensureYouTubeSuspensionHydration(). */
 export async function hydrateYouTubeProviderSuspensions(
-  loadRows: () => Promise<Array<{ keyFingerprint: string; retryAfter: string | null; observedAt?: string | null }>> = loadActiveYouTubeProviderSuspensions,
+  loadRows: () => Promise<Array<{ keyFingerprint: string; retryAfter: string | null; observedAt?: string | null; quotaGroup?: string | null }>> = loadActiveYouTubeProviderSuspensions,
 ): Promise<YouTubeSuspensionHydration> {
   const summary: YouTubeSuspensionHydration = { restored: 0, skipped: 0 };
   let rows;
@@ -358,13 +361,19 @@ export async function hydrateYouTubeProviderSuspensions(
   const nowMs = Date.now();
   for (const row of rows) {
     const key = byFingerprint.get(row.keyFingerprint);
+    const retryAfterMs = row.retryAfter ? Date.parse(row.retryAfter) : NaN;
+    const observedAtMs = row.observedAt ? Date.parse(row.observedAt) : NaN;
+    const horizon = suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs });
+    // Restore the group even when the originally denied key was removed from
+    // the pool: its sibling keys still share the project denial. If the row
+    // predates labels, resolve the current key's configured group.
+    const quotaGroup = row.quotaGroup || (key ? getYouTubeQuotaGroupForKey(key) : '');
+    if (quotaGroup) suspendYouTubeProject(quotaGroup, horizon, nowMs);
     if (!key) {
       summary.skipped += 1;
       continue;
     }
-    const retryAfterMs = row.retryAfter ? Date.parse(row.retryAfter) : NaN;
-    const observedAtMs = row.observedAt ? Date.parse(row.observedAt) : NaN;
-    youtubeProviderCooldown.restoreSuspended(key, suspensionRestoreHorizonMs({ retryAfterMs, observedAtMs, nowMs, probeIntervalMs }), { allowDue: true });
+    youtubeProviderCooldown.restoreSuspended(key, horizon, { allowDue: true });
     summary.restored += 1;
   }
   return summary;

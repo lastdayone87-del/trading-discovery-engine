@@ -68,6 +68,7 @@ import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
 import { youtubeProviderCooldown, YouTubeProvidersCoolingDownError } from './youtubeProviderCooldown';
+import { earliestYouTubeProjectRetryAt, isYouTubeProjectSuspended, suspendYouTubeProject } from './youtubeProjectSuspension';
 import { bumpInvalidApiKeyQuarantine } from './operationsTelemetry';
 import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type FeaturedChannelProviderResult } from './featuredChannelAdapter';
 export type { SearchOrdering } from './searchOrdering';
@@ -377,8 +378,16 @@ export async function availableKeyIndexes(
   deps: YouTubeKeyPoolPreflightDeps = {},
 ): Promise<number[]> {
   const rotation = keys.map((_key, index) => (activeKeyIndex + index) % keys.length);
-  const indexes = rotation.filter(index => youtubeProviderCooldown.eligible(keys[index]));
-  if (!indexes.length) { throwIfAllProvidersCoolingDown(keys); return []; }
+  const indexes = rotation.filter(index =>
+    youtubeProviderCooldown.eligible(keys[index])
+    && !isYouTubeProjectSuspended(getYouTubeQuotaGroupForKey(keys[index])),
+  );
+  if (!indexes.length) {
+    const projectRetryAt = earliestYouTubeProjectRetryAt(keys.map(key => getYouTubeQuotaGroupForKey(key)));
+    if (projectRetryAt !== null) throw new YouTubeProvidersCoolingDownError(projectRetryAt);
+    throwIfAllProvidersCoolingDown(keys);
+    return [];
+  }
   let enforcement = false;
   try {
     enforcement = await (deps.resolveEnforcement ?? (() => resolveKeyCapEnforcement(getAppSetting)))();
@@ -526,11 +535,17 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
     const configured = getConfiguredYouTubeProviders().find(item => item.key === providerKey);
     // Serialized with gated clears (arrival order): a re-suspension issued
     // after an in-flight clear executes after it, so the fresh row survives.
+    const quotaGroup = configured?.quotaGroup || getYouTubeQuotaGroupForKey(providerKey) || '';
+    // A deleted/mistyped key is key-scoped and must not sideline healthy
+    // siblings. Only a confirmed consumer/project suspension fans out.
+    if (quotaGroup && reason === 'CONSUMER_SUSPENDED') {
+      suspendYouTubeProject(quotaGroup, Date.now() + YOUTUBE_SUSPENSION_RETRY_AFTER_MS);
+    }
     await serializeYouTubeSuspensionWrite(() => recordYouTubeProviderSuspension({
       keyFingerprint: fingerprintYouTubeKey(providerKey),
       keyIndex: index >= 0 ? index + 1 : 0,
       envName: configured?.envName || '',
-      quotaGroup: configured?.quotaGroup || getYouTubeQuotaGroupForKey(providerKey) || '',
+      quotaGroup,
       status: reason === 'INVALID_API_KEY' ? 'INVALID_KEY' : 'SUSPENDED',
       retryAfterMs: YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
       reason,
@@ -664,6 +679,15 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
   // readiness, so without this wait a restart could reprobe an already-dead
   // key before its cooldown is restored. Resolves immediately once hydrated.
   await ensureYouTubeSuspensionHydration();
+  // Re-check the project at dispatch, not only when the claim list was built:
+  // a sibling request may have suspended the group while this request queued.
+  if (providerKey) {
+    const quotaGroup = getYouTubeQuotaGroupForKey(providerKey);
+    if (isYouTubeProjectSuspended(quotaGroup)) {
+      const retryAt = earliestYouTubeProjectRetryAt([quotaGroup]);
+      throw new YouTubeProvidersCoolingDownError(retryAt ?? Date.now() + 60_000);
+    }
+  }
   trace('entered youtubeFetch; before timeout-setting-read at server/youtube.ts:119');
   const configuredTimeout=Number(await getAppSetting('youtube_provider_timeout_ms',process.env.YOUTUBE_PROVIDER_TIMEOUT_MS||'30000'));
   trace('after timeout-setting-read at server/youtube.ts:119');
