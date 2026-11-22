@@ -57,6 +57,32 @@ test('403 ACCESS_DENIED is classified as credential suspension, not transient', 
   assert.equal(isQuotaExceeded(error), false);
 });
 
+test('403 PERMISSION_DENIED rate limit and resource denials do not suspend the key', async () => {
+  const rateLimitResponse = new Response(JSON.stringify({
+    error: {
+      code: 403,
+      message: 'The request cannot be completed because you have exceeded your rate limit.',
+      status: 'PERMISSION_DENIED',
+      errors: [{ reason: 'rateLimitExceeded' }],
+    },
+  }), { status: 403, headers: { 'content-type': 'application/json' } });
+  const rateLimitError = await youtubeHttpError(rateLimitResponse);
+  assert.equal(isConsumerSuspended(rateLimitError), false);
+  assert.equal(isYouTubeRateLimited(rateLimitError), true);
+
+  const resourceDeniedResponse = new Response(JSON.stringify({
+    error: {
+      code: 403,
+      message: 'The playlist identified with the request does not support the request.',
+      status: 'PERMISSION_DENIED',
+      errors: [{ reason: 'playlistItemsNotAccessible' }],
+    },
+  }), { status: 403, headers: { 'content-type': 'application/json' } });
+  const resourceDeniedError = await youtubeHttpError(resourceDeniedResponse);
+  assert.equal(isConsumerSuspended(resourceDeniedError), false);
+  assert.equal(isYouTubeRateLimited(resourceDeniedError), false);
+});
+
 test('youtubeHttpError distinguishes quotaExceeded from consumerSuspended', async () => {
   const quotaResponse = new Response(JSON.stringify({
     error: {

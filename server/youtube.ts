@@ -1048,8 +1048,10 @@ export function isConsumerSuspended(error: unknown): boolean {
     // quota or rate-limit 403 is excluded above; these authorization denials
     // are credential-scoped and must retire the key rather than fan out across
     // the pool on every acquisition.
-    const hasAuthorizationDenial = current.providerReasons?.some((reason: unknown) => /^(forbidden|access_?denied|permission_?denied)$/i.test(String(reason)))
-      || /\b(access_?denied|permission_?denied)\b/i.test(String(current.message ?? ''));
+    // Only explicit credential-denial reasons qualify. A bare
+    // PERMISSION_DENIED status/message is also used for rate limits and
+    // resource-specific denials, and must not suspend a healthy key.
+    const hasAuthorizationDenial = current.providerReasons?.some((reason: unknown) => /^(forbidden|access_?denied)$/i.test(String(reason)));
     if ((is403 || isPermissionDenied) && (hasSuspendedReason || hasAuthorizationDenial)) return true;
   }
   return false;
