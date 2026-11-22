@@ -27,7 +27,9 @@ test('AI enqueue capacity is bounded by today\'s remaining assertion and cost he
   assert.equal(aiAdjudicationCapacity(control,0,950,10),5);
   assert.equal(aiAdjudicationCapacity(control,10,0,10),0);
   assert.equal(aiAdjudicationCapacity(control,0,1000,10),0);
-  assert.equal(aiAdjudicationCapacity({...control,ai_paused:true},0,0,10),0);
+  assert.equal(aiAdjudicationCapacity(control,0,0,10,4),6);
+  assert.equal(aiAdjudicationCapacity(control,0,950,10,5),0);
+  assert.equal(aiAdjudicationCapacity({...control,ai_paused:true},0,0,10,0),0);
 });
 
 test('deferred ambiguous candidates have a bounded, funded backfill worker',()=>{

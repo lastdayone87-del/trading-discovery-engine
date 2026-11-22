@@ -83,12 +83,20 @@ export function aiAdjudicationCapacity(
   todayAssertions: number,
   todayCostMicrounits: number,
   reservedCostMicrounits: number,
+  activeQueuedJobs = 0,
 ): number {
   if (!aiAdjudicationAdmitted(control)) return 0;
-  const assertionRemaining = Math.max(0, Number(control!.daily_ai_assertions) - Math.max(0, todayAssertions));
+  const active = Math.max(0, Math.trunc(activeQueuedJobs) || 0);
+  // Existing PENDING/PROCESSING jobs are already ahead of this enqueue burst.
+  // Count them against both the assertion and cost headroom so a scoring pass
+  // cannot add more work than the adjudicator can still accept today.
+  const assertionRemaining = Math.max(0, Number(control!.daily_ai_assertions) - Math.max(0, todayAssertions) - active);
   const costRemaining = Math.max(0, Number(control!.max_ai_cost_microunits) - Math.max(0, todayCostMicrounits));
   const reserved = Math.max(0, reservedCostMicrounits);
-  const costSlots = reserved > 0 ? Math.floor(costRemaining / reserved) : assertionRemaining;
+  const queuedCost = active * reserved;
+  const costSlots = reserved > 0
+    ? Math.floor(Math.max(0, costRemaining - queuedCost) / reserved)
+    : assertionRemaining;
   return Math.max(0, Math.min(assertionRemaining, costSlots));
 }
 
@@ -100,7 +108,8 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
   const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);if(spent.rows[0].n>=control.rows[0].daily_scoring_candidates)throw new Error('Candidate scoring daily budget is exhausted.');
   const aiUsage=await db.query(`SELECT count(*)::int n,COALESCE(sum(cost_microunits),0)::bigint cost FROM candidate_adjudication_results WHERE completed_at>=date_trunc('day',now())`);
   const aiReservedCost=Math.max(0,Number(process.env.CANDIDATE_AI_COST_MICROUNITS||0));
-  const aiCapacity=aiAdjudicationCapacity(control.rows[0],Number(aiUsage.rows[0]?.n||0),Number(aiUsage.rows[0]?.cost||0),aiReservedCost);
+  const aiActive=await db.query(`SELECT count(*)::int n FROM jobs WHERE type='AI_ADJUDICATE_CANDIDATE' AND status IN ('PENDING','PROCESSING')`);
+  const aiCapacity=aiAdjudicationCapacity(control.rows[0],Number(aiUsage.rows[0]?.n||0),Number(aiUsage.rows[0]?.cost||0),aiReservedCost,Number(aiActive.rows[0]?.n||0));
   const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span IN(SELECT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[p.documentId]);
   const groups=new Map<string,CandidateEvidence[]>();for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
   if(groups.size>Number(control.rows[0].daily_scoring_candidates)-Number(spent.rows[0].n))throw new Error('Candidate scoring job exceeds the remaining daily budget.');
@@ -129,7 +138,8 @@ export async function enqueueDeferredAiAdjudications(limit=50):Promise<number>{
   if(!control.rowCount)return 0;
   const usage=await db.query(`SELECT count(*)::int n,COALESCE(sum(cost_microunits),0)::bigint cost FROM candidate_adjudication_results WHERE completed_at>=date_trunc('day',now())`);
   const reservedCost=Math.max(0,Number(process.env.CANDIDATE_AI_COST_MICROUNITS||0));
-  const capacity=aiAdjudicationCapacity(control.rows[0],Number(usage.rows[0]?.n||0),Number(usage.rows[0]?.cost||0),reservedCost);
+  const active=await db.query(`SELECT count(*)::int n FROM jobs WHERE type='AI_ADJUDICATE_CANDIDATE' AND status IN ('PENDING','PROCESSING')`);
+  const capacity=aiAdjudicationCapacity(control.rows[0],Number(usage.rows[0]?.n||0),Number(usage.rows[0]?.cost||0),reservedCost,Number(active.rows[0]?.n||0));
   if(capacity<=0)return 0;
   const bounded=Math.min(capacity,Math.max(1,Math.trunc(Number(limit))||50));
   const rows=await db.query(`
