@@ -13,6 +13,7 @@ import {
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { COUNTRY_BOUNDARY_RECOVERY_JOB } from './countryBoundaryRecovery';
 import { startOperationalMaintenanceScheduler } from './operationalMaintenanceScheduler';
+import { enqueueDeferredAiAdjudications } from './candidateScoring';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -343,6 +344,32 @@ function startCountryBoundaryRecoveryWorker(workerId: string): void {
 }
 
 /**
+ * Bounded backfill for ambiguous candidates whose AI enqueue was deferred
+ * while adjudication was paused or unfunded. The enqueue helper rechecks the
+ * same control and capacity gates, so this worker is inert until AI is ready.
+ */
+function startDeferredAiAdjudicationWorker(workerId: string): void {
+  const tick = async () => {
+    try {
+      const enqueued = await enqueueDeferredAiAdjudications(50);
+      if (enqueued > 0) {
+        console.info(JSON.stringify({
+          event: 'deferred_ai_adjudications_enqueued',
+          workerId,
+          enqueued,
+          timestamp: new Date().toISOString(),
+        }));
+      }
+    } catch (error) {
+      console.error(`[Queue Worker:${workerId}] Deferred AI adjudication sweep failed:`, error);
+    } finally {
+      schedule(tick, 5 * 60_000);
+    }
+  };
+  void tick();
+}
+
+/**
  * Dedicated corpus-pipeline consumer: harvest, scoring, and concept
  * resolution, through the existing processNextSearchJob path and its existing
  * control/budget gates. Concurrency is intentionally 1 (single consumer);
@@ -400,6 +427,9 @@ export function startOperationalMaintenanceWorkers(): void {
   // generic maintenance concurrency setting: harvest/scoring work is DB-local
   // and strictly gated by corpus/scoring controls and budgets.
   startCorpusPipelineWorker(`corpus_pipeline_${process.pid}_0`);
+  // Ambiguous candidates deferred while AI was paused/unfunded are picked up
+  // here only when the control plane is enabled and funded.
+  startDeferredAiAdjudicationWorker(`deferred_ai_${process.pid}_0`);
   // Recovery/projection sweeps are not claim-critical and run on one shared
   // interval instead of ahead of every claim in every worker pool.
   startOperationalMaintenanceScheduler();
