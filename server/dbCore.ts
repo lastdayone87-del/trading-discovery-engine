@@ -850,6 +850,42 @@ async function ensureClassificationSightingIndex(client: { query: (text: string,
 }
 
 /**
+ * Migration 207 indexes only the active reservation slice. The table retains
+ * millions of historical rows; without a partial index every quota
+ * reservation sequentially scanned the whole table and every expiry sweep
+ * rewrote it while holding the singleton tracker lock.
+ */
+async function ensureQuotaReservationActiveIndex(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const name = 'idx_quota_reservations_reserved_expiry';
+  const existing = await client.query(`
+    SELECT c.oid, i.indisvalid, i.indisready, i.indpred IS NOT NULL AS has_predicate,
+           i.indnatts, i.indnkeyatts,
+           CASE WHEN to_regclass('public.quota_reservations') IS NULL THEN false
+                ELSE i.indrelid = to_regclass('public.quota_reservations') END AS correct_table,
+           pg_get_indexdef(i.indexrelid) AS definition
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+     WHERE c.oid = to_regclass('public.${name}')
+  `);
+  const row = existing.rows[0];
+  const definition = String(row?.definition || '');
+  const correct = row?.correct_table === true
+    && row?.has_predicate === true
+    && Number(row?.indnatts) === 4
+    && Number(row?.indnkeyatts) === 1
+    && definition.includes('USING btree (expires_at)')
+    && definition.includes('INCLUDE (units, operation_type, operation_id)')
+    && definition.includes("status = 'RESERVED'");
+  if (row?.indisvalid && row?.indisready && correct) return;
+  if (row?.oid) {
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
+  }
+  const target = await client.query(`SELECT to_regclass('public.quota_reservations') AS oid`);
+  if (!target.rows[0]?.oid) return;
+  await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.quota_reservations (expires_at) INCLUDE (units, operation_type, operation_id) WHERE status='RESERVED'`);
+}
+
+/**
  * Migration 185 indexes the mature saturation sweep. Build both indexes
  * concurrently before the transactional migration loop; migration 185 only
  * adopts a valid index or verifies an empty table.
@@ -931,6 +967,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration185.rowCount) await ensureQuerySaturationIndexes(client);
     const migration206 = await client.query('SELECT 1 FROM schema_migrations WHERE version=206');
     if (!migration206.rowCount) await ensureCorpusOccurrenceIndexes(client);
+    const migration207 = await client.query('SELECT 1 FROM schema_migrations WHERE version=207');
+    if (!migration207.rowCount) await ensureQuotaReservationActiveIndex(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
@@ -2275,6 +2313,38 @@ async function ensureYouTubeKeyRows(db:QueryExecutor, today:string, keys:string[
     ON CONFLICT(quota_day,key_fingerprint) DO UPDATE SET key_index=excluded.key_index,daily_limit=excluded.daily_limit,updated_at=now()`,[today,fingerprintYouTubeKey(key),index+1,perKey]);
 }
 
+/**
+ * Charge exactly one per-key/day row inside the official-charge transaction.
+ * The old all-keys upsert locked every configured key before the singleton
+ * tracker update. A charge that paused between statements then held those key
+ * rows while a second charge held the tracker and waited for a key row,
+ * creating a lock-order convoy across every YouTube worker. This statement
+ * touches only the charged key and increments atomically.
+ */
+async function incrementYouTubeKeyQuota(db:QueryExecutor, quotaDay:string, keyFingerprint:string, keyIndex:number, units:number, perKey:number):Promise<void>{
+  await db.query(`INSERT INTO youtube_key_quota_usage(quota_day,key_fingerprint,key_index,units_used,daily_limit)
+    VALUES($1,$2,$3,$4,$5)
+    ON CONFLICT(quota_day,key_fingerprint) DO UPDATE SET
+      units_used=youtube_key_quota_usage.units_used+excluded.units_used,
+      key_index=excluded.key_index,
+      daily_limit=excluded.daily_limit,
+      updated_at=now()`,[quotaDay,keyFingerprint,keyIndex,units,perKey]);
+}
+
+/**
+ * Atomic Pacific-day rollover plus charge for the singleton quota tracker.
+ * Callers acquire this row lock last so it is held only for this statement and
+ * the commit, never across per-key or lease settlement work.
+ */
+async function incrementYouTubeQuotaTracker(db:QueryExecutor, trackerDay:string, limit:number, units:number):Promise<void>{
+  await db.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
+    VALUES('youtube',$1,$2,$3)
+    ON CONFLICT(id) DO UPDATE SET
+      units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN excluded.units_used ELSE quota_tracker.units_used+excluded.units_used END,
+      daily_limit=excluded.daily_limit,
+      last_reset=excluded.last_reset`,[units,limit,trackerDay]);
+}
+
 export async function getQuota():Promise<QuotaInfoExtended>{
   const db=await getDb(); const today=getYouTubeQuotaDay(); const keys=getYouTubeKeyPool(); const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000')); const limit=getDailyYouTubeQuotaBudget();
   const quotaGroups=getConfiguredYouTubeProviders().map(provider=>provider.quotaGroup);
@@ -2364,7 +2434,11 @@ export async function incrementQuota(
       // charge instead of double-counting the same response.
       if (!await claimYouTubeQuotaOperation(client, operationId, keyQuotaDay, keyFingerprint, units)) { await client.query('COMMIT'); return; }
     }
-    await ensureYouTubeQuotaDay(client,trackerDay,limit);await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);await ensureYouTubeKeyRows(client,keyQuotaDay,keys,perKey);await client.query(`UPDATE quota_tracker SET units_used=units_used+$1,daily_limit=$2,last_reset=$3 WHERE id='youtube'`,[units,limit,trackerDay]);await client.query(`UPDATE youtube_key_quota_usage SET units_used=units_used+$1,updated_at=now() WHERE quota_day=$2 AND key_fingerprint=$3`,[units,keyQuotaDay,keyFingerprint]);
+    // Lock and charge the single per-key row before the global tracker. A
+    // charge must never hold the singleton tracker while waiting for a per-key
+    // row; that inversion serialized every YouTube worker behind one paused
+    // settlement.
+    await incrementYouTubeKeyQuota(client,keyQuotaDay,keyFingerprint,keyIndex,units,perKey);
     if(reservation){
       // Settle the exact lease in the SAME transaction as the official
       // charge. Enforce failures roll the charge back (fail closed); shadow
@@ -2382,6 +2456,10 @@ export async function incrementQuota(
       // legacy unit-matched lease. Savepoint-guarded.
       await settleShadowLeaseWithSavepoint(client,{quotaDay:keyQuotaDay,keyFingerprint,units,operationId:shadowOperationId});
     }
+    // The tracker is the last lock acquired. Its critical section is just the
+    // atomic rollover/increment and the commit, so a slow lease settlement can
+    // never queue every other quota reservation behind it.
+    await incrementYouTubeQuotaTracker(client,trackerDay,limit,units);
     await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
 }
 
@@ -6355,12 +6433,16 @@ export async function tryReserveQuota(args: {
   );
   if (alreadyReserved.rowCount) return true;
   const demand = args.allocation === 'AUTONOMOUS' ? await readEnrichmentQuotaDemand(db) : null;
+  // Expire stale leases before taking the singleton tracker lock. The sweep can
+  // touch every historical reservation, and doing it inside the transaction
+  // held the tracker for the full scan.
+  await db.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at<=now()`);
   const client = await db.connect();
   try {
     await client.query('BEGIN');
     const quotaDay = getYouTubeQuotaDay();
     // Rollover belongs to admission so the first worker after the YouTube Pacific quota-day rollover can
-    // recover without relying on a dashboard/read request. The upsert holds the
+    // recover without relying on a dashboard/read request. This upsert owns the
     // tracker row lock for the rest of this reservation transaction.
     await client.query(`INSERT INTO quota_tracker(id,units_used,daily_limit,last_reset)
       VALUES('youtube',0,$1,$2)
@@ -6368,8 +6450,6 @@ export async function tryReserveQuota(args: {
         units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
         daily_limit=excluded.daily_limit,
         last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
-    await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
-    await client.query(`UPDATE quota_reservations SET status='EXPIRED' WHERE status='RESERVED' AND expires_at<=now()`);
     const existing = await client.query(
       `SELECT status,units FROM quota_reservations WHERE operation_type=$1 AND operation_id=$2 FOR UPDATE`,
       [args.operationType, args.operationId]
@@ -6379,11 +6459,15 @@ export async function tryReserveQuota(args: {
       await client.query('COMMIT');
       return true;
     }
+    // Restrict the aggregate to the partial active-reservation index. The old
+    // FILTER over the whole table forced a parallel sequential scan of every
+    // historical reservation while the singleton tracker lock was held.
     const totals = await client.query(
       `SELECT
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
-         COALESCE(SUM(units) FILTER (WHERE status='RESERVED' AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS reserved_total
-       FROM quota_reservations`,
+         COALESCE((SELECT SUM(units) FROM quota_reservations
+                    WHERE status='RESERVED'
+                      AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS reserved_total`,
       [args.operationType, args.operationId]
     );
     const row = totals.rows[0];
@@ -6451,7 +6535,6 @@ export async function topUpQuotaReservation(args: {
         units_used=CASE WHEN quota_tracker.last_reset<>excluded.last_reset THEN 0 ELSE quota_tracker.units_used END,
         daily_limit=excluded.daily_limit,
         last_reset=excluded.last_reset`, [args.dailyBudget, quotaDay]);
-    await client.query(`SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE`);
 
     const existing = await client.query(
       `SELECT units
@@ -6469,11 +6552,9 @@ export async function topUpQuotaReservation(args: {
     const totals = await client.query(
       `SELECT
          COALESCE((SELECT units_used FROM quota_tracker WHERE id='youtube'),0)::int AS actual_used,
-         COALESCE(SUM(units) FILTER (
-           WHERE status='RESERVED' AND expires_at>now()
-             AND NOT (operation_type=$1 AND operation_id=$2)
-         ),0)::int AS other_reserved_total
-       FROM quota_reservations`,
+         COALESCE((SELECT SUM(units) FROM quota_reservations
+                    WHERE status='RESERVED' AND expires_at>now()
+                      AND NOT (operation_type=$1 AND operation_id=$2)),0)::int AS other_reserved_total`,
       [args.operationType, args.operationId]
     );
     const currentUnits = Number(existing.rows[0].units);

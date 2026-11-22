@@ -224,15 +224,45 @@ test('incrementQuota combines group-aware budgeting, operationId idempotency, an
   const beginIndex = charge.indexOf("await client.query('BEGIN')");
   const trackerIndex = charge.indexOf('const trackerDay=getYouTubeQuotaDay();');
   assert.ok(beginIndex >= 0 && trackerIndex > beginIndex, 'tracker day is sampled after pool acquisition/BEGIN');
-  assert.ok(charge.includes('ensureYouTubeQuotaDay(client,trackerDay,limit)'));
-  assert.ok(charge.includes('ensureYouTubeKeyRows(client,keyQuotaDay,keys,perKey)'));
-  assert.ok(charge.includes('[units,limit,trackerDay]'));
-  assert.ok(charge.includes('[units,keyQuotaDay,keyFingerprint]'));
+  // The global tracker is the last lock acquired, and the charge touches only
+  // the single per-key row. The old all-keys upsert followed by a tracker
+  // update inverted that order and convoyed every worker behind one paused
+  // settlement.
+  assert.ok(charge.includes('incrementYouTubeKeyQuota(client,keyQuotaDay,keyFingerprint,keyIndex,units,perKey)'));
+  assert.ok(charge.includes('incrementYouTubeQuotaTracker(client,trackerDay,limit,units)'));
+  assert.doesNotMatch(charge, /ensureYouTubeKeyRows\(client/);
+  assert.doesNotMatch(charge, /SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE/);
+  const keyChargeIndex = charge.indexOf('incrementYouTubeKeyQuota(');
+  const trackerChargeIndex = charge.indexOf('incrementYouTubeQuotaTracker(');
+  const chargeCommitIndex = charge.indexOf("await client.query('COMMIT')", trackerChargeIndex);
+  assert.ok(keyChargeIndex > 0 && trackerChargeIndex > keyChargeIndex, 'per-key row must be charged before the tracker');
+  assert.ok(chargeCommitIndex > trackerChargeIndex, 'tracker update must commit after it is charged');
   // getQuota reports the same group-aware daily limit.
   const quotaStart = dbCore.indexOf('export async function getQuota');
   const quotaEnd = dbCore.indexOf('export async function incrementQuota', quotaStart);
   const quota = dbCore.slice(quotaStart, quotaEnd);
   assert.match(quota, /const limit=getDailyYouTubeQuotaBudget\(\)/);
+});
+
+test('quota reservation transactions keep the tracker lock off the reservation scan and expiry sweep', () => {
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const reserveStart = dbCore.indexOf('export async function tryReserveQuota');
+  const topUpStart = dbCore.indexOf('export async function topUpQuotaReservation');
+  const finishStart = dbCore.indexOf('export async function finishQuotaReservation');
+  assert.ok(reserveStart >= 0 && topUpStart > reserveStart && finishStart > topUpStart, 'reservation functions must remain discoverable');
+  const reserve = dbCore.slice(reserveStart, topUpStart);
+  const topUp = dbCore.slice(topUpStart, finishStart);
+
+  const expireIndex = reserve.indexOf("UPDATE quota_reservations SET status='EXPIRED'");
+  const connectIndex = reserve.indexOf('const client = await db.connect()');
+  assert.ok(expireIndex >= 0 && connectIndex > expireIndex, 'expiry sweep must run before the tracker transaction');
+  assert.doesNotMatch(reserve, /SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE/);
+  assert.doesNotMatch(topUp, /SELECT id FROM quota_tracker WHERE id='youtube' FOR UPDATE/);
+  // The aggregate must target the partial active-reservation index instead of
+  // scanning all historical rows while the tracker row is locked.
+  assert.match(reserve, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED'/);
+  assert.match(topUp, /SELECT SUM\(units\) FROM quota_reservations\s+WHERE status='RESERVED' AND expires_at>now\(\)/);
+  assert.match(dbCore, /idx_quota_reservations_reserved_expiry/);
 });
 
 test('probe allocation and per-key cap exhaustion defer without consuming an attempt', async () => {
@@ -372,10 +402,10 @@ test('normal-origin batches contain probe channel refusals; probe jobs still def
   );
 
   const source = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(source, /processPlaylistInspectionJob\(job,processDiscoveredChannelContained\)/);
-  assert.match(source, /processFeaturedChannelInspectionJob\(job,processDiscoveredChannelContained\)/);
+  assert.match(source, /processPlaylistInspectionJob\(job,\(raw,country,source\)=>processDiscoveredChannelContained\(raw,country,source,\{lane:'DISCOVERY'/);
+  assert.match(source, /processFeaturedChannelInspectionJob\(job,\(raw,country,source\)=>processDiscoveredChannelContained\(raw,country,source,\{lane:'DISCOVERY'/);
   assert.match(source, /inline: \(\) => processDiscoveredChannelContained\(raw, country, source/);
-  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{ jobId \}\)/);
+  assert.match(source, /const outcome = await processDiscoveredChannelContained\(raw, session\.country, 'manual_search', \{/);
   assert.match(source, /calculateQueryFunnel\(searchPage\?\.rawResultCount \?\? extracted\.length, observations, deferredResults\)/);
   assert.match(source, /deferredOnly: observations\.length === 0 && deferredResults > 0/);
   assert.match(source, /enqueueJob\('ENRICH_CHANNEL', deferred\.payload, deferred\.opts\)/);
