@@ -57,7 +57,7 @@ test('runtime wiring uses the dedicated heartbeat pool and avoids per-tick stale
   assert.match(db, /runtimePoolConfig\(requireDatabaseUrl\(\), 2, 'trading-discovery-heartbeat'\)/);
   assert.match(db, /export async function heartbeatJob[\s\S]{0,400}getHeartbeatDb\(\)/);
   assert.match(db, /idle_in_transaction_session_timeout=/);
-  assert.match(db, /read_only_pool_error/);
+  assert.match(db, /logPoolErrors\(new Pool\([\s\S]{0,500}?'read_only_pool_error'\)/);
   assert.match(db, /if \(!heartbeatPool\) \{\s*heartbeatPool = logPoolErrors/);
   assert.match(db, /databasePoolMax\(\)/);
   assert.match(queue, /const CLAIM_STALE_RECOVERY_INTERVAL_MS =/);

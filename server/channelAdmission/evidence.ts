@@ -208,8 +208,9 @@ export async function fetchAdmissionEvidence(
   const deadlineAtMs = Date.now() + timeoutMs;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<AdmissionEvidence>((resolve) => {
+    // Ref'd: cleared in finally, and a handle-free process must not exit
+    // before the deadline contract can settle.
     timer = setTimeout(() => resolve(evidenceTimeoutResult(input)), timeoutMs);
-    timer.unref?.();
   });
   const loader = admissionEvidenceLoaderForTests ?? fetchAdmissionEvidenceUnbounded;
   try {
