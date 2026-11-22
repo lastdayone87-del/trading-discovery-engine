@@ -2025,10 +2025,12 @@ export function getYouTubeKeyPool(): string[] { return getConfiguredYouTubeKeys(
 export function usableYouTubeProviders(){
   const configured=getConfiguredYouTubeProviders();
   const usable=configured.filter(provider=>{
-    const status=youtubeProviderCooldown.status(provider.key).status;
-    return status!=='Suspended'&&status!=='Daily Quota Exhausted';
+    // Suspended keys have zero usable capacity. Daily-exhausted keys remain in
+    // the budget because quota_tracker.units_used still includes their spend;
+    // removing them would understate consumption and over-admit healthy keys.
+    return youtubeProviderCooldown.status(provider.key).status!=='Suspended';
   });
-  return usable.length?usable:configured;
+  return usable;
 }
 export function getDailyYouTubeQuotaBudget():number{const perKey=Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000');const providers=usableYouTubeProviders();const map=describeQuotaProjectMap(providers);if(map.projectCount===0)return calculateYouTubeDailyBudget(providers.length,perKey);return calculateEffectiveYouTubeBudget(providers,perKey);}
 export function describeYouTubeQuotaProjectMap(){const providers=usableYouTubeProviders();const perKey=Math.max(1,Number(process.env.YOUTUBE_DAILY_QUOTA_PER_KEY||'10000'));const map=describeQuotaProjectMap(providers);return {...map,perKey,effectiveBudget:calculateEffectiveYouTubeBudget(providers,perKey),legacyKeySumBudget:calculateYouTubeDailyBudget(providers.length,perKey)};}

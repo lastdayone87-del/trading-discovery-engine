@@ -166,6 +166,11 @@ function startOfficialRecheckWorker(workerId: string): void {
     let reserved = false;
     let nextDelayMs = 1000;
     try {
+      const queue = await getQueueStatusFresh();
+      if (queue.channelProcessing.isPaused) {
+        nextDelayMs = IDLE_RECHECK_MS;
+        return;
+      }
       if (!await hasClaimableMaintenanceWork(OFFICIAL_RECHECK_TYPES)) {
         nextDelayMs = IDLE_RECHECK_MS;
         return;
