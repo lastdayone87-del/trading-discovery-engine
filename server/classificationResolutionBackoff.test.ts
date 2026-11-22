@@ -183,23 +183,31 @@ test('deferredOnly restricts the candidate set instead of admitting every status
   await reconcileClassificationResolutionGaps({ dryRun: true, cutoff: CUTOFF, deferredOnly: false, db } as any);
 
   assert.match(queries[0].sql, /NOT \$5::boolean OR c\.scan_status IN\('INTAKE_DEFERRED','PROVIDER_DEFERRED'\)/);
+  assert.match(queries[0].sql, /GREATEST\(/);
   assert.equal(queries[0].params[4], true);
   assert.equal(queries[1].params[4], false);
 });
 
 test('the deferred backfill lease is shared and can be disabled for tests', async () => {
   let updateRows = 0;
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
   const db = {
-    query: async (sql: string) => {
+    query: async (sql: string, params: unknown[] = []) => {
+      queries.push({ sql, params });
       if (sql.includes('UPDATE scheduler_state')) return { rowCount: updateRows };
       return { rowCount: 1 };
     },
   };
   updateRows = 0;
-  assert.equal(await acquireDeferredEnrichmentBackfillLease(db), false, 'another replica owns the window');
+  assert.equal(await acquireDeferredEnrichmentBackfillLease(db, 600_000), false, 'another replica owns the window');
   updateRows = 1;
-  assert.equal(await acquireDeferredEnrichmentBackfillLease(db), true, 'the lease is acquired once the window expires');
+  assert.equal(await acquireDeferredEnrichmentBackfillLease(db, 600_000), true, 'the lease is acquired once the window expires');
   assert.equal(await acquireDeferredEnrichmentBackfillLease(db, 0), true, 'tests can disable the lease');
+
+  assert.match(queries[0].sql, /INSERT INTO scheduler_state/);
+  assert.match(queries[1].sql, /UPDATE scheduler_state/);
+  assert.match(queries[1].sql, /last_run_at < now\(\).*\$2::int\*interval '1 millisecond'/);
+  assert.deepEqual(queries[1].params, ['deferred_enrichment_backfill', 600_000]);
 });
 
 test('a deferred reopen rolls back when the enqueue throws', async () => {

@@ -222,6 +222,9 @@ export function shouldPreserveExistingChannel(
     // owns the retry cadence and the cycle ceiling. Explicit operator scans stay
     // outside this guard.
     if (existing.scan_status === 'INTAKE_DEFERRED' || existing.scan_status === 'PROVIDER_DEFERRED') {
+      // An unresolved country is not evidence deferral: let Gate 1 run so a
+      // fresh sighting can resolve the creator's country or apply exclusion.
+      if (existing.country_status === 'UNCERTAIN') return false;
       return !isManualScan && source !== 'manual_search';
     }
 

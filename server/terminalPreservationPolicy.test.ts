@@ -64,6 +64,12 @@ test('machine-deferred evidence states wait for the bounded recovery sweep', () 
     assert.equal(shouldPreserveExistingChannel(deferred, source('manual_search'), false, NOW), false, 'manual-search source is enough to retry');
     assert.equal(shouldPreserveExistingChannel(deferred, source('recheck'), true, NOW), false);
   }
+  const unresolvedCountry = base({ trading_status: 'UNCERTAIN', scan_status: 'INTAKE_DEFERRED', country_status: 'UNCERTAIN', country: '' });
+  assert.equal(
+    shouldPreserveExistingChannel(unresolvedCountry, source('automated_query'), false, NOW),
+    false,
+    'fresh country evidence must still reach Gate 1 for an unresolved deferred row',
+  );
 });
 
 test('country rejected rows remain terminal even when old', () => {

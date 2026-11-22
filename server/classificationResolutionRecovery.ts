@@ -237,7 +237,7 @@ export async function reconcileClassificationResolutionGaps(
             EXISTS(SELECT 1 FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE 'operational-enrichment-terminal:%') AS terminal_recovery_marker,
-            COALESCE(
+            GREATEST(
               (SELECT MAX(e.created_at) FROM operational_enrichment_recovery_events e
                 WHERE e.channel_id=c.channel_id
                   AND e.event_key LIKE '${CYCLE_PREFIX}%'),
@@ -272,7 +272,7 @@ export async function reconcileClassificationResolutionGaps(
              AND active.status IN('PENDING','PROCESSING')
         )
         AND ($3::boolean OR NOT (
-          COALESCE(
+          GREATEST(
             (SELECT MAX(e.created_at) FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE '${CYCLE_PREFIX}%'),
@@ -361,6 +361,9 @@ export async function reconcileClassificationResolutionGaps(
       const client = await db.connect();
       try {
         await client.query('BEGIN');
+        // Serialize the active-job check and enqueue with the same
+        // channel/type advisory lock used by the job reopen guard.
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`${item.channelId}:ENRICH_CHANNEL`]);
         if (item.scanStatus === 'INTAKE_DEFERRED' || item.scanStatus === 'PROVIDER_DEFERRED') {
           // The enrichment worker refuses deferred rows. Reopen the exact
           // observed row inside the enqueue transaction, with an ownership
