@@ -40,8 +40,8 @@ test('the approved safety ceiling is aligned to 50 without lowering an operator 
 test('linked continuation segments reconstruct prior page streaks through ancestry', () => {
   assert.match(pageStore, /WITH RECURSIVE lineage AS/);
   assert.match(pageStore, /parent\.id=NULLIF\(child_run\.continued_from_run_id,''\)::uuid/);
-  assert.match(pageStore, /ROW_NUMBER\(\) OVER \(\s*PARTITION BY o\.query_run_id/);
-  assert.match(pageStore, /WHERE depth=0 OR segment_rank=1/);
+  assert.match(pageStore, /ORDER BY l\.depth ASC, o\.page_number DESC/);
+  assert.match(pageStore, /LIMIT 200/);
 });
 
 test('provisional low-value stops wait for page admission settlement but hard stops do not', () => {
@@ -58,7 +58,7 @@ test('provisional low-value stops wait for page admission settlement but hard st
   assert.match(pageStore, /deferred_reason='ADMISSION'/);
   assert.match(queue, /if \(observation\?\.deferredReason === 'ADMISSION'\)/);
   assert.match(queue, /PERSISTED_PAGE_ADMISSION_REVIEW/);
-  assert.match(queue, /PERSISTED_PAGE_ADMISSION_PENDING/);
+  assert.match(queue, /PERSISTED_PAGE_PROVISIONAL_STOP/);
   assert.match(queue, /observation\.shouldContinue === false/);
 });
 

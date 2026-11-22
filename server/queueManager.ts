@@ -914,22 +914,20 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
     return;
   }
   // Close the crash window between recording the provisional stop and writing
-  // the review marker: an unmarked stop with pending admissions and a cursor is
-  // still provisional. Hard ceilings never use this path.
+  // the review marker. A provisional stop with a cursor is always re-evaluated
+  // by the orphan sweep, whether its admissions are still pending or settled
+  // productive while the worker was down. Hard ceilings never use this path.
   if (observation
     && observation.shouldContinue === false
     && observation.nextPageToken
     && !ADMISSION_REVIEW_HARD_STOP_REASONS.has(observation.primaryReason)
     && !ADMISSION_REVIEW_HARD_STOP_REASONS.has(String(observation.stoppingReason || ''))) {
-    const pageOutcomes = await getAdmissionPageOutcomes(args.queryRunId, args.pageNumber);
-    if (Number(pageOutcomes.pending || 0) > 0) {
-      await deferAutonomousRunForAdmissionReview(
-        args.queryRunId,
-        args.pageNumber,
-        'PERSISTED_PAGE_ADMISSION_PENDING',
-      );
-      return;
-    }
+    await deferAutonomousRunForAdmissionReview(
+      args.queryRunId,
+      args.pageNumber,
+      'PERSISTED_PAGE_PROVISIONAL_STOP',
+    );
+    return;
   }
   const [paginationSetting, cdlSetting] = await Promise.all([
     getAppSetting('autonomous_pagination_enabled', 'true'),

@@ -682,22 +682,19 @@ export async function getAutonomousContinuationState(runId: string, pageNumber?:
            JOIN query_runs child_run ON child_run.id=child.id
            JOIN query_runs parent
              ON parent.id=NULLIF(child_run.continued_from_run_id,'')::uuid
-       ),
-       ranked AS (
-         SELECT o.distinct_creator_count,o.marginal_utility,o.decision_reason_codes,
-                o.continuation_decision_v2,l.depth,o.page_number,
-                ROW_NUMBER() OVER (
-                  PARTITION BY o.query_run_id ORDER BY o.page_number DESC
-                ) AS segment_rank
-           FROM autonomous_query_page_observations o
-           JOIN lineage l ON l.id=o.query_run_id
-          WHERE (l.depth=0 AND o.page_number < $2)
-             OR l.depth > 0
        )
-       SELECT distinct_creator_count,marginal_utility,decision_reason_codes,continuation_decision_v2
-         FROM ranked
-        WHERE depth=0 OR segment_rank=1
-        ORDER BY depth ASC, page_number DESC`,
+       SELECT o.distinct_creator_count,o.marginal_utility,o.decision_reason_codes,
+              o.continuation_decision_v2
+         FROM autonomous_query_page_observations o
+         JOIN lineage l ON l.id=o.query_run_id
+        WHERE (l.depth=0 AND o.page_number < $2)
+           OR l.depth > 0
+        ORDER BY l.depth ASC, o.page_number DESC
+        -- The legacy v1 streak needs real ancestor pages, but the stop
+        -- threshold is small. Bound the read to the most recent 200 pages so a
+        -- long linked chain cannot make every page decision scan unbounded
+        -- history while still covering four full 50-page segments.
+        LIMIT 200`,
       [runId, targetPage],
     ),
     getAutonomousPageMarginalMetrics(runId, targetPage, db),
