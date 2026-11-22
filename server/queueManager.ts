@@ -99,7 +99,7 @@ import { resolveScopeEligibility } from './scopeEligibility';
 import { processChannelThroughPipeline, isTerminalState, applyGate1CountryRejectionToExisting, type PipelineExecutionOptions } from './ingestionPipeline';
 import { evaluateLowAudienceGate, shouldReclassifyPreservedCompletedChannel } from './lowAudienceGate';
 import { applyPublicAboutToCandidate, fetchLiveYouTubeChannelData } from './youtubePublicAbout';
-import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { isPermanentTradingConfirmation, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { shouldEnqueueDiscordEvidenceReclassification, validatedDiscordEvidenceInvite } from './discordEvidence';
 import { resolveTerminalEnrichmentFailure } from './enrichmentLifecycle';
 import { recordEvidenceActionOutcome } from './voiEvidenceController';
@@ -4009,6 +4009,32 @@ export async function processClassificationJob(job: DurableJob): Promise<void> {
   const channelId = String(payload?.channelId || '');
   if (!channelId || !payload?.candidate) return;
   await assertCountryAllowed(String(payload.targetCountry || ''), `classification_worker:${job.id}`);
+  // A concurrent admission/enrichment pass may have confirmed the creator
+  // after this job was queued. The confirmation is authoritative; do not run
+  // another classifier pass that could only re-litigate it.
+  const existing = await getChannelById(channelId);
+  if (existing && isPermanentTradingConfirmation(existing.trading_status)) {
+    await reconcileClassificationResult({
+      channelId,
+      jobId: job.id,
+      channel: existing,
+      outcome: {
+        channelId,
+        channelName: existing.channel_name,
+        isNew: false,
+        wasKnown: true,
+        persisted: true,
+        countryStatus: existing.country_status,
+        tradingStatus: 'TRADING_CONFIRMED',
+        discordStatus: existing.discord_status,
+        discordInvite: existing.discord_invite || null,
+        channelRecord: existing,
+      },
+      persisted: true,
+    });
+    await completeJob(job.id);
+    return;
+  }
   const outcome = await processChannelThroughPipeline(
     payload.candidate,
     payload.targetCountry,
@@ -5707,6 +5733,41 @@ export async function triggerManualRecheck(
 
     freshCandidate.enrichmentStage = Math.max(1, freshCandidate.enrichmentStage || 0);
     freshCandidate.matchedDocument = { type: 'MANUAL', locator: `recheck:${channelId}` };
+
+    // A confirmed trading decision may refresh country/community evidence, but
+    // it must never be re-litigated by a manual recheck or the post-approval
+    // enrichment job. Run the community inspector only and leave the
+    // authoritative trading status untouched.
+    if (channel.trading_status === 'TRADING_CONFIRMED') {
+      console.log(`[Manual Recheck] Preserving confirmed trading classification for ${channel.channel_name} while refreshing community evidence.`);
+      try {
+        await inspectAndValidateChannel(channel, freshCandidate, true, enableDebug, false, undefined, {
+          lane: attribution?.lane || 'MANUAL',
+          jobType: attribution?.jobType || 'MANUAL_RECHECK',
+          ...(attribution?.jobId ? { jobId: attribution.jobId } : {}),
+          slicePass: 1,
+        });
+        const refreshed = await getChannelById(channelId) || channel;
+        return {
+          success: true,
+          message: `Confirmed trading classification preserved for ${channel.channel_name}; fresh Discord/community inspection completed.`,
+          channel: refreshed,
+          languageContext: selectExplicitTerminologyLanguageContext(freshCandidate)
+        };
+      } catch (error: any) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`[Manual Recheck] Community-only refresh failed for confirmed creator ${channelId}; preserving TRADING_CONFIRMED: ${detail}`);
+        return {
+          success: false,
+          message: `Confirmed trading classification preserved for ${channel.channel_name}, but fresh Discord/community inspection failed operationally. ${detail}`,
+          code: 'MANUAL_RESCAN_COMMUNITY_INCOMPLETE',
+          retryable: true,
+          errorClass: 'TRANSIENT',
+          channel: await getChannelById(channelId) || channel
+        };
+      }
+    }
+
     console.log(`[Manual Reclassification Started] Channel: ${channel.channel_name} (${channel.channel_id})`);
 
     try {

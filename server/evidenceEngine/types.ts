@@ -24,7 +24,14 @@ export type EvidenceSourceType =
   | 'gemini_semantic'
   | 'groq_semantic'
   | 'gemini_free_semantic'
-  | 'discord_metadata';
+  | 'discord_metadata'
+  /**
+   * The durable admission decision itself. A confirmed admission is a
+   * first-class trading result even when the original provider/citation
+   * metadata was not carried into the classification payload. This source
+   * records that provenance honestly instead of inferring a model provider.
+   */
+  | 'admission_decision';
 
 export type EvidencePolarity = 'POSITIVE' | 'NEGATIVE';
 

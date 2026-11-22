@@ -20,3 +20,10 @@ test('deterministic and human admissions are already final relevance decisions',
   assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: undefined }, 'ACTIVE'), false);
   assert.equal(admissionShortcutEligible({ ...base, admissionDecisionSource: 'DETERMINISTIC' }, 'OFF'), false);
 });
+
+test('a terminal pre-catalog semantic decision is final, but a legacy semantic router is not', () => {
+  assert.equal(admissionShortcutEligible({ ...base, admissionClassified: true }, 'ACTIVE'), true);
+  assert.equal(admissionShortcutEligible({ ...base, admissionClassified: false }, 'ACTIVE'), false);
+  assert.equal(admissionShortcutEligible({ ...base, admissionClassified: undefined }, 'ACTIVE'), false);
+  assert.equal(admissionShortcutEligible({ ...base, admissionClassified: true, admissionConfirmedTrading: false }, 'ACTIVE'), false);
+});

@@ -52,6 +52,14 @@ export async function decideReview(input:DecideInput) {
   const db=await getDb(); const client=await db.connect();
   try {
     await client.query('BEGIN');
+    // Any review action other than APPROVE may replace a terminal projection:
+    // REJECT moves a pending row to HUMAN_REJECTED, while REQUEST/FORCE_RESCAN
+    // deliberately return the row to UNCERTAIN for a new evidence pass. Mark
+    // the transaction as audited so the confirmed-trading and human-rejection
+    // guards permit exactly this explicit operator path.
+    if (input.action !== 'APPROVE') {
+      await client.query(`SET LOCAL app.force_review_rescan='on'`);
+    }
     const prior=await client.query(`SELECT d.*,r.state,r.review_version current_review_version,c.trading_status,c.scan_status,c.discord_status
       FROM channel_review_decisions d JOIN channel_reviews r USING(channel_id) JOIN channels c USING(channel_id)
       WHERE d.idempotency_key=$1`,[input.idempotencyKey]);
@@ -84,7 +92,6 @@ export async function decideReview(input:DecideInput) {
     } else if(input.action==='REJECT') {
       await client.query(`UPDATE channels SET trading_status='HUMAN_REJECTED',scan_status='SKIPPED_NON_TRADING',discord_status='NON_TRADING',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
     } else {
-      await client.query(`SET LOCAL app.force_review_rescan='on'`);
       await client.query(`UPDATE channel_reviews SET state='SUPERSEDED',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
       await client.query(`UPDATE channels SET trading_status='UNCERTAIN',scan_status='ENRICHMENT_PENDING',discord_status='UNCERTAIN',updated_at=now() WHERE channel_id=$1`,[input.channelId]);
       const jobKey=input.action==='REQUEST_RESCAN'?`request-review-rescan:${input.channelId}:${nextVersion}`:`force-review-rescan:${input.channelId}:${nextVersion}`;

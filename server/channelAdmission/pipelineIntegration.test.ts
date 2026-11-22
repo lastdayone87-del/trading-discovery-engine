@@ -239,6 +239,109 @@ test('review CLI rejects conflicting actions and maps each action explicitly', (
   assert.throws(() => parseAdmissionReviewAction({ admit: true, requeue: true }), /REVIEW_ACTION_CONFLICT/);
 });
 
+test('confirmed semantic admission without provider metadata stays confirmed', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Da Stock Analyst', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-confirmed-semantic',
+      channelName: 'Da Stock Analyst',
+      youtubeUrl: 'https://youtube.com/channel/UC-confirmed-semantic',
+      description: '',
+      videoTitles: ['#STI breakout', '#STI next week'],
+      admissionDecisionId: 'decision-semantic-1',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 88,
+      admissionCategory: 'General Trading',
+      admissionModel: 'gemini-3.5-flash-lite',
+      admissionCitations: [
+        { field: 'channel_title', quote: 'day trading', supports: 'TRADING' },
+        { field: 'channel_bio', quote: 'swing trade alerts', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.status, 'TRADING_CONFIRMED');
+  assert.equal(built.decision.deterministicRouting?.humanReview, false);
+  assert.equal(built.decision.deterministicRouting?.route, 'SEMANTIC_TRADING');
+  assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
+  assert.equal(built.decision.evidenceCollection.providers[0]?.provider, 'admission_decision');
+  assert.ok(built.decision.positiveEvidence.some(item => item.source === 'admission_decision'));
+});
+
+test('confirmed semantic admission without creator-owned citations stays reviewable', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Legacy Trader', description: 'market analysis', country: 'France' },
+    {
+      channelId: 'UC-confirmed-legacy',
+      channelName: 'Legacy Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-confirmed-legacy',
+      description: 'market analysis',
+      videoTitles: [],
+      admissionDecisionId: 'decision-semantic-2',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 91,
+      admissionCitations: [],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.status, 'UNCERTAIN');
+  assert.equal(built.decision.evidenceCollection.sufficiency, 'INSUFFICIENT');
+  assert.equal(built.decision.deterministicRouting?.humanReview, true);
+  assert.match(built.decision.evidenceCollection.reasonCodes.join(','), /SEMANTIC_ADMISSION_CITATIONS_MISSING/);
+});
+
+test('confirmed semantic admission with only title citations stays reviewable', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Title Only Trader', description: '', country: 'Unknown' },
+    {
+      channelId: 'UC-confirmed-title',
+      channelName: 'Title Only Trader',
+      youtubeUrl: 'https://youtube.com/channel/UC-confirmed-title',
+      description: '',
+      videoTitles: [],
+      admissionDecisionId: 'decision-semantic-title',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 91,
+      admissionCitations: [
+        { field: 'channel_title', quote: 'Title Only Trader', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.deterministicRouting?.humanReview, true);
+  assert.match(built.decision.deterministicRouting?.fallbackReason || '', /TITLE_ONLY/);
+});
+
+test('a low-confidence confirmed semantic admission still requires review', () => {
+  const built = buildAdmissionConfirmedClassification(
+    { channel_name: 'Weak Signal', description: 'price action and risk management', country: 'Unknown' },
+    {
+      channelId: 'UC-confirmed-low',
+      channelName: 'Weak Signal',
+      youtubeUrl: 'https://youtube.com/channel/UC-confirmed-low',
+      description: 'price action and risk management',
+      videoTitles: [],
+      admissionDecisionId: 'decision-semantic-low',
+      admissionStatus: 'ADMITTED',
+      admissionDecisionSource: 'SEMANTIC',
+      admissionConfirmedTrading: true,
+      admissionTradingConfidence: 40,
+      admissionCitations: [
+        { field: 'channel_bio', quote: 'price action and risk management', supports: 'TRADING' },
+      ],
+    },
+  );
+  assert.equal(built.result.status, 'UNCERTAIN');
+  assert.equal(built.decision.deterministicRouting?.humanReview, true);
+  assert.equal(built.decision.evidenceCollection.sufficiency, 'SUFFICIENT');
+});
+
 test('admission dedupe and admitted preservation prevent duplicate classification/enrichment', () => {
   const admit = functionSource(queue, 'admitDiscoveredChannel');
   const shared = functionSource(queue, 'processDiscoveredChannel');

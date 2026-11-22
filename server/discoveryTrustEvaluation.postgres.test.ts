@@ -31,7 +31,19 @@ test('Phase 12 PostgreSQL: persisted lineage, late outcomes, concurrency, window
     const concurrent=await Promise.all(Array.from({length:8},()=>materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:suffix})));
     assert.equal(new Set(concurrent.map(x=>x.snapshot_id)).size,1); assert.equal(concurrent[0].metrics.sampleCount,1); assert.equal(concurrent[0].metrics.qualityNewCreators,1);
     const replay=await materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:suffix}); assert.equal(replay.snapshot_id,concurrent[0].snapshot_id);
-    const reclassified=await db.query(`UPDATE channels SET trading_status='UNCERTAIN',quality_score=0 WHERE channel_id=$1 RETURNING trading_status,quality_score`,[channelId]);assert.deepEqual(reclassified.rows[0],{trading_status:'UNCERTAIN',quality_score:0});assert.equal(await captureCompletedRunObservation(runId),true);
+    // A corrective reclassification is an audited review action; it must set
+    // the same transaction-local escape the production review workflow uses.
+    const reclassClient=await db.connect();
+    let reclassified: any;
+    try {
+      await reclassClient.query('BEGIN');
+      await reclassClient.query(`SET LOCAL app.force_review_rescan='on'`);
+      reclassified=await reclassClient.query(`UPDATE channels SET trading_status='UNCERTAIN',quality_score=0 WHERE channel_id=$1 RETURNING trading_status,quality_score`,[channelId]);
+      await reclassClient.query('COMMIT');
+    } finally {
+      reclassClient.release();
+    }
+    assert.deepEqual(reclassified.rows[0],{trading_status:'UNCERTAIN',quality_score:0});assert.equal(await captureCompletedRunObservation(runId),true);
     await assert.rejects(materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:suffix}),/EVALUATION_REVISION_CONFLICT/);
     const revised=await materializeEvaluationWindow({windowStart:start,windowEnd:end,dimension:'concept',value:suffix,revision:2});assert.equal(revised.metrics.qualityNewCreators,0);
     await assert.rejects(db.query('DELETE FROM discovery_evaluation_snapshots WHERE snapshot_id=$1',[replay.snapshot_id]),/immutable/);

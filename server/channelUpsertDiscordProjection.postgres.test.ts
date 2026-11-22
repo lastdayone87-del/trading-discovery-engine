@@ -79,10 +79,33 @@ maybe('classification-only upserts never overwrite a newer Discord projection', 
   assert.equal(retained?.discord_status, 'ACTIVE');
   assert.equal(retained?.discord_invite, 'https://discord.gg/newroom');
 
-  // Gate 2 now writes the normalized shape (UNCERTAIN + untouched state). This
-  // fixture keeps the legacy NON_TRADING input on purpose: the DB invariant must
-  // still normalize it, clear the invite, and never persist a fabricated
-  // NON_TRADING Discord inspection.
+  // A plain classification upsert cannot downgrade the confirmed trading row.
+  await upsertChannel({
+    ...stale,
+    trading_status: 'NON_TRADING',
+    scan_status: 'SKIPPED_NON_TRADING',
+    discord_status: 'NON_TRADING',
+    discord_invite: null,
+  }, { allowDiscordClear: true });
+  const protectedConfirmed = await getChannelById(channelId);
+  assert.equal(protectedConfirmed?.trading_status, 'TRADING_CONFIRMED');
+  assert.equal(protectedConfirmed?.discord_status, 'ACTIVE');
+
+  // Gate 2 now writes the normalized shape (UNCERTAIN + untouched state). The
+  // fixture uses the audited review escape to reset the confirmed row first,
+  // because that is the only supported way to reopen a confirmed decision.
+  const resetClient = await db.connect();
+  try {
+    await resetClient.query('BEGIN');
+    await resetClient.query(`SET LOCAL app.force_review_rescan='on'`);
+    await resetClient.query(`UPDATE channels SET trading_status='UNCERTAIN' WHERE channel_id=$1`, [channelId]);
+    await resetClient.query('COMMIT');
+  } finally {
+    resetClient.release();
+  }
+  // This fixture keeps the legacy NON_TRADING input on purpose: the DB
+  // invariant must still normalize it, clear the invite, and never persist a
+  // fabricated NON_TRADING Discord inspection.
   await upsertChannel({
     ...stale,
     trading_status: 'NON_TRADING',

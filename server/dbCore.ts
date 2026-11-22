@@ -23,7 +23,7 @@ import { invalidateProviderCooldownCache, providerCooldownReadCache } from './co
 import { sanitizeSubscriberCountText } from './lowAudienceGate';
 import { countryIdentitySql } from './countryExclusionRules';
 import { classifyDiscoveryVisibility } from './discoveryStateVisibility';
-import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, type CountryPolicySnapshot } from './terminalPreservationPolicy';
+import { countryPolicySnapshotFromRow, countryPolicySnapshotMatches, isConfirmedTradingDowngrade, type CountryPolicySnapshot } from './terminalPreservationPolicy';
 import { safeCrawlerTelemetry, type CrawlerTelemetry } from './crawlerTelemetry';
 import { admitBulkEnqueue, commitBulkEnqueue, releaseBulkEnqueue, BulkEnqueueGuardError } from './acquisitionBulkEnqueueGuard';
 import { sanitizeAcquisitionAttribution, type AcquisitionAttribution } from './acquisitionLaneTaxonomy';
@@ -1746,6 +1746,17 @@ export async function upsertChannelWithResult(channel: ChannelRecord, options?: 
         await client.query('COMMIT');
         return false;
       }
+    }
+    // A confirmed trading decision is authoritative. A stale classifier,
+    // composition policy, enrichment pass, or review projection must never
+    // overwrite it through the ordinary upsert path. The lock makes this check
+    // and the write atomic; the DB trigger is the backstop for direct SQL.
+    if (locked && isConfirmedTradingDowngrade({
+      lockedTradingStatus: locked.trading_status,
+      incomingTradingStatus: channel.trading_status,
+    })) {
+      await client.query('COMMIT');
+      return false;
     }
     const preserveDiscord = options?.preserveDiscordOnUpdate === true
       || shouldRetainLockedDiscordProjection(channel, locked, options);

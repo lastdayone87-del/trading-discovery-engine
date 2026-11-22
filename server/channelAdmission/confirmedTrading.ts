@@ -34,11 +34,22 @@ export function buildAdmissionConfirmedClassification(
   const human = candidate.admissionDecisionSource === 'HUMAN';
   const deterministic = candidate.admissionDecisionSource === 'DETERMINISTIC';
   const nonSemantic = deterministic || human;
-  const provider = nonSemantic ? 'channel_metadata' as const : candidate.admissionProvider;
+  const admissionConfirmed = candidate.admissionConfirmedTrading === true;
+  // Semantic confirmation still needs creator-owned, non-title evidence. A
+  // confirmed admission with only a title citation is not enough to stand on
+  // its own; it stays reviewable. Missing provider provenance alone is not a
+  // downgrade: the admission decision is recorded as the honest source.
+  const semanticCreatorCitations = citations.filter(citation =>
+    citation.field !== 'channel_title' && citation.field !== 'search_match_context');
+  const usableCitations = nonSemantic ? citations : semanticCreatorCitations;
+  const hasTradingCitation = usableCitations.some(citation => citation.supports === 'TRADING');
+  const evidenceProvider = nonSemantic
+    ? 'channel_metadata' as const
+    : (candidate.admissionProvider || (admissionConfirmed && usableCitations.length > 0 ? 'admission_decision' as const : undefined));
   const timestamp = new Date().toISOString();
-  const positiveEvidence: EvidenceItem[] = provider ? citations.map((citation, index) => ({
+  const positiveEvidence: EvidenceItem[] = evidenceProvider ? usableCitations.map((citation, index) => ({
     id: `${human ? 'human-review' : deterministic ? 'deterministic' : 'semantic'}-admission-${index + 1}`,
-    source: provider,
+    source: evidenceProvider,
     polarity: 'POSITIVE',
     category: 'METHODOLOGY_CONCEPT',
     fact: `${human ? 'Human review admission' : deterministic ? 'Deterministic admission' : 'Semantic admission'} citation: ${citation.quote}`,
@@ -49,7 +60,7 @@ export function buildAdmissionConfirmedClassification(
     rawWeight: 1,
     finalWeight: confidence / 100,
     provenance: {
-      provider,
+      provider: evidenceProvider,
       type: human ? 'human_review_admission_citation' : deterministic ? 'deterministic_admission_citation' : 'semantic_admission_citation',
       matchedTerm: citation.quote,
       sourceRef: `${citation.field}${citation.index == null ? '' : `:${citation.index}`}`,
@@ -69,10 +80,49 @@ export function buildAdmissionConfirmedClassification(
     },
     timestamp,
   })) : [];
-  const providerMissing = !nonSemantic && citations.length > 0 && !provider;
-  const evidenceSufficiency = nonSemantic || positiveEvidence.length > 0 ? 'SUFFICIENT' as const : 'INSUFFICIENT' as const;
-  const degraded = human || deterministic ? false : confidence < ADMISSION_CONFIRMATION_MIN_CONFIDENCE || (!nonSemantic && positiveEvidence.length === 0);
+  if (nonSemantic && admissionConfirmed && positiveEvidence.length === 0) {
+    // Deterministic and human admissions are not AI confirmations. Their
+    // durable decision is a first-class evidence source even when a legacy
+    // payload lost its citations.
+    positiveEvidence.push({
+      id: `${human ? 'human-review' : 'deterministic'}-admission-decision`,
+      source: 'channel_metadata',
+      polarity: 'POSITIVE',
+      category: 'METHODOLOGY_CONCEPT',
+      fact: `${human ? 'Human review admission' : 'Deterministic admission'} decision ${candidate.admissionDecisionId || 'unknown'} confirmed trading focus at ${confidence}/100.`,
+      rawMatches: [candidate.admissionDecisionId || candidate.channelId],
+      confidence,
+      reliability: 'HIGH',
+      reliabilityMultiplier: 1,
+      rawWeight: 1,
+      finalWeight: confidence / 100,
+      provenance: {
+        provider: 'channel_metadata',
+        type: 'admission_decision',
+        matchedTerm: candidate.admissionDecisionId || candidate.channelId,
+        sourceRef: 'admission_decision',
+      },
+      timestamp,
+    });
+  }
+  const providerMissing = !nonSemantic && !candidate.admissionProvider;
+  const titleOnlySemanticEvidence = !nonSemantic && citations.length > 0 && usableCitations.length === 0;
+  const evidenceSufficiency = nonSemantic || (positiveEvidence.length > 0 && hasTradingCitation)
+    ? 'SUFFICIENT' as const
+    : 'INSUFFICIENT' as const;
+  const degraded = human || deterministic
+    ? false
+    : confidence < ADMISSION_CONFIRMATION_MIN_CONFIDENCE || evidenceSufficiency !== 'SUFFICIENT';
   const humanReview = degraded;
+  const semanticEvidenceGapReason = evidenceSufficiency === 'SUFFICIENT'
+    ? null
+    : titleOnlySemanticEvidence
+      ? 'SEMANTIC_ADMISSION_TITLE_ONLY_EVIDENCE'
+      : citations.length === 0
+        ? 'SEMANTIC_ADMISSION_CITATIONS_MISSING'
+        : providerMissing
+          ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING'
+          : 'SEMANTIC_ADMISSION_CITATIONS_MISSING';
   const reasonCode = human ? 'HUMAN_REVIEW_ADMISSION_CONFIRMED' : deterministic ? 'DETERMINISTIC_ADMISSION_CONFIRMED' : 'SEMANTIC_ADMISSION_CONFIRMED';
   const provenanceLabel = human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_ADMISSION' : 'SEMANTIC_ADMISSION';
   const versionTag = human ? 'human-review-admission-v1' : deterministic ? 'deterministic-admission-v1' : 'semantic-admission-v1';
@@ -106,13 +156,15 @@ export function buildAdmissionConfirmedClassification(
       fieldsPresent: human ? ['human_review_evidence'] : deterministic ? ['deterministic_evidence'] : positiveEvidence.length > 0 ? ['admission_evidence'] : [],
       reasonCodes: evidenceSufficiency === 'SUFFICIENT'
         ? [reasonCode]
-        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
-      providers: provider ? [{
-        provider,
+        : [semanticEvidenceGapReason || 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+      providers: evidenceProvider ? [{
+        provider: evidenceProvider,
         availability: 'AVAILABLE',
         evidenceCount: positiveEvidence.length,
         outcome: positiveEvidence.length > 0 ? 'EXECUTED_WITH_EVIDENCE' : 'EXECUTED_NO_MATCH',
-        reasonCodes: [human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_ADMISSION' : 'SEMANTIC_ADMISSION'],
+        reasonCodes: [evidenceProvider === 'admission_decision'
+          ? 'ADMISSION_DECISION_CONFIRMED'
+          : human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_ADMISSION' : 'SEMANTIC_ADMISSION'],
       }] : [],
       terminalNegativeSufficiency: {
         status: 'INSUFFICIENT',
@@ -130,7 +182,7 @@ export function buildAdmissionConfirmedClassification(
       coverageConfidence: evidenceSufficiency === 'SUFFICIENT' ? 100 : 0,
       reasonCodes: evidenceSufficiency === 'SUFFICIENT'
         ? [reasonCode]
-        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+        : [semanticEvidenceGapReason || 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
     classificationMethod: human ? 'HUMAN_REVIEW_ADMISSION' : deterministic ? 'DETERMINISTIC_EVIDENCE' : 'SEMANTIC_ADMISSION',
     recognitionState: human || deterministic || (confidence >= ADMISSION_CONFIRMATION_MIN_CONFIDENCE && evidenceSufficiency === 'SUFFICIENT') ? 'DECISIVE_TRADING' : 'AMBIGUOUS_THIN',
@@ -151,10 +203,10 @@ export function buildAdmissionConfirmedClassification(
       semanticPolicy: nonSemantic ? 'NONE' : 'SKIP',
       fallbackReason: evidenceSufficiency === 'SUFFICIENT'
         ? null
-        : (providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'),
+        : semanticEvidenceGapReason,
       reasonCodes: evidenceSufficiency === 'SUFFICIENT'
         ? [reasonCode]
-        : [providerMissing ? 'SEMANTIC_ADMISSION_PROVIDER_MISSING' : 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
+        : [semanticEvidenceGapReason || 'SEMANTIC_ADMISSION_CITATIONS_MISSING'],
     },
   };
   const result: TradingClassificationResult = {
