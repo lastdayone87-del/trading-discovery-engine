@@ -1214,7 +1214,9 @@ export const SCORE_CANDIDATES_BUDGET_GUARD: ClaimBudgetGuard = {
     // reserve that slice, not the entire document: a 685-span document cannot
     // fit a 100-snapshot budget, but its first 50-span slice can.
     const documentId = job?.payload?.documentId;
-    if (typeof documentId !== 'string' || !documentId) return { admitted: false, exhausted: false };
+    if (typeof documentId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(documentId)) {
+      return { admitted: false, exhausted: false };
+    }
     const control = await client.query(`SELECT scoring_paused AS paused,daily_scoring_candidates AS budget FROM candidate_scoring_controls WHERE singleton=true FOR UPDATE`);
     if (!control.rows.length) return { admitted: false, exhausted: true };
     const budget = Number(control.rows[0].budget);

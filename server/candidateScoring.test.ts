@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { aiAdjudicationAdmitted, aiAdjudicationCapacity, processCandidateScoringJob, scoreCandidate, scoringBatchSize, SCORING_BATCH_GROUPS, validateBoundedAssertion } from './candidateScoring';
+import { aiAdjudicationAdmitted, aiAdjudicationCapacity, MAX_OCCURRENCES_PER_SPAN, processCandidateScoringJob, scoreCandidate, scoringBatchSize, SCORING_BATCH_GROUPS, validateBoundedAssertion } from './candidateScoring';
 import { SCORE_CANDIDATES_BUDGET_GUARD } from './queueManager';
 
 const evidence=(span:string,cluster='c1',day='2026-07-01')=>({normalizedSpan:span,literalSpan:span,documentId:`d-${cluster}-${day}`,clusterKey:cluster,sourceType:'CHANNEL_METADATA',observedAt:`${day}T00:00:00.000Z`,language:'en',startOffset:0,endOffset:Array.from(span).length});
@@ -30,6 +30,8 @@ test('scoring continues through a durable bounded cursor without consuming attem
   assert.match(source,/ANY\(\$1::text\[\]\)/);
   assert.match(source,/row_number\(\) OVER \(PARTITION BY o\.normalized_span/);
   assert.match(source,/occurrence_rank <= \$2/);
+  assert.match(source,/ORDER BY a\.observed_at DESC,o\.occurrence_key DESC/);
+  assert.equal(MAX_OCCURRENCES_PER_SPAN, 1000);
   assert.match(source,/SCORING_BATCH_CONTINUE/);
   assert.match(source,/cursor:lastSpan/);
   assert.match(source,/SCORING_DAILY_BUDGET_EXHAUSTED/);
@@ -40,7 +42,7 @@ test('scoring continues through a durable bounded cursor without consuming attem
 });
 
 
-function scoringFakeDb() {
+function scoringFakeDb(captured: { cteParams?: any[] } = {}) {
   return {
     query: async (sql: string, params: any[] = []) => {
       const text = String(sql);
@@ -52,6 +54,7 @@ function scoringFakeDb() {
         return { rows: [{ normalized_span: 'order flow' }], rowCount: 1 };
       }
       if (text.includes('WITH occurrences AS')) {
+        captured.cteParams = params;
         return { rows: [{ normalized_span: 'order flow', literal_span: 'order flow', document_id: 'doc-1', entity_cluster_key: 'c1', source_type: 'CHANNEL_METADATA', observed_at: '2026-07-01T00:00:00Z', language: 'en', start_offset: 0, end_offset: 10 }], rowCount: 1 };
       }
       if (text.includes('FROM candidate_adjudication_results')) return { rows: [{ n: 0, cost: 0 }], rowCount: 1 };
@@ -71,10 +74,11 @@ function scoringFakeDb() {
 test('a scored slice persists its cursor and claim identity before continuing', async () => {
   let rescheduleArgs: any[] | undefined;
   let completed = false;
+  const captured: { cteParams?: any[] } = {};
   await processCandidateScoringJob(
-    { id: 'job-1', payload: { payloadSchemaVersion: 1, featureSetVersion: 'candidate-features-v1', documentId: 'doc-1' }, attempts: 1, locked_by: 'worker-1', reopen_generation: 2 },
+    { id: 'job-1', payload: { payloadSchemaVersion: 1, featureSetVersion: 'candidate-features-v1', documentId: '11111111-2222-4333-8444-555555555555' }, attempts: 1, locked_by: 'worker-1', reopen_generation: 2 },
     {
-      getDb: async () => scoringFakeDb() as any,
+      getDb: async () => scoringFakeDb(captured) as any,
       enqueueJob: async () => ({}) as any,
       rescheduleJob: async (...args: any[]) => { rescheduleArgs = args; return true; },
       completeJob: async () => { completed = true; },
@@ -84,12 +88,13 @@ test('a scored slice persists its cursor and claim identity before continuing', 
   assert.equal(rescheduleArgs?.[2], 'SCORING_BATCH_CONTINUE');
   assert.deepEqual(rescheduleArgs?.[3], { workerId: 'worker-1', attemptNumber: 1, generation: 2 });
   assert.equal(rescheduleArgs?.[4]?.cursor, 'order flow');
+  assert.equal(captured.cteParams?.[1], MAX_OCCURRENCES_PER_SPAN, 'the occurrence cap is bound into the evidence query');
 });
 
 test('a lost continuation claim is not reported as completed progress', async () => {
   let completed = false;
   await processCandidateScoringJob(
-    { id: 'job-2', payload: { payloadSchemaVersion: 1, featureSetVersion: 'candidate-features-v1', documentId: 'doc-1' }, attempts: 3, locked_by: 'stale-worker', reopen_generation: 0 },
+    { id: 'job-2', payload: { payloadSchemaVersion: 1, featureSetVersion: 'candidate-features-v1', documentId: '11111111-2222-4333-8444-555555555555' }, attempts: 3, locked_by: 'stale-worker', reopen_generation: 0 },
     {
       getDb: async () => scoringFakeDb() as any,
       enqueueJob: async () => ({}) as any,
@@ -114,13 +119,23 @@ test('the scoring claim guard admits the next slice, not the whole document', as
       throw new Error(`unexpected guard SQL: ${text.slice(0, 120)}`);
     },
   };
-  const verdict = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-3', payload: { documentId: 'doc-1' } });
+  const verdict = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-3', payload: { documentId: '11111111-2222-4333-8444-555555555555' } });
   assert.deepEqual(verdict, { admitted: true, exhausted: false });
 
-  const continued = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-4', payload: { documentId: 'doc-1', cursor: 'order flow' } });
+  const continued = await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-4', payload: { documentId: '11111111-2222-4333-8444-555555555555', cursor: 'order flow' } });
   assert.deepEqual(continued, { admitted: true, exhausted: false });
   assert.deepEqual(inFlightCalls[0], [SCORING_BATCH_GROUPS]);
   assert.deepEqual(inFlightCalls[1], [SCORING_BATCH_GROUPS]);
+});
+
+test('the scoring claim guard rejects a malformed document identity', async () => {
+  const client = {
+    query: async () => { throw new Error('malformed ids must not reach budget queries'); },
+  };
+  assert.deepEqual(
+    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'bad-job', payload: { documentId: 'not-a-uuid' } }),
+    { admitted: false, exhausted: false },
+  );
 });
 
 test('the scoring claim guard allows an empty document to reach completion', async () => {
@@ -134,7 +149,7 @@ test('the scoring claim guard allows an empty document to reach completion', asy
     },
   };
   assert.deepEqual(
-    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'empty-job', payload: { documentId: 'empty-doc' } }),
+    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'empty-job', payload: { documentId: '11111111-2222-4333-8444-555555555555' } }),
     { admitted: true, exhausted: false },
   );
 });
@@ -150,7 +165,7 @@ test('the scoring claim guard stops only when no daily snapshot budget remains',
     },
   };
   assert.deepEqual(
-    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-5', payload: { documentId: 'doc-1' } }),
+    await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(client, { id: 'job-5', payload: { documentId: '11111111-2222-4333-8444-555555555555' } }),
     { admitted: false, exhausted: true },
   );
 });

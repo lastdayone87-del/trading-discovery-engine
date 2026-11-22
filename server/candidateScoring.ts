@@ -162,7 +162,7 @@ export async function processCandidateScoringJob(job:{id:string;payload:any;atte
   const spanList=spans.rows.map((row:any)=>String(row.normalized_span));
   const values=await db.query(`WITH occurrences AS (
       SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset,
-             row_number() OVER (PARTITION BY o.normalized_span ORDER BY a.observed_at,o.occurrence_key) AS occurrence_rank
+             row_number() OVER (PARTITION BY o.normalized_span ORDER BY a.observed_at DESC,o.occurrence_key DESC) AS occurrence_rank
         FROM corpus_candidate_occurrences o
         JOIN corpus_documents d ON d.id=o.document_id
         JOIN corpus_source_artifacts a ON a.id=d.artifact_id
@@ -170,7 +170,7 @@ export async function processCandidateScoringJob(job:{id:string;payload:any;atte
     )
     SELECT normalized_span,literal_span,document_id,entity_cluster_key,source_type,observed_at,language,start_offset,end_offset
       FROM occurrences WHERE occurrence_rank <= $2
-     ORDER BY normalized_span,observed_at,occurrence_rank`,[spanList,MAX_OCCURRENCES_PER_SPAN]);
+     ORDER BY normalized_span,observed_at DESC,occurrence_rank`,[spanList,MAX_OCCURRENCES_PER_SPAN]);
   const groups=new Map<string,CandidateEvidence[]>();
   for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
   if(groups.size>remaining)throw new Error('Candidate scoring batch exceeds the remaining daily budget.');
