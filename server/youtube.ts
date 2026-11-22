@@ -1043,7 +1043,19 @@ export function isConsumerSuspended(error: unknown): boolean {
     const isPermissionDenied = /^PERMISSION_DENIED$/i.test(String(current.status ?? '')) || /\bPERMISSION_DENIED\b/i.test(String(current.message ?? ''));
     const hasSuspendedReason = current.providerReasons?.some((reason: unknown) => /^consumer_?suspended$/i.test(String(reason)))
       || /\bconsumer_?suspended\b/i.test(String(current.message ?? ''));
-    if ((is403 || isPermissionDenied) && hasSuspendedReason) return true;
+    // Google also reports disabled/suspended projects and restricted keys as
+    // 403 ACCESS_DENIED / forbidden without the consumerSuspended reason. A
+    // quota or rate-limit 403 is excluded above; these authorization denials
+    // are credential-scoped and must retire the key rather than fan out across
+    // the pool on every acquisition.
+    // Only explicit credential-denial reasons qualify. A bare
+    // PERMISSION_DENIED status/message is also used for rate limits and
+    // resource-specific denials, and must not suspend a healthy key.
+    const hasAuthorizationDenial = current.providerReasons?.some((reason: unknown) => /^(forbidden|access_?denied)$/i.test(String(reason)))
+      // "forbidden" is specific enough to be a credential denial; generic
+      // permission/access wording is not (rate limits and resource denials use it).
+      || /\bforbidden\b/i.test(String(current.message ?? ''));
+    if ((is403 || isPermissionDenied) && (hasSuspendedReason || hasAuthorizationDenial)) return true;
   }
   return false;
 }
