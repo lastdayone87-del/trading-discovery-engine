@@ -40,10 +40,6 @@ export function earliestYouTubeProjectRetryAt(
   return earliest;
 }
 
-export function clearYouTubeProjectSuspension(quotaGroup: string | null | undefined): void {
-  if (quotaGroup) projectSuspensions.delete(quotaGroup);
-}
-
 export function resetYouTubeProjectSuspensionsForTests(): void {
   projectSuspensions.clear();
 }

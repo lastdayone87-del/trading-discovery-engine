@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  clearYouTubeProjectSuspension,
   earliestYouTubeProjectRetryAt,
   isYouTubeProjectSuspended,
   resetYouTubeProjectSuspensionsForTests,
@@ -27,12 +26,11 @@ test('earliest project retry is reported for a fully suspended key set', () => {
   assert.equal(earliestYouTubeProjectRetryAt(['project-c'], now), null);
 });
 
-test('project suspension never shortens an existing later horizon and clears explicitly', () => {
+test('project suspension never shortens an existing later horizon', () => {
   resetYouTubeProjectSuspensionsForTests();
   const now = 1_000_000;
   suspendYouTubeProject('project-a', now + 120_000, now);
   suspendYouTubeProject('project-a', now + 30_000, now);
   assert.equal(isYouTubeProjectSuspended('project-a', now + 60_000), true);
-  clearYouTubeProjectSuspension('project-a');
-  assert.equal(isYouTubeProjectSuspended('project-a', now), false);
+  assert.equal(isYouTubeProjectSuspended('project-a', now + 120_001), false);
 });
