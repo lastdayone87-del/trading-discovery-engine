@@ -741,15 +741,24 @@ async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, val
   const row = existing.rows[0];
   const definition = String(row?.definition || '');
   const correct = definition.includes('corpus_candidate_occurrences')
-    && definition.includes('normalized_span')
-    && definition.includes('document_id')
-    && definition.includes('start_offset');
+    && definition.includes('USING btree (normalized_span, document_id, start_offset)');
   if (row?.indisvalid && row?.indisready && correct) return;
   if (row?.oid) {
     await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
   }
   const target = await client.query(`SELECT to_regclass('public.corpus_candidate_occurrences') AS oid`);
   if (!target.rows[0]?.oid) return;
+  // A B-tree entry above ~2.7 KB cannot be built. New extraction is capped at
+  // 512 bytes, but legacy rows must be checked before the concurrent build.
+  const oversized = await client.query(`SELECT 1 FROM corpus_candidate_occurrences WHERE octet_length(normalized_span)>2704 LIMIT 1`);
+  if (oversized.rowCount) {
+    console.warn(JSON.stringify({
+      event: 'corpus_scoring_index_blocked',
+      reason: 'OVERSIZED_NORMALIZED_SPAN',
+      timestamp: new Date().toISOString(),
+    }));
+    return;
+  }
   await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.corpus_candidate_occurrences(normalized_span, document_id, start_offset)`);
 }
 

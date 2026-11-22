@@ -11,6 +11,8 @@ test('corpus scoring has a concurrent normalized-span index migration', () => {
   assert.match(migration, /indisvalid/);
   assert.match(migration, /indisready/);
   assert.match(migration, /pg_get_indexdef/);
+  assert.match(migration, /USING btree \(normalized_span, document_id, start_offset\)/);
+  assert.match(migration, /octet_length\(normalized_span\)>2704/);
   assert.match(migration, /is not valid\/ready/);
 });
 
