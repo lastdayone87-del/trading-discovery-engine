@@ -1051,7 +1051,10 @@ export function isConsumerSuspended(error: unknown): boolean {
     // Only explicit credential-denial reasons qualify. A bare
     // PERMISSION_DENIED status/message is also used for rate limits and
     // resource-specific denials, and must not suspend a healthy key.
-    const hasAuthorizationDenial = current.providerReasons?.some((reason: unknown) => /^(forbidden|access_?denied)$/i.test(String(reason)));
+    const hasAuthorizationDenial = current.providerReasons?.some((reason: unknown) => /^(forbidden|access_?denied)$/i.test(String(reason)))
+      // "forbidden" is specific enough to be a credential denial; generic
+      // permission/access wording is not (rate limits and resource denials use it).
+      || /\bforbidden\b/i.test(String(current.message ?? ''));
     if ((is403 || isPermissionDenied) && (hasSuspendedReason || hasAuthorizationDenial)) return true;
   }
   return false;

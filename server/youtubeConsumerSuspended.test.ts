@@ -40,21 +40,28 @@ test('youtubeHttpError correctly extracts providerReasons from legacy and google
   assert.equal(isYouTubeRateLimited(error2), false);
 });
 
-test('403 ACCESS_DENIED is classified as credential suspension, not transient', async () => {
-  const response = new Response(JSON.stringify({
-    error: {
-      code: 403,
-      message: 'The request is missing a valid API key or the project is suspended.',
-      status: 'PERMISSION_DENIED',
-      errors: [{ reason: 'forbidden' }, { reason: 'ACCESS_DENIED' }],
-    },
-  }), { status: 403, headers: { 'content-type': 'application/json' } });
-  const error = await youtubeHttpError(response);
-  assert.equal((error as any).status, 403);
-  assert.deepEqual((error as any).providerReasons, ['forbidden', 'ACCESS_DENIED']);
+test('403 forbidden and ACCESS_DENIED are independently classified as suspension', async () => {
+  for (const reason of ['forbidden', 'ACCESS_DENIED']) {
+    const response = new Response(JSON.stringify({
+      error: {
+        code: 403,
+        message: 'The request is missing a valid API key or the project is suspended.',
+        status: 'PERMISSION_DENIED',
+        errors: [{ reason }],
+      },
+    }), { status: 403, headers: { 'content-type': 'application/json' } });
+    const error = await youtubeHttpError(response);
+    assert.equal((error as any).status, 403);
+    assert.deepEqual((error as any).providerReasons, [reason]);
+    assert.equal(isConsumerSuspended(error), true, reason);
+    assert.equal(isYouTubeRateLimited(error), false, reason);
+    assert.equal(isQuotaExceeded(error), false, reason);
+  }
+});
+
+test('message-only forbidden is still a credential denial', async () => {
+  const error = Object.assign(new Error('YouTube HTTP 403 forbidden'), { status: 403 });
   assert.equal(isConsumerSuspended(error), true);
-  assert.equal(isYouTubeRateLimited(error), false);
-  assert.equal(isQuotaExceeded(error), false);
 });
 
 test('403 PERMISSION_DENIED rate limit and resource denials do not suspend the key', async () => {
