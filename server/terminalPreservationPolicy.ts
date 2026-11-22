@@ -15,6 +15,32 @@ export function isPermanentTradingConfirmation(status: string | null | undefined
 }
 
 /**
+ * A confirmed trading decision is authoritative against stale classification,
+ * composition, review-projection, and enrichment writes. The only supported
+ * downgrade path is an audited review action, which sets the transaction-local
+ * `app.force_review_rescan` escape before its direct SQL update.
+ *
+ * This predicate is the application-side guard used by `upsertChannel`; the
+ * `channels_protect_trading_confirmation` trigger is the database backstop for
+ * every other writer.
+ */
+export function isConfirmedTradingDowngrade(input: {
+  lockedTradingStatus?: string | null;
+  incomingTradingStatus?: string | null;
+}): boolean {
+  return input.lockedTradingStatus === 'TRADING_CONFIRMED'
+    && String(input.incomingTradingStatus || 'UNCERTAIN') !== 'TRADING_CONFIRMED';
+}
+
+/** Recognize the database backstop's refusal so an insert race can be treated
+ * as a preserved write instead of a job failure. */
+export function isConfirmedTradingProtectionError(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown } | null | undefined;
+  return String(candidate?.code || '') === '23514'
+    && /confirmed trading channel requires an audited review rescan/i.test(String(candidate?.message || ''));
+}
+
+/**
  * Ordinary discovery must not classify, enrich, or downgrade a channel whose
  * trading classification was already confirmed. Explicit operator rechecks /
  * force-rescans (isManualScan=true) are the audited correction lane and are

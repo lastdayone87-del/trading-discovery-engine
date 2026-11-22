@@ -40,7 +40,7 @@ import { enrichmentOperationalFailure, hasDecisionGradeEvidenceWithoutFailedProv
 import { recordAdmissionShadow } from './candidateAdmission/shadowEvaluator';
 import { recordReviewEligibilityShadow } from './reviewEligibility/store';
 import { evaluateReviewEligibilityV2, resolveReviewProviderDegraded } from './reviewEligibility/policy';
-import { shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
+import { isPermanentTradingConfirmation, shouldBypassPreservationForDiscordEvidence, shouldPreserveExistingChannel, shouldPreserveResolvedCountry, shouldRevalidateConfirmedCountry, terminalScanStatusForConfirmedRediscovery } from './terminalPreservationPolicy';
 import { CANDIDATE_TRIAGE_POLICY_VERSION, hasIndependentTradingHypothesis, triageAutonomousSearchCandidate } from './candidateTriage';
 import { buildAdmissionConfirmedClassification } from './channelAdmission/confirmedTrading';
 import { getAdmissionMode } from './channelAdmission/store';
@@ -131,9 +131,13 @@ export interface IngestionCandidate extends DiscoveredChannelRaw {
 }
 
 /**
- * A deterministic PASS or explicit human ADMIT is a final relevance decision
- * and bypasses the classifier. Semantic admission is a router and must reach
- * the one full AI judge. Unknown provenance never shortcuts.
+ * A deterministic PASS, an explicit human ADMIT, or a terminal pre-catalog
+ * semantic decision is a final relevance decision and bypasses the classifier.
+ * Legacy semantic router rows still reach the full AI judge, and unknown
+ * provenance never shortcuts. A confirmed admission is authoritative: when a
+ * legacy payload lost its provider metadata, the shortcut records the
+ * admission decision as the evidence source while still requiring valid
+ * creator-owned non-title citations for a semantic confirmation.
  */
 export function admissionShortcutEligible(
   candidate: Pick<DiscoveredChannelRaw,
@@ -169,6 +173,25 @@ export interface IngestionPipelineOutcome {
   discordInvite: string | null;
   channelRecord?: ChannelRecord;
   skippedTerminalState?: boolean;
+}
+
+/** Authoritative projection after a stale write was refused by the confirmed
+ * trading guard. The caller must report the durable row, never its own stale
+ * non-confirmed verdict. */
+function confirmedTradingOutcome(channel: ChannelRecord): IngestionPipelineOutcome {
+  return {
+    channelId: channel.channel_id,
+    channelName: channel.channel_name,
+    isNew: false,
+    wasKnown: true,
+    persisted: true,
+    countryStatus: channel.country_status,
+    tradingStatus: 'TRADING_CONFIRMED',
+    discordStatus: channel.discord_status,
+    discordInvite: channel.discord_invite || null,
+    channelRecord: channel,
+    skippedTerminalState: true,
+  };
 }
 
 /**
@@ -1484,7 +1507,13 @@ async function processChannelThroughPipelineInContext(
     // it must be allowed to clear a previously serving Discord invite. Without
     // this explicit option the locked-row retention guard would keep the old
     // ACTIVE projection while the row's trading status becomes NON_TRADING.
-    await upsertChannel(nonTradingChannel, { allowDiscordClear: true });
+    const nonTradingWritten = await upsertChannelWithResult(nonTradingChannel, { allowDiscordClear: true });
+    if (!nonTradingWritten) {
+      const authoritative = await getChannelById(candidate.channelId);
+      if (authoritative && isPermanentTradingConfirmation(authoritative.trading_status)) {
+        return confirmedTradingOutcome(authoritative);
+      }
+    }
 
     return {
       channelId: candidate.channelId,
@@ -1560,7 +1589,13 @@ async function processChannelThroughPipelineInContext(
       Object.assign(withheldChannel,projectTradingReclassificationDiscordState(withheldChannel));
       withheldChannel.last_checked=now;
       applyCandidateObservability(withheldChannel,candidate);
-      await upsertChannel(withheldChannel,{preserveDiscordOnUpdate:true});
+      const withheldWritten = await upsertChannelWithResult(withheldChannel,{preserveDiscordOnUpdate:true});
+      if (!withheldWritten) {
+        const authoritative = await getChannelById(candidate.channelId);
+        if (authoritative && isPermanentTradingConfirmation(authoritative.trading_status)) {
+          return confirmedTradingOutcome(authoritative);
+        }
+      }
       void recordAdmissionShadow({channelId:candidate.channelId,priorState:'WITHHELD_INVESTIGATING',classificationStatus:'NEEDS_REVIEW',investigationState:'REVIEW_ELIGIBLE',classificationDiagnosticId,
         candidateHypothesis:{plausibleTradingHypothesis:false,positiveEvidenceCount:productionClassification.decision.positiveEvidence.length,triagePolicyVersion:CANDIDATE_TRIAGE_POLICY_VERSION},
         evidenceCoverage:{sufficiency:productionClassification.decision.evidenceCollection.sufficiency,degraded:productionClassification.decision.evidenceCollection.degraded,fieldsPresent:productionClassification.decision.evidenceCollection.fieldsPresent,enrichmentStage:currentStage,reasonCodes:['NO_INDEPENDENT_TRADING_HYPOTHESIS_AFTER_ENRICHMENT']}})
@@ -1665,7 +1700,15 @@ async function processChannelThroughPipelineInContext(
 
     // Classification-only write: the upsert keeps the locked row's Discord
     // projection so a validation committed during classification still wins.
-    await upsertChannel(uncertainChannel,{preserveDiscordOnUpdate:true});
+    // A stale classification must never overwrite a confirmation committed
+    // while this pass was running.
+    const uncertainWritten = await upsertChannelWithResult(uncertainChannel,{preserveDiscordOnUpdate:true});
+    if (!uncertainWritten) {
+      const authoritative = await getChannelById(candidate.channelId);
+      if (authoritative && isPermanentTradingConfirmation(authoritative.trading_status)) {
+        return confirmedTradingOutcome(authoritative);
+      }
+    }
     await recordReviewEligibilityShadow({channelId:candidate.channelId,classificationDiagnosticId,...reviewEligibilityInput,decidedAt:productionClassification.decision.timestamp});
     const authoritativeChannel=(await getChannelById(candidate.channelId))||uncertainChannel;
 

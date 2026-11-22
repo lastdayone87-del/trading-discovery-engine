@@ -467,7 +467,16 @@ export async function resolveAdmissionReview(input: {
       existing.discord_status = 'UNCERTAIN';
       existing.discord_invite = null;
       existing.last_checked = new Date().toISOString();
-      await upsertChannel(existing, { allowDiscordClear: true });
+      const written = await upsertChannelWithResult(existing, { allowDiscordClear: true });
+      if (!written) {
+        // The channel was confirmed while this admission review was open. A
+        // rejected admission must not silently leave the confirmed row serving;
+        // require the audited channel-review correction path instead.
+        throw Object.assign(
+          new Error('A confirmed trading channel requires the audited channel review workflow before rejection.'),
+          { code: 'CONFIRMED_TRADING_REVIEW_REQUIRED' },
+        );
+      }
     }
   }
   const recorded = await recordAdmissionOutcome({
@@ -1194,7 +1203,15 @@ export async function verifyAdmissionCandidate(
         details: `Admission ${ADMISSION_POLICY_VERSION}: ${policy.reasonCodes.join(', ')}. Evidence hash ${hash}.`,
         timestamp: existing.last_checked,
       }];
-      await upsertChannel(existing, { allowDiscordClear: true });
+      const written = await upsertChannelWithResult(existing, { allowDiscordClear: true });
+      if (!written) {
+        console.warn(JSON.stringify({
+          event: 'admission_rejection_preserved_confirmed',
+          channelId: existing.channel_id,
+          reason: 'confirmed trading is authoritative; rejection projection skipped',
+          timestamp: new Date().toISOString(),
+        }));
+      }
     }
   }
 
