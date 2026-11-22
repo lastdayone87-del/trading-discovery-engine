@@ -244,7 +244,7 @@ export function createReadOnlyDbPool(
 ): InstanceType<typeof Pool> {
   return new Pool({
     ...runtimePoolConfig(requireDatabaseUrl(), 1, applicationName),
-    options: '-c default_transaction_read_only=on -c idle_in_transaction_session_timeout=60000',
+    options: `-c default_transaction_read_only=on -c idle_in_transaction_session_timeout=${databaseIdleInTransactionTimeoutMs()}`,
   });
 }
 
