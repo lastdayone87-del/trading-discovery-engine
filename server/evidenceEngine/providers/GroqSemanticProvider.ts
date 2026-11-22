@@ -203,7 +203,7 @@ const GROQ_UNAUTHORIZED_COOLDOWN_MS = 15 * 60_000;
 function groqRouteCredentialKey(route: GroqRoute): string {
   // Route ids are positional and can be reassigned when keys are added or
   // removed; bind the credential cache to the key fingerprint instead.
-  return `${route.id}:${createHash('sha256').update(route.key).digest('hex').slice(0, 16)}`;
+  return createHash('sha256').update(route.key).digest('hex').slice(0, 24);
 }
 function groqRouteUnauthorizedRemainingMs(routeId: string, nowMs: number = Date.now()): number {
   const until = groqRouteUnauthorizedUntilMs.get(routeId);
@@ -234,9 +234,10 @@ function disableGroqOrg(orgId: string, nowMs: number = Date.now()): number {
 export interface GroqRouteHealth {
   route: string;
   org: string;
-  status: 'healthy'|'cooling'|'disabled';
+  status: 'healthy'|'cooling'|'disabled'|'unauthorized';
   cooldownRemainingMs: number;
   disabledRemainingMs: number;
+  unauthorizedRemainingMs?: number;
 }
 
 /** Credential-free route health for queue diagnostics and operator triage. */
@@ -248,9 +249,10 @@ export function getGroqRouteHealth(nowMs: number = Date.now()): GroqRouteHealth[
     return {
       route: route.id,
       org,
-      status: disabledRemainingMs > 0 ? 'disabled' : cooldownRemainingMs > 0 ? 'cooling' : 'healthy',
+      status: disabledRemainingMs > 0 ? 'disabled' : groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs) > 0 ? 'unauthorized' : cooldownRemainingMs > 0 ? 'cooling' : 'healthy',
       cooldownRemainingMs,
       disabledRemainingMs,
+      unauthorizedRemainingMs: groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs),
     };
   });
 }
@@ -354,7 +356,7 @@ export async function runGroqRouteFailover<T>(
       (a, b) => Number(isCooling(groqRouteOrg(a))) - Number(isCooling(groqRouteOrg(b))),
     );
   if (!ordered.length) {
-    throw new ProviderCallError('Groq route credentials are cooling down.', 'CREDENTIALS_EXHAUSTED', false, {
+    throw new ProviderCallError('Groq route credentials are cooling down.', 'CREDENTIALS_EXHAUSTED', true, {
       routeScoped: true,
       retryAfterMs: Math.min(...routes.map(route => groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route), nowMs()))),
       providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
@@ -698,6 +700,14 @@ export async function runGroqTextCompletion(
       // the gate re-checks both the cooldown (another caller may have armed
       // it while this call waited) and the budget before fetching.
       return await withGroqOrgPacingSlot(orgId, minIntervalMs, now, sleep, async () => {
+        // Another call may have rejected this credential while this one waited
+        // for the org pacing slot; recheck before spending a fetch.
+        if (groqRouteUnauthorizedRemainingMs(groqRouteCredentialKey(route)) > 0) {
+          throw new ProviderCallError('Groq route credential is cooling down.', 'CREDENTIALS_EXHAUSTED', true, {
+            routeScoped: true,
+            providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
+          });
+        }
         const recooledMs = groqOrgCooldownRemainingMs(orgId);
         if (recooledMs > 0) throw groqCooldownDeferredError(recooledMs);
         if (Date.now() >= Math.min(deadlineAtMs, attemptDeadlineMs)) {

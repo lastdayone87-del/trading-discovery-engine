@@ -1147,6 +1147,28 @@ test('a 401 route is cached and not retried on the next request', async () => {
   resetGroqCooldownForTests();
 });
 
+
+test('credential cache survives route-id reassignment and covers 403', async () => {
+  resetGroqCooldownForTests();
+  const rejected = classifyGroqHttpError(403, '{"error":{"message":"invalid api key"}}');
+  await assert.rejects(runGroqRouteFailover(
+    [{ id: 'groq-old-1', key: 'same-key', orgId: 'org-a' }],
+    async () => { throw rejected; },
+    { maxUnauthorizedFailures: 1 },
+  ));
+  const order: string[] = [];
+  const result = await runGroqRouteFailover(
+    [
+      { id: 'groq-new-1', key: 'same-key', orgId: 'org-a' },
+      { id: 'groq-new-2', key: 'healthy-key', orgId: 'org-b' },
+    ],
+    async route => { order.push(route.id); return route.id; },
+  );
+  assert.deepEqual(order, ['groq-new-2']);
+  assert.equal(result, 'groq-new-2');
+  resetGroqCooldownForTests();
+});
+
 test('systemic 401s stop after a bounded number of organizations', async () => {
   resetGroqCooldownForTests();
   const routes = Array.from({ length: 6 }, (_, index) => ({
