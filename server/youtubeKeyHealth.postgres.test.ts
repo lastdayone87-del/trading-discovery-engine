@@ -13,28 +13,32 @@ const maybe = enabled ? test : test.skip;
 
 const QUARANTINE_VALUE = 'UCabcdefghijklmnopqrstuv';
 const SUSPENSION_FP = 'test-fingerprint-0001';
+const QUARANTINE_SIGNATURE = 'test-request-signature';
 
 maybe('invalid-input quarantine records, reads, and expires', async t => {
   const { getDb } = await import('./dbCore');
   const db = await getDb();
   t.after(async () => {
-    await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
+    await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE provider='youtube' AND input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
   });
   // Establish our own state first: an interrupted previous run may have left
   // the fixed fixture row behind, which would poison the absence assertion.
-  await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
-  assert.equal(await isYouTubeInputQuarantined('channelId', QUARANTINE_VALUE), false);
-  await recordYouTubeInvalidInput('channelId', QUARANTINE_VALUE, 'channel-uploads', 60_000);
-  assert.equal(await isYouTubeInputQuarantined('channelId', QUARANTINE_VALUE), true);
-  await recordYouTubeInvalidInput('channelId', QUARANTINE_VALUE, 'channel-uploads', 60_000);
-  const hits = await db.query(`SELECT hits FROM youtube_invalid_input_quarantine WHERE input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
+  await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE provider='youtube' AND input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
+  assert.equal(await isYouTubeInputQuarantined('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', QUARANTINE_SIGNATURE), false);
+  await recordYouTubeInvalidInput('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', 60_000, QUARANTINE_SIGNATURE);
+  assert.equal(await isYouTubeInputQuarantined('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', QUARANTINE_SIGNATURE), true);
+  await recordYouTubeInvalidInput('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', 60_000, QUARANTINE_SIGNATURE);
+  assert.equal(await isYouTubeInputQuarantined('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', 'different-signature'), false);
+  const hits = await db.query(`SELECT hits FROM youtube_invalid_input_quarantine WHERE provider='youtube' AND input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
   assert.equal(Number(hits.rows[0]?.hits), 2);
   // Expiry is honored without waiting: backdate and re-check.
-  await db.query(`UPDATE youtube_invalid_input_quarantine SET expires_at=now()-interval '1 second' WHERE input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
-  assert.equal(await isYouTubeInputQuarantined('channelId', QUARANTINE_VALUE), false);
+  await db.query(`UPDATE youtube_invalid_input_quarantine SET expires_at=now()-interval '1 second' WHERE provider='youtube' AND input_kind='channelId' AND input_value=$1`, [QUARANTINE_VALUE]);
+  assert.equal(await isYouTubeInputQuarantined('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', QUARANTINE_SIGNATURE), false);
   // Empty/invalid inputs are no-ops, never rows.
-  await recordYouTubeInvalidInput('', '', 'channel-uploads', 60_000);
-  await recordYouTubeInvalidInput('channelId', QUARANTINE_VALUE, 'channel-uploads', -1);
+  await recordYouTubeInvalidInput('', '', '', 'channel-uploads', 60_000, '');
+  await recordYouTubeInvalidInput('youtube', 'channelId', QUARANTINE_VALUE, 'channel-uploads', -1, QUARANTINE_SIGNATURE);
+  const emptyRows = await db.query(`SELECT COUNT(*)::int AS n FROM youtube_invalid_input_quarantine WHERE provider='' AND input_value=''`);
+  assert.equal(Number(emptyRows.rows[0]?.n), 0);
 });
 
 maybe('provider suspension records, hydrates while fresh, and clears', async t => {

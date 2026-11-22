@@ -63,14 +63,14 @@ test('search queries normalize in full, then hash (no cleartext, no prefix colli
 });
 
 test('quarantine input extraction prefers channel identity, falls back to query hash', () => {
-  assert.deepEqual(
-    extractYouTubeQuarantineInput('channel-uploads', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&channelId=UCabcdefghijklmnopqrstuv&key=K'),
-    { kind: 'channelId', value: 'UCabcdefghijklmnopqrstuv' },
-  );
-  assert.deepEqual(
-    extractYouTubeQuarantineInput('channel-details', 'https://youtube.googleapis.com/youtube/v3/channels?part=snippet&id=UCabcdefghijklmnopqrstuv&key=K'),
-    { kind: 'channelId', value: 'UCabcdefghijklmnopqrstuv' },
-  );
+  const uploads = extractYouTubeQuarantineInput('channel-uploads', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&channelId=UCabcdefghijklmnopqrstuv&key=K');
+  assert.equal(uploads?.provider, 'youtube');
+  assert.equal(uploads?.kind, 'channelId');
+  assert.equal(uploads?.value, 'UCabcdefghijklmnopqrstuv');
+  assert.ok(uploads?.signature);
+  const details = extractYouTubeQuarantineInput('channel-details', 'https://youtube.googleapis.com/youtube/v3/channels?part=snippet&id=UCabcdefghijklmnopqrstuv&key=K');
+  assert.equal(details?.kind, 'channelId');
+  assert.equal(details?.value, 'UCabcdefghijklmnopqrstuv');
   const extracted = extractYouTubeQuarantineInput('search', 'https://youtube.googleapis.com/youtube/v3/search?part=snippet&q=OBX+Aksjehandel&key=K');
   assert.equal(extracted?.kind, 'searchQuery');
   assert.ok(extracted && /^[0-9a-f]{64}$/.test(extracted.value), 'extracted query identity must be the hash');

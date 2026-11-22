@@ -2049,20 +2049,39 @@ export interface YouTubeInvalidInputQuarantine {
 /** Durable memory of inputs that recently produced HTTP 400/404/422 from
  * YouTube (bad channel IDs, invalid query shapes). Readers must treat an
  * expired row as absent; writers prune expired rows opportunistically. */
-export async function recordYouTubeInvalidInput(inputKind: string, inputValue: string, operation: string, ttlMs: number): Promise<void> {
-  if (!inputKind || !inputValue || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
+export async function recordYouTubeInvalidInput(
+  provider: string,
+  inputKind: string,
+  inputValue: string,
+  operation: string,
+  ttlMs: number,
+  requestSignature: string,
+): Promise<void> {
+  if (!provider || !inputKind || !inputValue || !operation || !requestSignature || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
   const db = await getDb();
-  await db.query(`INSERT INTO youtube_invalid_input_quarantine(input_kind,input_value,operation,first_seen,last_seen,hits,expires_at)
-    VALUES($1,$2,$3,now(),now(),1,now()+($4||' milliseconds')::interval)
-    ON CONFLICT(input_kind,input_value) DO UPDATE SET operation=excluded.operation,last_seen=now(),hits=youtube_invalid_input_quarantine.hits+1,expires_at=now()+($4||' milliseconds')::interval`,
-    [inputKind, inputValue, operation || '', String(Math.trunc(ttlMs))]);
+  await db.query(`INSERT INTO youtube_invalid_input_quarantine(provider,input_kind,input_value,operation,request_signature,first_seen,last_seen,hits,expires_at)
+    VALUES($1,$2,$3,$4,$5,now(),now(),1,now()+($6||' milliseconds')::interval)
+    ON CONFLICT(provider,input_kind,input_value,operation,request_signature)
+    DO UPDATE SET last_seen=now(),hits=youtube_invalid_input_quarantine.hits+1,expires_at=now()+($6||' milliseconds')::interval`,
+    [provider, inputKind, inputValue, operation, requestSignature, String(Math.trunc(ttlMs))]);
   await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE expires_at <= now()`).catch(() => undefined);
 }
 
-export async function isYouTubeInputQuarantined(inputKind: string, inputValue: string): Promise<boolean> {
-  if (!inputKind || !inputValue) return false;
+export async function isYouTubeInputQuarantined(
+  provider: string,
+  inputKind: string,
+  inputValue: string,
+  operation: string,
+  requestSignature: string,
+): Promise<boolean> {
+  if (!provider || !inputKind || !inputValue || !operation || !requestSignature) return false;
   const db = await getDb();
-  const res = await db.query(`SELECT 1 FROM youtube_invalid_input_quarantine WHERE input_kind=$1 AND input_value=$2 AND expires_at > now() LIMIT 1`, [inputKind, inputValue]);
+  const res = await db.query(
+    `SELECT 1 FROM youtube_invalid_input_quarantine
+      WHERE provider=$1 AND input_kind=$2 AND input_value=$3 AND operation=$4 AND request_signature=$5
+        AND expires_at > now() LIMIT 1`,
+    [provider, inputKind, inputValue, operation, requestSignature],
+  );
   return (res.rowCount || 0) > 0;
 }
 
@@ -4442,16 +4461,19 @@ export async function scheduleAutonomousQueryRuns(
             [String(providerCooldownObservationWindowSecs())]
           ).catch(() => ({ rows: [] as any[] }));
           const coolingKeys = (coolingRes.rows || []).map((row: any) => ledgerProviderToRegistryKey(String(row.provider)));
+          const quarantinedProviders = await getQuarantinedQueryProviders(candidate.query.id, client)
+            .catch(() => new Set<string>());
           if (Array.isArray(rotationRes.rows) && rotationRes.rows.length > 0) {
             // A quota-free exploration decision must be served by quota-free
             // capacity. Filtering here prevents the stable rotation key from
             // selecting the official provider and failing later against the
             // exhausted portfolio floor.
-            const allocationRows = candidate.quotaFreeRequired
+            const baseRows = candidate.quotaFreeRequired
               ? quotaFreeSearchProviderRows(rotationRes.rows)
               : rotationRes.rows;
+            const allocationRows = baseRows.filter((row: any) => !quarantinedProviders.has(String(row.provider_key)));
             if (allocationRows.length === 0) {
-              throw new Error('QUOTA_FREE_PROVIDER_UNAVAILABLE');
+              throw new Error(baseRows.length === 0 ? 'QUOTA_FREE_PROVIDER_UNAVAILABLE' : 'QUERY_PROVIDER_QUARANTINED');
             }
             const picked = rotateActiveProviderRow(allocationRows, `scheduled:${candidate.query.id}:${candidate.query.country}`, coolingKeys);
             // Registry rows carry quota_domain (there is no cost_domain
@@ -4463,6 +4485,10 @@ export async function scheduleAutonomousQueryRuns(
             throw new Error('QUOTA_FREE_PROVIDER_UNAVAILABLE');
           }
         } catch (error) {
+          if (String((error as Error)?.message || '') === 'QUERY_PROVIDER_QUARANTINED') {
+            flushDiagnostic({ selectedQueryId: candidate.query.id, reservationOutcome: 'SKIPPED', reservationReasonCode: 'QUERY_PROVIDER_QUARANTINED', schedulingOutcome: 'NOT_REACHED', disposition: 'SKIPPED', reasonCode: 'COOLDOWN_OR_ELIGIBILITY_SKIP' });
+            continue;
+          }
           // Normal allocation keeps its historical fail-open default to the
           // official provider. A quota-free requirement cannot: falling back
           // would spend official budget the selector already found exhausted.
@@ -5889,33 +5915,61 @@ export async function recordQueryRunSightings(runId: string, queryId: number, si
  * spending cycles on the same invalid surface while other queries are eligible.
  * The cooldown is reversible and never shortens a later existing cooldown.
  */
+export async function quarantineQueryProvider(
+  queryId: number,
+  provider: string,
+  until: Date,
+  runner?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+): Promise<void> {
+  if (!Number.isFinite(queryId) || queryId <= 0 || !provider || !until || !Number.isFinite(until.getTime())) return;
+  const db = runner || await getDb();
+  await db.query(
+    `INSERT INTO query_provider_quarantine(query_id,provider,until)
+     VALUES($1,$2,$3)
+     ON CONFLICT(query_id,provider) DO UPDATE SET until=GREATEST(query_provider_quarantine.until,excluded.until)`,
+    [queryId, provider, until.toISOString()],
+  );
+  await db.query(`DELETE FROM query_provider_quarantine WHERE until<=now()`).catch(() => undefined);
+}
+
+export async function getQuarantinedQueryProviders(
+  queryId: number,
+  runner?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+): Promise<Set<string>> {
+  if (!Number.isFinite(queryId) || queryId <= 0) return new Set();
+  const db = runner || await getDb();
+  const res = await db.query(
+    `SELECT provider FROM query_provider_quarantine WHERE query_id=$1 AND until>now()`,
+    [queryId],
+  );
+  return new Set(res.rows.map(row => String(row.provider)));
+}
+
 export async function coolQueryForProviderQuarantine(
   queryId: number,
   inputKind: string,
   inputValue: string,
   runner?: { query: (text: string, params?: unknown[]) => Promise<{ rows: any[] }> },
+  identity?: { provider?: string; operation?: string; signature?: string },
 ): Promise<void> {
   if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
+  if (inputKind !== 'searchQuery') return;
+  const rawProvider = String(identity?.provider || '');
+  const provider = ledgerProviderToRegistryKey(rawProvider);
+  const operation = String(identity?.operation || '');
+  const signature = String(identity?.signature || '');
+  if (!provider || !operation || !signature) return;
   const db = runner || await getDb();
   const quarantine = await db.query(
     `SELECT expires_at FROM youtube_invalid_input_quarantine
-      WHERE input_kind=$1 AND input_value=$2
-      LIMIT 1`,
-    [inputKind, inputValue],
+      WHERE provider=$1 AND input_kind=$2 AND input_value=$3 AND operation=$4 AND request_signature=$5
+        AND expires_at>now() LIMIT 1`,
+    [rawProvider, inputKind, inputValue, operation, signature],
   );
-  const parsed = quarantine.rows[0]?.expires_at ? new Date(quarantine.rows[0].expires_at) : null;
-  // If the row expired or disappeared between the dispatch gate and failure
-  // handling, the quarantine is no longer active. Use a short cooldown instead
-  // of extending a stale seven-day quarantine.
-  const until = parsed && Number.isFinite(parsed.getTime()) && parsed.getTime() > Date.now()
-    ? parsed
-    : new Date(Date.now() + 60 * 60_000);
-  await db.query(
-    `UPDATE query_library
-        SET next_eligible_at=GREATEST(COALESCE(next_eligible_at,now()),$2::timestamptz)
-      WHERE id=$1`,
-    [queryId, until.toISOString()],
-  );
+  if (!quarantine.rows[0]?.expires_at) return;
+  // Scope the cooldown to this query/provider pair. The scheduler filters the
+  // provider; other healthy providers and retrieval shapes remain eligible.
+  await quarantineQueryProvider(queryId, provider, new Date(quarantine.rows[0].expires_at), db);
 }
 
 export async function failQueryRun(runId: string, error: unknown, terminal: boolean): Promise<void> {

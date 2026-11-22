@@ -81,7 +81,7 @@ test('Stage 4 PostgreSQL: provider-linked completion is success-gated and termin
 });
 
 
-test('Stage 4 PostgreSQL: a quarantined search input cools the query without shortening a later cooldown', { skip: databaseUrl ? false : 'PHASE4_POSTGRES_URL is required' }, async () => {
+test('Stage 4 PostgreSQL: a request-scoped quarantine never cools the whole query', { skip: databaseUrl ? false : 'PHASE4_POSTGRES_URL is required' }, async () => {
   process.env.DATABASE_URL = databaseUrl!;
   process.env.PGSSL = 'disable';
   const db = await getDb();
@@ -94,28 +94,16 @@ test('Stage 4 PostgreSQL: a quarantined search input cools the query without sho
        VALUES($1,'LU','EXPERIMENTAL','GENERAL',$1) RETURNING id`, [suffix]
     )).rows[0].id;
     await db.query(
-      `INSERT INTO youtube_invalid_input_quarantine(input_kind,input_value,operation,first_seen,last_seen,hits,expires_at)
-       VALUES('searchQuery',$1,'search-test',now(),now(),1,now()+interval '2 days')
-       ON CONFLICT(input_kind,input_value) DO UPDATE SET expires_at=EXCLUDED.expires_at`,
+      `INSERT INTO youtube_invalid_input_quarantine(provider,input_kind,input_value,operation,request_signature,first_seen,last_seen,hits,expires_at)
+       VALUES('youtube','searchQuery',$1,'search-test','test-signature',now(),now(),1,now()+interval '2 days')
+       ON CONFLICT(provider,input_kind,input_value,operation,request_signature)
+       DO UPDATE SET expires_at=EXCLUDED.expires_at`,
       [value]
     );
     await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
-    let row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    let days = (new Date(row.next_eligible_at).getTime() - Date.now()) / 86_400_000;
-    assert.ok(days > 1.9 && days < 2.1, `expected the quarantine expiry, got ${days} days`);
-
-    await db.query(`UPDATE query_library SET next_eligible_at=now()+interval '10 days' WHERE id=$1`, [queryId]);
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
-    row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    days = (new Date(row.next_eligible_at).getTime() - Date.now()) / 86_400_000;
-    assert.ok(days > 9.9, `expected the later cooldown to win, got ${days} days`);
-
+    const row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
+    assert.equal(row.next_eligible_at, null, 'a scoped request failure must not block healthy providers');
     await db.query('DELETE FROM youtube_invalid_input_quarantine WHERE input_value=$1', [value]);
-    await db.query('UPDATE query_library SET next_eligible_at=NULL WHERE id=$1', [queryId]);
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
-    row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    const hours = (new Date(row.next_eligible_at).getTime() - Date.now()) / 3_600_000;
-    assert.ok(hours > 0.9 && hours < 1.1, `expected the one-hour fallback, got ${hours} hours`);
   } finally {
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
     await db.query('DELETE FROM youtube_invalid_input_quarantine WHERE input_value=$1', [value]).catch(() => undefined);
