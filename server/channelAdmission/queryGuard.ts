@@ -24,6 +24,12 @@ export interface QueryAdmissionGuardInput {
 
 export interface QueryAdmissionGuardDecision {
   stop: boolean;
+  /**
+   * A provisional stop while admission verdicts are still pending. The run
+   * must be deferred and resumed after the admissions settle; it must never be
+   * recorded as a terminal page stop or a query quarantine.
+   */
+  defer?: boolean;
   quarantine: boolean;
   reasonCodes: string[];
 }
@@ -37,12 +43,12 @@ export interface QueryAdmissionGuardDecision {
 export function evaluateQueryAdmissionGuard(input: QueryAdmissionGuardInput): QueryAdmissionGuardDecision {
   const total = Math.max(0, input.outcomes.total);
   if (input.pageNumber < 2) return { stop: false, quarantine: false, reasonCodes: [] };
-  // Do not judge a page while its admission jobs are still queued, but do not
-  // let pagination run away before those verdicts exist. Stop this run without
-  // quarantining the query; the query remains selectable after the admissions
-  // settle.
+  // Do not judge a page while its admission jobs are still queued. This is a
+  // provisional deferral, not a terminal stop: the verdicts may turn the page
+  // into a productive one. The caller must defer the run and resume it after
+  // the admissions settle, without quarantining the query.
   if (Number(input.outcomes.pending || 0) > 0) {
-    return { stop: true, quarantine: false, reasonCodes: ['ADMISSION_PENDING_WAIT'] };
+    return { stop: true, defer: true, quarantine: false, reasonCodes: ['ADMISSION_PENDING_WAIT'] };
   }
   if (total < 8) return { stop: false, quarantine: false, reasonCodes: [] };
   const rejectedShare = input.outcomes.rejected / total;

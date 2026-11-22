@@ -48,6 +48,9 @@ import {
   getExcludedCountries,
   getAutonomousQuotaAvailability,
   getQueryRunProgress,
+  getQuotaFallbackRunState,
+  isInnertubeQuotaFallbackAvailable,
+  retargetQuotaBlockedRunToInnertube,
   updateQueryRunProgress,
   markQueryRunDeferred,
   markQueryRunResumeUnavailable,
@@ -118,8 +121,14 @@ import { evaluateAutonomousQueryAuthority, isDemandSignalRecord, isScopePromoted
 import { recordQueryArmOutcome } from './queryDiscoveryArms';
 import { getDiscoveryScope, resolveAutonomousCountries, resolveDiscoveryTargetQueueDepth, resolveScopePromotionForScope } from './autonomousDiscovery';
 import { getAutonomousQueueDepth } from './quotaRolloverReconciliation';
-import { YOUTUBE_INNERTUBE_MAX_PAGES, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
+import { YOUTUBE_INNERTUBE_MAX_PAGES, YOUTUBE_INNERTUBE_PROVIDER, INNERTUBE_TIMEOUT_CODE } from './youtubeInnertubeProvider';
 import { getNextYouTubeQuotaResetAt } from './youtubeQuotaDay';
+import {
+  evaluateInnertubeQuotaFallback,
+  innertubeFallbackCursor,
+  quotaFallbackMetadata,
+  requiresContinuationHandoff,
+} from './quotaFallback';
 import { shouldReactivateCommunityRecovery, reactivateCommunityRecovery, projectTerminalCommunityRetryFailure } from './communityRecovery';
 import { isProviderDeferredEnrichmentError } from './enrichmentOperationalFailure';
 import {
@@ -129,10 +138,13 @@ import {
   getAutonomousContinuationState,
   getAutonomousPageMarginalMetrics,
   getAutonomousPageObservation,
+  getAutonomousPageSettledGuardMetrics,
   getPageNoveltyMetrics,
   getAutonomousRunMetrics,
   listPendingAutonomousRuns,
+  markAutonomousPageDeferredForAdmission,
   recordAutonomousPage,
+  settleAutonomousPageAdmissionDeferral,
 } from './autonomousPageStore';
 import { recordPassivePage, recordShadowFailure } from './passiveExploration';
 import { enqueueTermHarvest, processTermHarvestJob, readCorpusBudgetForUpdate } from './candidateCorpus';
@@ -161,7 +173,7 @@ import { ADMISSION_VERIFICATION_JOB_TYPE, processAdmissionVerificationJob } from
 import { evaluateQueryAdmissionGuard } from './channelAdmission/queryGuard';
 import { allRoutesCoolingDown, groqFallbackCoolingDown } from './channelAdmission/routeHealth';
 export { allRoutesCoolingDown, groqFallbackCoolingDown, judgeRoutePoolHealthy } from './channelAdmission/routeHealth';
-import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery } from './channelAdmission/store';
+import { getAdmissionPageOutcomes, getAdmissionRunOutcomes, quarantineQuery, replayAdmissionOutcomesForPage } from './channelAdmission/store';
 import { processAiAdjudicationJob, processCandidateScoringJob } from './candidateScoring';
 import { processConceptResolutionJob } from './conceptGraph';
 import { processOfflineEvaluationJob } from './offlineEvaluation';
@@ -356,6 +368,30 @@ function isMissingAdmissionSchemaError(error: unknown): boolean {
   const namesAdmissionRelation = /semantic_admission_(candidates|decisions|sightings|model_calls)/i.test(message);
   const missingRelation = /relation ["']?[^"']*["']? does not exist/i.test(message);
   return namesAdmissionRelation && ((error as { code?: unknown })?.code === '42P01' || missingRelation);
+}
+
+/**
+ * Page-scoped admission replay is an accounting repair, not a retrieval
+ * dependency. The pre-admission schema must behave exactly as before; any
+ * other failure is real and must reach the worker retry path.
+ */
+async function replayPageAdmissionOutcomesSafe(queryRunId: string, pageNumber: number, strict = false): Promise<void> {
+  try {
+    await replayAdmissionOutcomesForPage({ queryRunId, pageNumber });
+  } catch (error) {
+    if (isMissingAdmissionSchemaError(error)) return;
+    if (strict) throw error;
+    // Before the page observation is durable, a replay failure must not turn
+    // into a provider re-fetch. The post-observation replay and recovery path
+    // both retry the repair strictly.
+    console.warn(JSON.stringify({
+      event: 'admission_sighting_replay_failed',
+      queryRunId,
+      pageNumber,
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString(),
+    }));
+  }
 }
 
 /**
@@ -609,6 +645,14 @@ interface AutonomousRunFinalizationArgs {
   continuationExplorationPagesRemaining: number;
   continuationResumeMode: ContinuationResumeMode;
   queryHold?: import('./queryResultConsistency').QueryResultConsistencyDecision | null;
+  /**
+   * Official pages actually charged when a quota-denied page hands off to
+   * InnerTube. Absent on ordinary finalization (current page was retrieved).
+   */
+  quotaChargedPages?: number;
+  /** Provider override for the continuation handoff (quota fallback). */
+  childProviderOverride?: ProviderAllocation;
+  childMetadataPatch?: Record<string, unknown>;
 }
 
 /**
@@ -675,7 +719,8 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
       providerRateLimited,
     });
   }
-  const quotaConsumed = providerCostUsd > 0 || args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : args.pageNumber * 100;
+  const quotaChargedPages = args.quotaChargedPages === undefined ? args.pageNumber : args.quotaChargedPages;
+  const quotaConsumed = providerCostUsd > 0 || args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 0 : quotaChargedPages * 100;
   const queryRecord = args.queryId ? await getQueryById(args.queryId) : null;
   const performance = queryRecord
     ? await evaluateQueryPerformance(queryRecord, finalMetrics, {
@@ -701,9 +746,12 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
       nextPageToken: args.nextPageToken,
       resumeMode: args.continuationResumeMode,
       explorationPagesRemaining: args.continuationExplorationPagesRemaining,
+      ...(args.childProviderOverride ? { providerOverride: args.childProviderOverride } : {}),
+      ...(args.childMetadataPatch ? { metadataPatch: args.childMetadataPatch } : {}),
     });
     const childJob = await enqueueJob('SEARCH_YOUTUBE', {
       ...args.job.payload,
+      ...(args.childProviderOverride ? { provider: args.childProviderOverride } : {}),
       queryRunId: segment.childRunId,
       pageNumber: 1,
       pageToken: args.nextPageToken,
@@ -714,13 +762,16 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
     });
     await setQueryRunJobId(segment.childRunId, childJob.id);
     console.log(JSON.stringify({
-      event: 'autonomous_page_ceiling_continuation',
+      event: args.childProviderOverride
+        ? 'autonomous_provider_fallback_continuation'
+        : 'autonomous_page_ceiling_continuation',
       parentRunId: args.queryRunId,
       childRunId: segment.childRunId,
       childJobId: childJob.id,
       segment: segment.segment,
       pageNumber: args.pageNumber,
       resumeMode: segment.resumeMode,
+      ...(args.childProviderOverride ? { childProvider: args.childProviderOverride.providerKey } : {}),
       timestamp: new Date().toISOString(),
     }));
   }
@@ -756,7 +807,7 @@ async function finalizeAutonomousSearchRun(args: AutonomousRunFinalizationArgs):
       channels_discovered: finalMetrics.distinctResults, unique_new_channels: finalMetrics.newChannels,
       quality_creators_discovered: finalMetrics.qualityChannels, communities_discovered: finalMetrics.communitiesDiscovered,
       cycle_quality_score: performance.performanceScore,
-      logs: [`Durable autonomous ${args.retrievalLane} lane run ${args.queryRunId} completed by ${args.workerId} via ${args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 'YOUTUBE_INNERTUBE_FREE' : 'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(args.pageMetrics)}`],
+      logs: [`Durable autonomous ${args.retrievalLane} lane run ${args.queryRunId} completed by ${args.workerId} via ${args.allocatedProvider.costDomain === 'YOUTUBE_INNERTUBE_FREE' ? 'YOUTUBE_INNERTUBE_FREE' : 'YOUTUBE_DATA_API'}.`, `Provider outcome: ${providerRunOutcome || 'UNAVAILABLE'}`, `Funnel: ${JSON.stringify(Object.keys(args.pageMetrics || {}).length ? args.pageMetrics : finalMetrics)}`],
     });
   }
   const neighborhoodInfo = await getNeighborhoodForQueryRun(args.queryRunId);
@@ -846,6 +897,10 @@ async function recoverPersistedAutonomousPage(args: PersistedPageRecoveryArgs): 
   const progress = await getQueryRunProgress(args.queryRunId);
   if (!progress) return;
   const observation = await getAutonomousPageObservation(args.queryRunId, args.pageNumber);
+  // Repair the insert-vs-admission race on replay as well: the page may have
+  // committed before an admission verdict and then crashed before the worker's
+  // post-insert replay ran.
+  await replayPageAdmissionOutcomesSafe(args.queryRunId, args.pageNumber, true);
   const [paginationSetting, cdlSetting] = await Promise.all([
     getAppSetting('autonomous_pagination_enabled', 'true'),
     getAppSetting('country_discovery_loop_enabled', 'true'),
@@ -977,6 +1032,27 @@ async function deferAutonomousRunForTime(runId: string, reason: string): Promise
   console.log(JSON.stringify({
     event: 'autonomous_run_deferred_time',
     runId,
+    deferredUntil,
+    reason: reason.slice(0, 300),
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+/**
+ * Pending admission verdicts are a temporary evidence wait, not a terminal
+ * page outcome. Keep the run resumable on the existing DEFERRED_TIME path: the
+ * page observation is re-opened for continuation when the page actually has a
+ * next cursor, so the reconciler enqueues the next page once admissions settle
+ * instead of finalizing the run on a stale low-novelty decision.
+ */
+async function deferAutonomousRunForAdmission(runId: string, pageNumber: number, reason: string): Promise<void> {
+  await markAutonomousPageDeferredForAdmission(runId, pageNumber);
+  const deferredUntil = new Date(Date.now() + AUTONOMOUS_TIME_DEFER_MS).toISOString();
+  await markQueryRunDeferred(runId, 'DEFERRED_TIME', deferredUntil);
+  console.log(JSON.stringify({
+    event: 'autonomous_run_deferred_admission',
+    runId,
+    pageNumber,
     deferredUntil,
     reason: reason.slice(0, 300),
     timestamp: new Date().toISOString(),
@@ -2393,6 +2469,7 @@ export async function processNextSearchJob(
     let allocatedProvider: ProviderAllocation = YOUTUBE_SEARCH_PROVIDER;
     let braveProvider = false;
     let quotaFreeInnertubeProvider = false;
+    let quotaFallbackApplied = false;
     if (queryRunId) {
       allocatedProvider=providerSnapshot(job.payload.provider||YOUTUBE_SEARCH_PROVIDER);
       const lineage=await (await getDb()).query(`SELECT provider_allocation_snapshot FROM query_runs WHERE id=$1`,[queryRunId]);
@@ -2417,14 +2494,108 @@ export async function processNextSearchJob(
         const budget=getDailyYouTubeQuotaBudget();
         const percent=Number(await getAppSetting('discovery_autonomous_quota_percent','70'));
         if(!await tryReserveQuota({operationType:'AUTONOMOUS_QUERY_PAGE',operationId:autonomousOperationId,allocation:'AUTONOMOUS',units:providerQuotaUnits,dailyBudget:budget,allocationPercent:percent})){
-          // A denied page is deferred, never completed or failed: the run keeps
-          // its page number and next-page cursor for the reconciler. Persist
-          // the provider's resume mode first, otherwise a page-1 deferral has
-          // no cursor mode and the reconciler cannot recover it.
-          await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
-          await deferAutonomousRunForQuota(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied');
-          await completeJob(job.id);
-          return true;
+          // The official search quota is exhausted. Before deferring, check
+          // whether this run can continue on the quota-free InnerTube lane.
+          // DATE-ordered, windowed, trial, treatment, and frontier-lineage
+          // runs are deliberately excluded: InnerTube cannot reproduce those
+          // retrieval semantics or lineage.
+          const fallbackState = await getQuotaFallbackRunState(queryRunId).catch(() => null);
+          const fallbackDecision = fallbackState
+            ? evaluateInnertubeQuotaFallback({
+                providerKey: fallbackState.providerKey,
+                searchOrdering: fallbackState.searchOrdering,
+                hasSearchWindow: fallbackState.hasSearchWindow || Boolean(searchWindow),
+                retrievalTreatmentOrigin: fallbackState.retrievalTreatmentOrigin,
+                allocationOrigin: fallbackState.allocationOrigin,
+                hasTrial: Boolean(job.payload.trial?.trialId),
+                isContinuationChild: Boolean(fallbackState.continuedFromRunId),
+              })
+            : { eligible: false, reasonCodes: ['RUN_STATE_UNAVAILABLE'] };
+          if (fallbackDecision.eligible
+            && !fallbackState!.continuedToRunId
+            && fallbackState!.pagesCompleted < YOUTUBE_INNERTUBE_MAX_PAGES
+            && await isInnertubeQuotaFallbackAvailable().catch(() => false)) {
+            if (!requiresContinuationHandoff(fallbackState!.pagesCompleted)) {
+              // Zero completed pages: no official units were spent, so the
+              // run can move provider identity in place and continue now.
+              const retargeted = await retargetQuotaBlockedRunToInnertube({
+                runId: queryRunId,
+                jobId: job.id,
+                provider: YOUTUBE_INNERTUBE_PROVIDER,
+              }).catch(error => {
+                console.warn(JSON.stringify({
+                  event: 'innertube_quota_fallback_retarget_failed',
+                  runId: queryRunId,
+                  jobId: job.id,
+                  error: error instanceof Error ? error.message : String(error),
+                  timestamp: new Date().toISOString(),
+                }));
+                return false;
+              });
+              if (retargeted) {
+                allocatedProvider = providerSnapshot(YOUTUBE_INNERTUBE_PROVIDER);
+                quotaFreeInnertubeProvider = true;
+                quotaFallbackApplied = true;
+                providerQuotaUnits = 0;
+                job.payload = { ...job.payload, provider: allocatedProvider, pageNumber: 1, pageToken: null };
+                console.log(JSON.stringify({
+                  event: 'innertube_quota_fallback_retargeted',
+                  runId: queryRunId,
+                  jobId: job.id,
+                  pageNumber,
+                  fromProvider: 'youtube-search',
+                  timestamp: new Date().toISOString(),
+                }));
+              }
+            } else {
+              // Official pages already completed: hand the remaining cursor to
+              // an InnerTube continuation child so the official run keeps its
+              // own quota/cost accounting and immutable provider identity.
+              await finalizeAutonomousSearchRun({
+                job,
+                workerId,
+                queryRunId,
+                queryId,
+                query,
+                country,
+                pageNumber,
+                retrievalLane,
+                searchOrdering,
+                retrievalConfigKey,
+                pageMetrics: {} as QueryFunnelMetrics,
+                allocatedProvider,
+                providerCostUsd: 0,
+                searchWorkerStartMs,
+                searchQuotaWaitMs,
+                searchRetrievalGrossMs: 0,
+                searchTopUpWaitMs: 0,
+                channelLoopStartMs: Date.now(),
+                channelLoopEndMs: Date.now(),
+                trial: job.payload.trial || null,
+                nextPageToken: innertubeFallbackCursor(fallbackState!.pagesCompleted),
+                createContinuation: true,
+                continuationExplorationPagesRemaining: fallbackState!.explorationPagesRemaining,
+                continuationResumeMode: 'REWALK',
+                quotaChargedPages: fallbackState!.pagesCompleted,
+                childProviderOverride: YOUTUBE_INNERTUBE_PROVIDER,
+                childMetadataPatch: quotaFallbackMetadata({
+                  fromProvider: 'youtube-search',
+                  reason: 'OFFICIAL_QUOTA_EXHAUSTED',
+                  pagesCompleted: fallbackState!.pagesCompleted,
+                }),
+              });
+              await completeJob(job.id);
+              return true;
+            }
+          }
+          if (!quotaFallbackApplied) {
+            // No compatible free provider: keep the existing deferral. The run
+            // retains its page number and next-page cursor for the reconciler.
+            await updateQueryRunProgress(queryRunId, { resumeMode: resumeModeForProvider(allocatedProvider.providerKey) }).catch(() => undefined);
+            await deferAutonomousRunForQuota(queryRunId, 'AUTONOMOUS_QUERY_PAGE quota reservation denied');
+            await completeJob(job.id);
+            return true;
+          }
         }
       }
       searchQuotaWaitMs += Date.now() - quotaWaitStartMs;
@@ -2434,7 +2605,7 @@ export async function processNextSearchJob(
         const preferredLanguage = preferredLanguageFromQueryMetadata(queryMetadata);
         const retrievalStartMs = Date.now();
         try {
-          searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
+          searchPage=await executeAllocatedRetrievalPage({provider:allocatedProvider,query,country,vocabulary:vocab,queryRunId,requestId:providerRequestBaseId,jobId:job.id,preferredLanguage,lane:retrievalLane,cursor:quotaFallbackApplied ? null : pageToken,ordering:searchOrdering,searchWindow:resolveExecutionSearchWindow(searchWindow),reserveAdditionalUnits:async additionalUnits=>{
             if(braveProvider||quotaFreeInnertubeProvider) return;
             const topUpStartMs = Date.now();
             const budget=getDailyYouTubeQuotaBudget();
@@ -2625,7 +2796,13 @@ export async function processNextSearchJob(
       const queryRecord = await getQueryById(queryId);
       if (!queryRecord) throw new Error(`Query ${queryId} no longer exists for run ${queryRunId}.`);
       const metrics = calculateQueryFunnel(searchPage?.rawResultCount ?? extracted.length, observations, deferredResults);
-      if (sightings.length) await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+      if (sightings.length) {
+        await recordQueryRunSightings(queryRunId, queryId, sightings.map(s=>({...s,pageNumber})));
+        // Admission verification can finish while this page is still being
+        // processed; replay those terminal outcomes after the sightings exist
+        // so an early verdict cannot leave a stale persisted=false row.
+        await replayPageAdmissionOutcomesSafe(queryRunId, pageNumber);
+      }
       const configuredMaxPages = Number(await getAppSetting('autonomous_pagination_max_pages', '50'));
       // A malformed setting must not become an unbounded (or NaN) page
       // ceiling. Fall back to the same 50-page default the migration seeds;
@@ -2809,6 +2986,9 @@ export async function processNextSearchJob(
         deferredReason: usingV2 ? decisionV2.deferReason : null,
       };
       await recordAutonomousPage(pageObservation);
+      // The page is now durable. A strict replay failure retries from the saved
+      // page through recovery, without buying the provider page again.
+      await replayPageAdmissionOutcomesSafe(queryRunId, pageNumber, true);
       try{await recordPassivePage({query,jobId:job.id,observation:pageObservation});}catch(shadowError){console.error('[Phase 5 shadow] Passive page write failed.',shadowError);await recordShadowFailure({queryRunId,jobId:job.id,stage:'PAGE_OUTCOME',error:shadowError}).catch(()=>undefined);}
       if (!queryResultHold && deferDecision) {
         if (decisionV2.deferReason === 'QUOTA') await deferAutonomousRunForQuota(queryRunId, decisionV2.primaryReason);
@@ -2826,7 +3006,7 @@ export async function processNextSearchJob(
           throw error;
         }),
       ]);
-      const admissionGuard = admissionOutcomes && admissionPageOutcomes && Number(admissionPageOutcomes.pending || 0) === 0
+      const admissionGuard = admissionOutcomes && admissionPageOutcomes
         ? evaluateQueryAdmissionGuard({
             pageNumber,
             outcomes: admissionOutcomes,
@@ -2837,7 +3017,25 @@ export async function processNextSearchJob(
             priorZeroQualityPages: prior.v2Streaks.lowValue,
           })
         : { stop: false, quarantine: false, reasonCodes: [] as string[] };
-      if (admissionGuard.stop) {
+      // Pending admission verdicts are a temporary evidence wait, but they can
+      // never override a real continuation stop (ceiling, run budget, low
+      // novelty, duplicate-heavy, wrong country) or an operator hold. Defer
+      // only when this page still needs more discovery and its own admission
+      // set is unresolved; run-level pending outcomes from an earlier page
+      // must not reopen a later page.
+      const admissionDeferEligible = admissionGuard.defer === true
+        && Number(admissionPageOutcomes?.pending || 0) > 0
+        && !queryResultHold
+        && continuationEnabled
+        && decision.shouldContinue === true;
+      if (admissionDeferEligible) {
+        await deferAutonomousRunForAdmission(queryRunId, pageNumber, admissionGuard.reasonCodes.join(','));
+        await completeJob(job.id);
+        return true;
+      }
+      // A provisional pending-admission guard must never be recorded as
+      // terminal contamination, including on a final page with no cursor.
+      if (admissionGuard.stop && !admissionGuard.defer) {
         await (await getDb()).query(
           `UPDATE autonomous_query_page_observations SET stopping_reason=$3,decision_reason_codes=COALESCE(decision_reason_codes,'[]'::jsonb)||$4::jsonb WHERE query_run_id=$1 AND page_number=$2`,
           [queryRunId, pageNumber, 'ADMISSION_CONTAMINATION', JSON.stringify(admissionGuard.reasonCodes)],
@@ -3334,6 +3532,64 @@ export async function resumeOrphanedAutonomousPages(options: {
     // finalize it from the durable observation instead.
     if (!firstPage) {
       const lastObservation = await getAutonomousPageObservation(run.runId, run.pagesCompleted);
+      if (lastObservation?.deferredReason === 'ADMISSION') {
+        // A time-only wake-up is not proof that the admission verdicts
+        // settled. Keep the run parked while this page still has pending
+        // candidates; once settled, re-apply the guard before buying another
+        // page so a rejection cannot leak one extra fetch.
+        const [pageOutcomes, runOutcomes] = await Promise.all([
+          getAdmissionPageOutcomes(run.runId, run.pagesCompleted),
+          getAdmissionRunOutcomes(run.runId),
+        ]);
+        if (Number(pageOutcomes.pending || 0) > 0) {
+          await deferAutonomousRunForAdmission(run.runId, run.pagesCompleted, 'ADMISSION_PENDING_WAIT');
+          skipped++;
+          continue;
+        }
+        await replayPageAdmissionOutcomesSafe(run.runId, run.pagesCompleted, true);
+        const [settledMetrics, priorState] = await Promise.all([
+          getAutonomousPageSettledGuardMetrics(run.runId, run.pagesCompleted),
+          getAutonomousContinuationState(run.runId, run.pagesCompleted),
+        ]);
+        const settledGuard = evaluateQueryAdmissionGuard({
+          pageNumber: run.pagesCompleted,
+          outcomes: runOutcomes,
+          tradingPrecision: settledMetrics.tradingPrecision,
+          qualityChannels: settledMetrics.qualityChannels,
+          tradingConfirmed: settledMetrics.tradingConfirmed,
+          classificationPending: settledMetrics.classificationPending,
+          priorZeroQualityPages: priorState.v2Streaks.lowValue,
+        });
+        if (settledGuard.stop && !settledGuard.defer) {
+          await settleAutonomousPageAdmissionDeferral(
+            run.runId,
+            run.pagesCompleted,
+            false,
+            'ADMISSION_CONTAMINATION',
+            settledGuard.reasonCodes,
+          );
+          if (settledGuard.quarantine) {
+            await quarantineQuery(run.queryId, settledGuard.reasonCodes).catch(error => {
+              console.warn('[AdmissionGuard] failed to quarantine settled query:', error);
+            });
+          }
+          await finalizeLinkedAutonomousParent(run);
+          skipped++;
+          continue;
+        }
+        const hasCursor = Boolean(run.nextPageToken) && run.resumeMode !== 'NONE';
+        await settleAutonomousPageAdmissionDeferral(
+          run.runId,
+          run.pagesCompleted,
+          hasCursor,
+          hasCursor ? null : 'NO_NEXT_PAGE',
+        );
+        if (!hasCursor) {
+          await finalizeLinkedAutonomousParent(run);
+          skipped++;
+          continue;
+        }
+      }
       if (lastObservation && lastObservation.shouldContinue === false) {
         await finalizeLinkedAutonomousParent(run);
         skipped++;

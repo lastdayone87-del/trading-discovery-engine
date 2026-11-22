@@ -239,6 +239,196 @@ export async function enqueueAdmissionVerification(input: {
   });
 }
 
+interface AdmissionSightingDisposition {
+  persisted: boolean;
+  funnelOutcome: string;
+  countryOutcome: string | null;
+  tradingOutcome: string | null;
+}
+
+/**
+ * Terminal admission outcomes must be projected back onto the original
+ * discovery sightings. Page novelty and continuation decisions read
+ * channel_sightings.persisted/was_known, not the admission tables; leaving the
+ * sighting at persisted=false makes a productive page look empty forever.
+ *
+ * ADMITTED/ADMITTED_AMBIGUOUS become persisted CLASSIFICATION_PENDING rows so
+ * the existing classification reconciliation can later replace the provisional
+ * outcome with the real country/trading verdict. Rejections and evidence
+ * exhaustion are terminal at admission time and are recorded as such.
+ */
+const ADMISSION_SIGHTING_DISPOSITIONS: Partial<Record<AdmissionStatus, AdmissionSightingDisposition>> = {
+  ADMITTED: { persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', countryOutcome: null, tradingOutcome: null },
+  ADMITTED_AMBIGUOUS: { persisted: true, funnelOutcome: 'CLASSIFICATION_PENDING', countryOutcome: null, tradingOutcome: null },
+  REJECTED_COUNTRY: { persisted: false, funnelOutcome: 'COUNTRY_REJECTED', countryOutcome: 'REJECTED', tradingOutcome: 'UNCERTAIN' },
+  REJECTED_UNRELATED: { persisted: false, funnelOutcome: 'NON_TRADING', countryOutcome: null, tradingOutcome: 'UNCERTAIN' },
+  NEEDS_REVIEW: { persisted: false, funnelOutcome: 'NEEDS_REVIEW', countryOutcome: null, tradingOutcome: 'UNCERTAIN' },
+  EXPIRED_MISSING_EVIDENCE: { persisted: false, funnelOutcome: 'UNCERTAIN', countryOutcome: null, tradingOutcome: 'UNCERTAIN' },
+};
+
+export async function reconcileAdmissionSightings(input: {
+  candidateId: string;
+  channelId: string;
+  status: AdmissionStatus;
+  client?: AdmissionQueryable;
+}): Promise<number> {
+  const disposition = ADMISSION_SIGHTING_DISPOSITIONS[input.status];
+  if (!disposition) return 0;
+  const db = input.client || await getDb();
+  const metadata = {
+    admissionStatus: input.status,
+    sightingOutcomeSource: 'ADMISSION',
+    admissionSightingReconciledAt: new Date().toISOString(),
+  };
+  const result = await db.query(
+    `WITH target AS (
+       SELECT id,channel_id
+         FROM semantic_admission_candidates
+        WHERE id=$1::uuid AND channel_id=$2
+     )
+     UPDATE channel_sightings cs
+        SET persisted=$3,
+            funnel_outcome=$4,
+            country_outcome=COALESCE($5::text,cs.country_outcome),
+            trading_outcome=COALESCE($6::text,cs.trading_outcome),
+            metadata=COALESCE(cs.metadata,'{}'::jsonb)||$7::jsonb
+       FROM semantic_admission_sightings s, target t
+      WHERE s.candidate_id=t.id
+        AND cs.query_run_id=s.query_run_id
+        AND cs.channel_id=t.channel_id
+        AND cs.was_known=false
+        AND (
+          $3::boolean=false
+          OR EXISTS (
+            SELECT 1 FROM channels ch
+             WHERE ch.channel_id=t.channel_id
+               AND ch.admitted_at IS NOT NULL
+               AND ch.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          )
+        )
+        -- Terminal classification outcomes are authoritative. Reconciliation
+        -- only resolves a still-pending sighting; it must never rewrite a
+        -- completed TRADING_CONFIRMED/NON_TRADING/COUNTRY_REJECTED verdict.
+        -- NEEDS_REVIEW is admission-owned only when this projection wrote it,
+        -- so a later human ADMIT can replace the provisional hold while a
+        -- classification-owned NEEDS_REVIEW remains untouched.
+        AND (
+          cs.funnel_outcome IS NULL
+          OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
+          OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
+        )
+        AND cs.page_number IS NOT DISTINCT FROM s.page_number
+        AND (s.result_rank IS NULL OR cs.result_rank=s.result_rank)`,
+    [
+      input.candidateId, input.channelId, disposition.persisted,
+      disposition.funnelOutcome, disposition.countryOutcome, disposition.tradingOutcome,
+      JSON.stringify(metadata),
+    ],
+  );
+  return result.rowCount || 0;
+}
+
+/**
+ * Admission verification runs concurrently with page retrieval. A candidate
+ * can reach a terminal outcome before the search worker inserts the page's
+ * channel_sightings, so the candidate-scoped reconciliation above finds no
+ * row and the later insert would stay pending forever. This page-scoped replay
+ * runs after sighting insertion (and on saved-page recovery) and applies every
+ * already-terminal admission outcome to that page's rows.
+ */
+export async function replayAdmissionOutcomesForPage(input: {
+  queryRunId: string;
+  pageNumber: number;
+  client?: AdmissionQueryable;
+}): Promise<number> {
+  const db = input.client || await getDb();
+  const reconciledAt = new Date().toISOString();
+  const result = await db.query(
+    `WITH scoped AS MATERIALIZED (
+       SELECT DISTINCT cs.id AS sighting_id,
+              c.id AS candidate_id
+         FROM channel_sightings cs
+         JOIN semantic_admission_sightings s
+           ON s.query_run_id=cs.query_run_id
+          AND s.page_number IS NOT DISTINCT FROM cs.page_number
+          AND (s.result_rank IS NULL OR s.result_rank=cs.result_rank)
+         JOIN semantic_admission_candidates c
+           ON c.id=s.candidate_id
+          AND c.channel_id=cs.channel_id
+        WHERE cs.query_run_id=$1
+          AND cs.page_number=$2
+          AND cs.was_known=false
+          AND (
+            cs.funnel_outcome IS NULL
+            OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
+            OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
+          )
+     ),
+     locked_candidates AS (
+       SELECT c.id,c.status
+         FROM semantic_admission_candidates c
+        WHERE c.id IN (SELECT candidate_id FROM scoped)
+        FOR SHARE
+     )
+     UPDATE channel_sightings cs
+        SET persisted = CASE
+              WHEN lc.status IN ('ADMITTED','ADMITTED_AMBIGUOUS') THEN true
+              ELSE false
+            END,
+            funnel_outcome = CASE lc.status
+              WHEN 'ADMITTED' THEN 'CLASSIFICATION_PENDING'
+              WHEN 'ADMITTED_AMBIGUOUS' THEN 'CLASSIFICATION_PENDING'
+              WHEN 'REJECTED_COUNTRY' THEN 'COUNTRY_REJECTED'
+              WHEN 'REJECTED_UNRELATED' THEN 'NON_TRADING'
+              WHEN 'NEEDS_REVIEW' THEN 'NEEDS_REVIEW'
+              ELSE 'UNCERTAIN'
+            END,
+            country_outcome = CASE
+              WHEN lc.status='REJECTED_COUNTRY' THEN 'REJECTED'
+              ELSE cs.country_outcome
+            END,
+            trading_outcome = CASE
+              WHEN lc.status IN ('REJECTED_COUNTRY','REJECTED_UNRELATED') THEN 'UNCERTAIN'
+              ELSE cs.trading_outcome
+            END,
+            metadata=COALESCE(cs.metadata,'{}'::jsonb)||jsonb_build_object(
+              'admissionStatus',lc.status,
+              'sightingOutcomeSource','ADMISSION',
+              'admissionSightingReconciledAt',$3::text
+            )
+       FROM scoped sc
+       JOIN locked_candidates lc ON lc.id=sc.candidate_id
+      WHERE cs.id=sc.sighting_id
+        AND cs.was_known=false
+        AND lc.status IN (
+          'ADMITTED','ADMITTED_AMBIGUOUS','REJECTED_COUNTRY','REJECTED_UNRELATED',
+          'NEEDS_REVIEW','EXPIRED_MISSING_EVIDENCE'
+        )
+        -- A repeat replay of the same terminal outcome is a no-op; only a
+        -- changed candidate status may replace an admission-owned projection.
+        AND cs.metadata->>'admissionStatus' IS DISTINCT FROM lc.status
+        -- The CTE may have waited on a classification writer's row lock.
+        -- Re-check the pending/source predicate on the locked target row so a
+        -- verdict committed while waiting is never overwritten.
+        AND (
+          cs.funnel_outcome IS NULL
+          OR cs.funnel_outcome IN ('CLASSIFICATION_PENDING','UNCERTAIN')
+          OR (cs.funnel_outcome='NEEDS_REVIEW' AND cs.metadata->>'sightingOutcomeSource'='ADMISSION')
+        )
+        AND (
+          lc.status NOT IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          OR EXISTS (
+            SELECT 1 FROM channels ch
+             WHERE ch.channel_id=cs.channel_id
+               AND ch.admitted_at IS NOT NULL
+               AND ch.admission_status IN ('ADMITTED','ADMITTED_AMBIGUOUS')
+          )
+        )`,
+    [input.queryRunId, input.pageNumber, reconciledAt],
+  );
+  return result.rowCount || 0;
+}
+
 export async function updateAdmissionCandidate(input: {
   id: string;
   status: AdmissionStatus;
@@ -283,7 +473,16 @@ export async function updateAdmissionCandidate(input: {
       input.expectedStatus ?? null, input.expectedAttempts ?? null,
     ],
   );
-  return result.rows[0] ? mapRow(result.rows[0]) : null;
+  const updated = result.rows[0] ? mapRow(result.rows[0]) : null;
+  if (updated && ADMISSION_SIGHTING_DISPOSITIONS[updated.status] && updated.status !== 'ADMITTED' && updated.status !== 'ADMITTED_AMBIGUOUS') {
+    await reconcileAdmissionSightings({
+      candidateId: updated.id,
+      channelId: updated.channel_id,
+      status: updated.status,
+      client: db,
+    });
+  }
+  return updated;
 }
 
 export async function recordAdmissionDecision(input: {
