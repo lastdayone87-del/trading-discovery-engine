@@ -6,7 +6,7 @@ export const CORPUS_POLICY_VERSION='corpus-policy-v1';
 export const EXTRACTOR_VERSION='deterministic-ngram-v1';
 export const OFFSET_SCHEME='UNICODE_CODE_POINT_V1';
 /** Keep the normalized span within a safe B-tree entry size. */
-export const MAX_CANDIDATE_SPAN_BYTES=512;
+export const MAX_CANDIDATE_SPAN_BYTES=2048;
 const word=/[\p{L}\p{N}][\p{L}\p{N}\p{M}'’.-]*/gu;
 const sha=(value:string)=>createHash('sha256').update(value).digest('hex');
 export interface CandidateSpan { literal:string; normalized:string; startOffset:number; endOffset:number; ngramSize:number; occurrenceKey:string }

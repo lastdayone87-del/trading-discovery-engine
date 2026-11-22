@@ -24,4 +24,8 @@ test('the migration runner builds the corpus scoring index concurrently before t
   const builder = dbCore.indexOf('const migration206');
   const loop = dbCore.indexOf('for (const file of files)');
   assert.ok(builder >= 0 && loop > builder, 'the concurrent index build must run before the transactional migration loop');
+  const ensure = dbCore.slice(dbCore.indexOf('async function ensureCorpusOccurrenceIndexes'), dbCore.indexOf('/**\n * Migration 168'));
+  assert.match(ensure, /DROP INDEX CONCURRENTLY IF EXISTS public\.\$\{name\}/);
+  assert.match(ensure, /USING btree \(normalized_span, document_id, start_offset\)/);
+  assert.match(ensure, /!definition\.includes\(' WHERE '\)/);
 });

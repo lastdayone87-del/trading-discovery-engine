@@ -25,7 +25,7 @@ BEGIN
     RAISE EXCEPTION 'idx_corpus_occurrences_normalized exists but is not valid/ready; rebuild it CONCURRENTLY out-of-band before applying migration 206';
   END IF;
 
-  IF index_oid IS NOT NULL AND pg_get_indexdef(index_oid) NOT LIKE '%USING btree (normalized_span, document_id, start_offset)%' THEN
+  IF index_oid IS NOT NULL AND (pg_get_indexdef(index_oid) NOT LIKE '%USING btree (normalized_span, document_id, start_offset)%' OR pg_get_indexdef(index_oid) LIKE '% WHERE %') THEN
     RAISE EXCEPTION 'idx_corpus_occurrences_normalized exists with the wrong table/columns; rebuild it CONCURRENTLY before applying migration 206';
   END IF;
 

@@ -741,7 +741,8 @@ async function ensureCorpusOccurrenceIndexes(client: { query: (text: string, val
   const row = existing.rows[0];
   const definition = String(row?.definition || '');
   const correct = definition.includes('corpus_candidate_occurrences')
-    && definition.includes('USING btree (normalized_span, document_id, start_offset)');
+    && definition.includes('USING btree (normalized_span, document_id, start_offset)')
+    && !definition.includes(' WHERE ');
   if (row?.indisvalid && row?.indisready && correct) return;
   if (row?.oid) {
     await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${name}`);
