@@ -166,17 +166,19 @@ export async function enqueueDeferredAiAdjudications(limit=50):Promise<number>{
 export async function processAiAdjudicationJob(job:{id:string;payload:any;attempts?:number}):Promise<void>{
   const p=job.payload;if(p.payloadSchemaVersion!==1||p.classifierVersion!==CLASSIFIER_VERSION)throw new Error('Unsupported AI_ADJUDICATE_CANDIDATE payload version.');const db=await getDb();const c=await db.query('SELECT * FROM candidate_scoring_controls WHERE singleton=true');
   if(!c.rowCount||c.rows[0].ai_paused){
-    // A pause is an operator control, not a failed adjudication. Keep the job
-    // owned but unclaimable until the control is re-enabled.
+    // A pause is an operator control, not a failed adjudication. Defer the job
+    // for retry without consuming its bounded attempts.
     await rescheduleJob(job.id,new Date(Date.now()+60*60_000).toISOString(),'AI_ADJUDICATION_PAUSED',{attemptNumber:job.attempts});
     return;
   }
   const usage=await db.query(`SELECT count(*)::int n,COALESCE(sum(cost_microunits),0)::bigint cost FROM candidate_adjudication_results WHERE completed_at>=date_trunc('day',now())`);const reservedCost=Math.max(0,Number(process.env.CANDIDATE_AI_COST_MICROUNITS||0));
   if(usage.rows[0].n>=c.rows[0].daily_ai_assertions||Number(usage.rows[0].cost)+reservedCost>Number(c.rows[0].max_ai_cost_microunits)){
     // Budget exhaustion must not consume the bounded attempts before any
-    // provider work starts. Defer to the next UTC day instead of failing.
-    const nextDay=new Date();nextDay.setUTCHours(24,0,0,0);
-    await rescheduleJob(job.id,nextDay.toISOString(),'AI_BUDGET_EXHAUSTED',{attemptNumber:job.attempts});
+    // provider work starts. Defer to the database's next day boundary so the
+    // SQL budget window and the retry window use the same timezone.
+    const nextDay=await db.query(`SELECT (date_trunc('day',now())+interval '1 day') AS next_day`);
+    const retryAt=nextDay.rows[0]?.next_day ? new Date(nextDay.rows[0].next_day) : new Date(Date.now()+24*60*60_000);
+    await rescheduleJob(job.id,retryAt.toISOString(),'AI_BUDGET_EXHAUSTED',{attemptNumber:job.attempts});
     return;
   }
   const key=process.env.GEMINI_API_KEY;if(!key)throw new Error('GEMINI_API_KEY is not configured.');const ai=new GoogleGenAI({apiKey:key});const prompt=`Classify only the literal source span below. Never rewrite or add a term. Abstain when uncertain. Return exactly JSON keys literalSpan,label,confidence,abstained,reasonCodes. Closed labels: ${ASSERTION_LABELS.join(',')}. literalSpan=${JSON.stringify(p.literalSpan)}`;

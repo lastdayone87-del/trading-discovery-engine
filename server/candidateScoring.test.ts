@@ -7,6 +7,7 @@ const evidence=(span:string,cluster='c1',day='2026-07-01')=>({normalizedSpan:spa
 
 test('AI adjudication jobs are only admitted when the paid control is enabled and funded',()=>{
   assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:1000}),true);
+  assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:'10',max_ai_cost_microunits:'1000'}),true);
   assert.equal(aiAdjudicationAdmitted({ai_paused:true,daily_ai_assertions:10,max_ai_cost_microunits:1000}),false);
   assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:0,max_ai_cost_microunits:1000}),false);
   assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:0}),false);
@@ -23,6 +24,7 @@ test('ambiguous scoring only enqueues AI work through the paid-control gate',()=
 test('AI enqueue capacity is bounded by today\'s remaining assertion and cost headroom',()=>{
   const control={ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:1000};
   assert.equal(aiAdjudicationCapacity(control,0,0,10),10);
+  assert.equal(aiAdjudicationCapacity({...control,daily_ai_assertions:'10',max_ai_cost_microunits:'1000'},0,0,10),10);
   assert.equal(aiAdjudicationCapacity(control,9,0,10),1);
   assert.equal(aiAdjudicationCapacity(control,0,950,10),5);
   assert.equal(aiAdjudicationCapacity(control,10,0,10),0);
@@ -32,7 +34,7 @@ test('AI enqueue capacity is bounded by today\'s remaining assertion and cost he
   assert.equal(aiAdjudicationCapacity({...control,ai_paused:true},0,0,10,0),0);
 });
 
-test('AI budget and pause deferrals do not consume bounded attempts',()=>{
+test('AI budget and pause deferrals are coded as reschedules',()=>{
   const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
   assert.match(source,/AI_ADJUDICATION_PAUSED/);
   assert.match(source,/AI_BUDGET_EXHAUSTED/);
