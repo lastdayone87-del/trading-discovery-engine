@@ -374,7 +374,7 @@ test('start is idempotent and stop ends the interval', async () => {
 
 test('the claim path keeps only claim-critical stale-job recovery', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
-  assert.match(queue, /await recoverStaleJobs\(\);/);
+  assert.match(queue, /recoverStaleJobs\(JOB_STALE_AFTER_MINUTES\)/);
   for (const moved of [
     'recoverStaleChannelLocks',
     'recoverStaleInvestigationSteps',
@@ -388,7 +388,7 @@ test('the claim path keeps only claim-critical stale-job recovery', () => {
     assert.doesNotMatch(queue, new RegExp(moved), `${moved} must not run in the claim path`);
   }
 
-  const recoveryAt = queue.indexOf('await recoverStaleJobs();');
+  const recoveryAt = queue.indexOf('recoverStaleJobs(JOB_STALE_AFTER_MINUTES)');
   const statusAt = queue.indexOf('const qStatus = await getQueueStatus();', recoveryAt);
   const claimAt = queue.indexOf('claimNextJob(', recoveryAt);
   assert.ok(recoveryAt >= 0, 'stale job recovery stays in the claim path');

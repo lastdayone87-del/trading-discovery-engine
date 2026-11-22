@@ -82,6 +82,12 @@ const MIGRATION_ADVISORY_LOCK = 741963284;
 
 let pool: InstanceType<typeof Pool> | null = null;
 let initPromise: Promise<InstanceType<typeof Pool>> | null = null;
+/**
+ * Heartbeats must not queue behind saturated general-purpose pools. Two
+ * dedicated connections are enough for all workers at a 60s interval and keep
+ * a healthy long-running job from being misclassified as stale.
+ */
+let heartbeatPool: InstanceType<typeof Pool> | null = null;
 
 const TRANSIENT_PG_STARTUP_CODES = new Set(['57P03','57P01','53300','08000','08001','08003','08006']);
 const TRANSIENT_PG_NETWORK_CODES = new Set(['ECONNREFUSED','ECONNRESET','ETIMEDOUT','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH']);
@@ -141,6 +147,49 @@ function postgresSslOptions(): false | { rejectUnauthorized: false } | undefined
   return process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined;
 }
 
+/**
+ * Runtime pool sizing. The historical node-postgres default of 10 connections
+ * is below the combined worker count once admission, classification, process,
+ * enrichment, search and maintenance lanes run concurrently. Pool starvation
+ * delays heartbeats and makes healthy jobs look stale, so size explicitly.
+ */
+export function databasePoolMax(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.DATABASE_POOL_MAX || '25');
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.min(50, Math.floor(parsed)) : 25;
+}
+
+/** Abort a transaction that was left idle by a caller bug. */
+export function databaseIdleInTransactionTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS || '60000');
+  return Number.isFinite(parsed) && parsed >= 1_000
+    ? Math.min(600_000, Math.floor(parsed))
+    : 60_000;
+}
+
+function postgresSessionOptions(idleInTransactionTimeoutMs = databaseIdleInTransactionTimeoutMs()): string {
+  return `-c idle_in_transaction_session_timeout=${idleInTransactionTimeoutMs}`;
+}
+
+function runtimePoolConfig(connectionString: string, max: number, applicationName: string) {
+  return {
+    connectionString,
+    ssl: postgresSslOptions(),
+    max,
+    application_name: applicationName,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+    options: postgresSessionOptions(),
+  };
+}
+
+function getHeartbeatDb(): InstanceType<typeof Pool> {
+  heartbeatPool ??= new Pool({
+    ...runtimePoolConfig(requireDatabaseUrl(), 2, 'trading-discovery-heartbeat'),
+    connectionTimeoutMillis: 5_000,
+  });
+  return heartbeatPool;
+}
+
 export async function getDb(): Promise<InstanceType<typeof Pool>> {
   // `pool` is assigned before connectivity checks, migrations, and default-data
   // seeding finish. Always join an in-flight initialization before exposing it;
@@ -150,7 +199,7 @@ export async function getDb(): Promise<InstanceType<typeof Pool>> {
   if (pool) return pool;
   initPromise = (async () => {
     const connectionString = requireDatabaseUrl();
-    pool = new Pool({ connectionString, ssl: postgresSslOptions() });
+    pool = new Pool(runtimePoolConfig(connectionString, databasePoolMax(), 'trading-discovery-engine'));
     try {
       await waitForPostgresReady(pool);
       await runMigrations();
@@ -178,11 +227,8 @@ export function createReadOnlyDbPool(
   applicationName = 'phase0-url-work-ledger-report',
 ): InstanceType<typeof Pool> {
   return new Pool({
-    connectionString: requireDatabaseUrl(),
-    ssl: postgresSslOptions(),
-    max: 1,
-    application_name: applicationName,
-    options: '-c default_transaction_read_only=on',
+    ...runtimePoolConfig(requireDatabaseUrl(), 1, applicationName),
+    options: '-c default_transaction_read_only=on -c idle_in_transaction_session_timeout=60000',
   });
 }
 
@@ -195,12 +241,7 @@ export function createReadOnlyDbPool(
 export function createOperatorWriteDbPool(
   applicationName = 'phase0-operator-write',
 ): InstanceType<typeof Pool> {
-  return new Pool({
-    connectionString: requireDatabaseUrl(),
-    ssl: postgresSslOptions(),
-    max: 1,
-    application_name: applicationName,
-  });
+  return new Pool(runtimePoolConfig(requireDatabaseUrl(), 1, applicationName));
 }
 
 export function saveDb(): void {
@@ -4267,7 +4308,12 @@ export async function recoverStaleChannelLocks(staleAfterMinutes=STALE_CHANNEL_L
  * worker stalls from queue depth. Recovery behavior itself is unchanged.
  */
 export function summarizeRecoveredStaleJobs(rows:Array<{type?:unknown;locked_at?:unknown}>,nowMs=Date.now()):{recovered:number;byType:Record<string,number>;oldestStuckMs:number}{const byType:Record<string,number>={};let oldestStuckMs=0;for(const row of rows){const type=typeof row.type==='string'&&row.type?row.type:'UNKNOWN';byType[type]=(byType[type]||0)+1;const lockedAt=typeof row.locked_at==='string'?Date.parse(row.locked_at):row.locked_at instanceof Date?row.locked_at.getTime():NaN;if(Number.isFinite(lockedAt))oldestStuckMs=Math.max(oldestStuckMs,nowMs-lockedAt);}return {recovered:rows.length,byType,oldestStuckMs};}
-export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);}
+export async function heartbeatJob(jobId:string,workerId:string):Promise<void>{
+  // Dedicated pool: a busy general pool must never delay the lease update and
+  // turn an actively progressing job into a stale one.
+  const db=getHeartbeatDb();
+  await db.query(`UPDATE jobs SET locked_at=now(),updated_at=now() WHERE id=$1 AND status='PROCESSING' AND locked_by=$2`,[jobId,workerId]);
+}
 
 export async function getSchedulerState(name='autonomous_discovery'):Promise<any>{const db=await getDb(); const res=await db.query('SELECT * FROM scheduler_state WHERE name=$1',[name]); return res.rows[0]||null;}
 export async function updateSchedulerState(name:string,patch:Record<string,any>):Promise<void>{const db=await getDb(); const current=await getSchedulerState(name); if(!current) await db.query('INSERT INTO scheduler_state(name) VALUES($1) ON CONFLICT DO NOTHING',[name]); const sets=Object.keys(patch).map((k,i)=>`${k}=$${i+2}`).join(','); if(sets) await db.query(`UPDATE scheduler_state SET ${sets},updated_at=now() WHERE name=$1`,[name,...Object.values(patch).map(v=>typeof v==='object'&&v!==null?JSON.stringify(v):v)]);}

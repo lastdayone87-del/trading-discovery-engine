@@ -124,7 +124,7 @@ export function assessAdmissionEvidenceCoverage(input: {
  * costs two units; the full-description fetch costs one more. A failure is
  * returned as PARTIAL evidence so the caller can retry instead of guessing.
  */
-export async function fetchAdmissionEvidence(input: {
+export interface AdmissionEvidenceInput {
   candidate: DiscoveredChannelRaw;
   targetCountry: string;
   source: AdmissionEvidence['source'];
@@ -135,8 +135,17 @@ export async function fetchAdmissionEvidence(input: {
   resultRank?: number;
   /** Stage 2 is a bounded playlist fallback for retries, never stage 1. */
   stage?: 1 | 2 | 3;
-}): Promise<AdmissionEvidence> {
-  const base: AdmissionEvidence = {
+}
+
+export function admissionEvidenceTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.ADMISSION_EVIDENCE_TIMEOUT_MS || '120000');
+  return Number.isFinite(parsed) && parsed >= 5_000
+    ? Math.min(600_000, Math.floor(parsed))
+    : 120_000;
+}
+
+function admissionEvidenceBase(input: AdmissionEvidenceInput): AdmissionEvidence {
+  return {
     channelId: input.candidate.channelId,
     channelName: input.candidate.channelName,
     youtubeUrl: input.candidate.youtubeUrl,
@@ -160,6 +169,33 @@ export async function fetchAdmissionEvidence(input: {
     evidenceStage: input.stage || 1,
     fetchedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Bound the whole evidence acquisition. The unbounded path retries keys and
+ * keyless fallbacks; a stuck provider must return a partial, retryable
+ * observation instead of holding an admission worker for the 15-minute stale
+ * recovery window. Overlapping work may finish later but performs no writes.
+ */
+export async function fetchAdmissionEvidence(input: AdmissionEvidenceInput): Promise<AdmissionEvidence> {
+  const timeoutMs = admissionEvidenceTimeoutMs();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<AdmissionEvidence>((resolve) => {
+    timer = setTimeout(() => resolve({
+      ...admissionEvidenceBase(input),
+      failureReason: 'ADMISSION_EVIDENCE_TIMEOUT',
+    }), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([fetchAdmissionEvidenceUnbounded(input), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function fetchAdmissionEvidenceUnbounded(input: AdmissionEvidenceInput): Promise<AdmissionEvidence> {
+  const base = admissionEvidenceBase(input);
   try {
     const enriched = await fetchYouTubeChannelEnrichment(input.candidate.channelId, input.candidate, input.stage || 1);
     const ids = (enriched.videos || []).map(video => String(video.id || '')).filter(Boolean);

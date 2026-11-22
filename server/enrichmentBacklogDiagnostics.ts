@@ -1,5 +1,5 @@
 import { getDb } from './db';
-import { CLASSIFICATION_JOB_TYPE, resolveEnrichmentWorkerCount } from './classificationDecoupling';
+import { CLASSIFICATION_JOB_TYPE, resolveDiscoveryWorkerLanePlan, resolveEnrichmentWorkerCount } from './classificationDecoupling';
 import { diagnoseEnrichmentBacklog } from './enrichmentBacklogDiagnosis';
 import { semanticPrefilterSnapshot } from './semanticPrefilter';
 import { enrichmentScaleMetricsTimeoutMs, enrichmentScaleThresholds, evaluateEnrichmentScaleGate, getRunningEnrichmentWorkerCount, loadEnrichmentScaleMetricsWithinDeadline } from './enrichmentScaleGate';
@@ -184,6 +184,7 @@ export async function getEnrichmentBacklogDiagnostics(requestedLimit=10):Promise
  */
 async function phase4Diagnostics():Promise<any>{
   const requestedWorkers=resolveEnrichmentWorkerCount();
+  const lanePlan=resolveDiscoveryWorkerLanePlan();
   const thresholds=enrichmentScaleThresholds();
   let semanticCache:any=null;
   let enrichmentScale:any=null;
@@ -203,11 +204,12 @@ async function phase4Diagnostics():Promise<any>{
   try{
     const metrics=await loadEnrichmentScaleMetricsWithinDeadline();
     if(!metrics)throw new Error('Enrichment scale metrics unavailable: the query failed or did not settle before the deadline.');
-    enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,metrics,decision:evaluateEnrichmentScaleGate(metrics,thresholds,requestedWorkers)};
+    enrichmentScale={advisory:true,lanePlan,runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,metrics,decision:evaluateEnrichmentScaleGate(metrics,thresholds,requestedWorkers)};
   }catch(error){
-    enrichmentScale={runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,thresholds,requestedWorkers)};
+    enrichmentScale={advisory:true,lanePlan,runningWorkers:getRunningEnrichmentWorkerCount(),liveDecision:true,unavailable:error instanceof Error?error.message:'unavailable',decision:evaluateEnrichmentScaleGate(undefined,thresholds,requestedWorkers)};
   }
   return {
+    lanePlan,
     semanticPrefilter:semanticPrefilterSnapshot(),
     semanticCache,
     enrichmentScale
