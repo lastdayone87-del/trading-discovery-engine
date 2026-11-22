@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { aiAdjudicationAdmitted, aiAdjudicationCapacity, scoreCandidate, validateBoundedAssertion } from './candidateScoring';
+import { aiAdjudicationAdmitted, aiAdjudicationCapacity, scoreCandidate, scoringBatchSize, SCORING_BATCH_GROUPS, validateBoundedAssertion } from './candidateScoring';
 
 const evidence=(span:string,cluster='c1',day='2026-07-01')=>({normalizedSpan:span,literalSpan:span,documentId:`d-${cluster}-${day}`,clusterKey:cluster,sourceType:'CHANNEL_METADATA',observedAt:`${day}T00:00:00.000Z`,language:'en',startOffset:0,endOffset:Array.from(span).length});
 
@@ -12,6 +12,28 @@ test('AI adjudication jobs are only admitted when the paid control is enabled an
   assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:0,max_ai_cost_microunits:1000}),false);
   assert.equal(aiAdjudicationAdmitted({ai_paused:false,daily_ai_assertions:10,max_ai_cost_microunits:0}),false);
   assert.equal(aiAdjudicationAdmitted(null),false);
+});
+
+test('scoring slices are bounded by the remaining daily budget',()=>{
+  assert.equal(scoringBatchSize(0),0);
+  assert.equal(scoringBatchSize(6),6);
+  assert.equal(scoringBatchSize(500),SCORING_BATCH_GROUPS);
+  assert.equal(scoringBatchSize(500,25),25);
+  assert.equal(scoringBatchSize(500,0),SCORING_BATCH_GROUPS);
+});
+
+test('scoring continues through a durable bounded cursor without consuming attempts',()=>{
+  const source=readFileSync(new URL('./candidateScoring.ts',import.meta.url),'utf8');
+  assert.match(source,/SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences WHERE document_id=\$1/);
+  assert.match(source,/normalized_span>\$2/);
+  assert.match(source,/ANY\(\$1::text\[\]\)/);
+  assert.match(source,/SCORING_BATCH_CONTINUE/);
+  assert.match(source,/cursor:lastSpan/);
+  assert.match(source,/SCORING_DAILY_BUDGET_EXHAUSTED/);
+  assert.match(source,/SCORING_PAUSED/);
+  assert.match(source,/rescheduleJob\(job\.id/);
+  const db=readFileSync(new URL('./dbCore.ts',import.meta.url),'utf8');
+  assert.match(db,/payload=COALESCE\(\$7::jsonb,payload\)/);
 });
 
 test('ambiguous scoring only enqueues AI work through the paid-control gate',()=>{

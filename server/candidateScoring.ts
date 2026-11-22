@@ -9,11 +9,24 @@ export const CLASSIFIER_VERSION='bounded-semantic-v1';
 export const PROMPT_VERSION='candidate-adjudication-prompt-v1';
 export const ASSERTION_SCHEMA_VERSION='candidate-assertion-schema-v1';
 export const ASSERTION_LABELS=['TRADING','NON_TRADING','AMBIGUOUS','SPAM','BRAND','PERSON','GENERIC','OTHER'] as const;
+/**
+ * One document can yield hundreds of distinct normalized spans. Processing
+ * all of them in one job loads a very large evidence set and can exceed the
+ * daily snapshot budget, which strands the job instead of making progress.
+ * Bound each run and continue from a durable cursor.
+ */
+export const SCORING_BATCH_GROUPS=50;
 export type AssertionLabel=typeof ASSERTION_LABELS[number];
 const sha=(v:string)=>createHash('sha256').update(v).digest('hex');
 const generic=new Set(['the','and','for','with','from','this','that','video','channel','official','new','live','today','finance','money','market']);
 const trading=/\b(trad(?:e|er|ing)|forex|futures?|options?|stocks?|crypto|bitcoin|price action|order flow|technical analysis|prop firm|invest(?:ing|ment))\b/iu;
 const injection=/\b(ignore (?:all |previous )?instructions|system prompt|developer message|jailbreak|respond with)\b/iu;
+
+export function scoringBatchSize(remaining:number, configured=SCORING_BATCH_GROUPS):number{
+  const left=Math.max(0,Math.floor(Number(remaining)||0));
+  const bounded=Math.max(1,Math.floor(Number(configured)||SCORING_BATCH_GROUPS));
+  return Math.min(left,bounded);
+}
 
 export interface CandidateEvidence {normalizedSpan:string;literalSpan:string;documentId:string;clusterKey:string;sourceType:string;observedAt:string;language:string;startOffset:number;endOffset:number}
 export interface CandidateFeatures {frequency:number;independentClusters:number;sourceDiversity:number;activeDays:number;temporalStability:number;burstScore:number;backgroundLift:number;languageAffinity:Record<string,number>;anomalyScore:number}
@@ -103,16 +116,41 @@ export function aiAdjudicationCapacity(
 export async function enqueueCandidateScoring(documentId:string):Promise<void>{await enqueueJob('SCORE_CANDIDATES',{payloadSchemaVersion:1,documentId,featureSetVersion:FEATURE_SET_VERSION},{priority:4,maxAttempts:3,idempotencyKey:`candidate-score:${documentId}:${FEATURE_SET_VERSION}`});}
 
 export async function processCandidateScoringJob(job:{id:string;payload:any}):Promise<void>{
-  const p=job.payload;if(p.payloadSchemaVersion!==1||p.featureSetVersion!==FEATURE_SET_VERSION)throw new Error('Unsupported SCORE_CANDIDATES payload version.');const db=await getDb();
-  const control=await db.query('SELECT * FROM candidate_scoring_controls WHERE singleton=true');if(!control.rowCount||control.rows[0].scoring_paused)throw new Error('Candidate scoring is paused.');
-  const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);if(spent.rows[0].n>=control.rows[0].daily_scoring_candidates)throw new Error('Candidate scoring daily budget is exhausted.');
+  const p=job.payload;
+  if(p.payloadSchemaVersion!==1||p.featureSetVersion!==FEATURE_SET_VERSION)throw new Error('Unsupported SCORE_CANDIDATES payload version.');
+  const db=await getDb();
+  const control=await db.query('SELECT * FROM candidate_scoring_controls WHERE singleton=true');
+  if(!control.rowCount||control.rows[0].scoring_paused){
+    // An operator pause is not a candidate failure. Defer without consuming a
+    // bounded attempt so the document resumes when scoring is re-enabled.
+    await rescheduleJob(job.id,new Date(Date.now()+60*60_000).toISOString(),'SCORING_PAUSED');
+    return;
+  }
+  const spent=await db.query(`SELECT count(*)::int n FROM candidate_feature_snapshots WHERE computed_at>=date_trunc('day',now())`);
+  const remaining=Math.max(0,Number(control.rows[0].daily_scoring_candidates)-Number(spent.rows[0].n));
+  if(remaining<=0){
+    // Keep the document queued for the next database day instead of failing it
+    // before any scoring work starts.
+    const nextDay=await db.query(`SELECT (date_trunc('day',now())+interval '1 day') AS next_day`);
+    const retryAt=nextDay.rows[0]?.next_day?new Date(nextDay.rows[0].next_day):new Date(Date.now()+24*60*60_000);
+    await rescheduleJob(job.id,retryAt.toISOString(),'SCORING_DAILY_BUDGET_EXHAUSTED',undefined,p);
+    return;
+  }
+  // Process at most one bounded slice of the document, and never more spans
+  // than the remaining daily snapshot budget allows.
+  const batchSize=scoringBatchSize(remaining);
+  const cursor=typeof p.cursor==='string'&&p.cursor.length?p.cursor:null;
+  const spans=await db.query(`SELECT DISTINCT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1 AND ($2::text IS NULL OR normalized_span>$2) ORDER BY normalized_span LIMIT $3`,[p.documentId,cursor,batchSize]);
+  if(!spans.rowCount){await completeJob(job.id);return;}
+  const spanList=spans.rows.map((row:any)=>String(row.normalized_span));
+  const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span=ANY($1::text[]) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[spanList]);
+  const groups=new Map<string,CandidateEvidence[]>();
+  for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
+  if(groups.size>remaining)throw new Error('Candidate scoring batch exceeds the remaining daily budget.');
   const aiUsage=await db.query(`SELECT count(*)::int n,COALESCE(sum(cost_microunits),0)::bigint cost FROM candidate_adjudication_results WHERE completed_at>=date_trunc('day',now())`);
   const aiReservedCost=Math.max(0,Number(process.env.CANDIDATE_AI_COST_MICROUNITS||0));
   const aiActive=await db.query(`SELECT count(*)::int n FROM jobs WHERE type='AI_ADJUDICATE_CANDIDATE' AND status IN ('PENDING','PROCESSING')`);
   const aiCapacity=aiAdjudicationCapacity(control.rows[0],Number(aiUsage.rows[0]?.n||0),Number(aiUsage.rows[0]?.cost||0),aiReservedCost,Number(aiActive.rows[0]?.n||0));
-  const values=await db.query(`SELECT o.normalized_span,o.literal_span,o.document_id::text,a.entity_cluster_key,a.source_type,a.observed_at,d.language,o.start_offset,o.end_offset FROM corpus_candidate_occurrences o JOIN corpus_documents d ON d.id=o.document_id JOIN corpus_source_artifacts a ON a.id=d.artifact_id WHERE o.normalized_span IN(SELECT normalized_span FROM corpus_candidate_occurrences WHERE document_id=$1) ORDER BY o.normalized_span,a.observed_at,o.occurrence_key`,[p.documentId]);
-  const groups=new Map<string,CandidateEvidence[]>();for(const r of values.rows){const row:CandidateEvidence={normalizedSpan:r.normalized_span,literalSpan:r.literal_span,documentId:r.document_id,clusterKey:r.entity_cluster_key,sourceType:r.source_type,observedAt:new Date(r.observed_at).toISOString(),language:r.language,startOffset:r.start_offset,endOffset:r.end_offset};groups.set(row.normalizedSpan,[...(groups.get(row.normalizedSpan)||[]),row]);}
-  if(groups.size>Number(control.rows[0].daily_scoring_candidates)-Number(spent.rows[0].n))throw new Error('Candidate scoring job exceeds the remaining daily budget.');
   const aiAdmitted=aiCapacity>0;
   let deferredAi=0;
   let aiEnqueued=0;
@@ -127,6 +165,14 @@ export async function processCandidateScoringJob(job:{id:string;payload:any}):Pr
     }
   }
   if(deferredAi>0)console.info(JSON.stringify({event:'candidate_ai_adjudication_deferred',count:deferredAi,reason:control.rows[0]?.ai_paused?'AI_PAUSED':'AI_BUDGET_UNAVAILABLE',timestamp:new Date().toISOString()}));
+  const lastSpan=spanList[spanList.length-1];
+  const hasMore=spans.rowCount===batchSize&&(await db.query(`SELECT 1 FROM corpus_candidate_occurrences WHERE document_id=$1 AND normalized_span>$2 LIMIT 1`,[p.documentId,lastSpan])).rowCount>0;
+  if(hasMore){
+    // Persist the cursor in the job payload and return the job to PENDING
+    // without consuming an attempt. The next claim continues this document.
+    await rescheduleJob(job.id,new Date(Date.now()+1_000).toISOString(),'SCORING_BATCH_CONTINUE',undefined,{...p,cursor:lastSpan});
+    return;
+  }
   await completeJob(job.id);
 }
 
