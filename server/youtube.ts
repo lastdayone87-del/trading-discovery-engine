@@ -1774,10 +1774,10 @@ export async function fetchYouTubeChannelEnrichment(
     throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
   }
   // Fail fast on a durably quarantined channel before touching any key.
-  await throwIfYouTubeInputQuarantined('channel-uploads', {
+  await throwIfYouTubeInputQuarantined('channel-details', {
     channelId,
-    signature: youtubeRequestSignature('youtube', 'channel-uploads', {
-      id: channelId, part: 'snippet,contentDetails,statistics',
+    signature: youtubeRequestSignature('youtube', 'channel-details', {
+      id: channelId, part: 'snippet,brandingSettings,statistics,contentDetails,topicDetails',
     }),
   });
   const acquisition = youtubePoolBackoff.beginAcquisition();

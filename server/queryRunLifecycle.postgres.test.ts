@@ -94,28 +94,38 @@ test('Stage 4 PostgreSQL: a quarantined search input cools the query without sho
        VALUES($1,'LU','EXPERIMENTAL','GENERAL',$1) RETURNING id`, [suffix]
     )).rows[0].id;
     await db.query(
-      `INSERT INTO youtube_invalid_input_quarantine(input_kind,input_value,operation,first_seen,last_seen,hits,expires_at)
-       VALUES('searchQuery',$1,'search-test',now(),now(),1,now()+interval '2 days')
-       ON CONFLICT(input_kind,input_value) DO UPDATE SET expires_at=EXCLUDED.expires_at`,
+      `INSERT INTO youtube_invalid_input_quarantine(provider,input_kind,input_value,operation,request_signature,first_seen,last_seen,hits,expires_at)
+       VALUES('youtube','searchQuery',$1,'search-test','test-signature',now(),now(),1,now()+interval '2 days')
+       ON CONFLICT(provider,input_kind,input_value,operation,request_signature)
+       DO UPDATE SET expires_at=EXCLUDED.expires_at`,
       [value]
     );
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
+    const singleProviderDb = {
+      query: (text: string, params?: unknown[]) => text.includes('discovery_provider_registry')
+        ? Promise.resolve({ rows: [{ n: 1 }] })
+        : db.query(text, params),
+    };
+    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, singleProviderDb);
     let row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
     let days = (new Date(row.next_eligible_at).getTime() - Date.now()) / 86_400_000;
     assert.ok(days > 1.9 && days < 2.1, `expected the quarantine expiry, got ${days} days`);
 
     await db.query(`UPDATE query_library SET next_eligible_at=now()+interval '10 days' WHERE id=$1`, [queryId]);
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
+    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, singleProviderDb);
     row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
     days = (new Date(row.next_eligible_at).getTime() - Date.now()) / 86_400_000;
     assert.ok(days > 9.9, `expected the later cooldown to win, got ${days} days`);
 
-    await db.query('DELETE FROM youtube_invalid_input_quarantine WHERE input_value=$1', [value]);
     await db.query('UPDATE query_library SET next_eligible_at=NULL WHERE id=$1', [queryId]);
-    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, db);
+    const alternateProviderDb = {
+      query: (text: string, params?: unknown[]) => text.includes('discovery_provider_registry')
+        ? Promise.resolve({ rows: [{ n: 2 }] })
+        : db.query(text, params),
+    };
+    await coolQueryForProviderQuarantine(queryId, 'searchQuery', value, alternateProviderDb);
     row = (await db.query('SELECT next_eligible_at FROM query_library WHERE id=$1', [queryId])).rows[0];
-    const hours = (new Date(row.next_eligible_at).getTime() - Date.now()) / 3_600_000;
-    assert.ok(hours > 0.9 && hours < 1.1, `expected the one-hour fallback, got ${hours} hours`);
+    assert.equal(row.next_eligible_at, null, 'a second healthy provider must keep the query eligible');
+    await db.query('DELETE FROM youtube_invalid_input_quarantine WHERE input_value=$1', [value]);
   } finally {
     if (queryId) await db.query('DELETE FROM query_library WHERE id=$1', [queryId]).catch(() => undefined);
     await db.query('DELETE FROM youtube_invalid_input_quarantine WHERE input_value=$1', [value]).catch(() => undefined);

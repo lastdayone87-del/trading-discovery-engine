@@ -5901,6 +5901,15 @@ export async function coolQueryForProviderQuarantine(
 ): Promise<void> {
   if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
   const db = runner || await getDb();
+  // A query-level cooldown blocks every provider and retrieval shape. When a
+  // second search provider is active, keep the query eligible so the healthy
+  // surface can serve it; the exact pre-dispatch signature gate still blocks
+  // the failed request shape.
+  const alternatives = await db.query(
+    `SELECT COUNT(*)::int AS n FROM discovery_provider_registry
+      WHERE mode IN ('ACTIVE','ACTIVE_GLOBAL') AND capabilities ? 'SEARCH_YOUTUBE'`,
+  );
+  if (Number(alternatives.rows[0]?.n || 0) > 1) return;
   const quarantine = await db.query(
     `SELECT MAX(expires_at) AS expires_at FROM youtube_invalid_input_quarantine
       WHERE input_kind=$1 AND input_value=$2`,
