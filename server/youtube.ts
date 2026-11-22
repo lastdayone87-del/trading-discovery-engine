@@ -63,6 +63,7 @@ import { fetchPublicAboutEvidence } from './youtubePublicAbout';
 import { hasMeaningfulCreatorText } from './evidenceEngine/creatorText';
 import { countrySearchHints, normalizeLanguageCode } from './countrySearchHints';
 import { assertYouTubeRelevanceLanguage } from './youtubeLanguageSupport';
+import { youtubeRequestSignature } from './youtubeQuarantineSignature';
 import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from './youtubePoolBackoff';
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
@@ -497,13 +498,18 @@ export function isYouTubeQuarantinedInput(error: unknown): boolean {
  * loops, so a bad input aborts instead of burning through every key. */
 export async function throwIfYouTubeInputQuarantined(
   operation: string,
-  input: { channelId?: string | null; query?: string | null },
+  input: { channelId?: string | null; query?: string | null; signature?: string | null; provider?: string },
 ): Promise<void> {
   const raw = input.channelId || input.query || null;
   const kind: YouTubeQuarantineInputKind = input.channelId ? 'channelId' : 'searchQuery';
   const value = normalizeYouTubeQuarantineInput(kind, raw);
-  if (!value) return;
-  if (await isYouTubeInputQuarantined(kind, value)) {
+  const provider = input.provider || 'youtube';
+  const signature = input.signature || youtubeRequestSignature(provider, operation, {
+    channelId: input.channelId || undefined,
+    q: input.query || undefined,
+  });
+  if (!value || !signature) return;
+  if (await isYouTubeInputQuarantined(provider, kind, value, operation, signature)) {
     throw new YouTubeQuarantinedInputError(kind, value, operation);
   }
 }
@@ -870,7 +876,7 @@ async function youtubeFetch(url:string,operation:string,actualCost:number,attemp
             else if(isInvalidApiKey(error)) await persistYouTubeKeySuspension(dispatchedProviderKey,'INVALID_API_KEY').catch(()=>undefined);
             else if(isYouTubeInputFailure(error) && !isYouTubePageTokenFailure(error)){
               const input=extractYouTubeQuarantineInput(operation,dispatchedUrl);
-              if(input) await recordYouTubeInvalidInput(input.kind,input.value,operation,YOUTUBE_INPUT_QUARANTINE_TTL_MS).catch(()=>undefined);
+              if(input) await recordYouTubeInvalidInput(input.provider,input.kind,input.value,input.operation,YOUTUBE_INPUT_QUARANTINE_TTL_MS,input.signature).catch(()=>undefined);
             }
             if(permanentInput){
               // Google charges at least one unit even for invalid requests, so
@@ -1192,13 +1198,23 @@ export async function searchYouTubeChannelPage(
   assertOfficialYouTubeQuotaOriginKnown('searchYouTubeChannelPage');
   const sanitizedQuery = sanitizeSearchQuery(query, countryName);
   if (!sanitizedQuery) return { channels: [], nextPageToken: null, rawResultCount: 0 };
-  // Fail fast on a durably quarantined query before touching any key.
-  await throwIfYouTubeInputQuarantined('search', { query: sanitizedQuery });
   const searchHints = countrySearchHints(countryName, vocab?.languages || [], lifecycle?.preferredLanguage);
   // Invariant guard: countrySearchHints already resolves a provider-supported
   // value, but a future profile or caller must fail before dispatch instead of
   // sending a value YouTube rejects and quarantining the query.
   const relevanceLanguage = assertYouTubeRelevanceLanguage(searchHints.relevanceLanguage);
+  const searchType = lane === 'VIDEO' ? 'video' : 'channel';
+  // Fail fast on a durably quarantined request shape before touching any key.
+  // The signature scopes the block to this provider/operation/parameter set.
+  await throwIfYouTubeInputQuarantined('search', {
+    query: sanitizedQuery,
+    signature: youtubeRequestSignature('youtube', 'search', {
+      part: 'snippet', type: searchType, order: youtubeOrder(ordering),
+      regionCode: searchHints.regionCode, relevanceLanguage,
+      publishedAfter: searchWindow?.publishedAfter,
+      publishedBefore: searchWindow?.publishedBefore,
+    }),
+  });
 
   const keyPool = getYouTubeKeyPool();
   const configuredMaxResults = Number(await getAppSetting('youtube_discovery_max_results', process.env.YOUTUBE_DISCOVERY_MAX_RESULTS || '25'));
@@ -1224,7 +1240,6 @@ export async function searchYouTubeChannelPage(
       try {
         console.log(`[YouTube API Pool] Attempting search with key #${currentIndex + 1}/${keyPool.length} (${apiKey.slice(0, 6)}...)...`);
         console.log(`[YouTube Outbound Trace] search attempt log returned; constructing request for key #${currentIndex + 1}, attempt ${attempt + 1}`);
-        const searchType = lane === 'VIDEO' ? 'video' : 'channel';
         const searchUrl = buildYouTubeApiUrl('search', apiKey, {
           part: 'snippet', type: searchType, order: youtubeOrder(ordering),
           q: sanitizedQuery, maxResults, pageToken: pageToken || undefined,
@@ -1340,7 +1355,12 @@ export async function fetchRecentVideoDescriptionsWithIds(channelId: string): Pr
   if (!channelId) return [];
   if (keyPool.length === 0) throw new Error('Recent-video description API is unavailable because no provider is configured.');
   // Fail fast on a durably quarantined channel before touching any key.
-  await throwIfYouTubeInputQuarantined('recent-videos-search', { channelId });
+  await throwIfYouTubeInputQuarantined('recent-videos-search', {
+    channelId,
+    signature: youtubeRequestSignature('youtube', 'recent-videos-search', {
+      part: 'snippet', channelId, order: 'date', type: 'video',
+    }),
+  });
   const acquisition = youtubePoolBackoff.beginAcquisition();
   let quotaExceededCount = 0;
 
@@ -1754,7 +1774,12 @@ export async function fetchYouTubeChannelEnrichment(
     throw new Error('YouTube enrichment requires at least one configured YouTube API key.');
   }
   // Fail fast on a durably quarantined channel before touching any key.
-  await throwIfYouTubeInputQuarantined('channel-uploads', { channelId });
+  await throwIfYouTubeInputQuarantined('channel-uploads', {
+    channelId,
+    signature: youtubeRequestSignature('youtube', 'channel-uploads', {
+      id: channelId, part: 'snippet,contentDetails,statistics',
+    }),
+  });
   const acquisition = youtubePoolBackoff.beginAcquisition();
 
   let lastError: Error | null = null;
@@ -2067,7 +2092,12 @@ export async function fetchYouTubeChannelCountryMetadata(channelId: string, fall
   // failures also degrade to the fallback; probe quota refusals below are
   // policy signals and propagate to the caller's normal failure lifecycle.
   try {
-    await throwIfYouTubeInputQuarantined('channel-country-metadata', { channelId });
+    await throwIfYouTubeInputQuarantined('channel-country-metadata', {
+      channelId,
+      signature: youtubeRequestSignature('youtube', 'channel-country-metadata', {
+        id: channelId, part: 'snippet,brandingSettings,statistics',
+      }),
+    });
   } catch (error) {
     if (isYouTubeQuarantinedInput(error)) return { ...fallback, countryMetadataStatus: 'UNAVAILABLE', countryMetadataCheckedAt: checkedAt };
   }

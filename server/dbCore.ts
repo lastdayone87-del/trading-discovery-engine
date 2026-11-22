@@ -2034,20 +2034,39 @@ export interface YouTubeInvalidInputQuarantine {
 /** Durable memory of inputs that recently produced HTTP 400/404/422 from
  * YouTube (bad channel IDs, invalid query shapes). Readers must treat an
  * expired row as absent; writers prune expired rows opportunistically. */
-export async function recordYouTubeInvalidInput(inputKind: string, inputValue: string, operation: string, ttlMs: number): Promise<void> {
-  if (!inputKind || !inputValue || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
+export async function recordYouTubeInvalidInput(
+  provider: string,
+  inputKind: string,
+  inputValue: string,
+  operation: string,
+  ttlMs: number,
+  requestSignature: string,
+): Promise<void> {
+  if (!provider || !inputKind || !inputValue || !operation || !requestSignature || !Number.isFinite(ttlMs) || ttlMs <= 0) return;
   const db = await getDb();
-  await db.query(`INSERT INTO youtube_invalid_input_quarantine(input_kind,input_value,operation,first_seen,last_seen,hits,expires_at)
-    VALUES($1,$2,$3,now(),now(),1,now()+($4||' milliseconds')::interval)
-    ON CONFLICT(input_kind,input_value) DO UPDATE SET operation=excluded.operation,last_seen=now(),hits=youtube_invalid_input_quarantine.hits+1,expires_at=now()+($4||' milliseconds')::interval`,
-    [inputKind, inputValue, operation || '', String(Math.trunc(ttlMs))]);
+  await db.query(`INSERT INTO youtube_invalid_input_quarantine(provider,input_kind,input_value,operation,request_signature,first_seen,last_seen,hits,expires_at)
+    VALUES($1,$2,$3,$4,$5,now(),now(),1,now()+($6||' milliseconds')::interval)
+    ON CONFLICT(provider,input_kind,input_value,operation,request_signature)
+    DO UPDATE SET last_seen=now(),hits=youtube_invalid_input_quarantine.hits+1,expires_at=now()+($6||' milliseconds')::interval`,
+    [provider, inputKind, inputValue, operation, requestSignature, String(Math.trunc(ttlMs))]);
   await db.query(`DELETE FROM youtube_invalid_input_quarantine WHERE expires_at <= now()`).catch(() => undefined);
 }
 
-export async function isYouTubeInputQuarantined(inputKind: string, inputValue: string): Promise<boolean> {
-  if (!inputKind || !inputValue) return false;
+export async function isYouTubeInputQuarantined(
+  provider: string,
+  inputKind: string,
+  inputValue: string,
+  operation: string,
+  requestSignature: string,
+): Promise<boolean> {
+  if (!provider || !inputKind || !inputValue || !operation || !requestSignature) return false;
   const db = await getDb();
-  const res = await db.query(`SELECT 1 FROM youtube_invalid_input_quarantine WHERE input_kind=$1 AND input_value=$2 AND expires_at > now() LIMIT 1`, [inputKind, inputValue]);
+  const res = await db.query(
+    `SELECT 1 FROM youtube_invalid_input_quarantine
+      WHERE provider=$1 AND input_kind=$2 AND input_value=$3 AND operation=$4 AND request_signature=$5
+        AND expires_at > now() LIMIT 1`,
+    [provider, inputKind, inputValue, operation, requestSignature],
+  );
   return (res.rowCount || 0) > 0;
 }
 
@@ -5883,9 +5902,8 @@ export async function coolQueryForProviderQuarantine(
   if (!Number.isFinite(queryId) || queryId <= 0 || !inputKind || !inputValue) return;
   const db = runner || await getDb();
   const quarantine = await db.query(
-    `SELECT expires_at FROM youtube_invalid_input_quarantine
-      WHERE input_kind=$1 AND input_value=$2
-      LIMIT 1`,
+    `SELECT MAX(expires_at) AS expires_at FROM youtube_invalid_input_quarantine
+      WHERE input_kind=$1 AND input_value=$2`,
     [inputKind, inputValue],
   );
   const parsed = quarantine.rows[0]?.expires_at ? new Date(quarantine.rows[0].expires_at) : null;

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { clearYouTubeProviderSuspension, getYouTubeKeyPool, loadActiveYouTubeProviderSuspensions } from './db';
 import { fingerprintYouTubeKey } from './youtubeQuotaAttribution';
 import { youtubeProviderCooldown } from './youtubeProviderCooldown';
+import { youtubeRequestSignatureFromUrl } from './youtubeQuarantineSignature';
 
 /** Invalid inputs stay quarantined for 7 days: long enough to break daily
  * rescan loops, short enough that a fixed upstream input recovers on its own. */
@@ -37,20 +38,29 @@ export function normalizeYouTubeQuarantineInput(kind: YouTubeQuarantineInputKind
  * Channel-scoped operations attribute to the channel; query operations
  * attribute to the normalized query text. Returns null when the URL carries
  * neither (nothing to remember). */
-export function extractYouTubeQuarantineInput(operation: string, url: string): { kind: YouTubeQuarantineInputKind; value: string } | null {
+export interface YouTubeQuarantineInput {
+  provider: 'youtube';
+  kind: YouTubeQuarantineInputKind;
+  value: string;
+  operation: string;
+  signature: string;
+}
+
+export function extractYouTubeQuarantineInput(operation: string, url: string): YouTubeQuarantineInput | null {
   let params: URLSearchParams;
   try {
     params = new URL(url).searchParams;
   } catch {
     return null;
   }
-  void operation;
+  const signature = youtubeRequestSignatureFromUrl('youtube', operation, url);
+  if (!signature) return null;
   const channelId = params.get('channelId') || params.get('id');
   const normalizedChannel = normalizeYouTubeQuarantineInput('channelId', channelId);
-  if (normalizedChannel) return { kind: 'channelId', value: normalizedChannel };
+  if (normalizedChannel) return { provider: 'youtube', kind: 'channelId', value: normalizedChannel, operation, signature };
   const query = params.get('q');
   const normalizedQuery = normalizeYouTubeQuarantineInput('searchQuery', query);
-  if (normalizedQuery) return { kind: 'searchQuery', value: normalizedQuery };
+  if (normalizedQuery) return { provider: 'youtube', kind: 'searchQuery', value: normalizedQuery, operation, signature };
   return null;
 }
 
