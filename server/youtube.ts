@@ -68,6 +68,7 @@ import { isQuotaExceeded, youtubePoolBackoff, type YouTubePoolAcquisition } from
 import { recordExecutionStage, recordFirstYouTubeRequest } from './executionTrace';
 import { youtubeRequestScheduler, type YouTubeRequestPriority } from './youtubeRequestScheduler';
 import { youtubeProviderCooldown, YouTubeProvidersCoolingDownError } from './youtubeProviderCooldown';
+import { clearYouTubeProjectSuspension, isYouTubeProjectSuspended, suspendYouTubeProject } from './youtubeProjectSuspension';
 import { bumpInvalidApiKeyQuarantine } from './operationsTelemetry';
 import { FEATURED_CHANNEL_PROVIDER_COST, parseFeaturedChannelSections, type FeaturedChannelProviderResult } from './featuredChannelAdapter';
 export type { SearchOrdering } from './searchOrdering';
@@ -377,7 +378,10 @@ export async function availableKeyIndexes(
   deps: YouTubeKeyPoolPreflightDeps = {},
 ): Promise<number[]> {
   const rotation = keys.map((_key, index) => (activeKeyIndex + index) % keys.length);
-  const indexes = rotation.filter(index => youtubeProviderCooldown.eligible(keys[index]));
+  const indexes = rotation.filter(index =>
+    youtubeProviderCooldown.eligible(keys[index])
+    && !isYouTubeProjectSuspended(getYouTubeQuotaGroupForKey(keys[index])),
+  );
   if (!indexes.length) { throwIfAllProvidersCoolingDown(keys); return []; }
   let enforcement = false;
   try {
@@ -526,15 +530,17 @@ async function persistYouTubeKeySuspension(providerKey: string, reason: string):
     const configured = getConfiguredYouTubeProviders().find(item => item.key === providerKey);
     // Serialized with gated clears (arrival order): a re-suspension issued
     // after an in-flight clear executes after it, so the fresh row survives.
+    const quotaGroup = configured?.quotaGroup || getYouTubeQuotaGroupForKey(providerKey) || '';
     await serializeYouTubeSuspensionWrite(() => recordYouTubeProviderSuspension({
       keyFingerprint: fingerprintYouTubeKey(providerKey),
       keyIndex: index >= 0 ? index + 1 : 0,
       envName: configured?.envName || '',
-      quotaGroup: configured?.quotaGroup || getYouTubeQuotaGroupForKey(providerKey) || '',
+      quotaGroup,
       status: reason === 'INVALID_API_KEY' ? 'INVALID_KEY' : 'SUSPENDED',
       retryAfterMs: YOUTUBE_SUSPENSION_RETRY_AFTER_MS,
       reason,
     }));
+    if (quotaGroup) suspendYouTubeProject(quotaGroup, Date.now() + YOUTUBE_SUSPENSION_RETRY_AFTER_MS);
   } catch {
     // Durable suspension is telemetry-grade hardening; a write failure must
     // never mask the original provider error.
@@ -998,6 +1004,7 @@ export async function readYouTubeJsonObject<T extends Record<string, any> = Reco
         // following eligible key so healthy keys share the workload instead
         // of one key absorbing everything until it fails.
         if(validatedIndex>=0)activeKeyIndex=advanceYouTubeRotation(validatedPool.length,validatedIndex);
+        clearYouTubeProjectSuspension(getYouTubeQuotaGroupForKey(context.providerKey));
       }
       if (shouldClearYouTubeSuspension(providerSuccessIsCurrent, wasSuspended)) {
         // Generation-gated, awaited clear: another request may have
