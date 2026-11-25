@@ -4,6 +4,7 @@ import {
   acquireDeferredEnrichmentBackfillLease,
   reconcileClassificationResolutionGaps,
   recordClassificationResolutionBackoff,
+  releaseDeferredEnrichmentBackfillLease,
 } from './classificationResolutionRecovery';
 
 const CUTOFF = '1970-01-01T00:00:00.000Z';
@@ -208,8 +209,12 @@ test('the deferred backfill lease is shared and can be disabled for tests', asyn
 
   assert.match(queries[0].sql, /INSERT INTO scheduler_state/);
   assert.match(queries[1].sql, /UPDATE scheduler_state/);
-  assert.match(queries[1].sql, /last_run_at < now\(\).*\$2::int\*interval '1 millisecond'/);
-  assert.deepEqual(queries[1].params, ['deferred_enrichment_backfill:shared', 600_000]);
+  assert.match(queries[1].sql, /last_run_at < now\(\).*\$3::int\*interval '1 millisecond'/);
+  assert.match(queries[1].sql, /is_running=false OR locked_at IS NULL OR locked_at < now\(\)-interval '5 minutes'/);
+  assert.deepEqual(queries[1].params, ['deferred_enrichment_backfill:shared', 'shared', 600_000]);
+  await releaseDeferredEnrichmentBackfillLease(db, 'shared', 'shared');
+  assert.match(queries.at(-1)!.sql, /SET is_running=false/);
+  assert.deepEqual(queries.at(-1)!.params, ['deferred_enrichment_backfill:shared', 'shared']);
 });
 
 test('a deferred reopen rolls back when the enqueue throws', async () => {

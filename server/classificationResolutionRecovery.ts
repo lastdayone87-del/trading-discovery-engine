@@ -104,44 +104,75 @@ export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 20;
 export const DEFERRED_ENRICHMENT_MAX_PENDING = 200;
 
 /**
- * Cross-replica lease for the deferred-only backfill. The in-memory scheduler
- * throttle is per process; this row makes the two-channel budget shared.
+ * In-flight lease for the deferred-only backfill. The timestamp enforces the
+ * cadence window; is_running/locked_by prevent a second caller from starting
+ * while a slow batch is still processing. A stale owner is reclaimed after
+ * five minutes so a crashed worker cannot block recovery forever.
  */
 export async function acquireDeferredEnrichmentBackfillLease(
   db: { query: (sql: string, params: unknown[]) => Promise<{ rowCount?: number | null }> },
   windowMs = DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS,
   slot = 'shared',
+  owner = 'shared',
 ): Promise<boolean> {
   if (!(windowMs > 0)) return true;
   const name = `deferred_enrichment_backfill:${slot}`;
   await db.query(
     `INSERT INTO scheduler_state(name,is_enabled,is_running,last_run_at,updated_at)
-     VALUES($1,true,false,now()-interval '1 hour',now()) ON CONFLICT(name) DO NOTHING`,
+     VALUES($1,true,false,NULL,now()) ON CONFLICT(name) DO NOTHING`,
     [name],
   );
   const lease = await db.query(
-    `UPDATE scheduler_state SET last_run_at=now(),updated_at=now()
-      WHERE name=$1 AND (last_run_at IS NULL OR last_run_at < now()-($2::int*interval '1 millisecond'))
+    `UPDATE scheduler_state
+        SET is_running=true,locked_by=$2,locked_at=now(),last_run_at=now(),updated_at=now()
+      WHERE name=$1
+        AND (is_running=false OR locked_at IS NULL OR locked_at < now()-interval '5 minutes')
+        AND (last_run_at IS NULL OR last_run_at < now()-($3::int*interval '1 millisecond'))
       RETURNING name`,
-    [name, windowMs],
+    [name, owner, windowMs],
   );
   return Number(lease.rowCount || 0) > 0;
+}
+
+export async function releaseDeferredEnrichmentBackfillLease(
+  db: { query: (sql: string, params: unknown[]) => Promise<unknown> },
+  slot = 'shared',
+  owner = 'shared',
+): Promise<void> {
+  const name = `deferred_enrichment_backfill:${slot}`;
+  await db.query(
+    `UPDATE scheduler_state
+        SET is_running=false,locked_by=NULL,locked_at=NULL,updated_at=now()
+      WHERE name=$1 AND locked_by=$2`,
+    [name, owner],
+  );
 }
 
 /** One bounded deferred-evidence recovery batch, shared by the scheduler and
  * the dedicated workers so every path uses the same queue buffer and limits. */
 export async function runDeferredEnrichmentBackfill(
   limit = DEFERRED_ENRICHMENT_BACKFILL_LIMIT,
-  options: { maxPending?: number; leaseSlot?: string } = {},
+  options: { maxPending?: number; leaseSlot?: string; leaseWindowMs?: number; db?: any } = {},
 ): Promise<ClassificationResolutionRecoveryResult> {
-  return reconcileClassificationResolutionGaps({
-    dryRun: false,
-    deferredOnly: true,
-    includeLegacy: true,
-    limit,
-    maxPending: options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING,
-    leaseSlot: options.leaseSlot,
-  });
+  const db = options.db || await getDb();
+  const slot = options.leaseSlot || 'shared';
+  const owner = randomUUID();
+  const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs, slot, owner);
+  if (!leased) {
+    return { dryRun: false, cutoff: (await readClassificationResolutionCutoff()) || new Date().toISOString(), scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: 0, failures: 0, items: [] };
+  }
+  try {
+    return await reconcileClassificationResolutionGaps({
+      dryRun: false,
+      deferredOnly: true,
+      includeLegacy: true,
+      limit,
+      maxPending: options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING,
+      db,
+    });
+  } finally {
+    await releaseDeferredEnrichmentBackfillLease(db, slot, owner);
+  }
 }
 
 export interface ClassificationResolutionRecoveryOptions {
@@ -251,10 +282,6 @@ export async function reconcileClassificationResolutionGaps(
       if (pendingCount >= maxPending) {
         return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: pendingCount, failures: 0, items: [] };
       }
-    }
-    const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs, options.leaseSlot);
-    if (!leased) {
-      return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: 0, failures: 0, items: [] };
     }
   }
   const limit = Math.min(200, Math.max(1, options.limit || 50));

@@ -96,7 +96,7 @@ import { operatorAuthorization, validateOperatorConfiguration } from './server/o
 import { createReadinessState, launchAfterReadiness } from './server/startupLifecycle';
 import { resolveBuildInfo } from './server/buildInfo';
 import { operationsTelemetrySnapshot } from './server/operationsTelemetry';
-import { getCommunityRetryWorkerHealth } from './server/operationalMaintenanceWorkers';
+import { getCommunityRetryWorkerHealth, getDeferredEnrichmentBackfillHealth } from './server/operationalMaintenanceWorkers';
 import { getOperationalMaintenanceSchedulerHealth } from './server/operationalMaintenanceScheduler';
 import { gatherCountryDiscoveryHealth, gatherCountryDiscoveryMetrics } from './server/countryDiscoveryHealth';
 import { dryRunCountryBoundaryCohort, enqueueCountryBoundaryCohort, COUNTRY_BOUNDARY_RECOVERY_VERSION } from './server/countryBoundaryRecovery';
@@ -611,6 +611,7 @@ async function startServer() {
         quota,
         maintenance: {
           communityRetry: getCommunityRetryWorkerHealth(),
+          deferredEnrichment: getDeferredEnrichmentBackfillHealth(),
           operational: getOperationalMaintenanceSchedulerHealth()
         }
       });
