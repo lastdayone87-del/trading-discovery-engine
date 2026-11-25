@@ -12,7 +12,7 @@ import { reconcileOrphanInvestigations, recoverStaleInvestigationSteps } from '.
 import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership } from './communityRecovery';
 import { COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON } from './communityRetryPolicy';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
-import { DEFERRED_ENRICHMENT_BACKFILL_LIMIT, reconcileClassificationResolutionGaps, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
+import { DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS, DEFERRED_ENRICHMENT_BACKFILL_LIMIT, reconcileClassificationResolutionGaps, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
 import { runQuerySaturationSweep } from './querySaturationSweep';
@@ -26,7 +26,6 @@ import { supersedeConfirmedReviewDebt } from './reviewStore';
  */
 export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
 export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
-export const DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS = 10 * 60_000;
 export const QUERY_SATURATION_SWEEP_INTERVAL_MS = 15 * 60_000;
 export const QUERY_ARM_RECONCILE_INTERVAL_MS = 5 * 60_000;
 export const CONFIRMED_REVIEW_DEBT_SWEEP_INTERVAL_MS = 15 * 60_000;

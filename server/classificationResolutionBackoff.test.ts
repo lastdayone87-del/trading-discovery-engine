@@ -184,6 +184,8 @@ test('deferredOnly restricts the candidate set instead of admitting every status
 
   assert.match(queries[0].sql, /NOT \$5::boolean OR c\.scan_status IN\('INTAKE_DEFERRED','PROVIDER_DEFERRED'\)/);
   assert.match(queries[0].sql, /GREATEST\(/);
+  assert.match(queries[0].sql, /positive_semantic/);
+  assert.match(queries[0].sql, /ORDER BY positive_semantic DESC/);
   assert.equal(queries[0].params[4], true);
   assert.equal(queries[1].params[4], false);
 });
@@ -207,7 +209,7 @@ test('the deferred backfill lease is shared and can be disabled for tests', asyn
   assert.match(queries[0].sql, /INSERT INTO scheduler_state/);
   assert.match(queries[1].sql, /UPDATE scheduler_state/);
   assert.match(queries[1].sql, /last_run_at < now\(\).*\$2::int\*interval '1 millisecond'/);
-  assert.deepEqual(queries[1].params, ['deferred_enrichment_backfill', 600_000]);
+  assert.deepEqual(queries[1].params, ['deferred_enrichment_backfill:shared', 600_000]);
 });
 
 test('a deferred reopen rolls back when the enqueue throws', async () => {
@@ -252,6 +254,30 @@ test('a deferred reopen rolls back when the enqueue throws', async () => {
   assert.equal(result.failures, 1);
   assert.ok(clientQueries.includes('ROLLBACK'), 'the reopen must roll back');
   assert.equal(clientQueries.includes('COMMIT'), false, 'no partial reopen may commit');
+});
+
+test('the deferred backfill stops enqueueing at the configured queue buffer', async () => {
+  let candidateQueries = 0;
+  const db = {
+    query: async (sql: string) => {
+      if (sql.includes('FROM jobs WHERE type=\'ENRICH_CHANNEL\'')) return { rows: [{ n: 200 }], rowCount: 1 };
+      if (sql.includes('FROM channels c')) candidateQueries += 1;
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    deferredOnly: true,
+    leaseWindowMs: 0,
+    maxPending: 200,
+    cutoff: CUTOFF,
+    limit: 20,
+    db,
+  } as any);
+  assert.equal(result.enqueued, 0);
+  assert.equal(result.skipped, 200);
+  assert.equal(candidateQueries, 0, 'a full enrichment queue must not query candidates');
 });
 
 test('the exhausted-review branch backs off a non-materialized review', async () => {

@@ -14,7 +14,7 @@ import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { COUNTRY_BOUNDARY_RECOVERY_JOB } from './countryBoundaryRecovery';
 import { startOperationalMaintenanceScheduler } from './operationalMaintenanceScheduler';
 import { enqueueDeferredAiAdjudications } from './candidateScoring';
-import { DEFERRED_ENRICHMENT_BACKFILL_LIMIT, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
+import { DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS, DEFERRED_ENRICHMENT_BACKFILL_LIMIT, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -371,15 +371,17 @@ function startDeferredAiAdjudicationWorker(workerId: string): void {
 }
 
 /**
- * Dedicated deferred-evidence recovery. Runs independently of the maintenance
- * scheduler so unrelated long sweeps cannot delay the bounded two-channel
- * batch. The database lease keeps replicas and the scheduler path from
- * exceeding the shared budget.
+ * Dedicated deferred-evidence recovery. Each worker owns an independent lease
+ * slot and a 20-channel batch per minute. The global queue-buffer gate stops
+ * enqueueing once 200 enrichment jobs are waiting, so the pipeline stays full
+ * without flooding providers or building an unbounded job queue.
  */
-function startDeferredEnrichmentBackfillWorker(workerId: string): void {
+function startDeferredEnrichmentBackfillWorker(workerId: string, slot: number): void {
   const tick = async () => {
     try {
-      const result = await runDeferredEnrichmentBackfill(DEFERRED_ENRICHMENT_BACKFILL_LIMIT);
+      const result = await runDeferredEnrichmentBackfill(DEFERRED_ENRICHMENT_BACKFILL_LIMIT, {
+        leaseSlot: `worker_${slot}`,
+      });
       if (result.enqueued > 0) {
         console.info(JSON.stringify({
           event: 'deferred_enrichment_backfill',
@@ -391,7 +393,7 @@ function startDeferredEnrichmentBackfillWorker(workerId: string): void {
     } catch (error) {
       console.error(`[Queue Worker:${workerId}] Deferred enrichment backfill failed:`, error);
     } finally {
-      schedule(tick, 10 * 60_000);
+      schedule(tick, DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS);
     }
   };
   void tick();
@@ -458,7 +460,11 @@ export function startOperationalMaintenanceWorkers(): void {
   // Ambiguous candidates deferred while AI was paused/unfunded are picked up
   // here only when the control plane is enabled and funded.
   startDeferredAiAdjudicationWorker(`deferred_ai_${process.pid}_0`);
-  startDeferredEnrichmentBackfillWorker(`deferred_enrichment_${process.pid}_0`);
+  const configuredBackfillWorkers = Number(process.env.DEFERRED_ENRICHMENT_BACKFILL_WORKERS || 2);
+  const backfillWorkers = Math.min(4, Math.max(1, Number.isFinite(configuredBackfillWorkers) ? Math.floor(configuredBackfillWorkers) : 2));
+  for (let slot = 0; slot < backfillWorkers; slot++) {
+    startDeferredEnrichmentBackfillWorker(`deferred_enrichment_${process.pid}_${slot}`, slot);
+  }
   // Recovery/projection sweeps are not claim-critical and run on one shared
   // interval instead of ahead of every claim in every worker pool.
   startOperationalMaintenanceScheduler();

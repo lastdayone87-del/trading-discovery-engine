@@ -105,11 +105,14 @@ test('only the community retry consumer scales; every other family runs exactly 
   assert.equal(workers.match(/startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/g)?.length, 1);
 });
 
-test('deferred evidence recovery has its own bounded worker', () => {
+test('deferred evidence recovery has a scalable bounded worker pool', () => {
   assert.match(workers, /startDeferredEnrichmentBackfillWorker/);
-  assert.match(workers, /runDeferredEnrichmentBackfill\(DEFERRED_ENRICHMENT_BACKFILL_LIMIT\)/);
-  assert.match(workers, /schedule\(tick, 10 \* 60_000\)/);
-  assert.equal(workers.match(/startDeferredEnrichmentBackfillWorker\(`deferred_enrichment_\$\{process\.pid\}_0`\)/g)?.length, 1);
+  assert.match(workers, /runDeferredEnrichmentBackfill\(DEFERRED_ENRICHMENT_BACKFILL_LIMIT/);
+  assert.match(workers, /schedule\(tick, DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS\)/);
+  assert.match(workers, /DEFERRED_ENRICHMENT_BACKFILL_WORKERS/);
+  assert.match(workers, /Math\.min\(4, Math\.max\(1/);
+  assert.match(workers, /for \(let slot = 0; slot < backfillWorkers; slot\+\+\)/);
+  assert.match(workers, /startDeferredEnrichmentBackfillWorker\(`deferred_enrichment_\$\{process\.pid\}_\$\{slot\}`/);
 });
 
 test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {

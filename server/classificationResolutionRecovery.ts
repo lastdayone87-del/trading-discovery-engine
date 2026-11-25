@@ -98,7 +98,10 @@ export async function ensureClassificationResolutionCutoff(): Promise<string> {
   return new Date(inserted.rows[0].created_at).toISOString();
 }
 
-export const DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS = 10 * 60_000;
+export const DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS = 60_000;
+export const DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS = 60_000;
+export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 20;
+export const DEFERRED_ENRICHMENT_MAX_PENDING = 200;
 
 /**
  * Cross-replica lease for the deferred-only backfill. The in-memory scheduler
@@ -107,9 +110,10 @@ export const DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS = 10 * 60_000;
 export async function acquireDeferredEnrichmentBackfillLease(
   db: { query: (sql: string, params: unknown[]) => Promise<{ rowCount?: number | null }> },
   windowMs = DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS,
+  slot = 'shared',
 ): Promise<boolean> {
   if (!(windowMs > 0)) return true;
-  const name = 'deferred_enrichment_backfill';
+  const name = `deferred_enrichment_backfill:${slot}`;
   await db.query(
     `INSERT INTO scheduler_state(name,is_enabled,is_running,last_run_at,updated_at)
      VALUES($1,true,false,now()-interval '1 hour',now()) ON CONFLICT(name) DO NOTHING`,
@@ -124,18 +128,19 @@ export async function acquireDeferredEnrichmentBackfillLease(
   return Number(lease.rowCount || 0) > 0;
 }
 
-export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 2;
-
 /** One bounded deferred-evidence recovery batch, shared by the scheduler and
- * the dedicated worker so both paths use the same lease and limits. */
+ * the dedicated workers so every path uses the same queue buffer and limits. */
 export async function runDeferredEnrichmentBackfill(
   limit = DEFERRED_ENRICHMENT_BACKFILL_LIMIT,
+  options: { maxPending?: number; leaseSlot?: string } = {},
 ): Promise<ClassificationResolutionRecoveryResult> {
   return reconcileClassificationResolutionGaps({
     dryRun: false,
     deferredOnly: true,
     includeLegacy: true,
     limit,
+    maxPending: options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING,
+    leaseSlot: options.leaseSlot,
   });
 }
 
@@ -146,6 +151,10 @@ export interface ClassificationResolutionRecoveryOptions {
   deferredOnly?: boolean;
   /** Shared lease window for deferred-only apply; 0 disables it in tests. */
   leaseWindowMs?: number;
+  /** Queue buffer cap; 0 disables the gate in tests. */
+  maxPending?: number;
+  /** Independent lease slot for each worker; omitted uses 'shared'. */
+  leaseSlot?: string;
   limit?: number;
   cutoff?: string;
   now?: number;
@@ -167,6 +176,7 @@ export interface ClassificationResolutionRecoveryItem {
   terminalFailureClass: string | null;
   recoveryCycles: number;
   lastChecked: string | null;
+  positiveSemantic: boolean;
   action: ResolutionRecoveryAction;
   reasonCodes: string[];
 }
@@ -232,7 +242,17 @@ export async function reconcileClassificationResolutionGaps(
   const dryRun = options.dryRun !== false;
   const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
   if (!dryRun && options.deferredOnly) {
-    const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs);
+    const maxPending = Number(options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING);
+    if (maxPending > 0) {
+      const pending = await db.query(
+        `SELECT count(*)::int AS n FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`,
+      );
+      const pendingCount = Number(pending.rows[0]?.n || 0);
+      if (pendingCount >= maxPending) {
+        return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: pendingCount, failures: 0, items: [] };
+      }
+    }
+    const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs, options.leaseSlot);
     if (!leased) {
       return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: 0, failures: 0, items: [] };
     }
@@ -243,6 +263,16 @@ export async function reconcileClassificationResolutionGaps(
             latest.id AS latest_job_id,latest.status AS latest_job_status,
             latest.terminal_failure_class,latest.attempts AS latest_job_attempts,
             latest.updated_at AS latest_job_updated_at,c.created_at AS channel_created_at,
+            EXISTS(
+              SELECT 1 FROM production_classification_diagnostics pd
+               WHERE pd.channel_id=c.channel_id
+                 AND pd.created_at > now()-interval '30 days'
+                 AND EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(COALESCE(pd.evidence_items,'[]'::jsonb)) e
+                    WHERE e->>'source' IN ('gemini_semantic','groq_semantic','gemini_free_semantic')
+                      AND e->>'polarity'='POSITIVE'
+                 )
+            ) AS positive_semantic,
             (SELECT count(*)::int FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE '${CYCLE_PREFIX}%') AS recovery_cycles,
@@ -296,7 +326,7 @@ export async function reconcileClassificationResolutionGaps(
             c.created_at
           ) > now()-interval '24 hours'
         ))
-      ORDER BY recovery_cooldown_active ASC,c.last_checked ASC NULLS FIRST,c.channel_id
+      ORDER BY positive_semantic DESC,recovery_cooldown_active ASC,c.last_checked ASC NULLS FIRST,c.channel_id
       LIMIT $4`,
     [Boolean(options.includeLegacy), cutoff, Boolean(dryRun), limit, Boolean(options.deferredOnly)],
   );
@@ -330,6 +360,7 @@ export async function reconcileClassificationResolutionGaps(
       terminalFailureClass: row.terminal_failure_class ? String(row.terminal_failure_class) : null,
       recoveryCycles: Number(row.recovery_cycles) || 0,
       lastChecked: row.last_checked ? new Date(row.last_checked).toISOString() : null,
+      positiveSemantic: row.positive_semantic === true,
       action: decision.action,
       reasonCodes: decision.reasonCodes,
     };
