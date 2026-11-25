@@ -12,7 +12,7 @@ import { reconcileOrphanInvestigations, recoverStaleInvestigationSteps } from '.
 import { reconcileCommunityAcquisitionRecovery, reconcileLegacyCommunityRetryOwnership } from './communityRecovery';
 import { COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_RETRY_REASON } from './communityRetryPolicy';
 import { projectProviderDeferredEnrichment, reconcileOperationalEnrichmentRecovery } from './operationalEnrichmentRecovery';
-import { reconcileClassificationResolutionGaps } from './classificationResolutionRecovery';
+import { DEFERRED_ENRICHMENT_BACKFILL_LIMIT, reconcileClassificationResolutionGaps, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
 import { triggerPhaseBObservationReconciliation } from './phaseBObservationOutbox';
 import { enqueueCommunityAcquisitionRetry, enqueueOperationalEnrichmentRecoveryJob, resumeOrphanedAutonomousPages } from './queueManager';
 import { runQuerySaturationSweep } from './querySaturationSweep';
@@ -27,7 +27,6 @@ import { supersedeConfirmedReviewDebt } from './reviewStore';
 export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
 export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
 export const DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS = 10 * 60_000;
-export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 2;
 export const QUERY_SATURATION_SWEEP_INTERVAL_MS = 15 * 60_000;
 export const QUERY_ARM_RECONCILE_INTERVAL_MS = 5 * 60_000;
 export const CONFIRMED_REVIEW_DEBT_SWEEP_INTERVAL_MS = 15 * 60_000;
@@ -411,12 +410,7 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       // Sparse-evidence deferrals are machine-owned and have no other retry
       // path. Apply a small bounded batch after the 24-hour cooldown so they
       // cannot churn through stage-0 classification on every rediscovery.
-      const result = await reconcileClassificationResolutionGaps({
-        dryRun: false,
-        deferredOnly: true,
-        includeLegacy: true,
-        limit: DEFERRED_ENRICHMENT_BACKFILL_LIMIT,
-      });
+      const result = await runDeferredEnrichmentBackfill(DEFERRED_ENRICHMENT_BACKFILL_LIMIT);
       if (result.failures > 0) {
         throw new Error(`Deferred enrichment backfill had ${result.failures} row failure(s); enqueued=${result.enqueued}, skipped=${result.skipped}.`);
       }

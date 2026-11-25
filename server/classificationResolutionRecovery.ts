@@ -124,6 +124,21 @@ export async function acquireDeferredEnrichmentBackfillLease(
   return Number(lease.rowCount || 0) > 0;
 }
 
+export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 2;
+
+/** One bounded deferred-evidence recovery batch, shared by the scheduler and
+ * the dedicated worker so both paths use the same lease and limits. */
+export async function runDeferredEnrichmentBackfill(
+  limit = DEFERRED_ENRICHMENT_BACKFILL_LIMIT,
+): Promise<ClassificationResolutionRecoveryResult> {
+  return reconcileClassificationResolutionGaps({
+    dryRun: false,
+    deferredOnly: true,
+    includeLegacy: true,
+    limit,
+  });
+}
+
 export interface ClassificationResolutionRecoveryOptions {
   dryRun?: boolean;
   includeLegacy?: boolean;

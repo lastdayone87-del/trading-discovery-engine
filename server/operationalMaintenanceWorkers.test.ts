@@ -105,6 +105,13 @@ test('only the community retry consumer scales; every other family runs exactly 
   assert.equal(workers.match(/startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/g)?.length, 1);
 });
 
+test('deferred evidence recovery has its own bounded worker', () => {
+  assert.match(workers, /startDeferredEnrichmentBackfillWorker/);
+  assert.match(workers, /runDeferredEnrichmentBackfill\(DEFERRED_ENRICHMENT_BACKFILL_LIMIT\)/);
+  assert.match(workers, /schedule\(tick, 10 \* 60_000\)/);
+  assert.equal(workers.match(/startDeferredEnrichmentBackfillWorker\(`deferred_enrichment_\$\{process\.pid\}_0`\)/g)?.length, 1);
+});
+
 test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {
   const scheduler = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
   assert.match(scheduler, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);

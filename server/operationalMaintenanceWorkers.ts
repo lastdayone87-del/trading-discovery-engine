@@ -14,6 +14,7 @@ import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { COUNTRY_BOUNDARY_RECOVERY_JOB } from './countryBoundaryRecovery';
 import { startOperationalMaintenanceScheduler } from './operationalMaintenanceScheduler';
 import { enqueueDeferredAiAdjudications } from './candidateScoring';
+import { DEFERRED_ENRICHMENT_BACKFILL_LIMIT, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -370,6 +371,33 @@ function startDeferredAiAdjudicationWorker(workerId: string): void {
 }
 
 /**
+ * Dedicated deferred-evidence recovery. Runs independently of the maintenance
+ * scheduler so unrelated long sweeps cannot delay the bounded two-channel
+ * batch. The database lease keeps replicas and the scheduler path from
+ * exceeding the shared budget.
+ */
+function startDeferredEnrichmentBackfillWorker(workerId: string): void {
+  const tick = async () => {
+    try {
+      const result = await runDeferredEnrichmentBackfill(DEFERRED_ENRICHMENT_BACKFILL_LIMIT);
+      if (result.enqueued > 0) {
+        console.info(JSON.stringify({
+          event: 'deferred_enrichment_backfill',
+          workerId,
+          enqueued: result.enqueued,
+          timestamp: new Date().toISOString(),
+        }));
+      }
+    } catch (error) {
+      console.error(`[Queue Worker:${workerId}] Deferred enrichment backfill failed:`, error);
+    } finally {
+      schedule(tick, 10 * 60_000);
+    }
+  };
+  void tick();
+}
+
+/**
  * Dedicated corpus-pipeline consumer: harvest, scoring, and concept
  * resolution, through the existing processNextSearchJob path and its existing
  * control/budget gates. Concurrency is intentionally 1 (single consumer);
@@ -430,6 +458,7 @@ export function startOperationalMaintenanceWorkers(): void {
   // Ambiguous candidates deferred while AI was paused/unfunded are picked up
   // here only when the control plane is enabled and funded.
   startDeferredAiAdjudicationWorker(`deferred_ai_${process.pid}_0`);
+  startDeferredEnrichmentBackfillWorker(`deferred_enrichment_${process.pid}_0`);
   // Recovery/projection sweeps are not claim-critical and run on one shared
   // interval instead of ahead of every claim in every worker pool.
   startOperationalMaintenanceScheduler();
