@@ -6465,9 +6465,16 @@ async function startDiscoveryWorkerLanes(): Promise<void> {
   // The discovery plan is not the only pool consumer: search, community retry,
   // corpus, maintenance, recheck, and HTTP request handlers share the same
   // connection pool. Keep the warning honest about the full estimate.
+  const positiveWorkers = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+  };
   const auxiliaryWorkers = resolveSearchWorkerCount()
-    + Math.max(1, Number(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY || 1))
-    + 4;
+    + positiveWorkers(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY, 1)
+    + positiveWorkers(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY, 1)
+    + 1 // deferred AI adjudication
+    + positiveWorkers(process.env.DEFERRED_ENRICHMENT_BACKFILL_WORKERS, 2)
+    + 4; // corpus pipeline, official recheck, country-boundary recovery, false-negative recovery
   if (plan.total + auxiliaryWorkers > poolMax) {
     console.warn(JSON.stringify({
       event: 'discovery_lane_pool_underprovisioned',

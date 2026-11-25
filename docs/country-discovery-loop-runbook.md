@@ -41,7 +41,7 @@ enrichment/classification scale gate:
 | `ADMISSION_WORKER_CONCURRENCY` | 4 | admission verification |
 | `CLASSIFICATION_WORKER_CONCURRENCY` | 4 | classification |
 | `PROCESS_DISCOVERY_WORKER_CONCURRENCY` | 1 | process/ingestion |
-| `ENRICHMENT_ONLY_WORKER_CONCURRENCY` | 1 | generic ENRICH backfill |
+| `ENRICHMENT_ONLY_WORKER_CONCURRENCY` | 3 | generic ENRICH backfill |
 
 Each lane is capped at 20 workers by the resolver (total maximum 80). Provider
 pacing, semantic cooldowns, quota reservations and daily budgets still apply
