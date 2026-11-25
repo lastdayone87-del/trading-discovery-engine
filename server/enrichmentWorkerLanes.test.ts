@@ -105,7 +105,7 @@ test('dedicated discovery lanes keep admission, classification, process, and enr
     },
     {
       type: 'ENRICH_CHANNEL',
-      concurrency: 1,
+      concurrency: 3,
       extraClaimableTypes: [],
       workerPrefix: 'enrich_channel_backlog',
     },

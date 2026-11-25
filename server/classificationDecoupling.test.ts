@@ -82,8 +82,8 @@ test('dedicated discovery lanes are independently sized and default to the stage
     admission: 4,
     classification: 4,
     process: 1,
-    enrichment: 1,
-    total: 10,
+    enrichment: 3,
+    total: 12,
   });
   assert.deepEqual(resolveDiscoveryWorkerLanePlan(env({
     ADMISSION_WORKER_CONCURRENCY: '6',
