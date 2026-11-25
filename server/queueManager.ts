@@ -6462,10 +6462,18 @@ let workersStarted = false;
 async function startDiscoveryWorkerLanes(): Promise<void> {
   const plan = resolveDiscoveryWorkerLanePlan();
   const poolMax = databasePoolMax();
-  if (plan.total > poolMax) {
+  // The discovery plan is not the only pool consumer: search, community retry,
+  // corpus, maintenance, recheck, and HTTP request handlers share the same
+  // connection pool. Keep the warning honest about the full estimate.
+  const auxiliaryWorkers = resolveSearchWorkerCount()
+    + Math.max(1, Number(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY || 1))
+    + 4;
+  if (plan.total + auxiliaryWorkers > poolMax) {
     console.warn(JSON.stringify({
       event: 'discovery_lane_pool_underprovisioned',
       workers: plan.total,
+      auxiliaryWorkers,
+      estimatedWorkers: plan.total + auxiliaryWorkers,
       databasePoolMax: poolMax,
       timestamp: new Date().toISOString(),
     }));
