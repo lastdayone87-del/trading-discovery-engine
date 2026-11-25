@@ -145,7 +145,7 @@ export function resolveDiscoveryWorkerLanePlan(env: NodeJS.ProcessEnv = process.
   const admission = lane('ADMISSION_WORKER_CONCURRENCY', 4);
   const classification = lane('CLASSIFICATION_WORKER_CONCURRENCY', 4);
   const process = lane('PROCESS_DISCOVERY_WORKER_CONCURRENCY', 1);
-  const enrichment = lane('ENRICHMENT_ONLY_WORKER_CONCURRENCY', 1);
+  const enrichment = lane('ENRICHMENT_ONLY_WORKER_CONCURRENCY', 3);
   return {
     admission,
     classification,

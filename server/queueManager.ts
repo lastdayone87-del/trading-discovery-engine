@@ -6462,10 +6462,25 @@ let workersStarted = false;
 async function startDiscoveryWorkerLanes(): Promise<void> {
   const plan = resolveDiscoveryWorkerLanePlan();
   const poolMax = databasePoolMax();
-  if (plan.total > poolMax) {
+  const positiveWorkers = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+  };
+  // Estimated non-discovery worker loops sharing the same pool. This is a
+  // lower-bound worker count, not a full connection count: HTTP handlers and
+  // short-lived maintenance queries also consume connections.
+  const auxiliaryWorkers = resolveSearchWorkerCount()
+    + positiveWorkers(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY, 1)
+    + Math.min(5, positiveWorkers(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY, 1))
+    + 1 // deferred AI adjudication
+    + Math.min(4, positiveWorkers(process.env.DEFERRED_ENRICHMENT_BACKFILL_WORKERS, 2))
+    + 4; // corpus pipeline, official recheck, country-boundary recovery, false-negative recovery
+  if (plan.total + auxiliaryWorkers > poolMax) {
     console.warn(JSON.stringify({
       event: 'discovery_lane_pool_underprovisioned',
       workers: plan.total,
+      auxiliaryWorkers,
+      estimatedWorkers: plan.total + auxiliaryWorkers,
       databasePoolMax: poolMax,
       timestamp: new Date().toISOString(),
     }));
