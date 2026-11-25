@@ -171,7 +171,8 @@ export async function runDeferredEnrichmentBackfill(
       db,
     });
   } finally {
-    await releaseDeferredEnrichmentBackfillLease(db, slot, owner);
+    await releaseDeferredEnrichmentBackfillLease(db, slot, owner)
+      .catch(error => console.warn('[DeferredEnrichment] lease release failed; the 5-minute stale-owner reclaim will recover it.', error instanceof Error ? error.message : error));
   }
 }
 
@@ -272,6 +273,7 @@ export async function reconcileClassificationResolutionGaps(
   const loadChannel = options.channelRowToRecord || channelRowToRecord;
   const dryRun = options.dryRun !== false;
   const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
+  let limit = Math.min(200, Math.max(1, options.limit || 50));
   if (!dryRun && options.deferredOnly) {
     const maxPending = Number(options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING);
     if (maxPending > 0) {
@@ -279,12 +281,16 @@ export async function reconcileClassificationResolutionGaps(
         `SELECT count(*)::int AS n FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`,
       );
       const pendingCount = Number(pending.rows[0]?.n || 0);
-      if (pendingCount >= maxPending) {
+      const available = Math.max(0, maxPending - pendingCount);
+      if (available < 1) {
         return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: pendingCount, failures: 0, items: [] };
       }
+      // Reserve only the remaining buffer. Concurrent workers can still race
+      // by at most one batch each; the buffer is a soft capacity target, not a
+      // correctness boundary.
+      limit = Math.min(limit, available);
     }
   }
-  const limit = Math.min(200, Math.max(1, options.limit || 50));
   const result = await db.query(
     `SELECT c.channel_id,c.channel_name,c.trading_status,c.scan_status,c.last_checked,
             latest.id AS latest_job_id,latest.status AS latest_job_status,

@@ -439,7 +439,6 @@ function startDeferredEnrichmentBackfillWorker(workerId: string, slot: number): 
       deferredEnrichmentHealth.enqueued += result.enqueued;
       if (result.scanned > 0) deferredEnrichmentHealth.skipped += result.skipped;
       deferredEnrichmentHealth.lastOutcome = result.enqueued > 0 ? 'ENQUEUED' : 'NO_WORK';
-      deferredEnrichmentHealth.lastError = null;
       if (result.enqueued > 0) {
         console.info(JSON.stringify({
           event: 'deferred_enrichment_backfill',

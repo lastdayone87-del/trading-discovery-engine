@@ -113,6 +113,7 @@ test('deferred evidence recovery has a scalable bounded worker pool', () => {
   assert.match(workers, /Math\.min\(4, Math\.max\(1/);
   assert.match(workers, /for \(let slot = 0; slot < backfillWorkers; slot\+\+\)/);
   assert.match(workers, /startDeferredEnrichmentBackfillWorker\(`deferred_enrichment_\$\{process\.pid\}_\$\{slot\}`/);
+  assert.match(workers, /leaseSlot: `worker_\$\{slot\}`/);
   assert.match(workers, /result\.failures > 0/);
   assert.match(workers, /deferred_enrichment_backfill_stalled/);
   assert.match(workers, /getDeferredEnrichmentBackfillHealth/);
