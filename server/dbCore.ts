@@ -4081,16 +4081,18 @@ export async function claimNextJob(workerId:string,types?:string[],excludedError
   return claimed;}
 export async function completeJob(jobId:string):Promise<void>{const db=await getDb(); await db.query(`UPDATE jobs SET status='COMPLETED',completed_at=now(),locked_by=NULL,locked_at=NULL,terminal_failure_class=NULL,capacity_deferrals=0,capacity_wait_started_at=NULL,parked_reason=NULL,parked_at=NULL,last_progress_at=now(),updated_at=now() WHERE id=$1`,[jobId]); await db.query(`UPDATE job_attempts SET status='COMPLETED',finished_at=now() WHERE job_id=$1 AND finished_at IS NULL`,[jobId]);}
 /**
- * Return a batch-owner job to PENDING after a completed URL-ledger slice. The
- * per-URL ledger owns the real attempt budget, so the channel-level claim is
- * refunded; otherwise a channel with more than five URL slices would exhaust
- * before its URL work could be processed.
+ * Return a batch-owner job to PENDING after a completed bounded slice. The
+ * slice owner (per-URL ledger or scoring cursor) owns the real progress, so the
+ * job-level claim is refunded; otherwise long work would exhaust its bounded
+ * attempts before the remaining slices could run. An optional payload update
+ * persists the continuation cursor atomically with the reschedule.
  */
 export async function rescheduleJob(
   jobId:string,
   runAfter:string,
   note:string,
   claim?:{workerId?:string|null;attemptNumber?:number;generation?:number},
+  payload?:any,
 ):Promise<boolean>{
   const db=await getDb();
   const client=await db.connect();
@@ -4110,14 +4112,15 @@ export async function rescheduleJob(
               parked_reason=NULL,
               parked_at=NULL,
               last_progress_at=now(),
-              updated_at=now()
+              updated_at=now(),
+              payload=COALESCE($7::jsonb,payload)
         WHERE id=$1
           AND status='PROCESSING'
           AND ($4::text IS NULL OR locked_by=$4)
           AND ($5::int IS NULL OR attempts=$5)
           AND ($6::int IS NULL OR reopen_generation=$6)
       RETURNING id`,
-      [jobId,message,runAfter,claim?.workerId??null,claim?.attemptNumber??null,claim?.generation??null],
+      [jobId,message,runAfter,claim?.workerId??null,claim?.attemptNumber??null,claim?.generation??null,payload===undefined?null:JSON.stringify(payload)],
     );
     if(!updated.rowCount){await client.query('ROLLBACK');return false;}
     await client.query(

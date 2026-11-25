@@ -183,11 +183,11 @@ test('budget guards observe pause, units, and in-flight usage', async () => {
     admitted: true,
     exhausted: false,
   });
-  // Two more spent units fill it beyond the 5-group reservation: denied but
-  // not exhausted (a smaller job could still fit, so scanning continues).
+  // Four remaining units still admit a bounded slice; the processor caps the
+  // batch to min(50, 4), so the oversized document does not have to fit whole.
   scoringRows.set('snapshots', [{ n: 6 }]);
   assert.deepEqual(await SCORE_CANDIDATES_BUDGET_GUARD.isAdmitted(scoringClient, job), {
-    admitted: false,
+    admitted: true,
     exhausted: false,
   });
   // Fully spent budget exhausts the type even for smaller jobs.
@@ -289,7 +289,7 @@ test('corpus claim types stay authorized by their existing paused controls', () 
   assert.match(queueManager, /readCorpusBudgetForUpdate\(client\)/);
   assert.match(queueManager, /remaining >= 1/);
   assert.match(queueManager, /claimableOverride\.includes\('TERM_HARVEST'\)/);
-  assert.match(queueManager, /count\(DISTINCT normalized_span\)/);
+  assert.match(queueManager, /count\(DISTINCT o\.normalized_span\)/);
 });
 
 test('harvest producer/consumer share the exact extractor version contract', async () => {
