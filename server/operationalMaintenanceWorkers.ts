@@ -14,6 +14,7 @@ import { youtubeProviderCooldown } from './youtubeProviderCooldown';
 import { COUNTRY_BOUNDARY_RECOVERY_JOB } from './countryBoundaryRecovery';
 import { startOperationalMaintenanceScheduler } from './operationalMaintenanceScheduler';
 import { enqueueDeferredAiAdjudications } from './candidateScoring';
+import { DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS, DEFERRED_ENRICHMENT_BACKFILL_LIMIT, runDeferredEnrichmentBackfill } from './classificationResolutionRecovery';
 
 type ClaimableOverride = NonNullable<Parameters<typeof processNextSearchJob>[0]>;
 
@@ -120,6 +121,40 @@ const corpusPipelineHealth: CorpusPipelineWorkerHealth = {
 
 export function getCorpusPipelineWorkerHealth(): CorpusPipelineWorkerHealth {
   return { ...corpusPipelineHealth };
+}
+
+type DeferredEnrichmentBackfillHealth = {
+  started: boolean;
+  startedAt: string | null;
+  workers: number;
+  ticks: number;
+  enqueued: number;
+  skipped: number;
+  failures: number;
+  inFlight: number;
+  lastTickAt: string | null;
+  lastOutcome: 'ENQUEUED' | 'NO_WORK' | 'ERROR' | null;
+  lastError: string | null;
+  stalledAt: string | null;
+};
+
+const deferredEnrichmentHealth: DeferredEnrichmentBackfillHealth = {
+  started: false,
+  startedAt: null,
+  workers: 0,
+  ticks: 0,
+  enqueued: 0,
+  skipped: 0,
+  failures: 0,
+  inFlight: 0,
+  lastTickAt: null,
+  lastOutcome: null,
+  lastError: null,
+  stalledAt: null,
+};
+
+export function getDeferredEnrichmentBackfillHealth(): DeferredEnrichmentBackfillHealth {
+  return { ...deferredEnrichmentHealth };
 }
 
 function schedule(next: () => void, delayMs: number): void {
@@ -370,6 +405,63 @@ function startDeferredAiAdjudicationWorker(workerId: string): void {
 }
 
 /**
+ * Dedicated deferred-evidence recovery. Each worker owns an independent lease
+ * slot and a 20-channel batch per minute. The global queue-buffer gate stops
+ * enqueueing once 200 enrichment jobs are waiting, so the pipeline stays full
+ * without flooding providers or building an unbounded job queue.
+ */
+function startDeferredEnrichmentBackfillWorker(workerId: string, slot: number): void {
+  deferredEnrichmentHealth.started = true;
+  deferredEnrichmentHealth.startedAt ??= new Date().toISOString();
+  deferredEnrichmentHealth.workers += 1;
+  const tick = async () => {
+    deferredEnrichmentHealth.ticks += 1;
+    deferredEnrichmentHealth.lastTickAt = new Date().toISOString();
+    deferredEnrichmentHealth.inFlight += 1;
+    const watchdog = setTimeout(() => {
+      deferredEnrichmentHealth.stalledAt = new Date().toISOString();
+      console.error(JSON.stringify({
+        event: 'deferred_enrichment_backfill_stalled',
+        workerId,
+        slot,
+        inFlightMs: 5 * 60_000,
+        timestamp: deferredEnrichmentHealth.stalledAt,
+      }));
+    }, 5 * 60_000);
+    watchdog.unref?.();
+    try {
+      const result = await runDeferredEnrichmentBackfill(DEFERRED_ENRICHMENT_BACKFILL_LIMIT, {
+        leaseSlot: `worker_${slot}`,
+      });
+      if (result.failures > 0) {
+        throw new Error(`Deferred enrichment backfill had ${result.failures} row failure(s); enqueued=${result.enqueued}, skipped=${result.skipped}.`);
+      }
+      deferredEnrichmentHealth.enqueued += result.enqueued;
+      if (result.scanned > 0) deferredEnrichmentHealth.skipped += result.skipped;
+      deferredEnrichmentHealth.lastOutcome = result.enqueued > 0 ? 'ENQUEUED' : 'NO_WORK';
+      if (result.enqueued > 0) {
+        console.info(JSON.stringify({
+          event: 'deferred_enrichment_backfill',
+          workerId,
+          enqueued: result.enqueued,
+          timestamp: new Date().toISOString(),
+        }));
+      }
+    } catch (error) {
+      deferredEnrichmentHealth.failures += 1;
+      deferredEnrichmentHealth.lastOutcome = 'ERROR';
+      deferredEnrichmentHealth.lastError = String((error as { message?: unknown })?.message || error).slice(0, 300);
+      console.error(`[Queue Worker:${workerId}] Deferred enrichment backfill failed:`, error);
+    } finally {
+      clearTimeout(watchdog);
+      deferredEnrichmentHealth.inFlight = Math.max(0, deferredEnrichmentHealth.inFlight - 1);
+      schedule(tick, DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS);
+    }
+  };
+  void tick();
+}
+
+/**
  * Dedicated corpus-pipeline consumer: harvest, scoring, and concept
  * resolution, through the existing processNextSearchJob path and its existing
  * control/budget gates. Concurrency is intentionally 1 (single consumer);
@@ -430,6 +522,11 @@ export function startOperationalMaintenanceWorkers(): void {
   // Ambiguous candidates deferred while AI was paused/unfunded are picked up
   // here only when the control plane is enabled and funded.
   startDeferredAiAdjudicationWorker(`deferred_ai_${process.pid}_0`);
+  const configuredBackfillWorkers = Number(process.env.DEFERRED_ENRICHMENT_BACKFILL_WORKERS || 2);
+  const backfillWorkers = Math.min(4, Math.max(1, Number.isFinite(configuredBackfillWorkers) ? Math.floor(configuredBackfillWorkers) : 2));
+  for (let slot = 0; slot < backfillWorkers; slot++) {
+    startDeferredEnrichmentBackfillWorker(`deferred_enrichment_${process.pid}_${slot}`, slot);
+  }
   // Recovery/projection sweeps are not claim-critical and run on one shared
   // interval instead of ahead of every claim in every worker pool.
   startOperationalMaintenanceScheduler();

@@ -8,7 +8,7 @@ import {
 } from './operationalMaintenanceScheduler';
 import { STALE_CHANNEL_LOCK_RECOVERY_INTERVAL_MS } from './staleChannelLockRecovery';
 
-const ALL_TASKS = ['locks', 'investigations', 'orphans', 'deferred', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'novelty', 'supersede', 'phaseb', 'resume', 'classification'];
+const ALL_TASKS = ['locks', 'investigations', 'orphans', 'community', 'legacy', 'projection', 'enrichment', 'resolution', 'novelty', 'supersede', 'phaseb', 'resume', 'classification'];
 
 function createDeps(failAt?: string) {
   const calls: string[] = [];
@@ -20,7 +20,6 @@ function createDeps(failAt?: string) {
     recoverStaleChannelLocks: make('locks'),
     recoverStaleInvestigationSteps: make('investigations'),
     reconcileOrphanInvestigations: make('orphans'),
-    reconcileDeferredEnrichmentGaps: make('deferred'),
     reconcileCommunityAcquisitionRecovery: make('community'),
     reconcileLegacyCommunityRetryOwnership: make('legacy'),
     projectProviderDeferredEnrichment: make('projection'),
@@ -74,27 +73,6 @@ test('classification sighting sweep is throttled by the scheduler clock', async 
   clock += 30_000;
   await scheduler.run();
   assert.equal(classificationCalls(), 2, 'the sweep runs once the interval elapses');
-});
-
-test('deferred enrichment backfill is throttled independently of the maintenance tick', async () => {
-  const { calls, dependencies } = createDeps();
-  let clock = 1_000_000;
-  const scheduler = createOperationalMaintenanceScheduler(dependencies, {
-    now: () => clock,
-    deferredEnrichmentBackfillIntervalMs: 600_000,
-  });
-  const backfills = () => calls.filter(call => call === 'deferred').length;
-
-  await scheduler.run();
-  assert.equal(backfills(), 1, 'the first tick runs a bounded backfill');
-
-  clock += 300_000;
-  await scheduler.run();
-  assert.equal(backfills(), 1, 'a tick inside the interval does not add enrichment work');
-
-  clock += 300_000;
-  await scheduler.run();
-  assert.equal(backfills(), 2, 'the backfill runs once the interval elapses');
 });
 
 test('query arm reconciliation is throttled by the scheduler clock', async () => {

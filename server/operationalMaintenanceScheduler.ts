@@ -26,8 +26,6 @@ import { supersedeConfirmedReviewDebt } from './reviewStore';
  */
 export const OPERATIONAL_MAINTENANCE_INTERVAL_MS = 10_000;
 export const CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS = 60_000;
-export const DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS = 10 * 60_000;
-export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 2;
 export const QUERY_SATURATION_SWEEP_INTERVAL_MS = 15 * 60_000;
 export const QUERY_ARM_RECONCILE_INTERVAL_MS = 5 * 60_000;
 export const CONFIRMED_REVIEW_DEBT_SWEEP_INTERVAL_MS = 15 * 60_000;
@@ -49,7 +47,6 @@ export interface OperationalMaintenanceDependencies {
   projectProviderDeferredEnrichment(): Promise<unknown>;
   reconcileOperationalEnrichmentRecovery(): Promise<unknown>;
   reconcileClassificationResolutionGaps(): Promise<unknown>;
-  reconcileDeferredEnrichmentGaps(): Promise<unknown>;
   triggerPhaseBObservationReconciliation(): unknown;
   resumeOrphanedAutonomousPages(): Promise<unknown>;
   /** Delayed repair of pending classification sightings; runs at minute scale. */
@@ -113,7 +110,6 @@ export function createOperationalMaintenanceScheduler(
 ): OperationalMaintenanceScheduler {
   const intervalMs = options.intervalMs ?? OPERATIONAL_MAINTENANCE_INTERVAL_MS;
   const classificationResolutionSweepIntervalMs = options.classificationResolutionSweepIntervalMs ?? CLASSIFICATION_RESOLUTION_SWEEP_INTERVAL_MS;
-  const deferredEnrichmentBackfillIntervalMs = options.deferredEnrichmentBackfillIntervalMs ?? DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS;
   const querySaturationSweepIntervalMs = options.querySaturationSweepIntervalMs ?? QUERY_SATURATION_SWEEP_INTERVAL_MS;
   const queryArmReconcileIntervalMs = options.queryArmReconcileIntervalMs ?? QUERY_ARM_RECONCILE_INTERVAL_MS;
   const confirmedReviewDebtSweepIntervalMs = options.confirmedReviewDebtSweepIntervalMs ?? CONFIRMED_REVIEW_DEBT_SWEEP_INTERVAL_MS;
@@ -141,7 +137,6 @@ export function createOperationalMaintenanceScheduler(
   let lastStaleChannelLockRecoveryMs: number | null = null;
   let lastClassificationSightingSweepMs: number | null = null;
   let lastClassificationResolutionSweepMs: number | null = null;
-  let lastDeferredEnrichmentBackfillMs: number | null = null;
   let lastQuerySaturationSweepMs: number | null = null;
   let lastQueryArmReconcileMs: number | null = null;
   let lastConfirmedReviewDebtSweepMs: number | null = null;
@@ -224,17 +219,6 @@ export function createOperationalMaintenanceScheduler(
     // its receiver keeps working when injected for tests or future runtimes.
     await isolate('stale_investigation_recovery', () => dependencies.recoverStaleInvestigationSteps());
     await isolate('orphan_investigation_reconciliation', () => dependencies.reconcileOrphanInvestigations());
-    if (lastDeferredEnrichmentBackfillMs === null
-      || nowMs - lastDeferredEnrichmentBackfillMs >= deferredEnrichmentBackfillIntervalMs) {
-      lastDeferredEnrichmentBackfillMs = nowMs;
-      await isolate('deferred_enrichment_backfill', async () => {
-        const result = await dependencies.reconcileDeferredEnrichmentGaps() as { enqueued?: number; skipped?: number; failures?: number } | undefined;
-        if ((result?.enqueued || 0) > 0) {
-          console.info('[Operational Maintenance] deferred enrichment backfill', result);
-        }
-      });
-    }
-
     await isolate('community_acquisition_recovery', () => dependencies.reconcileCommunityAcquisitionRecovery());
     await isolate('legacy_community_retry_ownership', () => dependencies.reconcileLegacyCommunityRetryOwnership());
     await isolate('provider_deferred_projection', () => dependencies.projectProviderDeferredEnrichment());
@@ -404,21 +388,6 @@ function createDefaultDependencies(): OperationalMaintenanceDependencies {
       });
       if (result.failures > 0) {
         throw new Error(`Classification resolution sweep had ${result.failures} row failure(s); enqueued=${result.enqueued}, exhaustedReviews=${result.exhaustedReviews}, permanentFailures=${result.permanentFailures}, skipped=${result.skipped}.`);
-      }
-      return result;
-    },
-    reconcileDeferredEnrichmentGaps: async () => {
-      // Sparse-evidence deferrals are machine-owned and have no other retry
-      // path. Apply a small bounded batch after the 24-hour cooldown so they
-      // cannot churn through stage-0 classification on every rediscovery.
-      const result = await reconcileClassificationResolutionGaps({
-        dryRun: false,
-        deferredOnly: true,
-        includeLegacy: true,
-        limit: DEFERRED_ENRICHMENT_BACKFILL_LIMIT,
-      });
-      if (result.failures > 0) {
-        throw new Error(`Deferred enrichment backfill had ${result.failures} row failure(s); enqueued=${result.enqueued}, skipped=${result.skipped}.`);
       }
       return result;
     },

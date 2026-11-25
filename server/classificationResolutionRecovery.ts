@@ -98,30 +98,82 @@ export async function ensureClassificationResolutionCutoff(): Promise<string> {
   return new Date(inserted.rows[0].created_at).toISOString();
 }
 
-export const DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS = 10 * 60_000;
+export const DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS = 60_000;
+export const DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS = 60_000;
+export const DEFERRED_ENRICHMENT_BACKFILL_LIMIT = 20;
+export const DEFERRED_ENRICHMENT_MAX_PENDING = 200;
 
 /**
- * Cross-replica lease for the deferred-only backfill. The in-memory scheduler
- * throttle is per process; this row makes the two-channel budget shared.
+ * In-flight lease for the deferred-only backfill. The timestamp enforces the
+ * cadence window; is_running/locked_by prevent a second caller from starting
+ * while a slow batch is still processing. A stale owner is reclaimed after
+ * five minutes so a crashed worker cannot block recovery forever.
  */
 export async function acquireDeferredEnrichmentBackfillLease(
   db: { query: (sql: string, params: unknown[]) => Promise<{ rowCount?: number | null }> },
   windowMs = DEFERRED_ENRICHMENT_BACKFILL_LEASE_MS,
+  slot = 'shared',
+  owner = 'shared',
 ): Promise<boolean> {
   if (!(windowMs > 0)) return true;
-  const name = 'deferred_enrichment_backfill';
+  const name = `deferred_enrichment_backfill:${slot}`;
   await db.query(
     `INSERT INTO scheduler_state(name,is_enabled,is_running,last_run_at,updated_at)
-     VALUES($1,true,false,now()-interval '1 hour',now()) ON CONFLICT(name) DO NOTHING`,
+     VALUES($1,true,false,NULL,now()) ON CONFLICT(name) DO NOTHING`,
     [name],
   );
   const lease = await db.query(
-    `UPDATE scheduler_state SET last_run_at=now(),updated_at=now()
-      WHERE name=$1 AND (last_run_at IS NULL OR last_run_at < now()-($2::int*interval '1 millisecond'))
+    `UPDATE scheduler_state
+        SET is_running=true,locked_by=$2,locked_at=now(),last_run_at=now(),updated_at=now()
+      WHERE name=$1
+        AND (is_running=false OR locked_at IS NULL OR locked_at < now()-interval '5 minutes')
+        AND (last_run_at IS NULL OR last_run_at < now()-($3::int*interval '1 millisecond'))
       RETURNING name`,
-    [name, windowMs],
+    [name, owner, windowMs],
   );
   return Number(lease.rowCount || 0) > 0;
+}
+
+export async function releaseDeferredEnrichmentBackfillLease(
+  db: { query: (sql: string, params: unknown[]) => Promise<unknown> },
+  slot = 'shared',
+  owner = 'shared',
+): Promise<void> {
+  const name = `deferred_enrichment_backfill:${slot}`;
+  await db.query(
+    `UPDATE scheduler_state
+        SET is_running=false,locked_by=NULL,locked_at=NULL,updated_at=now()
+      WHERE name=$1 AND locked_by=$2`,
+    [name, owner],
+  );
+}
+
+/** One bounded deferred-evidence recovery batch, shared by the scheduler and
+ * the dedicated workers so every path uses the same queue buffer and limits. */
+export async function runDeferredEnrichmentBackfill(
+  limit = DEFERRED_ENRICHMENT_BACKFILL_LIMIT,
+  options: { maxPending?: number; leaseSlot?: string; leaseWindowMs?: number; db?: any } = {},
+): Promise<ClassificationResolutionRecoveryResult> {
+  const db = options.db || await getDb();
+  const slot = options.leaseSlot || 'shared';
+  const owner = randomUUID();
+  const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs, slot, owner);
+  if (!leased) {
+    return { dryRun: false, cutoff: (await readClassificationResolutionCutoff()) || new Date().toISOString(), scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: 0, failures: 0, items: [] };
+  }
+  try {
+    return await reconcileClassificationResolutionGaps({
+      dryRun: false,
+      deferredOnly: true,
+      includeLegacy: true,
+      limit,
+      maxPending: options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING,
+      db,
+    });
+  } finally {
+    await releaseDeferredEnrichmentBackfillLease(db, slot, owner)
+      .catch(error => console.warn('[DeferredEnrichment] lease release failed; the 5-minute stale-owner reclaim will recover it.', error instanceof Error ? error.message : error));
+  }
 }
 
 export interface ClassificationResolutionRecoveryOptions {
@@ -131,6 +183,10 @@ export interface ClassificationResolutionRecoveryOptions {
   deferredOnly?: boolean;
   /** Shared lease window for deferred-only apply; 0 disables it in tests. */
   leaseWindowMs?: number;
+  /** Queue buffer cap; 0 disables the gate in tests. */
+  maxPending?: number;
+  /** Independent lease slot for each worker; omitted uses 'shared'. */
+  leaseSlot?: string;
   limit?: number;
   cutoff?: string;
   now?: number;
@@ -152,6 +208,7 @@ export interface ClassificationResolutionRecoveryItem {
   terminalFailureClass: string | null;
   recoveryCycles: number;
   lastChecked: string | null;
+  positiveSemantic: boolean;
   action: ResolutionRecoveryAction;
   reasonCodes: string[];
 }
@@ -216,18 +273,39 @@ export async function reconcileClassificationResolutionGaps(
   const loadChannel = options.channelRowToRecord || channelRowToRecord;
   const dryRun = options.dryRun !== false;
   const cutoff = options.cutoff || (dryRun ? (await readClassificationResolutionCutoff()) || new Date().toISOString() : await ensureClassificationResolutionCutoff());
+  let limit = Math.min(200, Math.max(1, options.limit || 50));
   if (!dryRun && options.deferredOnly) {
-    const leased = await acquireDeferredEnrichmentBackfillLease(db, options.leaseWindowMs);
-    if (!leased) {
-      return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: 0, failures: 0, items: [] };
+    const maxPending = Number(options.maxPending ?? DEFERRED_ENRICHMENT_MAX_PENDING);
+    if (maxPending > 0) {
+      const pending = await db.query(
+        `SELECT count(*)::int AS n FROM jobs WHERE type='ENRICH_CHANNEL' AND status IN ('PENDING','PROCESSING')`,
+      );
+      const pendingCount = Number(pending.rows[0]?.n || 0);
+      const available = Math.max(0, maxPending - pendingCount);
+      if (available < 1) {
+        return { dryRun, cutoff, scanned: 0, enqueued: 0, exhaustedReviews: 0, permanentFailures: 0, skipped: pendingCount, failures: 0, items: [] };
+      }
+      // Reserve only the remaining buffer. Concurrent workers can still race
+      // by at most one batch each; the buffer is a soft capacity target, not a
+      // correctness boundary.
+      limit = Math.min(limit, available);
     }
   }
-  const limit = Math.min(200, Math.max(1, options.limit || 50));
   const result = await db.query(
     `SELECT c.channel_id,c.channel_name,c.trading_status,c.scan_status,c.last_checked,
             latest.id AS latest_job_id,latest.status AS latest_job_status,
             latest.terminal_failure_class,latest.attempts AS latest_job_attempts,
             latest.updated_at AS latest_job_updated_at,c.created_at AS channel_created_at,
+            EXISTS(
+              SELECT 1 FROM production_classification_diagnostics pd
+               WHERE pd.channel_id=c.channel_id
+                 AND pd.created_at > now()-interval '30 days'
+                 AND EXISTS (
+                   SELECT 1 FROM jsonb_array_elements(COALESCE(pd.evidence_items,'[]'::jsonb)) e
+                    WHERE e->>'source' IN ('gemini_semantic','groq_semantic','gemini_free_semantic')
+                      AND e->>'polarity'='POSITIVE'
+                 )
+            ) AS positive_semantic,
             (SELECT count(*)::int FROM operational_enrichment_recovery_events e
               WHERE e.channel_id=c.channel_id
                 AND e.event_key LIKE '${CYCLE_PREFIX}%') AS recovery_cycles,
@@ -281,7 +359,7 @@ export async function reconcileClassificationResolutionGaps(
             c.created_at
           ) > now()-interval '24 hours'
         ))
-      ORDER BY recovery_cooldown_active ASC,c.last_checked ASC NULLS FIRST,c.channel_id
+      ORDER BY positive_semantic DESC,recovery_cooldown_active ASC,c.last_checked ASC NULLS FIRST,c.channel_id
       LIMIT $4`,
     [Boolean(options.includeLegacy), cutoff, Boolean(dryRun), limit, Boolean(options.deferredOnly)],
   );
@@ -315,6 +393,7 @@ export async function reconcileClassificationResolutionGaps(
       terminalFailureClass: row.terminal_failure_class ? String(row.terminal_failure_class) : null,
       recoveryCycles: Number(row.recovery_cycles) || 0,
       lastChecked: row.last_checked ? new Date(row.last_checked).toISOString() : null,
+      positiveSemantic: row.positive_semantic === true,
       action: decision.action,
       reasonCodes: decision.reasonCodes,
     };

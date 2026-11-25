@@ -105,6 +105,22 @@ test('only the community retry consumer scales; every other family runs exactly 
   assert.equal(workers.match(/startCorpusPipelineWorker\(`corpus_pipeline_\$\{process\.pid\}_0`\)/g)?.length, 1);
 });
 
+test('deferred evidence recovery has a scalable bounded worker pool', () => {
+  assert.match(workers, /startDeferredEnrichmentBackfillWorker/);
+  assert.match(workers, /runDeferredEnrichmentBackfill\(DEFERRED_ENRICHMENT_BACKFILL_LIMIT/);
+  assert.match(workers, /schedule\(tick, DEFERRED_ENRICHMENT_BACKFILL_INTERVAL_MS\)/);
+  assert.match(workers, /DEFERRED_ENRICHMENT_BACKFILL_WORKERS/);
+  assert.match(workers, /Math\.min\(4, Math\.max\(1/);
+  assert.match(workers, /for \(let slot = 0; slot < backfillWorkers; slot\+\+\)/);
+  assert.match(workers, /startDeferredEnrichmentBackfillWorker\(`deferred_enrichment_\$\{process\.pid\}_\$\{slot\}`/);
+  assert.match(workers, /leaseSlot: `worker_\$\{slot\}`/);
+  assert.match(workers, /result\.failures > 0/);
+  assert.match(workers, /deferred_enrichment_backfill_stalled/);
+  assert.match(workers, /getDeferredEnrichmentBackfillHealth/);
+  const server = readFileSync(new URL('../server.ts', import.meta.url), 'utf8');
+  assert.match(server, /deferredEnrichment: getDeferredEnrichmentBackfillHealth\(\)/);
+});
+
 test('legacy community reconciliation restores completed history without a stale-retry worker pass', () => {
   const scheduler = readFileSync(new URL('./operationalMaintenanceScheduler.ts', import.meta.url), 'utf8');
   assert.match(scheduler, /const legacyCommunityReconciliation = await reconcileLegacyCommunityRetryOwnership/);
