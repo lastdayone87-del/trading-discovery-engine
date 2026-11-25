@@ -45,7 +45,7 @@ enrichment/classification scale gate:
 
 Each lane is capped at 20 workers by the resolver (total maximum 80). Provider
 pacing, semantic cooldowns, quota reservations and daily budgets still apply
-inside each job. Startup warns if the lane total exceeds `DATABASE_POOL_MAX`. The Phase 4 scale gate remains available for diagnostics
+inside each job. Startup warns if the discovery lane total plus the estimated auxiliary worker loops exceeds `DATABASE_POOL_MAX`. The Phase 4 scale gate remains available for diagnostics
 and legacy backfill policy but no longer reduces startup capacity for the four
 lanes above. Raise lanes in production one step at a time while watching Gemini
 success, pacing, provider latency and heartbeat failures.

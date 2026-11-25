@@ -6462,18 +6462,18 @@ let workersStarted = false;
 async function startDiscoveryWorkerLanes(): Promise<void> {
   const plan = resolveDiscoveryWorkerLanePlan();
   const poolMax = databasePoolMax();
-  // The discovery plan is not the only pool consumer: search, community retry,
-  // corpus, maintenance, recheck, and HTTP request handlers share the same
-  // connection pool. Keep the warning honest about the full estimate.
   const positiveWorkers = (value: string | undefined, fallback: number): number => {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
   };
+  // Estimated non-discovery worker loops sharing the same pool. This is a
+  // lower-bound worker count, not a full connection count: HTTP handlers and
+  // short-lived maintenance queries also consume connections.
   const auxiliaryWorkers = resolveSearchWorkerCount()
     + positiveWorkers(process.env.MANUAL_SEARCH_WORKER_CONCURRENCY, 1)
-    + positiveWorkers(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY, 1)
+    + Math.min(5, positiveWorkers(process.env.COMMUNITY_RETRY_WORKER_CONCURRENCY || process.env.OPERATIONAL_MAINTENANCE_WORKER_CONCURRENCY, 1))
     + 1 // deferred AI adjudication
-    + positiveWorkers(process.env.DEFERRED_ENRICHMENT_BACKFILL_WORKERS, 2)
+    + Math.min(4, positiveWorkers(process.env.DEFERRED_ENRICHMENT_BACKFILL_WORKERS, 2))
     + 4; // corpus pipeline, official recheck, country-boundary recovery, false-negative recovery
   if (plan.total + auxiliaryWorkers > poolMax) {
     console.warn(JSON.stringify({
