@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acquireDeferredEnrichmentBackfillLease,
   reconcileClassificationResolutionGaps,
   recordClassificationResolutionBackoff,
 } from './classificationResolutionRecovery';
@@ -80,6 +81,177 @@ test('a non-materialized exhausted review writes a short-lived backoff event', a
     'EXHAUSTED_REVIEW_NOT_MATERIALIZED',
     'CURRENT_PENDING_REVIEW_PRESERVED',
   ]);
+});
+
+test('a deferred evidence row reopens and enqueues one bounded enrichment pass', async () => {
+  const updates: unknown[][] = [];
+  const clientQueries: Array<{ sql: string; params: unknown[] }> = [];
+  const db = {
+    query: async (sql: string) => {
+      if (sql.includes('FROM channels c')) {
+        return {
+          rows: [candidate({
+            scan_status: 'INTAKE_DEFERRED',
+            latest_job_status: 'COMPLETED',
+            terminal_failure_class: null,
+            latest_job_attempts: 1,
+            recovery_cycles: 0,
+          })],
+          rowCount: 1,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    connect: async () => ({
+      query: async (sql: string, params: unknown[] = []) => {
+        clientQueries.push({ sql, params });
+        if (sql.includes("UPDATE channels SET scan_status='ENRICHMENT_PENDING'")) {
+          updates.push(params);
+          return { rows: [{ channel_id: 'UC1' }], rowCount: 1 };
+        }
+        if (sql.includes('INSERT INTO operational_enrichment_recovery_events')) {
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      release: () => undefined,
+    }),
+  };
+  let enqueuedChannel: any;
+  let enqueuedReasons: string[] | undefined;
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    deferredOnly: true,
+    leaseWindowMs: 0,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => ({ materialized: false, reason: 'NOT_EXPECTED' }),
+    enqueueOperationalEnrichmentRecoveryJob: async (channel: any, reasons: string[]) => {
+      enqueuedChannel = channel;
+      enqueuedReasons = reasons;
+      return true;
+    },
+    channelRowToRecord: async () => ({ channel_id: 'UC1', scan_status: 'ENRICHMENT_PENDING' }) as any,
+  } as any);
+
+  assert.equal(result.enqueued, 1);
+  assert.equal(result.items[0].action, 'ENQUEUE_RECOVERY');
+  assert.deepEqual(result.items[0].reasonCodes, ['DEFERRED_EVIDENCE_RECOVERY']);
+  assert.deepEqual(updates[0], ['UC1', 'INTAKE_DEFERRED', '2026-01-01T00:00:00.000Z']);
+  assert.equal(enqueuedChannel.scan_status, 'ENRICHMENT_PENDING');
+  assert.deepEqual(enqueuedReasons, ['DEFERRED_EVIDENCE_RECOVERY']);
+  assert.ok(clientQueries.some(query => query.sql === 'COMMIT'), 'the reopen and enqueue must commit together');
+  assert.ok(
+    clientQueries.some(query => query.sql.includes('INSERT INTO operational_enrichment_recovery_events')
+      && String(query.params[0]).startsWith('operational-enrichment:')),
+    'the durable recovery-cycle event must be written inside the same transaction',
+  );
+});
+
+test('the deferred recovery cycle ceiling routes repeated exhaustion to review', async () => {
+  const { db } = fakeDb([candidate({ scan_status: 'INTAKE_DEFERRED', latest_job_status: 'COMPLETED', terminal_failure_class: null, recovery_cycles: 3 })]);
+  let reviewed = 0;
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    deferredOnly: true,
+    leaseWindowMs: 0,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => { reviewed += 1; return { materialized: true }; },
+    enqueueOperationalEnrichmentRecoveryJob: async () => { throw new Error('must not enqueue after the cycle ceiling'); },
+    channelRowToRecord: async () => ({ channel_id: 'UC1' }) as any,
+  } as any);
+
+  assert.equal(result.exhaustedReviews, 1);
+  assert.equal(result.enqueued, 0);
+  assert.equal(reviewed, 1);
+});
+
+test('deferredOnly restricts the candidate set instead of admitting every status', async () => {
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const db = {
+    query: async (sql: string, params: unknown[]) => {
+      queries.push({ sql, params });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await reconcileClassificationResolutionGaps({ dryRun: true, cutoff: CUTOFF, deferredOnly: true, db } as any);
+  await reconcileClassificationResolutionGaps({ dryRun: true, cutoff: CUTOFF, deferredOnly: false, db } as any);
+
+  assert.match(queries[0].sql, /NOT \$5::boolean OR c\.scan_status IN\('INTAKE_DEFERRED','PROVIDER_DEFERRED'\)/);
+  assert.match(queries[0].sql, /GREATEST\(/);
+  assert.equal(queries[0].params[4], true);
+  assert.equal(queries[1].params[4], false);
+});
+
+test('the deferred backfill lease is shared and can be disabled for tests', async () => {
+  let updateRows = 0;
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const db = {
+    query: async (sql: string, params: unknown[] = []) => {
+      queries.push({ sql, params });
+      if (sql.includes('UPDATE scheduler_state')) return { rowCount: updateRows };
+      return { rowCount: 1 };
+    },
+  };
+  updateRows = 0;
+  assert.equal(await acquireDeferredEnrichmentBackfillLease(db, 600_000), false, 'another replica owns the window');
+  updateRows = 1;
+  assert.equal(await acquireDeferredEnrichmentBackfillLease(db, 600_000), true, 'the lease is acquired once the window expires');
+  assert.equal(await acquireDeferredEnrichmentBackfillLease(db, 0), true, 'tests can disable the lease');
+
+  assert.match(queries[0].sql, /INSERT INTO scheduler_state/);
+  assert.match(queries[1].sql, /UPDATE scheduler_state/);
+  assert.match(queries[1].sql, /last_run_at < now\(\).*\$2::int\*interval '1 millisecond'/);
+  assert.deepEqual(queries[1].params, ['deferred_enrichment_backfill', 600_000]);
+});
+
+test('a deferred reopen rolls back when the enqueue throws', async () => {
+  const clientQueries: string[] = [];
+  const db = {
+    query: async (sql: string) => {
+      if (sql.includes('FROM channels c')) {
+        return {
+          rows: [candidate({
+            scan_status: 'INTAKE_DEFERRED',
+            latest_job_status: 'COMPLETED',
+            terminal_failure_class: null,
+            recovery_cycles: 0,
+          })],
+          rowCount: 1,
+        };
+      }
+      return { rows: [], rowCount: 0 };
+    },
+    connect: async () => ({
+      query: async (sql: string) => {
+        clientQueries.push(sql);
+        if (sql.includes("UPDATE channels SET scan_status='ENRICHMENT_PENDING'")) return { rows: [{ channel_id: 'UC1' }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      },
+      release: () => undefined,
+    }),
+  };
+  const result = await reconcileClassificationResolutionGaps({
+    dryRun: false,
+    includeLegacy: true,
+    deferredOnly: true,
+    leaseWindowMs: 0,
+    cutoff: CUTOFF,
+    limit: 1,
+    db,
+    materializeExhaustedReview: async () => ({ materialized: false, reason: 'NOT_EXPECTED' }),
+    enqueueOperationalEnrichmentRecoveryJob: async () => { throw new Error('enqueue failed'); },
+    channelRowToRecord: async () => ({ channel_id: 'UC1', scan_status: 'ENRICHMENT_PENDING' }) as any,
+  } as any);
+
+  assert.equal(result.failures, 1);
+  assert.ok(clientQueries.includes('ROLLBACK'), 'the reopen must roll back');
+  assert.equal(clientQueries.includes('COMMIT'), false, 'no partial reopen may commit');
 });
 
 test('the exhausted-review branch backs off a non-materialized review', async () => {
