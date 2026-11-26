@@ -108,17 +108,24 @@ export async function recordProviderCapacitySuccess(input: {
   provider: 'gemini' | 'groq';
   scopeKey: string;
   operation: string;
+  /** When the successful call started. A later failure must not be cleared. */
+  observedAt?: number | string;
 }, dbOverride?: CapacityDb): Promise<void> {
+  const observedAtMs = input.observedAt == null ? NaN : new Date(input.observedAt).getTime();
+  const observedAt = Number.isFinite(observedAtMs) ? new Date(observedAtMs).toISOString() : null;
   const client = await db(dbOverride);
-  await client.query(
+  const result = await client.query(
     `UPDATE provider_capacity_state
         SET state='HEALTHY', resume_at=NULL, probe_lease_until=NULL,
             last_success_at=now(), updated_at=now(), generation=generation+1
       WHERE provider=$1 AND scope_key=$2 AND (operation=$3 OR operation='*')
-        AND state <> 'HEALTHY'`,
-    [input.provider, input.scopeKey, input.operation],
+        AND state <> 'HEALTHY'
+        AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)`,
+    [input.provider, input.scopeKey, input.operation, observedAt],
   );
-  invalidate();
+  // A no-op update (already healthy, or an older success racing a newer
+  // failure) must not churn the shared capacity cache.
+  if (result.rowCount) invalidate();
 }
 
 interface CapacityRow {
@@ -193,25 +200,40 @@ export async function getSemanticCapacityStatus(
       }
       let value: ProviderCapacityStatus = { available: true, probe: false, resumeAt: null, reason: null };
       if (!healthy) {
-        const candidate = blockers
-          .filter(row => (row.state === 'EXHAUSTED' || row.state === 'PROBING')
-            && (expiryMs(row.resume_at) === null || (expiryMs(row.resume_at) as number) <= nowMs)
-            && (expiryMs(row.probe_lease_until) === null || (expiryMs(row.probe_lease_until) as number) <= nowMs))
-          .sort((a, b) => (a.operation === '*' ? 0 : 1) - (b.operation === '*' ? 0 : 1))[0];
-        if (candidate) {
-          const probe = await client.query(
-            `UPDATE provider_capacity_state
-                SET state='PROBING', probe_lease_until=now()+($4::int * interval '1 millisecond'), updated_at=now()
-              WHERE provider=$1 AND scope_key=$2 AND operation=$3
-                AND state IN ('EXHAUSTED','PROBING')
-                AND (resume_at IS NULL OR resume_at <= now())
-                AND (probe_lease_until IS NULL OR probe_lease_until <= now())
-              RETURNING provider, scope_key, operation`,
-            [candidate.provider, candidate.scope_key, candidate.operation, PROBE_LEASE_MS],
-          );
-          if (probe.rowCount) {
-            value = { available: true, probe: true, resumeAt: null, reason: 'PROBE' };
-          }
+        // One statement, one row lock: concurrent callers serialize on the
+        // candidate row. The loser re-checks the lease after the winner
+        // commits and finds no eligible row, so exactly one caller receives
+        // the reset probe even across processes.
+        const configuredJson = JSON.stringify(
+          [...configured.values()].map(account => ({ provider: account.provider, scope_key: account.scopeKey })),
+        );
+        const probe = await client.query(
+          `WITH eligible_accounts AS (
+             SELECT provider, scope_key
+               FROM jsonb_to_recordset($1::jsonb) AS x(provider text, scope_key text)
+           ), candidate AS (
+             SELECT s.provider, s.scope_key, s.operation
+               FROM provider_capacity_state s
+               JOIN eligible_accounts a
+                 ON a.provider=s.provider AND a.scope_key=s.scope_key
+              WHERE s.state IN ('EXHAUSTED','PROBING')
+                AND (s.resume_at IS NULL OR s.resume_at <= now())
+                AND (s.probe_lease_until IS NULL OR s.probe_lease_until <= now())
+              ORDER BY (s.operation='*') DESC, COALESCE(s.resume_at, to_timestamp(0)), s.provider, s.scope_key
+              LIMIT 1
+              FOR UPDATE OF s
+           )
+           UPDATE provider_capacity_state s
+              SET state='PROBING',
+                  probe_lease_until=now()+($2::int * interval '1 millisecond'),
+                  updated_at=now()
+             FROM candidate c
+            WHERE s.provider=c.provider AND s.scope_key=c.scope_key AND s.operation=c.operation
+            RETURNING s.provider, s.scope_key, s.operation`,
+          [configuredJson, PROBE_LEASE_MS],
+        );
+        if (probe.rowCount) {
+          value = { available: true, probe: true, resumeAt: null, reason: 'PROBE' };
         }
         if (!value.probe) {
           const resumeTimes = blockers

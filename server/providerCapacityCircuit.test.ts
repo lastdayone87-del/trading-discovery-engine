@@ -8,8 +8,9 @@ test('semantic claim gate and provider circuit are wired', () => {
   const resilience = readFileSync(new URL('./providerResilience.ts', import.meta.url), 'utf8');
   const groqProvider = readFileSync(new URL('./evidenceEngine/providers/GroqSemanticProvider.ts', import.meta.url), 'utf8');
   assert.match(queue, /getSemanticCapacityStatus/);
-  assert.match(queue, /semanticCapacity\.available/);
+  assert.match(queue, /await semanticCapacity\(\)/);
   assert.match(queue, /getSemanticCapacityStatus\(semanticCapacityAccounts\)/);
+  assert.match(queue, /enrichmentFullyClaimable && await semanticCapacity\(\) && claimableOverride\?\.includes\('PROCESS_DISCOVERED_CHANNEL'\)/);
   assert.match(queue, /scopeKey: geminiRouteOrg\(route\)/);
   assert.match(queue, /scopeKey: groqRouteOrg\(route\)/);
   assert.match(dbCore, /providerCapacityExhausted/);

@@ -46,7 +46,8 @@ test('flag off keeps the legacy capacity failure-budget path', async () => {
     assert.equal(disposition, 'RETRYING_WITHOUT_ATTEMPT');
     const transition = db.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
     assert.ok(transition, 'failJob must transition the job row');
-    assert.match(transition!.sql, /first_transient_failure_at=COALESCE/);
+    assert.match(transition!.sql, /first_transient_failure_at=CASE/);
+    assert.match(transition!.sql, /ELSE COALESCE\(first_transient_failure_at,\$4::timestamptz\)/);
     assert.doesNotMatch(transition!.sql, /capacity_lease_/);
     assert.doesNotMatch(transition!.sql, /created_at/);
   } finally {
@@ -94,9 +95,39 @@ test('flag on preserves the genuine first-failure anchor for transient failures'
     assert.equal(disposition, 'RETRYING_WITHOUT_ATTEMPT');
     const transition = db.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
     assert.ok(transition, 'failJob must transition the job row');
-    assert.match(transition!.sql, /first_transient_failure_at=COALESCE/);
+    assert.match(transition!.sql, /first_transient_failure_at=CASE/);
+    assert.match(transition!.sql, /ELSE COALESCE\(first_transient_failure_at,\$4::timestamptz\)/);
     assert.doesNotMatch(transition!.sql, /capacity_lease_/);
     assert.equal(transition!.values?.[3], anchor);
+  } finally {
+    delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
+  }
+});
+
+test('flag on suspends the transient anchor during provider-capacity parking', async () => {
+  process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
+  try {
+    const now = Date.UTC(2026, 10, 6, 12, 0, 0);
+    const anchor = new Date(now - 5 * 60 * 60_000).toISOString();
+    const db = makeDb({ attempts: 2, max_attempts: 5, first_transient_failure_at: anchor });
+    const retryAt = now + 8 * 60 * 60_000;
+    const error = Object.assign(new Error('Daily provider quota exhausted'), {
+      errorClass: 'RATE_LIMIT',
+      retryable: true,
+      providerCapacityExhausted: true,
+      providerReasons: ['PROVIDER_QUOTA_DAILY'],
+      retryAt,
+    });
+    const disposition = await failJob('job-capacity-parking', error, { db, now });
+
+    assert.equal(disposition, 'RETRYING_WITHOUT_ATTEMPT');
+    const transition = db.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
+    assert.ok(transition, 'failJob must transition the job row');
+    assert.match(transition!.sql, /first_transient_failure_at=CASE WHEN \$5::boolean/);
+    assert.match(transition!.sql, /first_transient_failure_at\+GREATEST\(\$3::timestamptz-now\(\)/);
+    assert.equal(transition!.values?.[2], new Date(retryAt).toISOString());
+    assert.equal(transition!.values?.[3], null, 'parking must not start a new transient anchor');
+    assert.equal(transition!.values?.[4], true);
   } finally {
     delete process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV];
   }

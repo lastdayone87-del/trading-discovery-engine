@@ -799,8 +799,17 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
       );
       try {
         const { recordProviderCapacitySuccess } = await import('./providerCapacityState');
-        await recordProviderCapacitySuccess({ provider: args.context.provider, scopeKey: org, operation: args.context.operation });
-      } catch { /* capacity state failure must not mask a successful provider response */ }
+        await recordProviderCapacitySuccess({
+          provider: args.context.provider,
+          scopeKey: org,
+          operation: args.context.operation,
+          // The success only closes a circuit that was observed before this
+          // call started; a failure recorded during the call must survive.
+          observedAt: started,
+        });
+      } catch (capacitySuccessError) {
+        console.warn('[ProviderCapacity] Failed to persist successful state:', String((capacitySuccessError as any)?.message || capacitySuccessError));
+      }
     }
     return value;
   }catch(error){
@@ -824,8 +833,11 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{}),...(scaleGateDeferral?{geminiScaleGateDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
     // A real upstream quota/credential response opens the durable circuit.
     // Local capacity deferrals never reached the provider and are excluded.
+    // Key-level 401/403 rejection is route-scoped (another key in the same
+    // organization may serve), so it must not block the whole account; only an
+    // organization-wide credential rejection does.
     const upstreamReasons = Array.isArray(typed.providerReasons) ? typed.providerReasons.map(String) : [];
-    const credentialFailure = typed.errorClass==='CREDENTIALS_EXHAUSTED' || upstreamReasons.includes('PROVIDER_ROUTE_UNAUTHORIZED');
+    const credentialFailure = typed.errorClass==='CREDENTIALS_EXHAUSTED';
     if (providerCallStarted && (args.context.provider==='gemini'||args.context.provider==='groq')
       && (typed.errorClass==='RATE_LIMIT'||credentialFailure)) {
       const org = String(
@@ -856,7 +868,8 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
           sourceEventId: event.id,
         });
         Object.assign(typed,{retryAt:persistedResumeAt,providerCapacityExhausted:true});
-      } catch {
+      } catch (capacityStateError) {
+        console.warn('[ProviderCapacity] Failed to persist exhausted state:', String((capacityStateError as any)?.message || capacityStateError));
         Object.assign(typed,{retryAt:resumeAt,providerCapacityExhausted:true});
       }
     }

@@ -1857,9 +1857,17 @@ export async function processNextSearchJob(
       }
     }
   }
-  const semanticCapacity = semanticGateNeeded && !geminiFreeSelectedForGate
-    ? await getSemanticCapacityStatus(semanticCapacityAccounts).catch(() => ({ available: true, probe: false, resumeAt: null, reason: null }))
-    : { available: true, probe: false, resumeAt: null, reason: null };
+  let semanticCapacityProbe: Promise<{ available: boolean }> | null = null;
+  const semanticCapacity = async (): Promise<boolean> => {
+    if (!semanticGateNeeded || geminiFreeSelectedForGate) return true;
+    // Resolve lazily, only when this tick is about to offer a semantic job
+    // type. Taking the one-shot probe lease on a tick that never claims
+    // semantic work would block the real probe for the lease duration.
+    if (!semanticCapacityProbe) {
+      semanticCapacityProbe = getSemanticCapacityStatus(semanticCapacityAccounts);
+    }
+    return (await semanticCapacityProbe).available;
+  };
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   // ENRICH_CHANNEL: every such job runs the full evidence pipeline. Under the
@@ -1921,18 +1929,18 @@ export async function processNextSearchJob(
     }
     // Classification and process lanes are separate from ENRICH backfill, so
     // their own overrides must be accepted outside the ENRICH-only block.
-    if (enrichmentFullyClaimable && semanticCapacity.available && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+    if (enrichmentFullyClaimable && await semanticCapacity() && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
       claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
     // Dedicated process lane: separate worker capacity removes classification
-    // starvation, while the semantic-availability gate prevents a defer storm.
-    // This must sit outside the ENRICH_CHANNEL-only block above so a
+    // starvation, while the same semantic-availability gate prevents a defer
+    // storm. This must sit outside the ENRICH_CHANNEL-only block above so a
     // process-only override can claim its job type.
-    if (enrichmentFullyClaimable && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
+    if (enrichmentFullyClaimable && await semanticCapacity() && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
-  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && semanticCapacity.available && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
+  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');

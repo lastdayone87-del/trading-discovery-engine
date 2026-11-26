@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import test, { after } from 'node:test';
+import test, { after, before } from 'node:test';
 import pg from 'pg';
 import type { Pool } from 'pg';
 import {
@@ -34,11 +34,15 @@ function groq(scopeKey: string): ProviderCapacityAccount {
   return { provider: 'groq', scopeKey };
 }
 
-maybe('capacity state parks until reset, allows exactly one probe, and closes on success', async () => {
+before(async () => {
+  if (!dedicatedUrl) return;
   pool = new pg.Pool({ connectionString: dedicatedUrl, max: 4 });
+  await pool.query(`DROP TABLE IF EXISTS provider_capacity_state`);
+  await pool.query(readFileSync(new URL('./db/migrations/210_provider_capacity_state.sql', import.meta.url), 'utf8'));
+});
+
+maybe('capacity state parks until reset, allows exactly one probe, and closes on success', async () => {
   const db = requirePool();
-  await db.query(`DROP TABLE IF EXISTS provider_capacity_state`);
-  await db.query(readFileSync(new URL('./db/migrations/210_provider_capacity_state.sql', import.meta.url), 'utf8'));
   resetProviderCapacityCacheForTests();
 
   const future = Date.now() + 60 * 60_000;
@@ -164,6 +168,71 @@ maybe('concurrent callers receive at most one probe', async () => {
   ]);
   assert.equal(results.filter(result => result.probe).length, 1, 'exactly one concurrent caller may win the probe');
   assert.equal(results.filter(result => !result.available).length, 1);
+});
+
+maybe('a quota failure during a probe reopens the circuit with a new reset', async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 60 * 60_000,
+  }, db);
+  await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second'`);
+  resetProviderCapacityCacheForTests();
+  assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).probe, true);
+  const nextReset = Date.now() + 8 * 60 * 60_000;
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: nextReset,
+  }, db);
+  resetProviderCapacityCacheForTests();
+  const parked = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
+  assert.equal(parked.available, false);
+  assert.equal(parked.probe, false);
+  assert.ok((parked.resumeAt || 0) >= nextReset - 1_000, 'the failed probe must persist the new reset time');
+});
+
+maybe('an older success cannot clear a newer failure', async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 60 * 60_000,
+  }, db);
+  await recordProviderCapacitySuccess({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: 'multilingual-semantic-classification',
+    observedAt: Date.now() - 60_000,
+  }, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal(
+    (await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available,
+    false,
+    'a success that started before the failure must not close the circuit',
+  );
+  await recordProviderCapacitySuccess({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: 'multilingual-semantic-classification',
+    observedAt: Date.now() + 1_000,
+  }, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);
 });
 
 after(async () => {

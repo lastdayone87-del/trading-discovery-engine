@@ -654,7 +654,7 @@ export async function runGroqTextCompletion(
     const orgId = groqRouteOrg(route);
     const base = {
       id: randomUUID(), provider: 'groq', operation,
-      requestMetadata: { groqRoute: route.id, groqOrg: orgId, groqModel: model }, attempt: 1,
+      requestMetadata: { groqRoute: route.id, groqOrg: orgId, groqModel: model, groqCallStartedAt: new Date(started).toISOString() }, attempt: 1,
       reservedCost: 0, policyVersion: 'provider-resilience-v1',
     };
     try {
@@ -824,7 +824,6 @@ export async function runGroqTextCompletion(
           timestamp: new Date().toISOString(),
         }));
       }
-      if (reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) failureMetadata.groqRouteUnauthorized = 'true';
       const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
       await emitBounded(emit, {
         ...base, status: statusFor(typed), latencyMs: Date.now() - started,
@@ -1171,10 +1170,16 @@ async function persistGroqCapacityEvent(event: ProviderCallEvent): Promise<void>
   const orgId = String(metadata.groqOrg || '').trim();
   if (!orgId) return;
   try {
-    await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: orgId, operation: event.operation });
-  } catch {
-    // Capacity persistence is best-effort; the provider event ledger remains
-    // authoritative and the existing cooldown path still protects the account.
+    await recordProviderCapacitySuccess({
+      provider: 'groq',
+      scopeKey: orgId,
+      operation: event.operation,
+      // Only a circuit observed before this call started may be closed; an
+      // earlier success must not erase a failure recorded while it ran.
+      observedAt: String(metadata.groqCallStartedAt || event.occurredAt || ''),
+    });
+  } catch (capacitySuccessError) {
+    console.warn('[ProviderCapacity] Failed to persist Groq success:', String((capacitySuccessError as any)?.message || capacitySuccessError));
   }
 }
 
@@ -1245,7 +1250,7 @@ export function defaultClient(
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         ...semanticObservabilityFields(observability),
-        requestMetadata: { ...(observability?.requestMetadata || {}), groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
+        requestMetadata: { ...(observability?.requestMetadata || {}), groqRoute: route.id, groqOrg: orgId, groqCallStartedAt: new Date(started).toISOString(), ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
@@ -1367,7 +1372,6 @@ export function defaultClient(
             timestamp: new Date().toISOString(),
           }));
         }
-        if (reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) failureMetadata.groqRouteUnauthorized = 'true';
         // Deferred short-circuits stay observable but must never restart the
         // persisted window: the shared expiry derives from the latest
         // RATE_LIMITED row, so a deferral is tagged and the resolver below
@@ -1378,9 +1382,8 @@ export function defaultClient(
         // lets an enrichment job park until the reset instead of consuming its
         // attempts. Local cooldown deferrals are excluded.
         if (!deferred && !aborted
-          && (typed.errorClass === 'RATE_LIMIT' || typed.errorClass === 'CREDENTIALS_EXHAUSTED'
-            || reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED'))) {
-          const credential = typed.errorClass === 'CREDENTIALS_EXHAUSTED' || reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED');
+          && (typed.errorClass === 'RATE_LIMIT' || typed.errorClass === 'CREDENTIALS_EXHAUSTED')) {
+          const credential = typed.errorClass === 'CREDENTIALS_EXHAUSTED';
           const resumeAt = credential
             ? Date.now() + 24 * 60 * 60_000
             : Date.now() + Math.max(1_000, groqRateLimitCooldownMs());
@@ -1397,7 +1400,8 @@ export function defaultClient(
               sourceEventId: base.id,
             });
             Object.assign(typed, { retryAt: persistedResumeAt, providerCapacityExhausted: true });
-          } catch {
+          } catch (capacityStateError) {
+            console.warn('[ProviderCapacity] Failed to persist Groq exhaustion:', String((capacityStateError as any)?.message || capacityStateError));
             Object.assign(typed, { retryAt: resumeAt, providerCapacityExhausted: true });
           }
         }
