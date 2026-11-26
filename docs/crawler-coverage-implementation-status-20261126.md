@@ -35,7 +35,7 @@
 | Browser/rendered/queue source-contract tests | **158/158 pass** |
 | Multilingual/lexicon tests | **pass** |
 | Crawler exploration/robots/content/YouTube | **pass** |
-| Full suite, final rebased run | 5,729 tests: **5,409 pass, 63 fail**, 257 skipped. No modified crawler/extraction/YouTube/robots test is in the failure set; the 63 are pre-existing/environmental legacy DB/source-text failures (quarantine, query lifecycle, release audits, `viteConfig`) |
+| Full suite, final rebased run | 5,748 tests: **5,428 pass, 63 fail**, 257 skipped. No modified crawler/extraction/YouTube/robots test is in the failure set; the 63 are pre-existing/environmental legacy DB/source-text failures (quarantine, query lifecycle, release audits, `viteConfig`) |
 | Failure-set comparison vs `origin/main` `f0aa55b3` | Every final failure name reproduces on the unmodified baseline in targeted runs (48 names from the baseline file set, including the file-level `viteConfig` entry, plus 13 from six missed files and 3 from `scopePromotedDiscovery`); no branch-only failure. The 63 test failures plus the file-level entry account for the 64-name comparison. The two `youtubeInnertubeProvider` timing failures seen under full-suite load pass when run alone (44/44) |
 | Targeted rebased review suite | **231/231 pass** across extraction, reserved codes, validation, obfuscation, collisions, multilingual, robots, exploration, content types, failure bodies, YouTube, rendered enqueue and queue source contracts |
 
@@ -85,6 +85,27 @@
   status; their bodies are scanned only for community-scored targets.
 - **Frontier canary keyed on the raw seed.** It now buckets by canonical site
   identity so scheme/www/path variants of one site receive one treatment.
+
+### Final review-loop hardening
+
+- Robots pacing is shared per origin across concurrent crawls, charges queue
+  time and wait time to a per-crawl budget, records the actual request-start
+  time, and releases destination slots when pacing skips a URL.
+- Rendered document/fetch/XHR requests consult the same robots policy. A
+  deterministic Disallow keeps coverage incomplete but non-retryable; only a
+  pacing-budget skip contributes retryability.
+- Community URL evidence uses decoded hostname + pathname, never query or
+  fragment text; IDN hosts are converted back from punycode. Ambiguous host
+  labels (`circle`, `join`, `signal`) require path/anchor evidence.
+- Playlist item text is not creator-owned evidence; only the playlist
+  description is. Creator-authored comments are prioritized before the cap.
+- Child robots rejection is checked before destination reservation, and
+  pacing-rejected URLs are marked visited so later pages cannot re-enqueue
+  them.
+- Base64 accepts UTF-8 printable payloads; inline `<br />`/closing-tag
+  fragments are rejoined; duplicate robots groups are merged.
+- Final bot review state: all review threads resolved; no unresolved findings
+  at commit `549af000`.
 
 ### Review corrections made during this batch
 
