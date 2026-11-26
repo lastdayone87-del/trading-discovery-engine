@@ -93,9 +93,16 @@ export function geminiFreeCooldownRemainingMs(nowMs: number = Date.now()): numbe
   return Math.max(0, geminiFreeCooldownUntilMs - nowMs);
 }
 
+/** All configured free routes rejected their credentials until this instant. */
+let geminiFreeCredentialExhaustedUntilMs = 0;
+export function geminiFreeCredentialExhausted(nowMs: number = Date.now()): boolean {
+  return geminiFreeCredentialExhaustedUntilMs > nowMs;
+}
+
 /** Test-only reset for the in-process cooldown. */
 export function resetGeminiFreeCooldownForTests(): void {
   geminiFreeCooldownUntilMs = 0;
+  geminiFreeCredentialExhaustedUntilMs = 0;
 }
 
 function geminiFreeCooldownDeferredError(remainingMs: number): ProviderCallError {
@@ -152,6 +159,7 @@ function geminiFreeFailoverCancelled(signal?: AbortSignal): ProviderCallError {
 
 export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], call: (route: GeminiFreeRoute) => Promise<T>, opts?: GeminiFreeRouteFailoverOptions): Promise<T> {
   let lastError: unknown;
+  let unauthorizedFailures = 0;
   for (const route of routes) {
     if (opts?.signal?.aborted) {
       if (abortedByDeadline(opts.signal)) {
@@ -166,12 +174,23 @@ export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], c
       // The caller already abandoned this evaluation; do not advance to
       // another key (or emit further timeout telemetry) for it.
       if (opts?.signal?.aborted) throw error;
+      if (error instanceof ProviderCallError) {
+        const reasons = Array.isArray(error.providerReasons) ? error.providerReasons : [];
+        if (error.errorClass === 'CREDENTIALS_EXHAUSTED' || reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) {
+          unauthorizedFailures++;
+        }
+      }
       // Free-tier rate limits are project-level, not key-level: failing over
       // to another key after a 429 would multiply the burst. Failover remains
       // for other retryable failures such as transient transport errors.
       if (error instanceof ProviderCallError && error.errorClass === 'RATE_LIMIT') throw error;
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
     }
+  }
+  // Every configured free key rejected its credential. Block the fallback in
+  // this process so the claim gate does not keep offering it as healthy.
+  if (unauthorizedFailures >= routes.length) {
+    geminiFreeCredentialExhaustedUntilMs = Math.max(geminiFreeCredentialExhaustedUntilMs, Date.now() + 24 * 60 * 60_000);
   }
   throw lastError || new ProviderCallError('No configured free Gemini route is available.', 'TRANSIENT', true);
 }

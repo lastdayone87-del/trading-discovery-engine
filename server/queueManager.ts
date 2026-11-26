@@ -191,7 +191,7 @@ import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemant
 import { getSemanticCapacityStatus, releaseProviderCapacityProbe, type ProviderCapacityProbe, type ProviderCapacityStatus } from './providerCapacityState';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
-import { shouldUseGeminiFreeSemantic, configuredGeminiFreeRoutes } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
+import { shouldUseGeminiFreeSemantic, configuredGeminiFreeRoutes, geminiFreeCredentialExhausted } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
@@ -1869,7 +1869,7 @@ export async function processNextSearchJob(
   const freeTierFallbackHealthy = async (): Promise<boolean> => {
     if (!geminiFreeFallbackForGate) return false;
     if (freeFallbackAvailable === null) {
-      freeFallbackAvailable = !(await isGeminiFreeSemanticCooldownActive());
+      freeFallbackAvailable = !(await isGeminiFreeSemanticCooldownActive()) && !geminiFreeCredentialExhausted();
     }
     return freeFallbackAvailable;
   };
@@ -1880,7 +1880,7 @@ export async function processNextSearchJob(
   // every serving route is actually cooling.
   const semanticRoutesCooling = async (): Promise<boolean> => {
     if (await freeTierFallbackHealthy()) return false;
-    if (shouldUseGeminiFreeSemantic()) return isGeminiFreeSemanticCooldownActive();
+    if (shouldUseGeminiFreeSemantic()) return (await isGeminiFreeSemanticCooldownActive()) || geminiFreeCredentialExhausted();
     if (shouldUseGroqSemantic()) {
       const routes = configuredGroqRoutes();
       if (!routes.length) return true;
@@ -1901,7 +1901,10 @@ export async function processNextSearchJob(
   let semanticCapacityProbe: Promise<ProviderCapacityStatus> | null = null;
   let takenCapacityProbe: ProviderCapacityProbe | null = null;
   const semanticCapacity = async (): Promise<boolean> => {
-    if (!semanticGateNeeded || geminiFreeSelectedForGate) return true;
+    if (!semanticGateNeeded) return true;
+    if (geminiFreeSelectedForGate) {
+      return !(await isGeminiFreeSemanticCooldownActive()) && !geminiFreeCredentialExhausted();
+    }
     if (await freeTierFallbackHealthy()) return true;
     // Resolve lazily, only when this tick is about to offer a semantic job
     // type. Taking the one-shot probe lease on a tick that never claims
