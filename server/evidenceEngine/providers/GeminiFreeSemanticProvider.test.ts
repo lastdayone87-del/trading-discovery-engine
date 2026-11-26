@@ -8,6 +8,7 @@ import {
   clearGeminiFreeSdkCacheForTests,
   defaultClient,
   geminiFreeCooldownRemainingMs,
+  geminiFreeCredentialExhausted,
   geminiFreeFailureCooldownUntilMs,
   geminiFreeFailureMetadata,
   geminiFreeRateLimitCooldownMs,
@@ -137,6 +138,22 @@ test('rate-limited free route failure surfaces without cross-route burst', async
     throw new ProviderCallError('Provider rate limit reached.', 'RATE_LIMIT', true, { status: 429 });
   }));
   assert.deepEqual(order, ['gemini-free-1']);
+});
+
+test('all rejected free routes block the pool until a later success', async () => {
+  resetGeminiFreeCooldownForTests();
+  const routes = [{ id: 'gemini-free-1', key: 'k1' }, { id: 'gemini-free-2', key: 'k2' }];
+  await assert.rejects(runGeminiFreeRouteFailover(routes, async () => {
+    throw new ProviderCallError('Provider rejected the route credential.', 'TRANSIENT', true, {
+      status: 401,
+      routeScoped: true,
+      providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
+    });
+  }));
+  assert.equal(geminiFreeCredentialExhausted(Date.now()), true);
+  const value = await runGeminiFreeRouteFailover(routes, async () => 'ok');
+  assert.equal(value, 'ok');
+  assert.equal(geminiFreeCredentialExhausted(Date.now()), false, 'a successful call must clear the credential block');
 });
 
 test('routing defaults to paid gemini and honors selection plus kill switch', () => {

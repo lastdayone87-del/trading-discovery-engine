@@ -168,7 +168,11 @@ export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], c
       throw geminiFreeFailoverCancelled(opts.signal);
     }
     try {
-      return await call(route);
+      const result = await call(route);
+      // A successful call proves the credentials work again; clear the
+      // in-process credential block immediately.
+      geminiFreeCredentialExhaustedUntilMs = 0;
+      return result;
     } catch (error) {
       lastError = error;
       // The caller already abandoned this evaluation; do not advance to

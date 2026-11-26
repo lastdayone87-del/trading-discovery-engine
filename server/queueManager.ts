@@ -1876,6 +1876,17 @@ export async function processNextSearchJob(
     }
     return freeFallbackAvailable;
   };
+  const groqRoutesServing = async (): Promise<boolean> => {
+    if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return false;
+    const routes = configuredGroqRoutes();
+    if (!routes.length) return false;
+    return !allRoutesCoolingDown(await Promise.all(routes.map(async route => {
+      const org = groqRouteOrg(route);
+      return groqFallbackCoolingDown(await isGroqOrgCooldownActive(org), groqOrgCooldownRemainingMs(org));
+    })));
+  };
+  const freePrimaryServing = async (): Promise<boolean> =>
+    !(await isGeminiFreeSemanticCooldownActive()) && !geminiFreeCredentialExhausted();
   // Admission claims were previously gated only by the durable circuit. Under
   // local token-bucket pressure the provider is deferred before any upstream
   // call, so no circuit row exists and a missing row looks healthy. Use the
@@ -1883,13 +1894,8 @@ export async function processNextSearchJob(
   // every serving route is actually cooling.
   const semanticRoutesCooling = async (): Promise<boolean> => {
     if (await freeTierFallbackHealthy()) return false;
-    if (shouldUseGeminiFreeSemantic()) return (await isGeminiFreeSemanticCooldownActive()) || geminiFreeCredentialExhausted();
-    if (shouldUseGroqSemantic()) {
-      const routes = configuredGroqRoutes();
-      if (!routes.length) return true;
-      return allRoutesCoolingDown(await Promise.all(routes.map(async route =>
-        groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
-    }
+    if (shouldUseGeminiFreeSemantic()) return !(await freePrimaryServing()) && !(await groqRoutesServing());
+    if (shouldUseGroqSemantic()) return !(await groqRoutesServing());
     const geminiBucketFullByOrg = async (): Promise<Map<string, boolean>> => {
       const now = Date.now();
       if (geminiBucketPressureCache && now - geminiBucketPressureCache.at < GEMINI_BUCKET_PRESSURE_CACHE_MS) {
@@ -1918,17 +1924,14 @@ export async function processNextSearchJob(
       : await isGeminiSemanticCooldownActive();
     if (!geminiCooling) return false;
     if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return true;
-    const groqRoutes = configuredGroqRoutes();
-    if (!groqRoutes.length) return true;
-    return allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route =>
-      groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
+    return !(await groqRoutesServing());
   };
   let semanticCapacityProbe: Promise<ProviderCapacityStatus> | null = null;
   let takenCapacityProbe: ProviderCapacityProbe | null = null;
   const semanticCapacity = async (): Promise<boolean> => {
     if (!semanticGateNeeded) return true;
     if (geminiFreeSelectedForGate) {
-      return !(await isGeminiFreeSemanticCooldownActive()) && !geminiFreeCredentialExhausted();
+      return (await freePrimaryServing()) || (await groqRoutesServing());
     }
     if (await freeTierFallbackHealthy()) return true;
     // Resolve lazily, only when this tick is about to offer a semantic job
@@ -1988,7 +1991,9 @@ export async function processNextSearchJob(
     const groqCooldownActive = groqRoutes.length > 0
       ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))))
       : (groqSelected ? await isGroqSemanticCooldownActive() : false);
-    const geminiFreeCooldownActive = geminiFreeSelected ? await isGeminiFreeSemanticCooldownActive() : false;
+    const geminiFreeCooldownActive = geminiFreeSelected
+      ? (await isGeminiFreeSemanticCooldownActive()) || geminiFreeCredentialExhausted()
+      : false;
     let groqFallbackConfigured = false;
     let groqFallbackCooldownActive = false;
     if (!groqSelected && !geminiFreeSelected && geminiCooldownActive) {
@@ -2020,14 +2025,14 @@ export async function processNextSearchJob(
     }
     // Classification and process lanes are separate from ENRICH backfill, so
     // their own overrides must be accepted outside the ENRICH-only block.
-    if (claimableOverride?.includes(CLASSIFICATION_JOB_TYPE) && (enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity()) {
+    if (claimableOverride?.includes(CLASSIFICATION_JOB_TYPE) && !(await semanticRoutesCooling()) && await semanticCapacity()) {
       claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
     // Dedicated process lane: separate worker capacity removes classification
     // starvation, while the same semantic-availability gate prevents a defer
     // storm. This must sit outside the ENRICH_CHANNEL-only block above so a
     // process-only override can claim its job type.
-    if (claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL') && (enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity()) {
+    if (claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL') && !(await semanticRoutesCooling()) && await semanticCapacity()) {
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
