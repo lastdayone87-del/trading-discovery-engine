@@ -11,6 +11,7 @@ test('semantic claim gate and provider circuit are wired', () => {
   assert.match(queue, /await semanticCapacity\(\)/);
   assert.match(queue, /getSemanticCapacityStatus\(semanticCapacityAccounts\)/);
   assert.match(queue, /admissionSemanticClaimable && \(!claimableOverride \|\| claimableOverride\.includes\('VERIFY_CHANNEL_ADMISSION'\)\) && !\(await semanticRoutesCooling\(\)\)/);
+  assert.match(queue, /claimableOverride\.includes\('ENRICH_CHANNEL'\)/);
   assert.match(queue, /releaseUnusedCapacityProbe\(\)/);
   assert.match(queue, /claimableOverride\?\.includes\('PROCESS_DISCOVERED_CHANNEL'\) && !\(await semanticRoutesCooling\(\)\) && await semanticCapacity\(\)/);
   assert.match(queue, /scopeKey: geminiRouteOrg\(route\)/);

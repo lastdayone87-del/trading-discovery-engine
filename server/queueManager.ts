@@ -1843,7 +1843,8 @@ export async function processNextSearchJob(
   const semanticGateNeeded = !claimableOverride
     || claimableOverride.includes(CLASSIFICATION_JOB_TYPE)
     || claimableOverride.includes(ADMISSION_VERIFICATION_JOB_TYPE)
-    || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL');
+    || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL')
+    || claimableOverride.includes('ENRICH_CHANNEL');
   // Build the eligible route set from configuration, not from whatever rows
   // happen to exist: a healthy account that has never failed must keep the
   // lane claimable even while a sibling account is exhausted. The selection
