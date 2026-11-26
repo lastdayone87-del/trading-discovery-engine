@@ -83,7 +83,7 @@ import { resolveExecutionSearchWindow } from './retrievalExperiment';
 import { assessQueryResultConsistency, shouldContinueSearchAfterConsistency } from './queryResultConsistency';
 import { trialContinuationCap } from './discoveryFrontierTrials';
 import { aggregatedLanguageCandidateSet, mergeCountryValidationResults, validateChannelCountry } from './countryValidator';
-import { runChannelInspection, hasProcessedAcquisitionEvidence } from './inspector';
+import { runChannelInspection, hasProcessedAcquisitionEvidence, creatorWebsiteHostsFromLinks } from './inspector';
 import { hasRetryableCommunityAcquisitionFailure } from './communityRetryPolicy';
 import { recordAcquisitionInspectionEvent } from './acquisitionLaneTelemetry';
 import { acquisitionLaneForJobType, summarizeAcquisitionInspection, type AcquisitionAttribution, type AcquisitionLane, type AcquisitionLaneInspection } from './acquisitionLaneTaxonomy';
@@ -4854,9 +4854,10 @@ export async function inspectAndValidateChannel(
       });
     }
     // Public YouTube surfaces are a separate high-yield acquisition path.
-    // Run only for TRADING_CONFIRMED channels with no recorded/just-found
-    // invite, behind a canary setting, so quota and parser load stay bounded
-    // and zero-invite creators are prioritized.
+    // Run for TRADING_CONFIRMED channels with no persisted invite, behind a
+    // canary setting, so quota and parser load stay bounded. Unvalidated
+    // static candidates do not suppress expansion; downstream validation and
+    // global dedupe still decide the winner.
     if (inspection && isYouTubeSurfaceExpansionEligible(channel)) {
       // Read the canary settings only for eligible zero-invite channels so
       // ordinary inspections do not pay two settings queries.
@@ -4873,7 +4874,10 @@ export async function inspectAndValidateChannel(
           const snapshot = await collectYouTubeSurfaceSnapshot(channel.channel_id, client);
           const youtubeCandidates = candidatesFromYouTubeSnapshot(snapshot, channel.channel_id);
           if (youtubeCandidates.length) {
-            inspection = mergeYouTubeSurfaceCandidates(inspection, youtubeCandidates);
+            inspection = mergeYouTubeSurfaceCandidates(inspection, youtubeCandidates, {
+              creatorName: channel.channel_name,
+              creatorWebsiteHosts: creatorWebsiteHostsFromLinks(inspection.observedChannelLinks || []),
+            });
             console.info(JSON.stringify({
               event: 'youtube_surface_candidates_retained',
               channelId: channel.channel_id,

@@ -224,8 +224,37 @@ test('viewer comments never become creator-owned through repetition', () => {
 
 test('only a recorded invite suppresses YouTube surface expansion', () => {
   assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'TRADING_CONFIRMED', discord_invite: null }), true);
+  assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'TRADING_CONFIRMED', discord_invite: '   ' }), true);
   assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'TRADING_CONFIRMED', discord_invite: 'https://discord.gg/known' }), false);
   assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'UNCERTAIN', discord_invite: null }), false);
+});
+
+test('YouTube merge preserves existing creator ownership context', () => {
+  const existing = makeDiscordCandidate({
+    locatorType: 'NATIVE_INVITE',
+    extractionConfidence: 'EXPLICIT',
+    nativeInviteCode: 'EXISTINGOWNED',
+    sourceSurface: 'CREATOR_WEBSITES',
+    sourceUrl: 'https://creator.example/links',
+    rawLocator: 'https://discord.gg/EXISTINGOWNED',
+  });
+  const youtube = makeDiscordCandidate({
+    locatorType: 'NATIVE_INVITE',
+    extractionConfidence: 'EXPLICIT',
+    nativeInviteCode: 'YTNEW',
+    sourceSurface: 'YOUTUBE_COMMENTS',
+    sourceUrl: 'https://youtube.com/channel/UC123',
+    rawLocator: 'https://discord.gg/YTNEW',
+  });
+  const merged = mergeYouTubeSurfaceCandidates(
+    { discordCandidates: [existing], foundInvite: 'EXISTINGOWNED' },
+    [youtube],
+    { creatorName: 'Creator', creatorWebsiteHosts: ['creator.example'] },
+  );
+  assert.equal(
+    merged.discordCandidates?.find(candidate => candidate.nativeInviteCode === 'EXISTINGOWNED')?.ownershipStatus,
+    'CREATOR_OWNED',
+  );
 });
 
 test('YouTube canary selection is deterministic and bounded', () => {

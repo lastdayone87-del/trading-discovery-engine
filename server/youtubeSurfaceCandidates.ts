@@ -392,9 +392,13 @@ export function mergeYouTubeSurfaceCandidates<T extends {
 }>(
   inspection: T,
   youtubeCandidates: DiscordCandidate[],
+  ownership: { creatorName?: string; creatorWebsiteHosts?: string[] } = {},
 ): T {
   if (!youtubeCandidates.length) return inspection;
-  const merged = mergeDiscordCandidates([...(inspection.discordCandidates || []), ...youtubeCandidates]);
+  const merged = mergeDiscordCandidates(
+    [...(inspection.discordCandidates || []), ...youtubeCandidates],
+    ownership,
+  );
   return {
     ...inspection,
     discordCandidates: merged,
