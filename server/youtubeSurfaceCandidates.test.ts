@@ -5,6 +5,7 @@ import {
   candidatesFromYouTubeSnapshot,
   collectYouTubeSurfaceSnapshot,
   isYouTubeSurfaceCanarySelected,
+  isYouTubeSurfaceExpansionEligible,
   mergeYouTubeSurfaceCandidates,
   YOUTUBE_SURFACE_SESSION_OPTIONS,
   type YouTubeSurfaceClient,
@@ -219,6 +220,12 @@ test('viewer comments never become creator-owned through repetition', () => {
   const candidates = candidatesFromYouTubeSnapshot(snapshot, 'channel-1');
   assert.equal(candidates.every(candidate => candidate.sourceSurface === 'YOUTUBE_COMMENTS'), true);
   assert.equal(candidates.every(candidate => candidate.ownershipStatus !== 'CREATOR_OWNED'), true);
+});
+
+test('only a recorded invite suppresses YouTube surface expansion', () => {
+  assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'TRADING_CONFIRMED', discord_invite: null }), true);
+  assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'TRADING_CONFIRMED', discord_invite: 'https://discord.gg/known' }), false);
+  assert.equal(isYouTubeSurfaceExpansionEligible({ trading_status: 'UNCERTAIN', discord_invite: null }), false);
 });
 
 test('YouTube canary selection is deterministic and bounded', () => {

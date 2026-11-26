@@ -208,6 +208,7 @@ import {
   collectYouTubeSurfaceSnapshot,
   createYouTubeSurfaceClient,
   isYouTubeSurfaceCanarySelected,
+  isYouTubeSurfaceExpansionEligible,
   mergeYouTubeSurfaceCandidates,
 } from './youtubeSurfaceCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
@@ -4856,13 +4857,7 @@ export async function inspectAndValidateChannel(
     // Run only for TRADING_CONFIRMED channels with no recorded/just-found
     // invite, behind a canary setting, so quota and parser load stay bounded
     // and zero-invite creators are prioritized.
-    if (
-      inspection
-      && channel.trading_status === 'TRADING_CONFIRMED'
-      && !channel.discord_invite
-      && !inspection.foundInvite
-      && !(inspection.discordCandidates || []).length
-    ) {
+    if (inspection && isYouTubeSurfaceExpansionEligible(channel)) {
       // Read the canary settings only for eligible zero-invite channels so
       // ordinary inspections do not pay two settings queries.
       let youtubeExpansionEnabled = false;

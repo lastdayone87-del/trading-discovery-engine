@@ -304,6 +304,18 @@ export async function collectYouTubeSurfaceSnapshot(
   return snapshot;
 }
 
+/** Priority gate for the YouTube surface canary. Only the recorded invite
+ * suppresses expansion; unvalidated static candidates do not, because they
+ * may fail validation and independent YouTube surfaces can still expose the
+ * creator's invite. Downstream dedupe/validation handles overlap. */
+export function isYouTubeSurfaceExpansionEligible(channel: {
+  trading_status?: string | null;
+  discord_invite?: string | null;
+}): boolean {
+  return channel.trading_status === 'TRADING_CONFIRMED'
+    && !String(channel.discord_invite || '').trim();
+}
+
 /**
  * Deterministic channel canary. `basisPoints` 10000 = all, 0 = none; the
  * default rollout uses 5% while zero-invite channels are prioritized. The
