@@ -1,5 +1,5 @@
 import test from 'node:test'; import assert from 'node:assert/strict'; import { readFileSync } from 'node:fs';
-import { executeProviderCall, shouldEmitProviderEvent, classifyProviderError, ProviderCallError, decideGeminiCapacity, isGeminiCapacityDeferral, isGeminiScaleGateDeferral, resolveGeminiRouteId, extractGoogleQuotaFailure, parseProviderRetryDelayMs, nextPacificMidnightMs, providerCooldownExpiryMs, type ProviderCallEvent } from './providerResilience';
+import { executeProviderCall, classifyProviderError, ProviderCallError, decideGeminiCapacity, isGeminiCapacityDeferral, isGeminiScaleGateDeferral, resolveGeminiRouteId, extractGoogleQuotaFailure, parseProviderRetryDelayMs, nextPacificMidnightMs, providerCooldownExpiryMs, type ProviderCallEvent } from './providerResilience';
 
 test('successful calls emit bounded, payload-free cost telemetry',async()=>{const events:ProviderCallEvent[]=[];const result=await executeProviderCall({context:{provider:'fake',operation:'read',actualCost:3,requestId:'r',runId:'run-1',jobId:'job-1',requestMetadata:{regionCode:'FR',relevanceLanguage:'fr'},attempt:2},timeoutMs:50,call:async()=>({secret:'not logged'}),emit:async e=>{events.push(e)}});assert.equal(result.secret,'not logged');assert.equal(events[0].status,'SUCCESS');assert.equal(events[0].actualCost,3);assert.equal(events[0].requestId,'r');assert.equal(events[0].runId,'run-1');assert.equal(events[0].jobId,'job-1');assert.deepEqual(events[0].requestMetadata,{regionCode:'FR',relevanceLanguage:'fr'});assert.equal(events[0].attempt,2);assert.equal(JSON.stringify(events).includes('not logged'),false)});
 test('deadline aborts a fake provider and produces a retryable typed timeout',async()=>{const events:ProviderCallEvent[]=[];await assert.rejects(executeProviderCall({context:{provider:'fake',operation:'hang'},timeoutMs:10,call:signal=>new Promise((_r,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')))),emit:async e=>{events.push(e)}}),(e:any)=>e instanceof ProviderCallError&&e.errorClass==='TIMEOUT'&&e.retryable);assert.equal(events[0].status,'TIMEOUT')});
@@ -242,8 +242,3 @@ test('a per-minute declared reset still applies when it extends past the fixed c
   assert.equal(decision.action, 'DEFER');
 });
 
-test('local capacity deferrals are not persisted as provider-call events', () => {
-  assert.equal(shouldEmitProviderEvent(true, false), true, 'lock timeouts must remain visible');
-  assert.equal(shouldEmitProviderEvent(false, true), false);
-  assert.equal(shouldEmitProviderEvent(false, false), true);
-});

@@ -12,6 +12,8 @@ on:
       - 'server/providerEventIndexes.test.ts'
       - 'server/providerEventIndexes.postgres.test.ts'
       - 'server/db/migrations/209_provider_event_indexes.sql'
+      - 'server/providerResilience.ts'
+      - 'server/providerResilience.test.ts'
       - 'server/db/migrations/207_quota_reservation_active_index.sql'
       - 'server/db/migrations/208_quota_reservation_consumed_index.sql'
       - '.github/workflows/quota-reservation-locking.yml'

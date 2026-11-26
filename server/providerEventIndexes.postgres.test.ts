@@ -40,7 +40,7 @@ function assertUsesIndex(plan: unknown, indexName: string): void {
   assert.ok(nodes.some(node => String(node['Index Name'] || '') === indexName), `plan must use ${indexName}`);
 }
 
-async function setup(): Promise<void> {
+async function createSchema(): Promise<void> {
   const db = requirePool();
   await db.query(`DROP TABLE IF EXISTS provider_call_events`);
   await db.query(`
@@ -54,6 +54,14 @@ async function setup(): Promise<void> {
       request_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
       occurred_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE INDEX idx_provider_events_time ON provider_call_events (occurred_at DESC);
+    CREATE INDEX idx_provider_events_provider_operation_time ON provider_call_events (provider, operation, occurred_at DESC);
+  `);
+}
+
+async function seedData(): Promise<void> {
+  const db = requirePool();
+  await db.query(`
     INSERT INTO provider_call_events(provider, operation, status, request_metadata, occurred_at, run_id)
     SELECT 'gemini', 'multilingual-semantic-classification', 'SUCCESS',
            jsonb_build_object('geminiOrg','gemini-project-'||(1+(g%5))::text),
@@ -88,18 +96,19 @@ async function setup(): Promise<void> {
   `);
 }
 
-maybe('migration 209 adopts all provider-event indexes and the hot reads use them', async () => {
+maybe('migration 209 creates on an empty table, re-adopts, and the hot reads use the indexes', async () => {
   pool = new pg.Pool({ connectionString: dedicatedUrl, max: 4 });
-  await setup();
+  await createSchema();
   const db = requirePool();
-  await db.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_gemini_active_org_time ON public.provider_call_events ((request_metadata->>'geminiOrg'), occurred_at DESC) WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'`);
-  await db.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_groq_rate_org_time ON public.provider_call_events ((request_metadata->>'groqOrg'), occurred_at DESC) WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true'`);
-  await db.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_rate_provider_time ON public.provider_call_events (provider, occurred_at DESC) WHERE status='RATE_LIMITED'`);
-  await db.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_run_id ON public.provider_call_events (run_id, provider, operation, status) WHERE run_id IS NOT NULL`);
-  await db.query(`ANALYZE provider_call_events`);
-
   const migration = readFileSync(new URL('./db/migrations/209_provider_event_indexes.sql', import.meta.url), 'utf8');
+  // First run must exercise the migration's empty-table CREATE path.
   await db.query(migration);
+  const created = await db.query(`SELECT c.relname, i.indisvalid, i.indisready FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relname IN ('idx_provider_events_gemini_active_org_time','idx_provider_events_groq_rate_org_time','idx_provider_events_rate_provider_time','idx_provider_events_run_id')`);
+  assert.equal(created.rowCount, 4);
+  assert.ok(created.rows.every(row => row.indisvalid === true && row.indisready === true));
+  // Second run must adopt the same indexes without rebuilding.
+  await db.query(migration);
+  await seedData();
 
   const cases: Array<[string, string]> = [
     [`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'='gemini-project-1' AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`, 'idx_provider_events_gemini_active_org_time'],

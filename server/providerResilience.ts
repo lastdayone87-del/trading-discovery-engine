@@ -765,20 +765,6 @@ export function isGeminiScaleGateDeferral(
     reason === 'GEMINI_ORG_TOKEN_BUCKET_EMPTY' || reason.includes('DEFERRED'));
 }
 
-/**
- * Local capacity deferrals never reached a provider. Persisting one ledger row
- * per deferred job turns a provider outage into a write storm and feeds the
- * capacity scans with rows that cannot answer a quota question. Keep only
- * upstream calls (and the Phase 2 state transition) in the durable ledger.
- */
-export function shouldEmitProviderEvent(capacityDeferral: boolean, scaleGateDeferral: boolean): boolean {
-  // Suppress only reason-coded capacity deferrals that never reached Google.
-  // Lock waits and deadline contention are still provider-capacity telemetry
-  // and must remain visible to the scale gate. `capacityDeferral` alone is too
-  // broad: it also covers pre-call lock timeouts.
-  return !scaleGateDeferral;
-}
-
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{
   // An already-aborted caller must never start a billable request. Without
   // this check the abort listener is installed after the fact, so downstream
@@ -834,9 +820,7 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
       await persistCapacityOutcome(event).catch(()=>undefined);
     }
     await releaseCapacity();
-    if (shouldEmitProviderEvent(capacityDeferral, scaleGateDeferral)) {
-      await args.emit(event).catch(()=>undefined);
-    }
+    await args.emit(event).catch(()=>undefined);
     throw typed;
   }finally{
     if(timer)clearTimeout(timer); args.signal?.removeEventListener('abort',abort);
