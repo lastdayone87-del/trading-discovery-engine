@@ -16,6 +16,8 @@ on:
       - 'server/operationalMaintenanceScheduler.ts'
       - 'server/operationalMaintenanceScheduler.test.ts'
       - 'server/staleChannelLockRecovery.test.ts'
+      - 'server/providerEventIndexes.test.ts'
+      - 'server/db/migrations/209_provider_event_indexes.sql'
       - 'server/queueManagerDiscoveryOverflow.test.ts'
       - 'server/channelAdmission/evidence.ts'
       - 'server/channelAdmission/pipelineIntegration.test.ts'
@@ -46,6 +48,7 @@ jobs:
           server/runtimeCapacityConfig.test.ts
           server/operationalMaintenanceScheduler.test.ts
           server/staleChannelLockRecovery.test.ts
+          server/providerEventIndexes.test.ts
           server/queueManagerDiscoveryOverflow.test.ts
           server/channelAdmission/pipelineIntegration.test.ts
       - name: TypeScript validation
