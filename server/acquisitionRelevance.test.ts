@@ -67,13 +67,26 @@ describe('acquisition relevance tiering (fail-open, recall-safe)', () => {
       contextMatches: false,
     });
     assert.notEqual(trusted.tier, 'BLOCK');
-    // Community hint never demotes/blocks.
-    const hinted = classifyUrlRelevance({
+    // Community evidence in the pathname or hostname never demotes/blocks.
+    const pathHinted = classifyUrlRelevance({
+      url: 'https://calendly.com/someuser/community',
+      source: 'VIDEO_1_DESCRIPTION',
+      contextMatches: false,
+    });
+    assert.equal(pathHinted.tier, 'ELIGIBLE');
+    const hostHinted = classifyUrlRelevance({
+      url: 'https://community.example/page',
+      source: 'VIDEO_1_DESCRIPTION',
+      contextMatches: false,
+    });
+    assert.equal(hostHinted.tier, 'ELIGIBLE');
+    // Query/fragment text is not community evidence.
+    const queryOnly = classifyUrlRelevance({
       url: 'https://calendly.com/someuser/book-meeting?x=discord',
       source: 'VIDEO_1_DESCRIPTION',
       contextMatches: false,
     });
-    assert.equal(hinted.tier, 'ELIGIBLE');
+    assert.equal(queryOnly.tier, 'DEMOTE');
   });
 
   it('BLOCK tier is reserved: no semantic rule emits it on representative corpus', () => {

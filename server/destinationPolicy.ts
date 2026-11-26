@@ -146,7 +146,8 @@ export function shouldFollowDestination(input: {
   // matches hyphenated/underscored URLs and CTAs (`Trading-Room`). Serialized
   // URLs percent-encode accented terms; decode before matching.
   const decodedPath = decodeCommunityUrl(pathname);
-  const text = `${decodedPath.replace(/[-_/]+/g, ' ')} ${String(input.anchorText || '').replace(/[-_/]+/g, ' ')}`;
+  const decodedHost = decodeCommunityUrl(host);
+  const text = `${decodedHost.replace(/[-_.]+/g, ' ')} ${decodedPath.replace(/[-_/]+/g, ' ')} ${String(input.anchorText || '').replace(/[-_/]+/g, ' ')}`;
   const knownHost = isKnownCommunityDestinationHost(host);
   // Concatenated URL slugs (`/vipintraders`) are legitimate community
   // evidence even when token boundaries prevent an anchor-style match.

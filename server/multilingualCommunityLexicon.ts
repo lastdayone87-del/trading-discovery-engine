@@ -129,16 +129,19 @@ export function decodeCommunityUrl(value: string): string {
   }
 }
 
-/** Decode only the pathname of an absolute URL. Query/fragment text is never
- * community evidence: encoded redirect or tracking parameters must not make
- * an unrelated destination look like a community page. */
+/** Decode only the hostname and pathname of an absolute URL. Query/fragment
+ * text is never community evidence: encoded redirect or tracking parameters
+ * must not make an unrelated destination look like a community page. */
 export function decodeCommunityUrlPath(value: string): string {
   try {
-    return decodeCommunityUrl(new URL(value).pathname);
+    const parsed = new URL(value);
+    return `${decodeCommunityUrl(parsed.hostname)} ${decodeCommunityUrl(parsed.pathname)}`;
   } catch {
     return decodeCommunityUrl(value);
   }
 }
+
+export const communityUrlEvidence = decodeCommunityUrlPath;
 
 export const MULTILINGUAL_URL_COMMUNITY_EVIDENCE = new RegExp(
   '(?:^|[/._-])(?:'

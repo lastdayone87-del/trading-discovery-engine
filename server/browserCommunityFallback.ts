@@ -1,7 +1,7 @@
 import * as cheerio from 'cheerio';
 import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
-import { decodeCommunityUrlPath, MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
+import { communityUrlEvidence, MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
 import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
@@ -607,7 +607,7 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
-  const pathText = decodeCommunityUrlPath(rawUrl);
+  const pathText = communityUrlEvidence(rawUrl);
   const normalized = pathText.replace(/[-_/]+/g, ' ');
   return COMMUNITY_HINTS.test(pathText)
     || COMMUNITY_HINTS.test(normalized)
