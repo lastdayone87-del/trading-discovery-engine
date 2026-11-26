@@ -19,6 +19,15 @@ export interface RobotsPacingBudget {
   spentMs: number;
 }
 
+/** Update the origin clock to the actual request start. Callers that pass a
+ * request-start hook use this so DNS/connection setup cannot shorten the
+ * interval observed by the next request. */
+export function markRobotsRequestStarted(rawUrl: string): void {
+  let origin: string;
+  try { origin = new URL(rawUrl).origin; } catch { return; }
+  if (origin) lastRequestAt.set(origin, Date.now());
+}
+
 function pruneIdleOrigins(now: number): void {
   if (lastRequestAt.size <= MAX_TRACKED_ORIGINS) return;
   for (const [origin, at] of lastRequestAt) {

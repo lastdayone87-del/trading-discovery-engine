@@ -703,6 +703,10 @@ export interface ProfilerFetchOptions {
    * enforcement so a Disallow rule or exhausted pacing budget cannot be
    * bypassed by an allowed seed redirecting into it. */
   shouldFollowRedirect?: (targetUrl: string) => Promise<'allow' | 'disallow' | 'budget'>;
+  /** Called immediately before each guarded fetch, with the URL actually
+   * contacted, so pacing can record request-start time rather than permit
+   * time. */
+  onRequestStart?: (targetUrl: string) => void;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -945,6 +949,7 @@ export async function fetchProfilerUrl(
     for (;;) {
       redirectsFollowed.push(currentUrl);
       visited.add(currentUrl);
+      options.onRequestStart?.(currentUrl);
       const response = await guardedFetch(currentUrl, {
         signal: controller.signal,
         headers,

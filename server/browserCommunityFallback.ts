@@ -4,7 +4,7 @@ import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
-import { paceRobotsOrigin } from './robotsPacing';
+import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, browserRuntimeConcurrency, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
@@ -4821,6 +4821,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               drops.countUnique(robots === 'budget' ? 'robots-delay-budget' : 'robots-disallowed', raw);
               return false;
             }
+            markRobotsRequestStarted(raw);
           }
           try {
             return (await assessPublicDestination(raw, limits.resolveHost)).allowed;

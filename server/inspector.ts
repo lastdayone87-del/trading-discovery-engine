@@ -26,7 +26,7 @@ import {
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
 import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
-import { paceRobotsOrigin } from './robotsPacing';
+import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
 import { isCrawlerCanarySelected, mergeNavigationQueue, resolveCrawlerExplorationLimits } from './crawlerExplorationLimits';
 import { CRAWLER_MAX_REDIRECT_HOPS, extractHeadDiscovery, fetchProfilerUrl, isSiteProfilerEnabled, runSiteProfiler, type ProfilerTransportFailure } from './siteProfiler';
 import {COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, clampRetryAtTimestamp, communityAcquisitionRetryDirective, isCommunityRetryableObservation, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
@@ -450,7 +450,7 @@ function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): 
   return resolveHost ?? defaultDnsResolve;
 }
 
-async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false,beforeRedirect?:((targetUrl:string)=>Promise<'allow'|'disallow'|'budget'>)|undefined):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
+async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false,beforeRedirect?:((targetUrl:string)=>Promise<'allow'|'disallow'|'budget'>)|undefined,onRequestStart?:((targetUrl:string)=>void)|undefined):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
   // The end-to-end budget starts before the admission lookup. The lookup gets
   // only the remaining slice, and the following fetch gets what is left after
@@ -523,6 +523,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
     },
     ...((probeTerminalNotFoundBody||scanFailureBody)?{terminalNotFoundBodyMaxChars:64_000,terminalNotFoundBodyTimeoutMs:1_500}:{}),
     ...(beforeRedirect?{shouldFollowRedirect:beforeRedirect}:{}),
+    ...(onRequestStart?{onRequestStart}:{}),
   });
   if(!fetched){
     const timedOut=transportFailure?.name==='AbortError'||Date.now()-fetchStartedAt>=9900;
@@ -701,6 +702,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
   };
   // Redirect targets must clear the same policy before contact; otherwise an
   // allowed seed could redirect into a Disallow path and bypass enforcement.
+  const requestStartMarker=robotsPolicy?((target:string)=>markRobotsRequestStarted(target)):undefined;
   const robotsPermit=async(target:string):Promise<'allow'|'disallow'|'budget'>=>{
     if(!robotsPolicy)return 'allow';
     const decision=await robotsPolicy.decide(target);
@@ -835,7 +837,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       }
       // The terminal 404/410 barrier only ever consumes the seed's own
       // observation, so only seed fetches pay for the bounded body probe.
-      const acquired=await fetchExternalPage(url,fetchImpl,resolveHost,true,undefined,false,robotsPermit);
+      const acquired=await fetchExternalPage(url,fetchImpl,resolveHost,true,undefined,false,robotsPermit,requestStartMarker);
       page=acquired.page;
       // A failed/blocked fetch can still carry terminal invite evidence in a
       // redirect target or a readable 401/403/404 body. Scan both before the
@@ -986,7 +988,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
           }
         }
         iframeDocumentsInspected++;
-        const iframeAcquired=await fetchExternalPage(absolute,fetchImpl,resolveHost,false,currentOrigin,false,robotsPermit);
+        const iframeAcquired=await fetchExternalPage(absolute,fetchImpl,resolveHost,false,currentOrigin,false,robotsPermit,requestStartMarker);
         if(!iframeAcquired.page){
           if(iframeAcquired.observation?.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',absolute);
           seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] same-origin frame unavailable: ${absolute}`);continue;
@@ -1076,7 +1078,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     }
     const reservation=destinationBudget.reserve(next.url,next.from||url);if(!reservation.admitted){seedCeiling??='exploration-limit';drops.count('destination-budget');logDetails.push(`Destination budget (${reservation.reason}): skipped ${next.url}; seed coverage remains incomplete.`);continue;}
     visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);
-    const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
+    const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit,requestStartMarker),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
       // Child error bodies can contain shared footers. Only scan when the
       // child was nominated as a community-relevant navigation target.
       const failureCandidates=subAcquired.observation?.failureClass!=='ROBOTS_DISALLOWED'&&next.score>0
