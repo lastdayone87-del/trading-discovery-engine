@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { crawlExternalLinks } from './inspector';
-import { isCrawlerCanarySelected, resolveCrawlerExplorationLimits } from './crawlerExplorationLimits';
+import { isCrawlerCanarySelected, mergeNavigationQueue, resolveCrawlerExplorationLimits } from './crawlerExplorationLimits';
 
 const resolver = async (): Promise<string[]> => ['93.184.216.1'];
 
@@ -15,6 +15,32 @@ test('exploration limits preserve defaults and accept a canary expansion', () =>
     resolveCrawlerExplorationLimits({ CRAWLER_MAX_DEPTH: '99', CRAWLER_QUEUE_CAP: '1', CRAWLER_PAGE_CAP: 'x' }),
     { maxDepth: 8, queueCap: 12, pageCap: 12 },
   );
+});
+
+test('queue merging keeps the shallowest path and the highest score', () => {
+  const merged = mergeNavigationQueue(
+    [{ url: 'https://creator.example/hub', score: 10, depth: 1 }],
+    [{ url: 'https://creator.example/hub', score: 90, depth: 3 }],
+    12,
+  );
+  assert.equal(merged.queue.length, 1);
+  assert.equal(merged.queue[0]?.score, 90);
+  assert.equal(merged.queue[0]?.depth, 1);
+  assert.equal(merged.overflow, 0);
+});
+
+test('queue merging applies the cap to the merged queue', () => {
+  const existing = Array.from({ length: 12 }, (_, index) => ({
+    url: `https://creator.example/${index}`,
+    score: 10 + index,
+    depth: 1,
+  }));
+  const merged = mergeNavigationQueue(existing, [
+    { url: 'https://creator.example/new', score: 100, depth: 2 },
+  ], 12);
+  assert.equal(merged.queue.length, 12);
+  assert.equal(merged.queue[0]?.url, 'https://creator.example/new');
+  assert.equal(merged.overflow, 1);
 });
 
 test('frontier canary is deterministic and bounded', () => {

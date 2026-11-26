@@ -51,12 +51,16 @@ export async function paceRobotsOrigin(
   const tail = prior.then(() => gate);
   originTails.set(origin, tail);
   const remaining = maxBudgetMs - budget.spentMs;
+  let queueTimer: ReturnType<typeof setTimeout> | undefined;
   const acquired = remaining <= 0
     ? false
     : await Promise.race([
         prior.then(() => true),
-        new Promise<false>(resolve => setTimeout(() => resolve(false), remaining)),
+        new Promise<false>(resolve => {
+          queueTimer = setTimeout(() => resolve(false), remaining);
+        }),
       ]);
+  if (queueTimer) clearTimeout(queueTimer);
   if (!acquired) {
     // Do not hold this caller on a busy origin, but release the gate once the
     // prior holder finishes so later callers are not permanently blocked.

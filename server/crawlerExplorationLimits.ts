@@ -33,6 +33,42 @@ export function resolveCrawlerExplorationLimits(env: NodeJS.ProcessEnv = process
   };
 }
 
+export interface NavigationQueueItem {
+  url: string;
+  score: number;
+  from?: string;
+  depth?: number;
+}
+
+/** Merge newly discovered navigation targets into the pending queue by URL.
+ * A shallower path stays authoritative for the same URL even when a deeper
+ * path has a higher hint score; otherwise the deeper copy can push the URL
+ * past maxDepth and lose an otherwise reachable page. The cap applies to the
+ * merged queue, not just to the additions. */
+export function mergeNavigationQueue(
+  existing: readonly NavigationQueueItem[],
+  additions: readonly NavigationQueueItem[],
+  cap: number,
+): { queue: NavigationQueueItem[]; overflow: number } {
+  const byUrl = new Map<string, NavigationQueueItem>();
+  for (const item of existing) byUrl.set(item.url, { ...item });
+  for (const item of additions) {
+    const prior = byUrl.get(item.url);
+    if (!prior) {
+      byUrl.set(item.url, { ...item });
+      continue;
+    }
+    const best = item.score > prior.score ? item : prior;
+    byUrl.set(item.url, {
+      ...best,
+      depth: Math.min(prior.depth ?? Number.POSITIVE_INFINITY, item.depth ?? Number.POSITIVE_INFINITY),
+    });
+  }
+  const merged = [...byUrl.values()].sort((a, b) => b.score - a.score);
+  const boundedCap = Math.max(1, Math.trunc(cap) || 1);
+  return { queue: merged.slice(0, boundedCap), overflow: Math.max(0, merged.length - boundedCap) };
+}
+
 /** Deterministic 0–10000 canary bucket for a seed/site. The default is a 5%
  * rollout; 10000 = all, 0 = none. Used by frontier/site-profiler canaries so
  * a retry cannot flip treatment. */
