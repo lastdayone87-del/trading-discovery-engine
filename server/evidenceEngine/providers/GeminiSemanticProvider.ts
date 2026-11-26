@@ -50,6 +50,17 @@ export function semanticObservabilityFields(
   return fields;
 }
 
+/** Stable per-call key for spreading routes without changing retry identity. */
+export function geminiRotationKey(observability?: SemanticObservabilityContext): string | undefined {
+  return observability?.jobId
+    || observability?.runId
+    || observability?.requestMetadata?.channelId
+    || observability?.requestMetadata?.queryRunId
+    || observability?.requestMetadata?.semanticBatchJobIds
+    || observability?.requestMetadata?.semanticBatchRunIds
+    || observability?.requestMetadata?.semanticBatchChannelIds;
+}
+
 /** Paid-provider context passed to executeProviderCall, which copies these
  * fields onto the persisted provider_call_events row. */
 export function geminiSemanticProviderContext(
@@ -203,14 +214,21 @@ export async function runGeminiRouteFailover<T>(
   let unauthorizedFailures = 0;
   const tried = new Set<GeminiRoute>();
   // Healthy accounts first; independent jobs start at different healthy
-  // accounts so one project cannot absorb every call and hit the semantic
-  // attempt deadline before failover reaches its siblings.
+  // quota organizations so one project cannot absorb every call and hit the
+  // semantic attempt deadline before failover reaches its siblings. Keys that
+  // share an organization share one quota pool, so rotation counts orgs, not
+  // configured key slots.
   const healthy = routes.filter(route => !isCooling(geminiRouteOrg(route)));
   const cooling = routes.filter(route => isCooling(geminiRouteOrg(route)));
-  const start = geminiRouteRotationStart(opts?.rotationKey, healthy.length);
+  const healthyByOrg = new Map<string, GeminiRoute[]>();
+  for (const route of healthy) {
+    const org = geminiRouteOrg(route);
+    healthyByOrg.set(org, [...(healthyByOrg.get(org) || []), route]);
+  }
+  const orgs = [...healthyByOrg.keys()];
+  const start = geminiRouteRotationStart(opts?.rotationKey, orgs.length);
   const ordered = [
-    ...healthy.slice(start),
-    ...healthy.slice(0, start),
+    ...[...orgs.slice(start), ...orgs.slice(0, start)].flatMap(org => healthyByOrg.get(org) || []),
     ...cooling,
   ];
   for (const route of ordered) {
@@ -342,10 +360,7 @@ export function defaultClient(): SemanticModelClient | undefined {
     }, {
       isOrgCooling: orgId => coolingOrgs.has(orgId),
       signal,
-      rotationKey: observability?.jobId
-        || observability?.runId
-        || observability?.requestMetadata?.channelId
-        || observability?.requestMetadata?.queryRunId,
+      rotationKey: geminiRotationKey(observability),
     }).catch(async (error: unknown) => {
       // Single-key rejection is route-scoped and handled by failover. When
       // every configured key is rejected, block each configured account so

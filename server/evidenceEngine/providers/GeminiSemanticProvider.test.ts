@@ -5,6 +5,7 @@ import {
   GEMINI_BATCH_OUTPUT_TOKENS_MAX,
   GeminiSemanticProvider,
   geminiBatchOutputConfig,
+  geminiRotationKey,
   type SemanticModelClient
 } from './GeminiSemanticProvider';
 import { classifyProviderError, ProviderCallError } from '../../providerResilience';
@@ -122,7 +123,7 @@ test('rate-limited Gemini route failure surfaces without cross-route burst',asyn
 
 test('independent jobs start at different healthy Gemini accounts',async()=>{
   const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
-  const routes=[1,2,3].map(n=>({id:`gemini-${n}`,key:`hidden-${n}`}));
+  const routes=[1,2,3].map(n=>({id:`gemini-${n}`,key:`hidden-${n}`,orgId:`org-${n}`}));
   const starts:string[]=[];
   for(const rotationKey of ['job-1','job-2','job-3','job-4','job-5','job-6','job-7','job-8']){
     const result=await runGeminiRouteFailover(routes,async route=>{
@@ -132,6 +133,34 @@ test('independent jobs start at different healthy Gemini accounts',async()=>{
     assert.equal(result,starts[starts.length-1]);
   }
   assert.equal(new Set(starts).size,3,'all healthy projects must receive traffic');
+});
+
+test('shared-org sibling keys do not multiply rotation slots',async()=>{
+  const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
+  const routes=[
+    {id:'org-a-key-1',key:'hidden-a1',orgId:'org-a'},
+    {id:'org-a-key-2',key:'hidden-a2',orgId:'org-a'},
+    {id:'org-b-key-1',key:'hidden-b1',orgId:'org-b'},
+  ];
+  const firstKeys:string[]=[];
+  for(const rotationKey of ['job-1','job-2','job-3','job-4','job-5','job-6','job-7','job-8']){
+    let first='';
+    await runGeminiRouteFailover(routes,async route=>{
+      first=route.id;
+      return route.id;
+    },{rotationKey});
+    firstKeys.push(first);
+  }
+  assert.ok(firstKeys.includes('org-a-key-1'));
+  assert.ok(firstKeys.includes('org-b-key-1'));
+  assert.ok(!firstKeys.includes('org-a-key-2'),'sibling key must not receive a rotation slot');
+});
+
+test('mixed batches keep a stable rotation key', () => {
+  assert.equal(geminiRotationKey({ jobId: 'job-1' }), 'job-1');
+  assert.equal(geminiRotationKey({ requestMetadata: { semanticBatchJobIds: 'job-1,job-2' } }), 'job-1,job-2');
+  assert.equal(geminiRotationKey({ requestMetadata: { semanticBatchChannelIds: 'channel-1,channel-2' } }), 'channel-1,channel-2');
+  assert.equal(geminiRotationKey(undefined), undefined);
 });
 
 test('transient transport failure still advances to the next authorized route',async()=>{
