@@ -71,12 +71,14 @@ test('invite labels and concatenated slugs open unknown hosts', () => {
 });
 
 test('IDN hostnames and relative paths are matched without query text', () => {
-  const idn = new URL('https://communauté.example/page').toString();
-  const decision = shouldFollowDestination({
-    url: idn,
-    currentUrl: 'https://creator.example/',
-  });
-  assert.equal(decision.eligible, true);
+  for (const host of ['communauté.example', '社区.example', 'コミュニティ.example']) {
+    const idn = new URL(`https://${host}/page`).toString();
+    const decision = shouldFollowDestination({
+      url: idn,
+      currentUrl: 'https://creator.example/',
+    });
+    assert.equal(decision.eligible, true, host);
+  }
   assert.equal(communityNavigationScore('/page?next=discord', ''), 0);
   assert.ok(communityNavigationScore('/community', '') > 0);
 });

@@ -173,7 +173,7 @@ export function decodeCommunityHost(value: string): string {
  * remain path/label-only evidence so unrelated hosts do not consume crawl
  * slots. */
 export const MULTILINGUAL_HOST_COMMUNITY_EVIDENCE = new RegExp(
-  '(?:^|\\.)(?:discord|community|invites?|trading[-_ ]?(?:room|floor|club)|comunidad|comunidade|communaut[eé]|gemeinschaft|gemeenschap|fellesskap|gemenskap|pobal|comhphobal|communautéit|comunità)(?:\\.|$)',
+  '(?:^|\\.)(?:discord|community|invites?|trading[-_ ]?(?:room|floor|club)|comunidad|comunidade|communaut[eé]|gemeinschaft|gemeenschap|fellesskap|gemenskap|fællesskab|faellesskab|pobal|comhphobal|communautéit|comunità|مجتمع|ديسكورد|社区|社群|群组|コミュニティ|グループ)(?:\\.|$)',
   'i',
 );
 
