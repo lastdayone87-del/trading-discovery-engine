@@ -74,6 +74,7 @@ import {
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
   isRetryableInfrastructureFailure,
+  resolveGeminiOrgBucketExpiryMs,
   coolQueryForProviderQuarantine,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
@@ -1049,6 +1050,8 @@ export function canClaimCommunityRetry(
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastSemanticCooldownEnrichProbeAt = 0;
+let geminiBucketPressureCache: { at: number; value: Map<string, boolean> } | null = null;
+const GEMINI_BUCKET_PRESSURE_CACHE_MS = 5_000;
 /**
  * Claim-time stale recovery used to run a FOR UPDATE scan on every worker
  * tick. With a dozen lanes that is a transaction storm that can starve
@@ -1887,9 +1890,31 @@ export async function processNextSearchJob(
       return allRoutesCoolingDown(await Promise.all(routes.map(async route =>
         groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
     }
+    const geminiBucketFullByOrg = async (): Promise<Map<string, boolean>> => {
+      const now = Date.now();
+      if (geminiBucketPressureCache && now - geminiBucketPressureCache.at < GEMINI_BUCKET_PRESSURE_CACHE_MS) {
+        return geminiBucketPressureCache.value;
+      }
+      const value = new Map<string, boolean>();
+      for (const route of configuredGeminiRoutes()) {
+        const org = geminiRouteOrg(route);
+        if (value.has(org)) continue;
+        // Fail open: a bucket read failure must not stall discovery.
+        const expiry = await resolveGeminiOrgBucketExpiryMs(org, now).catch(() => undefined);
+        value.set(org, expiry !== undefined);
+      }
+      geminiBucketPressureCache = { at: now, value };
+      return value;
+    };
     const geminiRoutes = configuredGeminiRoutes();
     const geminiCooling = geminiRoutes.length > 0
-      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
+      ? await (async () => {
+          const buckets = await geminiBucketFullByOrg();
+          return allRoutesCoolingDown(await Promise.all(geminiRoutes.map(async route => {
+            const org = geminiRouteOrg(route);
+            return (await isGeminiOrgCooldownActive(org)) || buckets.get(org) === true;
+          })));
+        })()
       : await isGeminiSemanticCooldownActive();
     if (!geminiCooling) return false;
     if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return true;
@@ -1995,18 +2020,18 @@ export async function processNextSearchJob(
     }
     // Classification and process lanes are separate from ENRICH backfill, so
     // their own overrides must be accepted outside the ENRICH-only block.
-    if ((enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity() && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+    if (claimableOverride?.includes(CLASSIFICATION_JOB_TYPE) && (enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity()) {
       claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
     // Dedicated process lane: separate worker capacity removes classification
     // starvation, while the same semantic-availability gate prevents a defer
     // storm. This must sit outside the ENRICH_CHANNEL-only block above so a
     // process-only override can claim its job type.
-    if ((enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity() && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
+    if (claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL') && (enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity()) {
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
-  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && !(await semanticRoutesCooling()) && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
+  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION')) && !(await semanticRoutesCooling()) && await semanticCapacity()) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
