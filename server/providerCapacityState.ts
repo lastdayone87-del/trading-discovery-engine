@@ -4,6 +4,8 @@ export interface ProviderCapacityProbe {
   provider: 'gemini' | 'groq';
   scopeKey: string;
   operation: string;
+  /** Exact lease timestamp; prevents an expired worker releasing a newer probe. */
+  leaseUntil: string;
 }
 
 export interface ProviderCapacityStatus {
@@ -158,8 +160,10 @@ export async function releaseProviderCapacityProbe(
         SET state='EXHAUSTED', probe_lease_until=NULL, updated_at=now()
       WHERE provider=$1 AND scope_key=$2 AND operation=$3
         AND state='PROBING'
-        AND probe_lease_until IS NOT NULL AND probe_lease_until > now()`,
-    [probe.provider, probe.scopeKey, probe.operation],
+        AND probe_lease_until IS NOT NULL
+        AND probe_lease_until = $4::timestamptz
+        AND probe_lease_until > now()`,
+    [probe.provider, probe.scopeKey, probe.operation, probe.leaseUntil],
   );
   if (result.rowCount) invalidate();
 }
@@ -268,7 +272,7 @@ export async function getSemanticCapacityStatus(
                   updated_at=now()
              FROM candidate c
             WHERE s.provider=c.provider AND s.scope_key=c.scope_key AND s.operation=c.operation
-            RETURNING s.provider, s.scope_key, s.operation`,
+            RETURNING s.provider, s.scope_key, s.operation, s.probe_lease_until::text AS probe_lease_until_text`,
           [blockerJson, PROBE_LEASE_MS],
         );
         if (probe.rowCount) {
@@ -282,6 +286,7 @@ export async function getSemanticCapacityStatus(
               provider: leased.provider as 'gemini' | 'groq',
               scopeKey: String(leased.scope_key),
               operation: String(leased.operation),
+              leaseUntil: String(leased.probe_lease_until_text),
             },
           };
         }

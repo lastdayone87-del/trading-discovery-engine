@@ -1438,11 +1438,11 @@ export function defaultClient(
         && (error.providerReasons || []).includes('PROVIDER_ROUTE_UNAUTHORIZED')) {
         const resumeAt = Date.now() + 24 * 60 * 60_000;
         let persistedResumeAt = resumeAt;
-        for (const route of configuredGroqRoutes()) {
+        for (const org of [...new Set(configuredGroqRoutes().map(groqRouteOrg))]) {
           try {
             persistedResumeAt = Math.max(persistedResumeAt, await recordProviderCapacityExhausted({
               provider: 'groq',
-              scopeKey: groqRouteOrg(route),
+              scopeKey: org,
               operation: '*',
               state: 'BLOCKED',
               reasonCode: 'PROVIDER_ROUTE_UNAUTHORIZED',

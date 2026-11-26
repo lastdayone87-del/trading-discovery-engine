@@ -65,7 +65,14 @@ maybe('capacity state parks until reset, allows exactly one probe, and closes on
   await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second' WHERE provider='gemini' AND scope_key='gemini-project-1'`);
   resetProviderCapacityCacheForTests();
   const probe = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
-  assert.deepEqual(probe, { available: true, probe: true, resumeAt: null, reason: 'PROBE', probeAccount: { provider: 'gemini', scopeKey: 'gemini-project-1', operation: '*' } });
+  assert.equal(probe.available, true);
+  assert.equal(probe.probe, true);
+  assert.equal(probe.reason, 'PROBE');
+  assert.deepEqual(
+    { provider: probe.probeAccount?.provider, scopeKey: probe.probeAccount?.scopeKey, operation: probe.probeAccount?.operation },
+    { provider: 'gemini', scopeKey: 'gemini-project-1', operation: '*' },
+  );
+  assert.ok(probe.probeAccount?.leaseUntil, 'the probe must carry its exact lease token');
   const noSecondProbe = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(noSecondProbe.available, false, 'only one worker may hold the probe lease');
   await releaseProviderCapacityProbe(probe.probeAccount!, db);
@@ -99,7 +106,8 @@ maybe('a blocked credential route remains unavailable until success or operator 
   resetProviderCapacityCacheForTests();
   const blocked = await getSemanticCapacityStatus([groq('groq-org-1')], Date.now(), db);
   assert.equal(blocked.available, false);
-  await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: 'groq-org-1', operation: '*', observedAt: Date.now() + 60_000 }, db);
+  await db.query(`UPDATE provider_capacity_state SET observed_at=now()-interval '60 seconds'`);
+  await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: 'groq-org-1', operation: '*', observedAt: Date.now() }, db);
   resetProviderCapacityCacheForTests();
   assert.equal((await getSemanticCapacityStatus([groq('groq-org-1')], Date.now(), db)).available, true);
 });
@@ -144,11 +152,12 @@ maybe("a daily '*' failure overrides a stale healthy operation row", async () =>
   resetProviderCapacityCacheForTests();
   const parked = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(parked.available, false, "the daily '*' row must hide the older healthy operation row");
+  await db.query(`UPDATE provider_capacity_state SET observed_at=now()-interval '60 seconds' WHERE operation='*'`);
   await recordProviderCapacitySuccess({
     provider: 'gemini',
     scopeKey: 'gemini-project-1',
     operation: 'multilingual-semantic-classification',
-    observedAt: Date.now() + 60_000,
+    observedAt: Date.now(),
   }, db);
   resetProviderCapacityCacheForTests();
   assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);
@@ -231,11 +240,12 @@ maybe('an older success cannot clear a newer failure', async () => {
     false,
     'a success that started before the failure must not close the circuit',
   );
+  await db.query(`UPDATE provider_capacity_state SET observed_at=now()-interval '60 seconds'`);
   await recordProviderCapacitySuccess({
     provider: 'gemini',
     scopeKey: 'gemini-project-1',
     operation: 'multilingual-semantic-classification',
-    observedAt: Date.now() + 60_000,
+    observedAt: Date.now(),
   }, db);
   resetProviderCapacityCacheForTests();
   assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);
@@ -271,6 +281,39 @@ maybe('an expired operation row cannot probe past a future daily block', async (
     `SELECT state FROM provider_capacity_state WHERE provider='gemini' AND scope_key='gemini-project-1' AND operation='multilingual-semantic-classification'`,
   );
   assert.equal(exact.rows[0].state, 'EXHAUSTED');
+});
+
+maybe('an expired worker cannot release a newer probe lease', async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 60 * 60_000,
+  }, db);
+  await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second'`);
+  resetProviderCapacityCacheForTests();
+  const first = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
+  assert.equal(first.probe, true);
+  // Simulate the first worker's lease expiring before it releases.
+  await db.query(`UPDATE provider_capacity_state SET probe_lease_until=now()-interval '1 second'`);
+  resetProviderCapacityCacheForTests();
+  const second = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
+  assert.equal(second.probe, true);
+  await releaseProviderCapacityProbe(first.probeAccount!, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal(
+    (await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).probe,
+    false,
+    'the stale release must not clear the replacement lease',
+  );
+  await releaseProviderCapacityProbe(second.probeAccount!, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).probe, true);
 });
 
 after(async () => {
