@@ -167,6 +167,41 @@ test('legacy foundInvite is persisted, claimed, and admitted when structured los
   assert.equal(result.discoveredInvite, 'NEW2');
 });
 
+test('unowned viewer/playlist candidates never make a global claim', async () => {
+  const { admitInspectionDiscordCandidates } = await import('./queueManager');
+  const persisted: string[][] = [];
+  const claimed: string[][] = [];
+  const candidate = (code: string, surface: string) => ({
+    candidateId: `test:${code}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: surface,
+    rawLocator: `https://discord.gg/${code}`,
+    normalizedLocator: `https://discord.gg/${code}`,
+    nativeInviteCode: code,
+    sourceUrl: `https://source.example/${code}`,
+    extractionConfidence: 'EXPLICIT',
+    observations: [{ sourceSurface: surface, sourceUrl: `https://source.example/${code}`, rawLocator: `https://discord.gg/${code}`, extractionConfidence: 'EXPLICIT' }],
+  });
+  const deps = {
+    persist: async (_channelId: string, candidates: Array<{ candidateId: string }>) => { persisted.push(candidates.map(c => c.candidateId)); },
+    claim: async (items: Array<{ code: string }>) => {
+      claimed.push(items.map(i => i.code));
+      return items.map(i => ({ code: i.code, admitted: true, firstChannelId: 'chanX' }));
+    },
+    removeLosers: async () => 0,
+    executionNow: async () => new Date().toISOString(),
+  };
+  const result = await admitInspectionDiscordCandidates(
+    [candidate('STATIC1', 'CREATOR_WEBSITES'), candidate('VIEWER1', 'YOUTUBE_COMMENTS')] as never,
+    'VIEWER1',
+    'chanX',
+    deps as never,
+  );
+  assert.deepEqual(claimed, [['static1']]);
+  assert.deepEqual(result.candidates.map(c => c.nativeInviteCode), ['STATIC1']);
+  assert.equal(persisted.flat().includes('test:VIEWER1'), false);
+});
+
 test('reconcile and validation share one admitted inspection view', async () => {
   const fs = await import('node:fs');
   const { fileURLToPath } = await import('node:url');

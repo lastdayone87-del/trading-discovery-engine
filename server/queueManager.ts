@@ -202,7 +202,7 @@ import { canContinueCommunityInspectionAfterDegradedManualClassification } from 
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, communityRetryDirectiveOwnsDurableWork, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
-import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, detectDiscordInviteCaseCollisions, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, detectDiscordInviteCaseCollisions, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, isUnownedSurfaceDiscordCandidate, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import {
   candidatesFromYouTubeSnapshot,
   collectYouTubeSurfaceSnapshot,
@@ -445,6 +445,26 @@ export async function admitInspectionDiscordCandidates(
     executionNow: () => getDbStatementNow(),
   },
 ): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number; discardedOwnerChannelIds: string[] }> {
+  // Viewer comments and curated playlist-item text are not creator-controlled.
+  // Keep them out of the global claim path until a creator-owned surface
+  // corroborates the same code; otherwise a viewer can permanently claim
+  // another creator's invite before ownership is known.
+  const unownedCandidates = structuredCandidates.filter(isUnownedSurfaceDiscordCandidate);
+  const claimableCandidates = structuredCandidates.filter(candidate => !isUnownedSurfaceDiscordCandidate(candidate));
+  const foundCode = discordInviteCodeOf(foundInvite);
+  const foundIsUnownedOnly = !!foundCode
+    && unownedCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode)
+    && !claimableCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode);
+  const effectiveFoundInvite = foundIsUnownedOnly ? null : foundInvite;
+  if (unownedCandidates.length) {
+    console.info(JSON.stringify({
+      event: 'discord_unowned_surface_candidates_deferred',
+      channelId,
+      count: unownedCandidates.length,
+      codes: unownedCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
+      timestamp: new Date().toISOString(),
+    }));
+  }
   const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
     candidateId: candidate.candidateId,
     rawLocator: candidate.rawLocator,
@@ -458,10 +478,10 @@ export async function admitInspectionDiscordCandidates(
   // execution (discovered_at at/after the DB statement clock read below).
   // DB-side time keeps the window consistent with persisted discovered_at.
   const provisionalSince = await deps.executionNow();
-  const preLegacy = !structuredCandidates.length && foundInvite
-    ? buildLegacyDiscordCandidate(foundInvite, discordInviteCodeOf(foundInvite))
+  const preLegacy = !claimableCandidates.length && effectiveFoundInvite
+    ? buildLegacyDiscordCandidate(effectiveFoundInvite, discordInviteCodeOf(effectiveFoundInvite))
     : null;
-  const provisional = [...structuredCandidates, ...(preLegacy ? [preLegacy] : [])];
+  const provisional = [...claimableCandidates, ...(preLegacy ? [preLegacy] : [])];
   if (provisional.length) await deps.persist(channelId, toPersist(provisional));
   const provisionalIdsForCode = (want: Set<string>) => [...new Set(provisional
     .filter(candidate => { const code = discordInviteCodeOf(candidate.nativeInviteCode); return !!code && want.has(code); })
@@ -480,21 +500,20 @@ export async function admitInspectionDiscordCandidates(
     .filter(claim => !claim.admitted && claim.firstChannelId && claim.firstChannelId !== channelId)
     .map(claim => String(claim.firstChannelId));
   let admittedCodes = new Set(inviteClaims.filter(claim => claim.admitted).map(claim => claim.code));
-  let admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
+  let admission = admitDiscordCandidates(claimableCandidates, effectiveFoundInvite, admittedCodes);
   // A trail-level foundInvite naming a code outside the structured set is
   // claimed only when nothing was admitted: claiming it unconditionally
   // would park codes that are never processed, blackholing later channels.
-  const foundCode = discordInviteCodeOf(foundInvite);
   if (!admission.candidates.length && foundCode && !claimSources.has(foundCode)) {
     // Persist-before-claim (crash-safe ordering) also applies here: the
     // legacy row must exist before its code can be claimed.
-    const legacyFallback = buildLegacyDiscordCandidate(foundInvite, foundCode);
+    const legacyFallback = buildLegacyDiscordCandidate(effectiveFoundInvite, foundCode);
     if (legacyFallback) {
       await deps.persist(channelId, toPersist([legacyFallback]));
       const [legacyClaim] = await deps.claim([{ code: foundCode, sourceSurface: null, sourceUrl: null }], channelId);
       if (legacyClaim.admitted) {
         admittedCodes = new Set([...admittedCodes, foundCode]);
-        admission = admitDiscordCandidates(structuredCandidates, foundInvite, admittedCodes);
+        admission = admitDiscordCandidates(claimableCandidates, effectiveFoundInvite, admittedCodes);
       } else {
         if (legacyClaim.firstChannelId && legacyClaim.firstChannelId !== channelId) discardedOwnerChannelIds.push(String(legacyClaim.firstChannelId));
         await deps.removeLosers(channelId, [foundCode], [legacyFallback.candidateId], provisionalSince);

@@ -336,6 +336,18 @@ export function detectDiscordInviteCaseCollisions(items:DiscordCandidate[]):Disc
     .map(([canonicalCode,codes])=>({canonicalCode,codes:[...codes]}));
 }
 
+const UNOWNED_SURFACES = new Set<AcquisitionSurface>(['YOUTUBE_COMMENTS', 'YOUTUBE_PLAYLIST_ITEMS']);
+
+/** True when every observation comes from a surface the creator does not
+ * control. These candidates may be useful context but must not make an
+ * irreversible global registry claim before creator ownership is established. */
+export function isUnownedSurfaceDiscordCandidate(candidate: DiscordCandidate): boolean {
+  const observations = candidate.observations?.length
+    ? candidate.observations
+    : [{ sourceSurface: candidate.sourceSurface }];
+  return observations.length > 0 && observations.every(observation => UNOWNED_SURFACES.has(observation.sourceSurface));
+}
+
 export function mergeDiscordCandidates(items:DiscordCandidate[],input:{creatorName?:string;creatorWebsiteHosts?:string[]}={}):DiscordCandidate[]{
   const byCanonical=new Map<string,DiscordCandidate>();
   for(const item of items){
