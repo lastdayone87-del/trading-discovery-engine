@@ -74,7 +74,7 @@ import {
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
   isRetryableInfrastructureFailure,
-  resolveGeminiOrgBucketExpiryMs,
+  isGeminiOrgBucketFull,
   coolQueryForProviderQuarantine,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
@@ -1858,8 +1858,12 @@ export async function processNextSearchJob(
     && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true'
     && configuredGeminiFreeRoutes().length > 0;
   const semanticCapacityAccounts: Array<{ provider: 'gemini' | 'groq'; scopeKey: string }> = [];
-  if (semanticGateNeeded && !geminiFreeSelectedForGate) {
-    if (shouldUseGroqSemantic()) {
+  if (semanticGateNeeded) {
+    if (geminiFreeSelectedForGate) {
+      if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true') {
+        for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
+      }
+    } else if (shouldUseGroqSemantic()) {
       for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
     } else {
       for (const route of configuredGeminiRoutes()) semanticCapacityAccounts.push({ provider: 'gemini', scopeKey: geminiRouteOrg(route) });
@@ -1906,8 +1910,8 @@ export async function processNextSearchJob(
         const org = geminiRouteOrg(route);
         if (value.has(org)) continue;
         // Fail open: a bucket read failure must not stall discovery.
-        const expiry = await resolveGeminiOrgBucketExpiryMs(org, now).catch(() => undefined);
-        value.set(org, expiry !== undefined);
+        const full = await isGeminiOrgBucketFull(org, now).catch(() => false);
+        value.set(org, full);
       }
       geminiBucketPressureCache = { at: now, value };
       return value;
@@ -1931,9 +1935,12 @@ export async function processNextSearchJob(
   const semanticCapacity = async (): Promise<boolean> => {
     if (!semanticGateNeeded) return true;
     if (geminiFreeSelectedForGate) {
-      return (await freePrimaryServing()) || (await groqRoutesServing());
+      if (await freePrimaryServing()) return true;
+      if (!(await groqRoutesServing())) return false;
+      // Fall through: the Groq fallback must also pass the durable circuit.
+    } else if (await freeTierFallbackHealthy()) {
+      return true;
     }
-    if (await freeTierFallbackHealthy()) return true;
     // Resolve lazily, only when this tick is about to offer a semantic job
     // type. Taking the one-shot probe lease on a tick that never claims
     // semantic work would block the real probe for the lease duration.
@@ -2016,7 +2023,7 @@ export async function processNextSearchJob(
       : 0;
     const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
     enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable;
-    if ((enrichmentFullyClaimable || enrichmentProbe) && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
+    if ((enrichmentFullyClaimable || enrichmentProbe) && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
       claimableTypes.push('ENRICH_CHANNEL');
       // Classification jobs require the semantic decision and remain gated
       // while every semantic route is cooling. ENRICH is allowed as a bounded

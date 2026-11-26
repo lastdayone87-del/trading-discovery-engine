@@ -195,10 +195,13 @@ export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], c
   // this process and mark the error so the job parks instead of consuming a
   // retry attempt.
   if (unauthorizedFailures >= routes.length) {
-    const resumeAt = Date.now() + 24 * 60 * 60_000;
-    geminiFreeCredentialExhaustedUntilMs = Math.max(geminiFreeCredentialExhaustedUntilMs, resumeAt);
+    const credentialBlockUntil = Date.now() + 24 * 60 * 60_000;
+    geminiFreeCredentialExhaustedUntilMs = Math.max(geminiFreeCredentialExhaustedUntilMs, credentialBlockUntil);
     if (lastError && typeof lastError === 'object') {
-      Object.assign(lastError, { retryAt: resumeAt, providerCapacityExhausted: true });
+      // Park the tripping job only briefly. The 24-hour block applies to the
+      // fallback's claim eligibility; another provider in the chain may
+      // recover much sooner, so do not hold the job for a day.
+      Object.assign(lastError, { retryAt: Date.now() + 90_000, providerCapacityExhausted: true });
     }
   }
   throw lastError || new ProviderCallError('No configured free Gemini route is available.', 'TRANSIENT', true);

@@ -4317,6 +4317,23 @@ export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=D
   }catch{return undefined;}
 }
 /**
+ * True when the account's rolling token bucket is at its configured call cap.
+ * A recent call alone is not pressure; the count must reach the same cap used
+ * by acquireGeminiCapacity.
+ */
+export async function isGeminiOrgBucketFull(orgId:string,nowMs:number=Date.now()):Promise<boolean>{
+  const windowRaw=process.env.GEMINI_ORG_RATE_WINDOW_MS;
+  const windowMs=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  const maxRaw=String(process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE ?? '').trim();
+  const maxCalls=maxRaw===''?10:Number(maxRaw);
+  if(!Number.isFinite(windowMs)||windowMs<=0||!Number.isFinite(maxCalls)||maxCalls<=0)return false;
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT count(*)::int AS n FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at > now() - ($2::int * interval '1 millisecond')`,[orgId,Math.floor(windowMs)]);
+    return Number(res.rows[0]?.n||0)>=maxCalls;
+  }catch{return false;}
+}
+/**
  * Pool-wide Groq semantic cooldown expiry from persisted provider_call_events:
  * one RATE_LIMITED event on any route cools the whole pool. Retained for
  * legacy callers and failures without a known scoped org; per-org callers
