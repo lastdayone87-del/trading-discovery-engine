@@ -6,11 +6,19 @@ import {
   collectYouTubeSurfaceSnapshot,
   isYouTubeSurfaceCanarySelected,
   mergeYouTubeSurfaceCandidates,
+  YOUTUBE_SURFACE_SESSION_OPTIONS,
   type YouTubeSurfaceClient,
   type YouTubeSurfaceSnapshot,
 } from './youtubeSurfaceCandidates';
 
 const text = (value: string) => ({ toString: () => value });
+
+test('production Innertube client uses a fast local session', () => {
+  assert.equal(YOUTUBE_SURFACE_SESSION_OPTIONS.retrieve_player, false);
+  assert.equal(YOUTUBE_SURFACE_SESSION_OPTIONS.retrieve_innertube_config, false);
+  assert.equal(YOUTUBE_SURFACE_SESSION_OPTIONS.generate_session_locally, true);
+  assert.equal(YOUTUBE_SURFACE_SESSION_OPTIONS.enable_session_cache, false);
+});
 
 test('collects pinned, top, older, Community and playlist text with bounds', async () => {
   const channel = {
