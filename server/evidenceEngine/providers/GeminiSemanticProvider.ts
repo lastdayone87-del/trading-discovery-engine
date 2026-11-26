@@ -227,10 +227,13 @@ export async function runGeminiRouteFailover<T>(
   }
   const orgs = [...healthyByOrg.keys()];
   const start = geminiRouteRotationStart(opts?.rotationKey, orgs.length);
-  const ordered = [
-    ...[...orgs.slice(start), ...orgs.slice(0, start)].flatMap(org => healthyByOrg.get(org) || []),
-    ...cooling,
-  ];
+  const ordered = !opts?.rotationKey
+    // Preserve the legacy configured order for callers without a rotation key.
+    ? [...healthy, ...cooling]
+    : [
+        ...[...orgs.slice(start), ...orgs.slice(0, start)].flatMap(org => healthyByOrg.get(org) || []),
+        ...cooling,
+      ];
   for (const route of ordered) {
     if (opts?.signal?.aborted) {
       if (abortedByDeadline(opts.signal)) {

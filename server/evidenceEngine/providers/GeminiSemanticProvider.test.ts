@@ -156,6 +156,23 @@ test('shared-org sibling keys do not multiply rotation slots',async()=>{
   assert.ok(!firstKeys.includes('org-a-key-2'),'sibling key must not receive a rotation slot');
 });
 
+test('legacy failover keeps configured order for shared-org keys',async()=>{
+  const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
+  const routes=[
+    {id:'org-a-key-1',key:'hidden-a1',orgId:'org-a'},
+    {id:'org-b-key-1',key:'hidden-b1',orgId:'org-b'},
+    {id:'org-a-key-2',key:'hidden-a2',orgId:'org-a'},
+  ];
+  const calls:string[]=[];
+  const result=await runGeminiRouteFailover(routes,async route=>{
+    calls.push(route.id);
+    if(route.id==='org-a-key-1')throw new ProviderCallError('connection reset','TRANSIENT',true);
+    return route.id;
+  });
+  assert.equal(result,'org-b-key-1');
+  assert.deepEqual(calls,['org-a-key-1','org-b-key-1']);
+});
+
 test('mixed batches keep a stable rotation key', () => {
   assert.equal(geminiRotationKey({ jobId: 'job-1' }), 'job-1');
   assert.equal(geminiRotationKey({ requestMetadata: { semanticBatchJobIds: 'job-1,job-2' } }), 'job-1,job-2');
