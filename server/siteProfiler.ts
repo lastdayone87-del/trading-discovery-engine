@@ -212,26 +212,50 @@ export function parseRobotsTxt(text: string): ParsedRobots {
  * token beats an earlier shorter one); the `*` group applies only when no
  * product token matches. Returns nulls (unknown, never negative) when no
  * group applies. */
+function mergeRobotsGroups(groups: RobotsGroup[]): RobotsGroup {
+  const merged: RobotsGroup = { agents: [], allow: [], disallow: [] };
+  let maxDelay = Number.NEGATIVE_INFINITY;
+  for (const group of groups) {
+    for (const agent of group.agents) if (!merged.agents.includes(agent)) merged.agents.push(agent);
+    merged.allow.push(...group.allow);
+    merged.disallow.push(...group.disallow);
+    const raw = (group as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw;
+    const seconds = Number(raw);
+    if (raw !== undefined && Number.isFinite(seconds) && seconds > maxDelay) maxDelay = seconds;
+  }
+  if (maxDelay !== Number.NEGATIVE_INFINITY) {
+    (merged as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw = String(maxDelay);
+  }
+  return merged;
+}
+
 export function evaluateRobotsForPath(
   parsed: ParsedRobots,
   userAgent: string,
   path: string,
 ): RobotsEvaluation {
   const agent = userAgent.toLowerCase();
-  let group: RobotsGroup | null = null;
+  // RFC 9309 allows the same user-agent to appear in multiple groups; their
+  // rules must be combined. Selecting only the first wildcard group would let
+  // a later duplicate `User-agent: *` Disallow be ignored.
   let bestSpecificity = -1;
+  const specific: RobotsGroup[] = [];
   for (const candidate of parsed.groups) {
     for (const token of candidate.agents) {
       if (token === '*') continue;
       if (agent !== token && !agent.startsWith(token)) continue;
       if (token.length > bestSpecificity) {
         bestSpecificity = token.length;
-        group = candidate;
+        specific.length = 0;
+        specific.push(candidate);
+      } else if (token.length === bestSpecificity && !specific.includes(candidate)) {
+        specific.push(candidate);
       }
     }
   }
-  if (!group) group = parsed.groups.find(g => g.agents.includes('*')) || null;
-  if (!group) return { allowed: null, crawlDelaySeconds: null, matchedRule: null };
+  const selected = specific.length ? specific : parsed.groups.filter(g => g.agents.includes('*'));
+  if (!selected.length) return { allowed: null, crawlDelaySeconds: null, matchedRule: null };
+  const group = mergeRobotsGroups(selected);
   const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Specificity for longest-match ordering: literal octets actually
   // constraining the path. A bare `/*` (one literal octet) never outranks a

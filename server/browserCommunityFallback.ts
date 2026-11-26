@@ -4502,13 +4502,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
     ? new RobotsCrawlPolicy(fetch, limits.resolveHost)
     : null;
   const renderedRobotsBudget = { spentMs: 0 };
-  const renderedRobotsAllowed = async (rawUrl: string): Promise<boolean> => {
-    if (!renderedRobotsPolicy) return true;
+  const renderedRobotsAllowed = async (rawUrl: string): Promise<'allow' | 'disallow' | 'budget'> => {
+    if (!renderedRobotsPolicy) return 'allow';
     const decision = await renderedRobotsPolicy.decide(rawUrl);
-    if (!decision.allowed) return false;
+    if (!decision.allowed) return 'disallow';
     let origin: string;
-    try { origin = new URL(rawUrl).origin; } catch { return true; }
-    return paceRobotsOrigin(origin, decision.crawlDelayMs, renderedRobotsBudget);
+    try { origin = new URL(rawUrl).origin; } catch { return 'allow'; }
+    return (await paceRobotsOrigin(origin, decision.crawlDelayMs, renderedRobotsBudget)) ? 'allow' : 'budget';
   };
   const telemetry: BrowserFallbackTelemetry = {
     requestsStarted: 0,
@@ -4812,9 +4812,15 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // data:, blob:, about:, and similar are not network destinations.
             return true;
           }
-          if (resourceType === 'document' && !(await renderedRobotsAllowed(raw))) {
-            drops.countUnique('robots-disallowed', raw);
-            return false;
+          // Gate navigation and script-driven page requests (fetch/XHR), not
+          // passive subresources. A policy skip is recorded under the reason
+          // that actually occurred so pacing is not mislabeled as Disallow.
+          if (resourceType === 'document' || resourceType === 'fetch' || resourceType === 'xhr') {
+            const robots = await renderedRobotsAllowed(raw);
+            if (robots !== 'allow') {
+              drops.countUnique(robots === 'budget' ? 'robots-delay-budget' : 'robots-disallowed', raw);
+              return false;
+            }
           }
           try {
             return (await assessPublicDestination(raw, limits.resolveHost)).allowed;

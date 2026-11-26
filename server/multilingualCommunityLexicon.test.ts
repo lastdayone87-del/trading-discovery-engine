@@ -60,11 +60,23 @@ test('invite labels and concatenated slugs open unknown hosts', () => {
     anchorText: 'Get an invite',
   });
   assert.equal(label.eligible, true, 'invite');
-  const slug = shouldFollowDestination({
-    url: 'https://unknown.example/vipintraders',
-    currentUrl: 'https://creator.example/',
-  });
-  assert.equal(slug.eligible, true, 'vipintraders');
+  for (const slug of ['vipintraders', 'comunidadprivada']) {
+    const decision = shouldFollowDestination({
+      url: `https://unknown.example/${slug}`,
+      currentUrl: 'https://creator.example/',
+    });
+    assert.equal(decision.eligible, true, slug);
+  }
+});
+
+test('ordinary URL substrings are not community evidence', () => {
+  for (const slug of ['remember', 'groupon', 'privateer']) {
+    const decision = shouldFollowDestination({
+      url: `https://unknown.example/${slug}`,
+      currentUrl: 'https://creator.example/',
+    });
+    assert.equal(decision.eligible, false, slug);
+  }
 });
 
 test('generic access terms no longer open an unknown host alone', () => {

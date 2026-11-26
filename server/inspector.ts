@@ -742,7 +742,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     if(debugLog)debugLog.discordRegexAttempts.push({source:'crawlExternalLinks_direct',url,result:direct.map(c=>c.nativeInviteCode)});
     if(direct.length){seedFound=true;observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'FOUND',retryable:false,detail:`${direct.length} direct Discord candidate(s) in URL`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});continue;}
 
-    let pagesInspected=0,redirectsFollowed=0,seedCeiling:CeilingKind|undefined;
+    let pagesInspected=0,redirectsFollowed=0,seedCeiling:CeilingKind|undefined,rootRobots:{crawlDelayMs:number}|undefined;
     // First ceiling wins: the first cap encountered is what first cut
     // coverage short (later caps are moot for the truncated remainder).
     // dropReasons counters retain every occurrence, so no information about
@@ -758,12 +758,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         logDetails.push(`[robots] disallowed by ${robots.matchedRule||'explicit rule'}: ${url}`);
         continue;
       }
-      if(!(await respectRobotsDelay(url,robots))){
-        drops.count('robots-delay-budget');seedCeiling??='robots-delay-budget';
-        observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'ROBOTS_DELAY_BUDGET',detail:'Per-crawl Crawl-delay budget exhausted before the seed request; coverage is incomplete',observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,ceiling:'robots-delay-budget',dropReasons:drops.snapshot()})});
-        logDetails.push(`[robots] Crawl-delay budget exhausted; seed not fetched: ${url}`);
-        continue;
-      }
+      rootRobots=robots;
     }
     // P-C per-seed frontier state (flag-gated): declared before first use so
     // root accounting below never hits temporal-dead-zone errors.
@@ -830,6 +825,14 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       if(sharedRoot.communityIntents?.length)communityIntents.push(...sharedRoot.communityIntents);
       page={html:'',finalUrl:sharedRoot.finalUrl,truncated:false};
     }else{
+      // Pace as late as possible before the request so DNS/redirect work in
+      // the fetch does not shorten the observed interval to the next crawl.
+      if(robotsPolicy&&rootRobots&&!(await respectRobotsDelay(url,rootRobots))){
+        drops.count('robots-delay-budget');seedCeiling??='robots-delay-budget';
+        observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'ROBOTS_DELAY_BUDGET',detail:'Per-crawl Crawl-delay budget exhausted before the seed request; coverage is incomplete',observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,ceiling:'robots-delay-budget',dropReasons:drops.snapshot()})});
+        logDetails.push(`[robots] Crawl-delay budget exhausted; seed not fetched: ${url}`);
+        continue;
+      }
       // The terminal 404/410 barrier only ever consumes the seed's own
       // observation, so only seed fetches pay for the bounded body probe.
       const acquired=await fetchExternalPage(url,fetchImpl,resolveHost,true,undefined,false,robotsPermit);
@@ -1056,22 +1059,24 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       },{marginalFloor:frontier?.marginalFloor??0,remainingValueFloor:frontier?.remainingValueFloor??0,marginalWindow:frontier?.marginalWindow??5});
       if(frontierDecision.action==='STOP'){seedCeiling??='frontier-yield';drops.count('frontier-yield-stop');logDetails.push(`[Frontier] stopping child exploration: ${frontierDecision.reason}.`);break;}
     }
-    queue.sort((a,b)=>b.score-a.score);const next=queue.shift()!;if(next.depth>explorationLimits.maxDepth){seedCeiling??='depth-limit';drops.count('depth-limit');continue;}if(visited.has(next.url)||sharedVisited.has(sharedKey(next.url)??'')){drops.count('already-visited');continue;}if(robotsPolicy){
+    queue.sort((a,b)=>b.score-a.score);const next=queue.shift()!;let nextRobots:{crawlDelayMs:number}|undefined;if(next.depth>explorationLimits.maxDepth){seedCeiling??='depth-limit';drops.count('depth-limit');continue;}if(visited.has(next.url)||sharedVisited.has(sharedKey(next.url)??'')){drops.count('already-visited');continue;}if(robotsPolicy){
       const robots=await robotsPolicy.decide(next.url);
       if(!robots.allowed){
         drops.countUnique('robots-disallowed',next.url);
         observations.push({requestedUrl:next.url,finalUrl:next.url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:false,failureClass:'ROBOTS_DISALLOWED',detail:`robots.txt Disallow matched ${robots.matchedRule||'(path)'}; URL not fetched`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,dropReasons:drops.snapshot()})});
         continue;
       }
-      if(!(await respectRobotsDelay(next.url,robots))){
-        drops.count('robots-delay-budget');
-        seedCeiling??='robots-delay-budget';
-        logDetails.push(`[robots] Crawl-delay budget exhausted; child not fetched: ${next.url}`);
-        continue;
-      }
+      nextRobots=robots;
     }
     const reservation=destinationBudget.reserve(next.url,next.from||url);if(!reservation.admitted){seedCeiling??='exploration-limit';drops.count('destination-budget');logDetails.push(`Destination budget (${reservation.reason}): skipped ${next.url}; seed coverage remains incomplete.`);continue;}
-    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
+    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);
+    if(robotsPolicy&&nextRobots&&!(await respectRobotsDelay(next.url,nextRobots))){
+      drops.count('robots-delay-budget');
+      seedCeiling??='robots-delay-budget';
+      logDetails.push(`[robots] Crawl-delay budget exhausted; child not fetched: ${next.url}`);
+      continue;
+    }
+    const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
       // Child error bodies can contain shared footers. Only scan when the
       // child was nominated as a community-relevant navigation target.
       const failureCandidates=subAcquired.observation?.failureClass!=='ROBOTS_DISALLOWED'&&next.score>0
@@ -1095,7 +1100,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       frontierYieldHistory.push(childYield);frontierEvidenceUnits+=childYield;
       await frontierRecordCoverage(next.url,childYield>0?'FOUND':(subPage.truncated?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH'),'HTTP_STATIC',childYield);
       await frontierAdmitChildren(children,next.depth);
-    }if(next.depth>=explorationLimits.maxDepth){const seenChildren=new Set<string>();const unvisitedChildren=children.filter(child=>{if(seenChildren.has(child.url))return false;seenChildren.add(child.url);return !visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'');});if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else{const bestChild=new Map<string,{url:string;score:number;from?:string}>();for(const child of children){const prior=bestChild.get(child.url);if(!prior||child.score>prior.score)bestChild.set(child.url,child);}const duplicateChildren=Math.max(0,children.length-bestChild.size);if(duplicateChildren>0)drops.count('duplicate',duplicateChildren);const uniqueChildren=[...bestChild.values()].filter(child=>!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??''));const room=Math.max(0,explorationLimits.queueCap-queue.length);queue.push(...uniqueChildren.slice(0,room).map(child=>({...child,depth:next.depth+1})));const overflow=Math.max(0,uniqueChildren.length-room);if(overflow>0){seedCeiling??='queue-cap';drops.count('queue-cap',overflow);}}}
+    }if(next.depth>=explorationLimits.maxDepth){const seenChildren=new Set<string>();const unvisitedChildren=children.filter(child=>{if(seenChildren.has(child.url))return false;seenChildren.add(child.url);return !visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'');});if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else{const bestChild=new Map<string,{url:string;score:number;from?:string}>();for(const child of children){const prior=bestChild.get(child.url);if(!prior||child.score>prior.score)bestChild.set(child.url,child);}const duplicateChildren=Math.max(0,children.length-bestChild.size);if(duplicateChildren>0)drops.count('duplicate',duplicateChildren);const pending=new Map(queue.map(item=>[item.url,item]));for(const child of bestChild.values()){if(visited.has(child.url)||sharedVisited.has(sharedKey(child.url)??''))continue;const candidate={...child,depth:next.depth+1};const prior=pending.get(child.url);if(!prior||candidate.score>prior.score)pending.set(child.url,candidate);}const merged=[...pending.values()].sort((a,b)=>b.score-a.score);const capped=merged.slice(0,explorationLimits.queueCap);const overflow=Math.max(0,merged.length-capped.length);queue.length=0;queue.push(...capped);if(overflow>0){seedCeiling??='queue-cap';drops.count('queue-cap',overflow);}}}
     if(queue.some(item=>!visited.has(item.url)))seedCeiling??='exploration-limit';const leftoverUnvisited=queue.filter(item=>!visited.has(item.url)).length;if(leftoverUnvisited>0)drops.count('exploration-limit',leftoverUnvisited);
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
     const foundForSeed=seedFound||discovered.length>beforeSeed;

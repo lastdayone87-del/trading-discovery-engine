@@ -46,6 +46,15 @@ test('Crawl-delay closes its user-agent group before a following bot group', asy
   assert.equal((await policy.decide('https://creator.example/public')).allowed, true);
 });
 
+test('duplicate wildcard groups are merged instead of the first winning', async () => {
+  const policy = new RobotsCrawlPolicy(
+    fetchRobots('User-agent: *\nCrawl-delay: 1\n\nUser-agent: *\nDisallow: /private\n'),
+    resolver,
+  );
+  assert.equal((await policy.decide('https://creator.example/private')).allowed, false);
+  assert.equal((await policy.decide('https://creator.example/public')).allowed, true);
+});
+
 test('403, 429, 5xx and unreachable robots are unavailable, not a block', async () => {
   for (const status of [403, 429, 500]) {
     const policy = new RobotsCrawlPolicy(fetchRobots('', status), resolver);

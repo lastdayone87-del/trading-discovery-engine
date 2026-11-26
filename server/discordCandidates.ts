@@ -234,7 +234,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   else if(surfaces.has('RECENT_VIDEO_DESCRIPTIONS')){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
   else if(surfaces.has('SOCIAL_PROFILES')){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
   else if(surfaces.has('CREATOR_WEBSITES')){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
-  else if(surfaces.has('YOUTUBE_PLAYLIST_ITEMS')){score+=20;reasons.push('CURATED_PLAYLIST_ITEM');}
+  else if(surfaces.has('YOUTUBE_PLAYLIST_ITEMS')){score+=0;reasons.push('CURATED_PLAYLIST_ITEM');}
   else if(surfaces.has('YOUTUBE_COMMENTS')){score+=0;reasons.push('VIEWER_COMMENT_SURFACE');}
 
   // A channel external link is a creator-controlled surface. Explicit extraction
