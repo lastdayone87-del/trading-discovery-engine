@@ -387,6 +387,11 @@ test('Telegram community roots and non-Telegram community links remain eligible'
   assert.equal(isTelegramPostPermalink('https://t.me/vipintraders'), false);
   assert.equal(shouldEnqueueRenderedCommunityLink('https://t.me/vipintraders'), true);
   assert.equal(shouldEnqueueRenderedCommunityLink('https://example.com/vip-community'), true);
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://example.com/communaut%C3%A9-priv%C3%A9e'), true);
+  // Query/fragment text is not path evidence: an encoded redirect parameter
+  // must not consume the rendered crawl budget.
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://example.com/page?next=%2Fvipintraders'), false);
+  assert.equal(shouldEnqueueRenderedCommunityLink('https://example.com/page#%2Fcommunity'), false);
 });
 
 test('rendered retry policy rotates sessions for blocked responses', () => {
@@ -960,10 +965,12 @@ function routeLike(
   };
 }
 
-test('rendered robots skips keep coverage incomplete', () => {
+test('rendered robots skips keep coverage incomplete without needless retries', () => {
   const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
-  assert.match(source, /const robotsBlocked = \(\(drops\.snapshot\(\)\['robots-disallowed'\]/);
-  assert.match(source, /requiredWorkRemaining:requiredWorkRemaining\|\|robotsBlocked/);
+  assert.match(source, /const robotsDisallowed = \(drops\.snapshot\(\)\['robots-disallowed'\]/);
+  assert.match(source, /const robotsDelayBudget = \(drops\.snapshot\(\)\['robots-delay-budget'\]/);
+  assert.match(source, /policyBlocked:robotsDisallowed/);
+  assert.match(source, /requiredWorkRemaining:requiredWorkRemaining\|\|robotsDelayBudget/);
   assert.match(source, /robots === 'budget' \? 'robots-delay-budget' : 'robots-disallowed'/);
 });
 

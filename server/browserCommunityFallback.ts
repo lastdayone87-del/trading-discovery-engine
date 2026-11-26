@@ -1,7 +1,7 @@
 import * as cheerio from 'cheerio';
 import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
-import { decodeCommunityUrl, MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
+import { decodeCommunityUrlPath, MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
 import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
@@ -607,11 +607,11 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
-  const decoded = decodeCommunityUrl(rawUrl);
-  const normalized = decoded.replace(/[-_/]+/g, ' ');
-  return COMMUNITY_HINTS.test(rawUrl)
+  const pathText = decodeCommunityUrlPath(rawUrl);
+  const normalized = pathText.replace(/[-_/]+/g, ' ');
+  return COMMUNITY_HINTS.test(pathText)
     || COMMUNITY_HINTS.test(normalized)
-    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(decoded);
+    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathText);
 }
 
 /**
@@ -3645,6 +3645,9 @@ export function resolveRenderedCompletionState(input: {
    */
   coverageReason?: RenderedCoverageReason;
   coverageRetryable?: boolean;
+  /** Deterministic robots policy block: incomplete, but retry cannot change
+   * the same policy decision. */
+  policyBlocked?: boolean;
 }): { complete: boolean; queueComplete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
@@ -3683,7 +3686,8 @@ export function resolveRenderedCompletionState(input: {
   // context gaps stay visible without owning retry; budget/interaction/scroll
   // gaps are retryable.
   const coverageIncomplete = input.coverageReason !== undefined && input.coverageReason !== 'COMPLETE';
-  const incomplete = baseIncomplete || coverageIncomplete;
+  const policyIncomplete = input.policyBlocked === true;
+  const incomplete = baseIncomplete || coverageIncomplete || policyIncomplete;
   const retryable = baseIncomplete || (coverageIncomplete && input.coverageRetryable !== false);
   // `queueComplete` keeps the pre-coverage traversal verdict available so the
   // terminal stop attribution ("ran out of enqueueable links") does not
@@ -6420,12 +6424,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           timedOut || pageBudgetExhausted,
           retryableRequiredGapCount,
         );
-        const robotsBlocked = ((drops.snapshot()['robots-disallowed'] || 0) + (drops.snapshot()['robots-delay-budget'] || 0)) > 0;
+        const robotsDisallowed = (drops.snapshot()['robots-disallowed'] || 0) > 0;
+        const robotsDelayBudget = (drops.snapshot()['robots-delay-budget'] || 0) > 0;
         const coverageGapRetryable = interactionGap || timedOut || pageBudgetExhausted
           || scrollCapReachedStillGrowing || contextMeasurementAbandoned
-          || retryableRequiredGapCount > 0 || robotsBlocked;
+          || retryableRequiredGapCount > 0 || robotsDelayBudget;
         const coverageRetryable = coverageGapRetryable || coverageReason === 'BOUNDED';
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,requiredWorkRemaining:requiredWorkRemaining||robotsBlocked,coverageReason,coverageRetryable});
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,requiredWorkRemaining:requiredWorkRemaining||robotsDelayBudget,coverageReason,coverageRetryable,policyBlocked:robotsDisallowed});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;

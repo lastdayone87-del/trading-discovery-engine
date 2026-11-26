@@ -129,6 +129,17 @@ export function decodeCommunityUrl(value: string): string {
   }
 }
 
+/** Decode only the pathname of an absolute URL. Query/fragment text is never
+ * community evidence: encoded redirect or tracking parameters must not make
+ * an unrelated destination look like a community page. */
+export function decodeCommunityUrlPath(value: string): string {
+  try {
+    return decodeCommunityUrl(new URL(value).pathname);
+  } catch {
+    return decodeCommunityUrl(value);
+  }
+}
+
 export const MULTILINGUAL_URL_COMMUNITY_EVIDENCE = new RegExp(
   '(?:^|[/._-])(?:'
   + '(?:discord|community|join|invites?|vip|trading[-_ ]?(?:room|floor|club)|signals?|skool|whop|circle|patreon|comunidad|comunidade|communaut[eé]|gemeinschaft|gemeenschap|fellesskap|gemenskap|pobal|comhphobal|communautéit|comunità)'

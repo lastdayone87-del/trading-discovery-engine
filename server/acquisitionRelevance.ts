@@ -197,7 +197,7 @@ export function extractRelevanceSignals(input: {
       contextMatches: input.contextMatches === true,
       kind,
       platformFamily,
-      communityHint: COMMUNITY_HINT.test(decodeCommunityUrl(`${path} ${input.url}`).replace(/[-_/]+/g, ' ')),
+      communityHint: COMMUNITY_HINT.test(decodeCommunityUrl(path).replace(/[-_/]+/g, ' ')),
       creatorCanonical: canonicalSet.has(host) || canonicalSet.has(registrable),
       wrapperPresent: typeof input.wrapperUrl === 'string' && input.wrapperUrl.length > 0,
       admissionEligible,
