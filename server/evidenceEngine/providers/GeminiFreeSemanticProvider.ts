@@ -192,9 +192,14 @@ export async function runGeminiFreeRouteFailover<T>(routes: GeminiFreeRoute[], c
     }
   }
   // Every configured free key rejected its credential. Block the fallback in
-  // this process so the claim gate does not keep offering it as healthy.
+  // this process and mark the error so the job parks instead of consuming a
+  // retry attempt.
   if (unauthorizedFailures >= routes.length) {
-    geminiFreeCredentialExhaustedUntilMs = Math.max(geminiFreeCredentialExhaustedUntilMs, Date.now() + 24 * 60 * 60_000);
+    const resumeAt = Date.now() + 24 * 60 * 60_000;
+    geminiFreeCredentialExhaustedUntilMs = Math.max(geminiFreeCredentialExhaustedUntilMs, resumeAt);
+    if (lastError && typeof lastError === 'object') {
+      Object.assign(lastError, { retryAt: resumeAt, providerCapacityExhausted: true });
+    }
   }
   throw lastError || new ProviderCallError('No configured free Gemini route is available.', 'TRANSIENT', true);
 }
