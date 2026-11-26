@@ -4426,6 +4426,13 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     };
   }
   if(failureCode==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
+  // Provider-capacity circuit: the row's reset time is authoritative and may
+  // be many hours away. Park without consuming an attempt or applying the
+  // generic six-hour transient-age terminal rule.
+  if((error as any)?.providerCapacityExhausted===true){
+    const capacityResumeAt=Number((error as any)?.retryAt);
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Number.isFinite(capacityResumeAt)&&capacityResumeAt>now?capacityResumeAt:now+60_000};
+  }
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
     const retryAt=Number(error?.retryAt);

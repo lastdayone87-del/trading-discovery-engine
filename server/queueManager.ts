@@ -188,6 +188,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
+import { getSemanticCapacityStatus } from './providerCapacityState';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
@@ -1836,6 +1837,12 @@ export async function processNextSearchJob(
   await recoverStaleJobsIfDue();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
+  const semanticGateNeeded = !claimableOverride
+    || claimableOverride.includes(CLASSIFICATION_JOB_TYPE)
+    || claimableOverride.includes(ADMISSION_VERIFICATION_JOB_TYPE);
+  const semanticCapacity = semanticGateNeeded
+    ? await getSemanticCapacityStatus().catch(() => ({ available: true }))
+    : { available: true };
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   // ENRICH_CHANNEL: every such job runs the full evidence pipeline. Under the
@@ -1897,7 +1904,7 @@ export async function processNextSearchJob(
     }
     // Classification and process lanes are separate from ENRICH backfill, so
     // their own overrides must be accepted outside the ENRICH-only block.
-    if (enrichmentFullyClaimable && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+    if (enrichmentFullyClaimable && semanticCapacity.available && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
       claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
     // Dedicated process lane: separate worker capacity removes classification
@@ -1908,7 +1915,7 @@ export async function processNextSearchJob(
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
-  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
+  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && semanticCapacity.available && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');

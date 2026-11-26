@@ -791,6 +791,17 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     try { await persistCapacityOutcome(event); } catch (pacingStateError) { console.warn('[Gemini Capacity Diagnostic] Failed to persist successful pacing outcome before unlock.',String((pacingStateError as any)?.message||pacingStateError)); }
     await releaseCapacity();
     await args.emit(event).catch(()=>undefined);
+    if (providerCallStarted && (args.context.provider==='gemini'||args.context.provider==='groq')) {
+      const org = String(
+        (args.context.requestMetadata as any)?.geminiOrg
+        || (args.context.requestMetadata as any)?.groqOrg
+        || 'pool'
+      );
+      try {
+        const { recordProviderCapacitySuccess } = await import('./providerCapacityState');
+        await recordProviderCapacitySuccess({ provider: args.context.provider, scopeKey: org, operation: args.context.operation });
+      } catch { /* capacity state failure must not mask a successful provider response */ }
+    }
     return value;
   }catch(error){
     // A caller-supplied deadline aborts through the same controller. Preserve
@@ -811,6 +822,42 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     const capacityDeferral=isGeminiCapacityDeferral(args.context.provider,providerCallStarted);
     const scaleGateDeferral=isGeminiScaleGateDeferral(args.context.provider,providerCallStarted,typed);
     const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{}),...(scaleGateDeferral?{geminiScaleGateDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
+    // A real upstream quota/credential response opens the durable circuit.
+    // Local capacity deferrals never reached the provider and are excluded.
+    if (providerCallStarted && (args.context.provider==='gemini'||args.context.provider==='groq')
+      && (typed.errorClass==='RATE_LIMIT'||typed.errorClass==='CREDENTIALS_EXHAUSTED')) {
+      const org = String(
+        (args.context.requestMetadata as any)?.geminiOrg
+        || (args.context.requestMetadata as any)?.groqOrg
+        || (typed as any)?.geminiOrg
+        || (typed as any)?.groqOrg
+        || 'pool'
+      );
+      const daily = typed.quotaScope==='DAILY';
+      const operation = daily || typed.errorClass==='CREDENTIALS_EXHAUSTED' ? '*' : args.context.operation;
+      const resumeAt = typed.errorClass==='CREDENTIALS_EXHAUSTED'
+        ? Date.now()+24*60*60_000
+        : (Number.isFinite(Number(typed.cooldownUntilMs)) && Number(typed.cooldownUntilMs)>Date.now()
+          ? Number(typed.cooldownUntilMs)
+          : (Number.isFinite(Number(typed.retryAfterMs)) && Number(typed.retryAfterMs)>0
+            ? Date.now()+Number(typed.retryAfterMs)
+            : (daily ? nextPacificMidnightMs() : Date.now()+90_000)));
+      try {
+        const { recordProviderCapacityExhausted } = await import('./providerCapacityState');
+        const persistedResumeAt = await recordProviderCapacityExhausted({
+          provider: args.context.provider,
+          scopeKey: org,
+          operation,
+          state: typed.errorClass==='CREDENTIALS_EXHAUSTED'?'BLOCKED':'EXHAUSTED',
+          reasonCode: typed.providerReasons?.[0] || typed.errorClass,
+          resumeAt,
+          sourceEventId: event.id,
+        });
+        Object.assign(typed,{retryAt:persistedResumeAt,providerCapacityExhausted:true});
+      } catch {
+        Object.assign(typed,{retryAt:resumeAt,providerCapacityExhausted:true});
+      }
+    }
     if(capacityLease&&(typed.errorClass==='TIMEOUT'||typed.errorClass==='CANCELLED')){
       const cleanupController=new AbortController();
       const cleanupDeadlineAtMs=Date.now()+GEMINI_OUTCOME_CLEANUP_TIMEOUT_MS;
