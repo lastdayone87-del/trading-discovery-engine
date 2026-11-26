@@ -1458,7 +1458,12 @@ export function defaultClient(
       // reset across every failed account so an enrichment job does not park
       // for 24 hours behind a blocked last route when another org recovers in
       // a minute.
-      if (routeFailureResets.length && error && typeof error === 'object') {
+      // Only a capacity-class final error may inherit an earlier route's
+      // reset. A transient 5xx must follow the normal retry path, not park
+      // behind an unrelated credential block.
+      const capacityClassError = error instanceof ProviderCallError
+        && (error.errorClass === 'RATE_LIMIT' || error.errorClass === 'CREDENTIALS_EXHAUSTED');
+      if (capacityClassError && routeFailureResets.length && error && typeof error === 'object') {
         Object.assign(error, {
           retryAt: Math.min(...routeFailureResets),
           providerCapacityExhausted: true,

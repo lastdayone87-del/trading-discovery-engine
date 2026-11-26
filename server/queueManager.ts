@@ -1865,11 +1865,19 @@ export async function processNextSearchJob(
       }
     }
   }
+  let freeFallbackAvailable: boolean | null = null;
+  const freeTierFallbackHealthy = async (): Promise<boolean> => {
+    if (!geminiFreeFallbackForGate) return false;
+    if (freeFallbackAvailable === null) {
+      freeFallbackAvailable = !(await isGeminiFreeSemanticCooldownActive());
+    }
+    return freeFallbackAvailable;
+  };
   let semanticCapacityProbe: Promise<ProviderCapacityStatus> | null = null;
   let takenCapacityProbe: ProviderCapacityProbe | null = null;
   const semanticCapacity = async (): Promise<boolean> => {
     if (!semanticGateNeeded || geminiFreeSelectedForGate) return true;
-    if (geminiFreeFallbackForGate && !(await isGeminiFreeSemanticCooldownActive())) return true;
+    if (await freeTierFallbackHealthy()) return true;
     // Resolve lazily, only when this tick is about to offer a semantic job
     // type. Taking the one-shot probe lease on a tick that never claims
     // semantic work would block the real probe for the lease duration.
@@ -1959,14 +1967,14 @@ export async function processNextSearchJob(
     }
     // Classification and process lanes are separate from ENRICH backfill, so
     // their own overrides must be accepted outside the ENRICH-only block.
-    if (enrichmentFullyClaimable && await semanticCapacity() && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+    if ((enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity() && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
       claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
     // Dedicated process lane: separate worker capacity removes classification
     // starvation, while the same semantic-availability gate prevents a defer
     // storm. This must sit outside the ENRICH_CHANNEL-only block above so a
     // process-only override can claim its job type.
-    if (enrichmentFullyClaimable && await semanticCapacity() && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
+    if ((enrichmentFullyClaimable || await freeTierFallbackHealthy()) && await semanticCapacity() && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }

@@ -253,6 +253,8 @@ maybe('an expired operation row cannot probe past a future daily block', async (
     reasonCode: 'PROVIDER_QUOTA_MINUTE',
     resumeAt: Date.now() - 60_000,
   }, db);
+  await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second'
+                  WHERE provider='gemini' AND scope_key='gemini-project-1' AND operation='multilingual-semantic-classification'`);
   await recordProviderCapacityExhausted({
     provider: 'gemini',
     scopeKey: 'gemini-project-1',
