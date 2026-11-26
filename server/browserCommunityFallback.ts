@@ -1,7 +1,7 @@
 import * as cheerio from 'cheerio';
 import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
-import { MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
+import { decodeCommunityUrl, MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
 import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
@@ -607,10 +607,11 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
-  const normalized = rawUrl.replace(/[-_/]+/g, ' ');
+  const decoded = decodeCommunityUrl(rawUrl);
+  const normalized = decoded.replace(/[-_/]+/g, ' ');
   return COMMUNITY_HINTS.test(rawUrl)
     || COMMUNITY_HINTS.test(normalized)
-    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(rawUrl);
+    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(decoded);
 }
 
 /**
@@ -6419,11 +6420,12 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           timedOut || pageBudgetExhausted,
           retryableRequiredGapCount,
         );
+        const robotsBlocked = ((drops.snapshot()['robots-disallowed'] || 0) + (drops.snapshot()['robots-delay-budget'] || 0)) > 0;
         const coverageGapRetryable = interactionGap || timedOut || pageBudgetExhausted
           || scrollCapReachedStillGrowing || contextMeasurementAbandoned
-          || retryableRequiredGapCount > 0;
+          || retryableRequiredGapCount > 0 || robotsBlocked;
         const coverageRetryable = coverageGapRetryable || coverageReason === 'BOUNDED';
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,requiredWorkRemaining,coverageReason,coverageRetryable});
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,requiredWorkRemaining:requiredWorkRemaining||robotsBlocked,coverageReason,coverageRetryable});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;

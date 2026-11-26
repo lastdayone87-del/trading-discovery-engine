@@ -30,9 +30,11 @@ test('time spent queued behind another crawl counts against the budget', async (
   await paceRobotsOrigin(origin, 1, { spentMs: 0 });
   const holder = paceRobotsOrigin(origin, 80, { spentMs: 0 });
   const started = Date.now();
-  const queued = await paceRobotsOrigin(origin, 80, { spentMs: 0 }, 15);
+  const queuedBudget = { spentMs: 0 };
+  const queued = await paceRobotsOrigin(origin, 80, queuedBudget, 15);
   assert.equal(queued, false);
   assert.ok(Date.now() - started < 70, 'a queued caller must not wait out the origin delay');
+  assert.ok(queuedBudget.spentMs >= 10, 'queued time is charged to the crawl budget');
   assert.equal(await holder, true);
 });
 

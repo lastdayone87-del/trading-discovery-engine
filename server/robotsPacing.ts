@@ -71,8 +71,10 @@ export async function paceRobotsOrigin(
       ]);
   if (queueTimer) clearTimeout(queueTimer);
   if (!acquired) {
-    // Do not hold this caller on a busy origin, but release the gate once the
-    // prior holder finishes so later callers are not permanently blocked.
+    // Charge the time already spent queued so the crawl's budget reflects
+    // the work it actually paid for, then release the gate once the prior
+    // holder finishes so later callers are not permanently blocked.
+    budget.spentMs += Date.now() - queuedAt;
     prior.finally(() => {
       release();
       if (originTails.get(origin) === tail) originTails.delete(origin);

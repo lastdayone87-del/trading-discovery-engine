@@ -30,7 +30,7 @@
  * ELIGIBLE (legacy behavior byte-identical).
  */
 import { assessCrawlAdmission } from './communitySurfacePolicy';
-import { MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
+import { decodeCommunityUrl, MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { canonicalSiteIdentity } from './siteIdentity';
 
 export type RelevanceTier = 'BLOCK' | 'DEMOTE' | 'ELIGIBLE';
@@ -197,7 +197,7 @@ export function extractRelevanceSignals(input: {
       contextMatches: input.contextMatches === true,
       kind,
       platformFamily,
-      communityHint: COMMUNITY_HINT.test(`${path} ${input.url}`.replace(/[-_/]+/g, ' ')),
+      communityHint: COMMUNITY_HINT.test(decodeCommunityUrl(`${path} ${input.url}`).replace(/[-_/]+/g, ' ')),
       creatorCanonical: canonicalSet.has(host) || canonicalSet.has(registrable),
       wrapperPresent: typeof input.wrapperUrl === 'string' && input.wrapperUrl.length > 0,
       admissionEligible,

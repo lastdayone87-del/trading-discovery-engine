@@ -1,5 +1,6 @@
 import { assessCrawlAdmission, isKnownBrokerOrExchangeHost } from './communitySurfacePolicy';
 import {
+  decodeCommunityUrl,
   MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE,
   MULTILINGUAL_URL_COMMUNITY_EVIDENCE,
   MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
@@ -142,13 +143,15 @@ export function shouldFollowDestination(input: {
   let pathname = input.url;
   try { pathname = new URL(input.url).pathname || '/'; } catch { /* admission already validated */ }
   // Path and anchor separators are normalized so the space-delimited lexicon
-  // matches hyphenated/underscored URLs and CTAs (`Trading-Room`).
-  const text = `${pathname.replace(/[-_/]+/g, ' ')} ${String(input.anchorText || '').replace(/[-_/]+/g, ' ')}`;
+  // matches hyphenated/underscored URLs and CTAs (`Trading-Room`). Serialized
+  // URLs percent-encode accented terms; decode before matching.
+  const decodedPath = decodeCommunityUrl(pathname);
+  const text = `${decodedPath.replace(/[-_/]+/g, ' ')} ${String(input.anchorText || '').replace(/[-_/]+/g, ' ')}`;
   const knownHost = isKnownCommunityDestinationHost(host);
   // Concatenated URL slugs (`/vipintraders`) are legitimate community
   // evidence even when token boundaries prevent an anchor-style match.
   const strongEvidence = hasStrongCommunityEvidence(text)
-    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathname);
+    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(decodedPath);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);
   const eligible = sameOrigin
     || Boolean(input.structuredNominated)
@@ -244,7 +247,7 @@ export function createDestinationBudget(input: {
    * of the external host. Without it, legacy same-origin behavior is retained. */
   seedUrl?: string;
 } = {}): {
-  reserve: (url: string, currentUrl: string) => { admitted: boolean; reason: 'same-origin' | 'admitted' | 'host-budget' | 'page-budget' };
+  reserve: (url: string, currentUrl: string) => { admitted: boolean; reason: 'same-origin' | 'admitted' | 'host-budget' | 'page-budget'; release?: () => void };
 } {
   const maxHosts = Math.max(1, Math.trunc(input.maxCrossOriginHosts ?? 3) || 3);
   const maxPages = Math.max(1, Math.trunc(input.maxPagesPerHost ?? 2) || 2);
@@ -280,7 +283,19 @@ export function createDestinationBudget(input: {
       }
       pages.add(key);
       pagesByHost.set(host, pages);
-      return { admitted: true, reason: 'admitted' as const };
+      const result = { admitted: true, reason: 'admitted' as const };
+      // Non-enumerable so existing deep-equality contracts stay stable while
+      // callers can still release a slot after a post-reservation policy skip
+      // (for example the Crawl-delay budget).
+      Object.defineProperty(result, 'release', {
+        enumerable: false,
+        value: () => {
+          const currentPages = pagesByHost.get(host);
+          if (!currentPages?.delete(key)) return;
+          if (currentPages.size === 0) pagesByHost.delete(host);
+        },
+      });
+      return result;
     },
   };
 }

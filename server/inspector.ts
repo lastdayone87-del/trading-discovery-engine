@@ -20,6 +20,7 @@ import { fetchLiveYouTubeChannelData, parseAboutPageMetadataFromHtml } from './y
 import { resolveDocumentBaseUrlFromRoot, stripBaseElements } from './documentBase';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import {
+  decodeCommunityUrl,
   MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE,
   MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
 } from './multilingualCommunityLexicon';
@@ -387,7 +388,7 @@ const CROSS_DOMAIN_COMMUNITY_HOSTS = new Set(['linktr.ee','www.linktr.ee','beaco
 export function communityNavigationScore(href:string,label:string):number {
   // Normalize URL separators so space-delimited lexicon phrases match
   // hyphenated paths (`/trading-room` -> `trading room`).
-  const haystack=`${href} ${label}`.toLowerCase().replace(/[-_/]+/g,' ');
+  const haystack=`${decodeCommunityUrl(href)} ${label}`.toLowerCase().replace(/[-_/]+/g,' ');
   // One pass per tier, not one pass per lexicon term. The lexicon is
   // multilingual and large; per-anchor substring loops would be a material
   // static-crawl cost.
@@ -1070,14 +1071,17 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       }
       nextRobots=robots;
     }
+    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);
+    const reservation=destinationBudget.reserve(next.url,next.from||url);if(!reservation.admitted){seedCeiling??='exploration-limit';drops.count('destination-budget');logDetails.push(`Destination budget (${reservation.reason}): skipped ${next.url}; seed coverage remains incomplete.`);continue;}
     if(robotsPolicy&&nextRobots&&!(await respectRobotsDelay(next.url,nextRobots))){
+      // A pacing skip after reservation must not consume the host/page slot;
+      // visited already prevents a later page from re-enqueueing it.
+      reservation.release?.();
       drops.count('robots-delay-budget');
       seedCeiling??='robots-delay-budget';
       logDetails.push(`[robots] Crawl-delay budget exhausted; child not fetched: ${next.url}`);
       continue;
     }
-    const reservation=destinationBudget.reserve(next.url,next.from||url);if(!reservation.admitted){seedCeiling??='exploration-limit';drops.count('destination-budget');logDetails.push(`Destination budget (${reservation.reason}): skipped ${next.url}; seed coverage remains incomplete.`);continue;}
-    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);
     const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit,requestStartMarker),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
       // Child error bodies can contain shared footers. Only scan when the
       // child was nominated as a community-relevant navigation target.

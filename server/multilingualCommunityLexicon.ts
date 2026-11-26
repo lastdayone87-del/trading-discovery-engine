@@ -118,6 +118,17 @@ export const MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE = termRegex(MULTILINGUAL_WEAK_
 /** URL-slug evidence. Path segments concatenate words (`/vipintraders`,
  * `/tradingroom`), so token-boundary anchor matching alone misses them. Kept
  * to distinctive community terms; generic prose words stay out. */
+/** Decode percent-encoded path text for lexicon matching. Malformed escapes
+ * fall back to the raw value; this never performs a network or filesystem
+ * operation. */
+export function decodeCommunityUrl(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export const MULTILINGUAL_URL_COMMUNITY_EVIDENCE = new RegExp(
   '(?:^|[/._-])(?:'
   + '(?:discord|community|join|invites?|vip|trading[-_ ]?(?:room|floor|club)|signals?|skool|whop|circle|patreon|comunidad|comunidade|communaut[eé]|gemeinschaft|gemeenschap|fellesskap|gemenskap|pobal|comhphobal|communautéit|comunità)'

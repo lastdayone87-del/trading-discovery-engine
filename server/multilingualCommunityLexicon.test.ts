@@ -60,7 +60,7 @@ test('invite labels and concatenated slugs open unknown hosts', () => {
     anchorText: 'Get an invite',
   });
   assert.equal(label.eligible, true, 'invite');
-  for (const slug of ['vipintraders', 'comunidadprivada']) {
+  for (const slug of ['vipintraders', 'comunidadprivada', 'communaut%C3%A9-priv%C3%A9e']) {
     const decision = shouldFollowDestination({
       url: `https://unknown.example/${slug}`,
       currentUrl: 'https://creator.example/',

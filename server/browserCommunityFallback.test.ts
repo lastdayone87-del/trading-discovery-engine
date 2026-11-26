@@ -960,6 +960,13 @@ function routeLike(
   };
 }
 
+test('rendered robots skips keep coverage incomplete', () => {
+  const source = fs.readFileSync(new URL('./browserCommunityFallback.ts', import.meta.url), 'utf8');
+  assert.match(source, /const robotsBlocked = \(\(drops\.snapshot\(\)\['robots-disallowed'\]/);
+  assert.match(source, /requiredWorkRemaining:requiredWorkRemaining\|\|robotsBlocked/);
+  assert.match(source, /robots === 'budget' \? 'robots-delay-budget' : 'robots-disallowed'/);
+});
+
 test('route guard tells the policy whether a request is a document navigation', async () => {
   const seen: Array<string | undefined> = [];
   let continued = 0;
