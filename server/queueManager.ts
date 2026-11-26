@@ -1873,6 +1873,31 @@ export async function processNextSearchJob(
     }
     return freeFallbackAvailable;
   };
+  // Admission claims were previously gated only by the durable circuit. Under
+  // local token-bucket pressure the provider is deferred before any upstream
+  // call, so no circuit row exists and a missing row looks healthy. Use the
+  // same route-cooldown truth as the enrichment gate so admission parks while
+  // every serving route is actually cooling.
+  const semanticRoutesCooling = async (): Promise<boolean> => {
+    if (await freeTierFallbackHealthy()) return false;
+    if (shouldUseGeminiFreeSemantic()) return isGeminiFreeSemanticCooldownActive();
+    if (shouldUseGroqSemantic()) {
+      const routes = configuredGroqRoutes();
+      if (!routes.length) return true;
+      return allRoutesCoolingDown(await Promise.all(routes.map(async route =>
+        groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
+    }
+    const geminiRoutes = configuredGeminiRoutes();
+    const geminiCooling = geminiRoutes.length > 0
+      ? allRoutesCoolingDown(await Promise.all(geminiRoutes.map(route => isGeminiOrgCooldownActive(geminiRouteOrg(route)))))
+      : await isGeminiSemanticCooldownActive();
+    if (!geminiCooling) return false;
+    if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return true;
+    const groqRoutes = configuredGroqRoutes();
+    if (!groqRoutes.length) return true;
+    return allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route =>
+      groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))));
+  };
   let semanticCapacityProbe: Promise<ProviderCapacityStatus> | null = null;
   let takenCapacityProbe: ProviderCapacityProbe | null = null;
   const semanticCapacity = async (): Promise<boolean> => {
@@ -1978,7 +2003,7 @@ export async function processNextSearchJob(
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
-  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
+  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && !(await semanticRoutesCooling()) && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
