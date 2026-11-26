@@ -8,6 +8,7 @@ import {
   recordProviderCapacityExhausted,
   recordProviderCapacitySuccess,
   resetProviderCapacityCacheForTests,
+  type ProviderCapacityAccount,
 } from './providerCapacityState';
 
 const dedicatedUrl = process.env.PROVIDER_CAPACITY_TEST_DATABASE_URL;
@@ -23,6 +24,14 @@ let pool: Pool | null = null;
 function requirePool(): Pool {
   assert.ok(pool, 'pool must be initialized by the schema test');
   return pool;
+}
+
+function gemini(scopeKey: string): ProviderCapacityAccount {
+  return { provider: 'gemini', scopeKey };
+}
+
+function groq(scopeKey: string): ProviderCapacityAccount {
+  return { provider: 'groq', scopeKey };
 }
 
 maybe('capacity state parks until reset, allows exactly one probe, and closes on success', async () => {
@@ -43,21 +52,21 @@ maybe('capacity state parks until reset, allows exactly one probe, and closes on
     sourceEventId: 'event-1',
   }, db);
   resetProviderCapacityCacheForTests();
-  const parked = await getSemanticCapacityStatus(Date.now(), db);
+  const parked = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(parked.available, false);
   assert.equal(parked.probe, false);
   assert.ok((parked.resumeAt || 0) > Date.now());
 
   await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second' WHERE provider='gemini' AND scope_key='gemini-project-1'`);
   resetProviderCapacityCacheForTests();
-  const probe = await getSemanticCapacityStatus(Date.now(), db);
+  const probe = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.deepEqual(probe, { available: true, probe: true, resumeAt: null, reason: 'PROBE' });
-  const noSecondProbe = await getSemanticCapacityStatus(Date.now(), db);
+  const noSecondProbe = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(noSecondProbe.available, false, 'only one worker may hold the probe lease');
 
   await recordProviderCapacitySuccess({ provider: 'gemini', scopeKey: 'gemini-project-1', operation: 'multilingual-semantic-classification' }, db);
   resetProviderCapacityCacheForTests();
-  const healthy = await getSemanticCapacityStatus(Date.now(), db);
+  const healthy = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(healthy.available, true);
   assert.equal(healthy.probe, false);
 });
@@ -76,11 +85,85 @@ maybe('a blocked credential route remains unavailable until success or operator 
     sourceEventId: 'event-2',
   }, db);
   resetProviderCapacityCacheForTests();
-  const blocked = await getSemanticCapacityStatus(Date.now(), db);
+  const blocked = await getSemanticCapacityStatus([groq('groq-org-1')], Date.now(), db);
   assert.equal(blocked.available, false);
   await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: 'groq-org-1', operation: '*' }, db);
   resetProviderCapacityCacheForTests();
-  assert.equal((await getSemanticCapacityStatus(Date.now(), db)).available, true);
+  assert.equal((await getSemanticCapacityStatus([groq('groq-org-1')], Date.now(), db)).available, true);
+});
+
+maybe('a configured account with no state row keeps the pool available', async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 60 * 60_000,
+  }, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, false);
+  const withHealthySibling = await getSemanticCapacityStatus(
+    [gemini('gemini-project-1'), gemini('gemini-project-2')],
+    Date.now(),
+    db,
+  );
+  assert.equal(withHealthySibling.available, true, 'a never-failed configured account must remain eligible');
+  assert.equal(withHealthySibling.probe, false);
+});
+
+maybe("a daily '*' failure overrides a stale healthy operation row", async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacitySuccess({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: 'multilingual-semantic-classification',
+  }, db);
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 60 * 60_000,
+  }, db);
+  resetProviderCapacityCacheForTests();
+  const parked = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
+  assert.equal(parked.available, false, "the daily '*' row must hide the older healthy operation row");
+  await recordProviderCapacitySuccess({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: 'multilingual-semantic-classification',
+  }, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);
+});
+
+maybe('concurrent callers receive at most one probe', async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 60 * 60_000,
+  }, db);
+  await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second'`);
+  resetProviderCapacityCacheForTests();
+  const results = await Promise.all([
+    getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db),
+    getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db),
+  ]);
+  assert.equal(results.filter(result => result.probe).length, 1, 'exactly one concurrent caller may win the probe');
+  assert.equal(results.filter(result => !result.available).length, 1);
 });
 
 after(async () => {

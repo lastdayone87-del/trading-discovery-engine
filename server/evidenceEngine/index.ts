@@ -177,6 +177,11 @@ export async function executeSemanticChain(
       // cooldown. Omitted when absent to keep report shapes stable.
       const failedOrg = [ (err as { groqOrg?: unknown })?.groqOrg, (err as { geminiOrg?: unknown })?.geminiOrg ]
         .map(value => String(value || '').trim()).find(Boolean);
+      // The provider boundary marks a real upstream quota/credential failure
+      // with the circuit reset time. Preserve it so the operational wrapper and
+      // decideJobFailure can park without consuming the generic retry budget.
+      const providerCapacityExhausted = (err as { providerCapacityExhausted?: unknown })?.providerCapacityExhausted === true;
+      const capacityRetryAt = Number((err as { retryAt?: unknown })?.retryAt);
       reports.push({ provider: provider.name, availability: 'FAILED', evidenceCount: 0,
         outcome: timeout ? 'FAILED_TIMEOUT' : 'FAILED_PROVIDER',
         reasonCodes: safeProviderFailureReasonCodes(err, timeout),
@@ -184,7 +189,13 @@ export async function executeSemanticChain(
         // carry request details and remain on the existing log line only.
         reason: `Provider failure (${String(err?.errorClass || 'UNKNOWN')}).`,
         durationMs: Date.now() - started,
-        ...(failedOrg ? { orgId: failedOrg } : {}) });
+        ...(failedOrg ? { orgId: failedOrg } : {}),
+        ...(providerCapacityExhausted
+          ? {
+              providerCapacityExhausted: true,
+              ...(Number.isFinite(capacityRetryAt) && capacityRetryAt > Date.now() ? { retryAt: capacityRetryAt } : {}),
+            }
+          : {}) });
       priorFailed = true;
     }
   }

@@ -1840,9 +1840,26 @@ export async function processNextSearchJob(
   const semanticGateNeeded = !claimableOverride
     || claimableOverride.includes(CLASSIFICATION_JOB_TYPE)
     || claimableOverride.includes(ADMISSION_VERIFICATION_JOB_TYPE);
-  const semanticCapacity = semanticGateNeeded
-    ? await getSemanticCapacityStatus().catch(() => ({ available: true }))
-    : { available: true };
+  // Build the eligible route set from configuration, not from whatever rows
+  // happen to exist: a healthy account that has never failed must keep the
+  // lane claimable even while a sibling account is exhausted. The selection
+  // mirrors the enrichment cooldown gate below, so an explicit Groq-only or
+  // Gemini-free deployment never consults an ineligible provider's circuit.
+  const geminiFreeSelectedForGate = semanticGateNeeded && shouldUseGeminiFreeSemantic();
+  const semanticCapacityAccounts: Array<{ provider: 'gemini' | 'groq'; scopeKey: string }> = [];
+  if (semanticGateNeeded && !geminiFreeSelectedForGate) {
+    if (shouldUseGroqSemantic()) {
+      for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
+    } else {
+      for (const route of configuredGeminiRoutes()) semanticCapacityAccounts.push({ provider: 'gemini', scopeKey: geminiRouteOrg(route) });
+      if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true') {
+        for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
+      }
+    }
+  }
+  const semanticCapacity = semanticGateNeeded && !geminiFreeSelectedForGate
+    ? await getSemanticCapacityStatus(semanticCapacityAccounts).catch(() => ({ available: true, probe: false, resumeAt: null, reason: null }))
+    : { available: true, probe: false, resumeAt: null, reason: null };
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   // ENRICH_CHANNEL: every such job runs the full evidence pipeline. Under the

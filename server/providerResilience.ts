@@ -824,8 +824,10 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
     const event:ProviderCallEvent={...base,requestMetadata:{...base.requestMetadata,...providerFailureMetadata(typed),...(capacityDeferral?{geminiCapacityDeferral:'true'}:{}),...(scaleGateDeferral?{geminiScaleGateDeferral:'true'}:{})},status:statusFor(typed),latencyMs:Date.now()-started,actualCost:0,errorClass:typed.errorClass,occurredAt:new Date().toISOString()};
     // A real upstream quota/credential response opens the durable circuit.
     // Local capacity deferrals never reached the provider and are excluded.
+    const upstreamReasons = Array.isArray(typed.providerReasons) ? typed.providerReasons.map(String) : [];
+    const credentialFailure = typed.errorClass==='CREDENTIALS_EXHAUSTED' || upstreamReasons.includes('PROVIDER_ROUTE_UNAUTHORIZED');
     if (providerCallStarted && (args.context.provider==='gemini'||args.context.provider==='groq')
-      && (typed.errorClass==='RATE_LIMIT'||typed.errorClass==='CREDENTIALS_EXHAUSTED')) {
+      && (typed.errorClass==='RATE_LIMIT'||credentialFailure)) {
       const org = String(
         (args.context.requestMetadata as any)?.geminiOrg
         || (args.context.requestMetadata as any)?.groqOrg
@@ -834,8 +836,8 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
         || 'pool'
       );
       const daily = typed.quotaScope==='DAILY';
-      const operation = daily || typed.errorClass==='CREDENTIALS_EXHAUSTED' ? '*' : args.context.operation;
-      const resumeAt = typed.errorClass==='CREDENTIALS_EXHAUSTED'
+      const operation = daily || credentialFailure ? '*' : args.context.operation;
+      const resumeAt = credentialFailure
         ? Date.now()+24*60*60_000
         : (Number.isFinite(Number(typed.cooldownUntilMs)) && Number(typed.cooldownUntilMs)>Date.now()
           ? Number(typed.cooldownUntilMs)
@@ -848,8 +850,8 @@ export async function executeProviderCall<T>(args:{context:ProviderCallContext; 
           provider: args.context.provider,
           scopeKey: org,
           operation,
-          state: typed.errorClass==='CREDENTIALS_EXHAUSTED'?'BLOCKED':'EXHAUSTED',
-          reasonCode: typed.providerReasons?.[0] || typed.errorClass,
+          state: credentialFailure?'BLOCKED':'EXHAUSTED',
+          reasonCode: upstreamReasons[0] || typed.errorClass,
           resumeAt,
           sourceEventId: event.id,
         });

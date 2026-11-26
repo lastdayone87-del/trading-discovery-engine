@@ -6,8 +6,12 @@ test('semantic claim gate and provider circuit are wired', () => {
   const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
   const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
   const resilience = readFileSync(new URL('./providerResilience.ts', import.meta.url), 'utf8');
+  const groqProvider = readFileSync(new URL('./evidenceEngine/providers/GroqSemanticProvider.ts', import.meta.url), 'utf8');
   assert.match(queue, /getSemanticCapacityStatus/);
   assert.match(queue, /semanticCapacity\.available/);
+  assert.match(queue, /getSemanticCapacityStatus\(semanticCapacityAccounts\)/);
+  assert.match(queue, /scopeKey: geminiRouteOrg\(route\)/);
+  assert.match(queue, /scopeKey: groqRouteOrg\(route\)/);
   assert.match(dbCore, /providerCapacityExhausted/);
   assert.match(dbCore, /RETRYING_WITHOUT_ATTEMPT/);
   assert.match(resilience, /recordProviderCapacityExhausted/);
@@ -15,4 +19,8 @@ test('semantic claim gate and provider circuit are wired', () => {
   assert.match(resilience, /typed\.quotaScope==='DAILY'/);
   assert.match(resilience, /nextPacificMidnightMs/);
   assert.match(resilience, /providerCapacityExhausted:true/);
+  assert.match(groqProvider, /persistGroqCapacityEvent/);
+  assert.match(groqProvider, /recordProviderCapacityExhausted/);
+  assert.match(groqProvider, /recordProviderCapacitySuccess/);
+  assert.match(groqProvider, /groqCooldownDeferral/);
 });

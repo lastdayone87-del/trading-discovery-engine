@@ -7,6 +7,7 @@ import {
   statusFor,
   type ProviderCallEvent,
 } from '../../providerResilience';
+import { recordProviderCapacityExhausted, recordProviderCapacitySuccess } from '../../providerCapacityState';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
 import { defaultSemanticResultCachePort, isCacheableSemanticResult, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
@@ -823,6 +824,7 @@ export async function runGroqTextCompletion(
           timestamp: new Date().toISOString(),
         }));
       }
+      if (reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) failureMetadata.groqRouteUnauthorized = 'true';
       const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
       await emitBounded(emit, {
         ...base, status: statusFor(typed), latencyMs: Date.now() - started,
@@ -1156,7 +1158,28 @@ export function capGroqSemanticPrompt(
   return capSinglePrompt(parsed, maxChars, maxTokens);
 }
 
+/**
+ * Close the durable capacity circuit when the Groq semantic client sees a real
+ * success. The client calls fetch directly (not executeProviderCall), so its
+ * event sink is the only shared boundary for that provider. Failure parking is
+ * recorded at the call site so the thrown error can also carry the reset time
+ * into enrichment retry scheduling.
+ */
+async function persistGroqCapacityEvent(event: ProviderCallEvent): Promise<void> {
+  if (event.provider !== 'groq' || event.status !== 'SUCCESS') return;
+  const metadata = (event.requestMetadata || {}) as Record<string, unknown>;
+  const orgId = String(metadata.groqOrg || '').trim();
+  if (!orgId) return;
+  try {
+    await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: orgId, operation: event.operation });
+  } catch {
+    // Capacity persistence is best-effort; the provider event ledger remains
+    // authoritative and the existing cooldown path still protects the account.
+  }
+}
+
 function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
+  void persistGroqCapacityEvent(event);
   return appendProviderCallEvent(event).catch(() => undefined);
 }
 
@@ -1344,11 +1367,40 @@ export function defaultClient(
             timestamp: new Date().toISOString(),
           }));
         }
+        if (reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) failureMetadata.groqRouteUnauthorized = 'true';
         // Deferred short-circuits stay observable but must never restart the
         // persisted window: the shared expiry derives from the latest
         // RATE_LIMITED row, so a deferral is tagged and the resolver below
         // excludes tagged rows. Genuine provider 429s carry no tag.
         const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
+        // Genuine upstream quota/credential responses open the account circuit
+        // and carry the persisted reset time on the thrown error. This is what
+        // lets an enrichment job park until the reset instead of consuming its
+        // attempts. Local cooldown deferrals are excluded.
+        if (!deferred && !aborted
+          && (typed.errorClass === 'RATE_LIMIT' || typed.errorClass === 'CREDENTIALS_EXHAUSTED'
+            || reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED'))) {
+          const credential = typed.errorClass === 'CREDENTIALS_EXHAUSTED' || reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED');
+          const resumeAt = credential
+            ? Date.now() + 24 * 60 * 60_000
+            : Date.now() + Math.max(1_000, groqRateLimitCooldownMs());
+          try {
+            const persistedResumeAt = await recordProviderCapacityExhausted({
+              provider: 'groq',
+              scopeKey: orgId,
+              operation: credential ? '*' : base.operation,
+              state: credential ? 'BLOCKED' : 'EXHAUSTED',
+              reasonCode: reasons.includes('GROQ_ORGANIZATION_RESTRICTED')
+                ? 'GROQ_ORGANIZATION_RESTRICTED'
+                : (reasons[0] || typed.errorClass),
+              resumeAt,
+              sourceEventId: base.id,
+            });
+            Object.assign(typed, { retryAt: persistedResumeAt, providerCapacityExhausted: true });
+          } catch {
+            Object.assign(typed, { retryAt: resumeAt, providerCapacityExhausted: true });
+          }
+        }
         await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),

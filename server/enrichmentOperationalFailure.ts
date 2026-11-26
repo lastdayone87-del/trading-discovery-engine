@@ -63,6 +63,10 @@ export interface OperationalProviderFailure {
    * cooldown. Absent for legacy callers and non-scoped failures.
    */
   orgId?: string;
+  /** Upstream quota/credential failure that opened the durable circuit. */
+  providerCapacityExhausted?: boolean;
+  /** Epoch milliseconds when the failed account may serve again. */
+  retryAt?: number;
 }
 
 /**
@@ -71,6 +75,14 @@ export interface OperationalProviderFailure {
  * deadlines for genuine ambiguity or unrelated failures.
  */
 export class OperationalEnrichmentProviderError extends ProviderCallError {
+  /**
+   * Set when an uncovered failure came from a real upstream quota/credential
+   * response. decideJobFailure parks these until retryAt without consuming an
+   * attempt or hitting the generic six-hour transient terminal rule.
+   */
+  readonly providerCapacityExhausted: boolean;
+  readonly retryAt?: number;
+
   constructor(public readonly providerFailures: OperationalProviderFailure[]) {
     const providerReasons = [...new Set(providerFailures.flatMap(failure => failure.reasonCodes))];
     const evidence = providerFailures
@@ -83,6 +95,15 @@ export class OperationalEnrichmentProviderError extends ProviderCallError {
       { providerReasons }
     );
     this.name = 'OperationalEnrichmentProviderError';
+    const parked = providerFailures.filter(failure => failure.providerCapacityExhausted === true);
+    this.providerCapacityExhausted = parked.length > 0;
+    const resumeTimes = parked
+      .map(failure => Number(failure.retryAt))
+      .filter((ms): ms is number => Number.isFinite(ms) && ms > 0);
+    // The earliest account reset is the first moment this evaluation can make
+    // progress again; retrying then is cheap because the circuit is still
+    // closed for the others and this error stays attempt-free.
+    this.retryAt = resumeTimes.length ? Math.min(...resumeTimes) : undefined;
   }
 }
 
@@ -159,7 +180,9 @@ export function enrichmentOperationalFailure(
     .map(provider => ({
       provider: provider.provider,
       reasonCodes: [...new Set((provider.reasonCodes || []).filter(code => OPERATIONAL_PROVIDER_REASONS.has(code)))],
-      ...(typeof provider.orgId === 'string' && provider.orgId ? { orgId: provider.orgId } : {})
+      ...(typeof provider.orgId === 'string' && provider.orgId ? { orgId: provider.orgId } : {}),
+      ...(provider.providerCapacityExhausted === true ? { providerCapacityExhausted: true } : {}),
+      ...(Number.isFinite(Number(provider.retryAt)) && Number(provider.retryAt) > 0 ? { retryAt: Number(provider.retryAt) } : {})
     }))
     .filter(provider => provider.reasonCodes.length > 0);
   if (!providerFailures.length) return null;
