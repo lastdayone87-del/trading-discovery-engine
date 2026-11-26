@@ -668,7 +668,7 @@ async function acquireGeminiCapacity(context:ProviderCallContext,signal?:AbortSi
       // rows feed its cooldown window (strict org tag match — untagged rows
       // cool no account), so one exhausted account never paces the healthy
       // ones.
-      queryWithDeadline(client,`SELECT occurred_at, request_metadata->>'quotaScope' AS quota_scope, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
+      queryWithDeadline(client,`SELECT occurred_at, request_metadata->>'quotaScope' AS quota_scope, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at >= now() - interval '2 days' ORDER BY occurred_at DESC LIMIT 1`,[orgId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND request_metadata->>'geminiOrg'=$2 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_SEMANTIC_OPERATION,orgId],signal,deadlineAtMs),
       queryWithDeadline(client,`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND operation=$1 AND request_metadata->>'geminiOrg'=$2 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`,[GEMINI_VOCABULARY_OPERATION,orgId],signal,deadlineAtMs),
       // Rolling per-account token bucket. Counts every attempt that reached
@@ -772,7 +772,11 @@ export function isGeminiScaleGateDeferral(
  * upstream calls (and the Phase 2 state transition) in the durable ledger.
  */
 export function shouldEmitProviderEvent(capacityDeferral: boolean, scaleGateDeferral: boolean): boolean {
-  return !capacityDeferral && !scaleGateDeferral;
+  // Suppress only reason-coded capacity deferrals that never reached Google.
+  // Lock waits and deadline contention are still provider-capacity telemetry
+  // and must remain visible to the scale gate. `capacityDeferral` alone is too
+  // broad: it also covers pre-call lock timeouts.
+  return !scaleGateDeferral;
 }
 
 export async function executeProviderCall<T>(args:{context:ProviderCallContext; timeoutMs:number; enabled?:boolean; signal?:AbortSignal; call:(signal:AbortSignal)=>Promise<T>; emit:ProviderEventSink; trace?:(stage:string)=>void}):Promise<T>{

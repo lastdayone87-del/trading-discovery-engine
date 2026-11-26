@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { ensureProviderEventIndexes } from './dbCore';
 import test, { after } from 'node:test';
 import pg from 'pg';
 import type { Pool } from 'pg';
@@ -102,6 +103,7 @@ maybe('migration 209 adopts all provider-event indexes and the hot reads use the
 
   const cases: Array<[string, string]> = [
     [`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'='gemini-project-1' AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' ORDER BY occurred_at DESC LIMIT 1`, 'idx_provider_events_gemini_active_org_time'],
+    [`SELECT occurred_at, request_metadata->>'quotaScope' AS quota_scope, MAX((request_metadata->>'cooldownUntilMs')::bigint) FILTER (WHERE request_metadata->>'cooldownUntilMs' ~ '^[0-9]+$') OVER () AS cooldown_until_ms FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND request_metadata->>'geminiOrg'='gemini-project-1' AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at>=now()-interval '2 days' ORDER BY occurred_at DESC LIMIT 1`, 'idx_provider_events_gemini_active_org_time'],
     [`SELECT occurred_at FROM provider_call_events WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true' AND request_metadata->>'groqOrg'='groq-org-1' ORDER BY occurred_at DESC LIMIT 1`, 'idx_provider_events_groq_rate_org_time'],
     [`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND status='RATE_LIMITED' AND occurred_at>=now()-interval '2 days' ORDER BY occurred_at DESC LIMIT 1`, 'idx_provider_events_rate_provider_time'],
     [`SELECT COUNT(*)::int FROM provider_call_events WHERE run_id='run-gemini-1' AND provider='gemini' AND operation='multilingual-semantic-classification' AND status='SUCCESS'`, 'idx_provider_events_run_id'],
@@ -115,4 +117,13 @@ maybe('migration 209 adopts all provider-event indexes and the hot reads use the
 after(async () => {
   if (!pool) return;
   try { await pool.query(`DROP TABLE IF EXISTS provider_call_events`); } finally { await pool.end(); }
+});
+
+maybe('boot repair rebuilds an index with a valid but wrong key order', async () => {
+  const db = requirePool();
+  await db.query(`DROP INDEX CONCURRENTLY IF EXISTS idx_provider_events_run_id`);
+  await db.query(`CREATE INDEX idx_provider_events_run_id ON provider_call_events (status, operation, provider, run_id) WHERE run_id IS NOT NULL`);
+  await ensureProviderEventIndexes(db);
+  const definition = await db.query(`SELECT pg_get_indexdef(to_regclass('public.idx_provider_events_run_id')) AS definition`);
+  assert.match(definition.rows[0].definition, /USING btree \(run_id, provider, operation, status\)/);
 });

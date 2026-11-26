@@ -27,22 +27,27 @@ BEGIN
       ('idx_provider_events_gemini_active_org_time',
        'CREATE INDEX IF NOT EXISTS idx_provider_events_gemini_active_org_time ON public.provider_call_events ((request_metadata->>''geminiOrg''), occurred_at DESC) WHERE provider=''gemini'' AND COALESCE(request_metadata->>''geminiCapacityDeferral'','''') <> ''true''',
        2,
-       ARRAY['geminiOrg', 'occurred_at DESC', 'provider = ''gemini''', 'geminiCapacityDeferral']::text[]),
+       'USING btree (((request_metadata ->> ''geminiOrg''::text)), occurred_at DESC)',
+       '((provider = ''gemini''::text) AND (COALESCE((request_metadata ->> ''geminiCapacityDeferral''::text), ''''::text) <> ''true''::text))'),
       ('idx_provider_events_groq_rate_org_time',
        'CREATE INDEX IF NOT EXISTS idx_provider_events_groq_rate_org_time ON public.provider_call_events ((request_metadata->>''groqOrg''), occurred_at DESC) WHERE provider=''groq'' AND status=''RATE_LIMITED'' AND COALESCE(request_metadata->>''groqCooldownDeferral'','''') <> ''true''',
        2,
-       ARRAY['groqOrg', 'occurred_at DESC', 'provider = ''groq''', 'status = ''RATE_LIMITED''', 'groqCooldownDeferral']::text[]),
+       'USING btree (((request_metadata ->> ''groqOrg''::text)), occurred_at DESC)',
+       '((provider = ''groq''::text) AND (status = ''RATE_LIMITED''::text) AND (COALESCE((request_metadata ->> ''groqCooldownDeferral''::text), ''''::text) <> ''true''::text))'),
       ('idx_provider_events_rate_provider_time',
        'CREATE INDEX IF NOT EXISTS idx_provider_events_rate_provider_time ON public.provider_call_events (provider, occurred_at DESC) WHERE status=''RATE_LIMITED''',
        2,
-       ARRAY['provider', 'occurred_at DESC', 'status = ''RATE_LIMITED''']::text[]),
+       'USING btree (provider, occurred_at DESC)',
+       '(status = ''RATE_LIMITED''::text)'),
       ('idx_provider_events_run_id',
        'CREATE INDEX IF NOT EXISTS idx_provider_events_run_id ON public.provider_call_events (run_id, provider, operation, status) WHERE run_id IS NOT NULL',
        4,
-       ARRAY['run_id', 'provider', 'operation', 'status', 'run_id IS NOT NULL']::text[])
-    ) AS t(name, create_sql, key_count, fragments)
+       'USING btree (run_id, provider, operation, status)',
+       '(run_id IS NOT NULL)')
+    ) AS t(name, create_sql, key_count, key_definition, predicate)
   LOOP
     SELECT c.oid, i.indisvalid, i.indisready, i.indisunique, i.indnkeyatts,
+           i.indpred, i.indrelid,
            i.indpred IS NOT NULL AS has_predicate,
            i.indrelid = target_oid AS correct_table,
            pg_get_indexdef(i.indexrelid) AS definition
@@ -55,10 +60,8 @@ BEGIN
       IF NOT found.indisvalid OR NOT found.indisready OR found.indisunique
          OR NOT found.has_predicate OR NOT found.correct_table
          OR found.indnkeyatts <> expected.key_count
-         OR EXISTS (
-           SELECT 1 FROM unnest(expected.fragments) fragment
-            WHERE found.definition NOT LIKE '%' || fragment || '%'
-         ) THEN
+         OR found.definition NOT LIKE '%' || expected.key_definition || '%'
+         OR btrim(regexp_replace(pg_get_expr(found.indpred, found.indrelid), '\s+', ' ', 'g')) <> expected.predicate THEN
         RAISE EXCEPTION '% exists with the wrong definition; rebuild it CONCURRENTLY before applying migration 209', expected.name;
       END IF;
     ELSE

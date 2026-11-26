@@ -243,7 +243,7 @@ test('a per-minute declared reset still applies when it extends past the fixed c
 });
 
 test('local capacity deferrals are not persisted as provider-call events', () => {
-  assert.equal(shouldEmitProviderEvent(true, false), false);
+  assert.equal(shouldEmitProviderEvent(true, false), true, 'lock timeouts must remain visible');
   assert.equal(shouldEmitProviderEvent(false, true), false);
   assert.equal(shouldEmitProviderEvent(false, false), true);
 });

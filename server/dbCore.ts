@@ -935,29 +935,33 @@ const PROVIDER_EVENT_INDEXES = [
     name: 'idx_provider_events_gemini_active_org_time',
     create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_gemini_active_org_time ON public.provider_call_events ((request_metadata->>'geminiOrg'), occurred_at DESC) WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'`,
     keyCount: 2,
-    fragments: ['geminiOrg', 'occurred_at DESC', "provider = 'gemini'::text", 'geminiCapacityDeferral'],
+    keyDefinition: "USING btree (((request_metadata ->> 'geminiOrg'::text)), occurred_at DESC)",
+    predicate: "((provider = 'gemini'::text) AND (COALESCE((request_metadata ->> 'geminiCapacityDeferral'::text), ''::text) <> 'true'::text))",
   },
   {
     name: 'idx_provider_events_groq_rate_org_time',
     create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_groq_rate_org_time ON public.provider_call_events ((request_metadata->>'groqOrg'), occurred_at DESC) WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true'`,
     keyCount: 2,
-    fragments: ['groqOrg', 'occurred_at DESC', "provider = 'groq'::text", "status = 'RATE_LIMITED'::text", 'groqCooldownDeferral'],
+    keyDefinition: "USING btree (((request_metadata ->> 'groqOrg'::text)), occurred_at DESC)",
+    predicate: "((provider = 'groq'::text) AND (status = 'RATE_LIMITED'::text) AND (COALESCE((request_metadata ->> 'groqCooldownDeferral'::text), ''::text) <> 'true'::text))",
   },
   {
     name: 'idx_provider_events_rate_provider_time',
     create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_rate_provider_time ON public.provider_call_events (provider, occurred_at DESC) WHERE status='RATE_LIMITED'`,
     keyCount: 2,
-    fragments: ['provider', 'occurred_at DESC', "status = 'RATE_LIMITED'::text"],
+    keyDefinition: "USING btree (provider, occurred_at DESC)",
+    predicate: "(status = 'RATE_LIMITED'::text)",
   },
   {
     name: 'idx_provider_events_run_id',
     create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_run_id ON public.provider_call_events (run_id, provider, operation, status) WHERE run_id IS NOT NULL`,
     keyCount: 4,
-    fragments: ['run_id', 'provider', 'operation', 'status', 'run_id IS NOT NULL'],
+    keyDefinition: "USING btree (run_id, provider, operation, status)",
+    predicate: "(run_id IS NOT NULL)",
   },
 ] as const;
 
-async function ensureProviderEventIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+export async function ensureProviderEventIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
   const target = await client.query(`SELECT to_regclass('public.provider_call_events') AS oid`);
   const tableOid = target.rows[0]?.oid;
   if (!tableOid) return;
@@ -967,6 +971,7 @@ async function ensureProviderEventIndexes(client: { query: (text: string, values
              i.indpred IS NOT NULL AS has_predicate,
              CASE WHEN to_regclass('public.provider_call_events') IS NULL THEN false
                   ELSE i.indrelid = to_regclass('public.provider_call_events') END AS correct_table,
+             pg_get_expr(i.indpred, i.indrelid) AS predicate,
              pg_get_indexdef(i.indexrelid) AS definition
         FROM pg_class c
         JOIN pg_index i ON i.indexrelid = c.oid
@@ -974,11 +979,13 @@ async function ensureProviderEventIndexes(client: { query: (text: string, values
     `);
     const row = existing.rows[0];
     const definition = String(row?.definition || '');
+    const predicate = String(row?.predicate || '');
     const correct = row?.correct_table === true
       && row?.indisunique === false
       && row?.has_predicate === true
       && Number(row?.indnkeyatts) === index.keyCount
-      && index.fragments.every(fragment => definition.includes(fragment));
+      && definition.includes(index.keyDefinition)
+      && predicate === index.predicate;
     if (row?.indisvalid && row?.indisready && correct) continue;
     if (row?.oid) {
       await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${index.name}`);
