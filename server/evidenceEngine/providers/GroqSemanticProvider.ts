@@ -7,6 +7,7 @@ import {
   statusFor,
   type ProviderCallEvent,
 } from '../../providerResilience';
+import { recordProviderCapacityExhausted, recordProviderCapacitySuccess } from '../../providerCapacityState';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import { abortedByDeadline } from './abortReason';
 import { defaultSemanticResultCachePort, isCacheableSemanticResult, semanticResultCacheKey, SEMANTIC_RESULT_CACHE_HIT_REASON, type SemanticResultCachePort } from '../semanticResultCache';
@@ -653,7 +654,7 @@ export async function runGroqTextCompletion(
     const orgId = groqRouteOrg(route);
     const base = {
       id: randomUUID(), provider: 'groq', operation,
-      requestMetadata: { groqRoute: route.id, groqOrg: orgId, groqModel: model }, attempt: 1,
+      requestMetadata: { groqRoute: route.id, groqOrg: orgId, groqModel: model, groqCallStartedAt: new Date(started).toISOString() }, attempt: 1,
       reservedCost: 0, policyVersion: 'provider-resilience-v1',
     };
     try {
@@ -1156,7 +1157,34 @@ export function capGroqSemanticPrompt(
   return capSinglePrompt(parsed, maxChars, maxTokens);
 }
 
+/**
+ * Close the durable capacity circuit when the Groq semantic client sees a real
+ * success. The client calls fetch directly (not executeProviderCall), so its
+ * event sink is the only shared boundary for that provider. Failure parking is
+ * recorded at the call site so the thrown error can also carry the reset time
+ * into enrichment retry scheduling.
+ */
+async function persistGroqCapacityEvent(event: ProviderCallEvent): Promise<void> {
+  if (event.provider !== 'groq' || event.status !== 'SUCCESS') return;
+  const metadata = (event.requestMetadata || {}) as Record<string, unknown>;
+  const orgId = String(metadata.groqOrg || '').trim();
+  if (!orgId) return;
+  try {
+    await recordProviderCapacitySuccess({
+      provider: 'groq',
+      scopeKey: orgId,
+      operation: event.operation,
+      // Only a circuit observed before this call started may be closed; an
+      // earlier success must not erase a failure recorded while it ran.
+      observedAt: String(metadata.groqCallStartedAt || event.occurredAt || ''),
+    });
+  } catch (capacitySuccessError) {
+    console.warn('[ProviderCapacity] Failed to persist Groq success:', String((capacitySuccessError as any)?.message || capacitySuccessError));
+  }
+}
+
 function emitGroqEvent(event: ProviderCallEvent): Promise<void> {
+  void persistGroqCapacityEvent(event);
   return appendProviderCallEvent(event).catch(() => undefined);
 }
 
@@ -1199,6 +1227,9 @@ export function defaultClient(
       const remainingMs = Math.max(0, Math.min(...configuredGroqRoutes().map(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)))));
       throw groqPoolDisabledError(remainingMs);
     }
+    // Reset hints from every failed route in this failover, not only the last
+    // one thrown. The job should wake when any failed account can serve again.
+    const routeFailureResets: number[] = [];
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
       const orgId = groqRouteOrg(route);
@@ -1222,7 +1253,7 @@ export function defaultClient(
       const base = {
         id: randomUUID(), provider: 'groq', operation: 'multilingual-semantic-classification',
         ...semanticObservabilityFields(observability),
-        requestMetadata: { ...(observability?.requestMetadata || {}), groqRoute: route.id, groqOrg: orgId, ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
+        requestMetadata: { ...(observability?.requestMetadata || {}), groqRoute: route.id, groqOrg: orgId, groqCallStartedAt: new Date(started).toISOString(), ...(promptCapped ? { groqPromptCapped: 'true' } : {}) }, attempt: 1,
         reservedCost: 0, policyVersion: 'provider-resilience-v1',
       };
       try {
@@ -1349,6 +1380,38 @@ export function defaultClient(
         // RATE_LIMITED row, so a deferral is tagged and the resolver below
         // excludes tagged rows. Genuine provider 429s carry no tag.
         const deferred = (error as { groqCooldownDeferred?: unknown })?.groqCooldownDeferred === true;
+        // Genuine upstream quota/credential responses open the account circuit
+        // and carry the persisted reset time on the thrown error. This is what
+        // lets an enrichment job park until the reset instead of consuming its
+        // attempts. Local cooldown deferrals are excluded.
+        if (!deferred && !aborted
+          && (typed.errorClass === 'RATE_LIMIT' || typed.errorClass === 'CREDENTIALS_EXHAUSTED')) {
+          const credential = typed.errorClass === 'CREDENTIALS_EXHAUSTED';
+          const resumeAt = credential
+            ? Date.now() + 24 * 60 * 60_000
+            : Date.now() + Math.max(1_000, groqRateLimitCooldownMs());
+          try {
+            const persistedResumeAt = await recordProviderCapacityExhausted({
+              provider: 'groq',
+              scopeKey: orgId,
+              operation: credential ? '*' : base.operation,
+              state: credential ? 'BLOCKED' : 'EXHAUSTED',
+              reasonCode: reasons.includes('GROQ_ORGANIZATION_RESTRICTED')
+                ? 'GROQ_ORGANIZATION_RESTRICTED'
+                : (reasons[0] || typed.errorClass),
+              resumeAt,
+              sourceEventId: base.id,
+            });
+            Object.assign(typed, { retryAt: persistedResumeAt, providerCapacityExhausted: true });
+          } catch (capacityStateError) {
+            console.warn('[ProviderCapacity] Failed to persist Groq exhaustion:', String((capacityStateError as any)?.message || capacityStateError));
+            Object.assign(typed, { retryAt: resumeAt, providerCapacityExhausted: true });
+          }
+        }
+        if ((typed as { providerCapacityExhausted?: unknown }).providerCapacityExhausted === true) {
+          const parkedUntil = Number((typed as { retryAt?: unknown }).retryAt);
+          if (Number.isFinite(parkedUntil) && parkedUntil > 0) routeFailureResets.push(parkedUntil);
+        }
         await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
@@ -1367,6 +1430,46 @@ export function defaultClient(
       isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0,
       signal,
       maxContentFailures: Math.max(1, Math.floor(Number(process.env.GROQ_JSON_VALIDATION_MAX_ROUTES || '2')) || 2),
+    }).catch(async (error: unknown) => {
+      // Every configured key rejected is a pool-wide credential outage, not a
+      // single-key rejection. Open BLOCKED rows for each org so semantic jobs
+      // park instead of consuming retry attempts.
+      if (error instanceof ProviderCallError && error.errorClass === 'CREDENTIALS_EXHAUSTED'
+        && (error.providerReasons || []).includes('PROVIDER_ROUTE_UNAUTHORIZED')) {
+        const resumeAt = Date.now() + 24 * 60 * 60_000;
+        let persistedResumeAt = resumeAt;
+        for (const org of [...new Set(configuredGroqRoutes().map(groqRouteOrg))]) {
+          try {
+            persistedResumeAt = Math.max(persistedResumeAt, await recordProviderCapacityExhausted({
+              provider: 'groq',
+              scopeKey: org,
+              operation: '*',
+              state: 'BLOCKED',
+              reasonCode: 'PROVIDER_ROUTE_UNAUTHORIZED',
+              resumeAt,
+            }));
+          } catch {
+            // The local marker below still parks the job if persistence fails.
+          }
+        }
+        Object.assign(error, { retryAt: persistedResumeAt, providerCapacityExhausted: true });
+      }
+      // The failover surfaces only the last route's error. Attach the earliest
+      // reset across every failed account so an enrichment job does not park
+      // for 24 hours behind a blocked last route when another org recovers in
+      // a minute.
+      // Only a capacity-class final error may inherit an earlier route's
+      // reset. A transient 5xx must follow the normal retry path, not park
+      // behind an unrelated credential block.
+      const capacityClassError = error instanceof ProviderCallError
+        && (error.errorClass === 'RATE_LIMIT' || error.errorClass === 'CREDENTIALS_EXHAUSTED');
+      if (capacityClassError && routeFailureResets.length && error && typeof error === 'object') {
+        Object.assign(error, {
+          retryAt: Math.min(...routeFailureResets),
+          providerCapacityExhausted: true,
+        });
+      }
+      throw error;
     });
     return response;
   }};

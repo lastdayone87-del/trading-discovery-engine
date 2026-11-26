@@ -37,7 +37,7 @@ test('overflow jobs run in the enrichment lane with admission already decided', 
 });
 
 test('overflow jobs follow semantic availability and are claimable only by the enrichment pool', () => {
-  assert.match(source, /enrichmentFullyClaimable[\s\S]{0,220}PROCESS_DISCOVERED_CHANNEL/);
+  assert.match(source, /claimableOverride\?\.includes\('PROCESS_DISCOVERED_CHANNEL'\) && !\(await semanticRoutesCooling\(\)\) && await semanticCapacity\(\)/);
   assert.match(source, /\[CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL'\]/);
 });
 

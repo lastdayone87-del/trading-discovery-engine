@@ -253,6 +253,26 @@ test('semantic chain FAILED reports carry the failed quota org', async () => {
   assert.equal((reports[0] as { orgId?: string }).orgId, 'slot-2');
 });
 
+test('semantic chain FAILED reports preserve the capacity marker and reset time', async () => {
+  const { executeSemanticChain } = await import('./evidenceEngine');
+  const { ProviderCallError } = await import('./providerResilience');
+  const retryAt = Date.now() + 8 * 60 * 60_000;
+  const failing = {
+    name: 'gemini_semantic',
+    availability: () => ({ availability: 'AVAILABLE' as const }),
+    collectEvidence: async () => {
+      throw Object.assign(
+        new ProviderCallError('Daily quota exhausted.', 'RATE_LIMIT', true),
+        { geminiOrg: 'slot-1', providerReasons: ['PROVIDER_QUOTA_DAILY'], providerCapacityExhausted: true, retryAt },
+      );
+    },
+  };
+  const { reports } = await executeSemanticChain([failing] as any, {} as any, {} as any);
+  assert.equal(reports.length, 1);
+  assert.equal((reports[0] as { providerCapacityExhausted?: boolean }).providerCapacityExhausted, true);
+  assert.equal((reports[0] as { retryAt?: number }).retryAt, retryAt);
+});
+
 test('per-org cooldown resolvers scope by org label, not route', async () => {
   const groq = await import('./evidenceEngine/providers/GroqSemanticProvider') as unknown as Record<string, unknown>;
   assert.equal(groq.resolveGroqOrgCooldownExpiryMs, undefined, 'resolvers live in dbCore, not the provider module');
@@ -334,4 +354,35 @@ test('direct gemini rate limit survives the operational wrapper with its org', (
   assert.ok(error, 'gemini outage without decision-grade support must throw');
   assert.ok(error!.providerReasons.includes('PROVIDER_RATE_LIMIT'));
   assert.equal((error as unknown as { providerFailures: Array<{ orgId?: string }> }).providerFailures[0].orgId, 'slot-1');
+});
+
+test('provider-capacity reset time survives the operational wrapper and parks beyond the transient age limit', () => {
+  const now = 1_700_000_000_000;
+  const retryAt = now + 8 * 60 * 60_000; // beyond the generic six-hour terminal window
+  const r = report(true, ['PROVIDER_RATE_LIMIT'], 'SUFFICIENT');
+  (r.providers[0] as { providerCapacityExhausted?: boolean }).providerCapacityExhausted = true;
+  (r.providers[0] as { retryAt?: number }).retryAt = retryAt;
+  const error = enrichmentOperationalFailure(r, true, false);
+  assert.ok(error);
+  assert.equal((error as unknown as { providerCapacityExhausted?: boolean }).providerCapacityExhausted, true);
+  assert.equal((error as unknown as { retryAt?: number }).retryAt, retryAt);
+  const decision = decideJobFailure(error, 4, 4, now, now - 7 * 60 * 60_000);
+  assert.equal(decision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
+  assert.equal(decision.runAfter, retryAt, 'jobs must park until the provider reset, not consume attempts');
+});
+
+test('route credential failures survive the operational reason filter', () => {
+  for (const reason of ['PROVIDER_AUTH_FAILED', 'PROVIDER_PERMISSION_DENIED', 'PROVIDER_ROUTE_UNAUTHORIZED']) {
+    const r = report(true, [reason], 'SUFFICIENT');
+    const error = enrichmentOperationalFailure(r, true, false);
+    assert.ok(error, `${reason} must not be dropped as non-operational`);
+    assert.ok(error!.providerReasons.includes(reason));
+  }
+});
+
+test('a successful fallback is never blocked by a capacity marker on the failed primary', () => {
+  const collection = fallbackReport();
+  (collection.providers[0] as { providerCapacityExhausted?: boolean }).providerCapacityExhausted = true;
+  (collection.providers[0] as { retryAt?: number }).retryAt = Date.now() + 60 * 60_000;
+  assert.equal(enrichmentOperationalFailure(collection, true, false), null);
 });

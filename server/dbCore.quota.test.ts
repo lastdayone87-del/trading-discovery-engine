@@ -335,6 +335,21 @@ test('probe allocation and per-key cap exhaustion defer without consuming an att
   assert.equal(stale.runAfter, now + 60_000);
 });
 
+test('provider capacity exhaustion parks beyond the generic transient age limit without consuming an attempt', async () => {
+  const { decideJobFailure } = await import('./dbCore');
+  const now = new Date('2026-11-26T01:00:00.000Z').getTime();
+  const resumeAt = now + 14 * 60 * 60_000;
+  const error = Object.assign(new Error('daily quota exhausted'), {
+    providerCapacityExhausted: true,
+    retryAt: resumeAt,
+    retryable: true,
+  });
+  assert.deepEqual(decideJobFailure(error, 3, 3, now, now - 7 * 60 * 60_000), {
+    disposition: 'RETRYING_WITHOUT_ATTEMPT',
+    runAfter: resumeAt,
+  });
+});
+
 test('normal allocation exhaustion keeps its transient age limit; probe markers do not', async () => {
   const { decideJobFailure } = await import('./dbCore');
   const { ProbeQuotaExceededError, ProbeQuotaUnavailableError } = await import('./quotaKeyCapShadow');

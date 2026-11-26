@@ -74,6 +74,7 @@ import {
   reconcileClassificationSighting,
   projectClassificationFailureIfPending,
   isRetryableInfrastructureFailure,
+  isGeminiOrgBucketFull,
   coolQueryForProviderQuarantine,
 } from './db';
 import { recomputeNeighborhoodRetrievalEvidence } from './retrievalPolicyEvidence';
@@ -188,9 +189,10 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
+import { getSemanticCapacityStatus, releaseProviderCapacityProbe, type ProviderCapacityProbe, type ProviderCapacityStatus } from './providerCapacityState';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
-import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
+import { shouldUseGeminiFreeSemantic, configuredGeminiFreeRoutes, geminiFreeCredentialExhausted } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
@@ -1048,6 +1050,8 @@ export function canClaimCommunityRetry(
 
 const AUTONOMOUS_TIME_DEFER_MS = 5 * 60_000;
 let lastSemanticCooldownEnrichProbeAt = 0;
+let geminiBucketPressureCache: { at: number; value: Map<string, boolean> } | null = null;
+const GEMINI_BUCKET_PRESSURE_CACHE_MS = 5_000;
 /**
  * Claim-time stale recovery used to run a FOR UPDATE scan on every worker
  * tick. With a dozen lanes that is a transaction storm that can starve
@@ -1836,6 +1840,136 @@ export async function processNextSearchJob(
   await recoverStaleJobsIfDue();
   const qStatus = await getQueueStatus();
   const claimableTypes: string[] = [];
+  const semanticGateNeeded = !claimableOverride
+    || claimableOverride.includes(CLASSIFICATION_JOB_TYPE)
+    || claimableOverride.includes(ADMISSION_VERIFICATION_JOB_TYPE)
+    || claimableOverride.includes('PROCESS_DISCOVERED_CHANNEL')
+    || claimableOverride.includes('ENRICH_CHANNEL');
+  // Build the eligible route set from configuration, not from whatever rows
+  // happen to exist: a healthy account that has never failed must keep the
+  // lane claimable even while a sibling account is exhausted. The selection
+  // mirrors the enrichment cooldown gate below, so an explicit Groq-only or
+  // Gemini-free deployment never consults an ineligible provider's circuit.
+  const geminiFreeSelectedForGate = semanticGateNeeded && shouldUseGeminiFreeSemantic();
+  // Free-tier Gemini is also appended as a keyed fallback when another
+  // provider is primary. If it is configured and not cooling, the semantic
+  // chain still has a serving route even when every paid Gemini/Groq circuit
+  // is open, so the claim gate must not park admission/classification.
+  const geminiFreeFallbackForGate = semanticGateNeeded && !geminiFreeSelectedForGate
+    && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true'
+    && configuredGeminiFreeRoutes().length > 0;
+  const semanticCapacityAccounts: Array<{ provider: 'gemini' | 'groq'; scopeKey: string }> = [];
+  if (semanticGateNeeded) {
+    if (geminiFreeSelectedForGate) {
+      if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true') {
+        for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
+      }
+    } else if (shouldUseGroqSemantic()) {
+      for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
+    } else {
+      for (const route of configuredGeminiRoutes()) semanticCapacityAccounts.push({ provider: 'gemini', scopeKey: geminiRouteOrg(route) });
+      if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true') {
+        for (const route of configuredGroqRoutes()) semanticCapacityAccounts.push({ provider: 'groq', scopeKey: groqRouteOrg(route) });
+      }
+    }
+  }
+  let freeFallbackAvailable: boolean | null = null;
+  const freeTierFallbackHealthy = async (): Promise<boolean> => {
+    if (!geminiFreeFallbackForGate) return false;
+    if (freeFallbackAvailable === null) {
+      freeFallbackAvailable = !(await isGeminiFreeSemanticCooldownActive()) && !geminiFreeCredentialExhausted();
+    }
+    return freeFallbackAvailable;
+  };
+  const groqRoutesServing = async (): Promise<boolean> => {
+    if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return false;
+    const routes = configuredGroqRoutes();
+    if (!routes.length) return false;
+    return !allRoutesCoolingDown(await Promise.all(routes.map(async route => {
+      const org = groqRouteOrg(route);
+      return groqFallbackCoolingDown(await isGroqOrgCooldownActive(org), groqOrgCooldownRemainingMs(org));
+    })));
+  };
+  const freePrimaryServing = async (): Promise<boolean> =>
+    !(await isGeminiFreeSemanticCooldownActive()) && !geminiFreeCredentialExhausted();
+  // Admission claims were previously gated only by the durable circuit. Under
+  // local token-bucket pressure the provider is deferred before any upstream
+  // call, so no circuit row exists and a missing row looks healthy. Use the
+  // same route-cooldown truth as the enrichment gate so admission parks while
+  // every serving route is actually cooling.
+  const semanticRoutesCooling = async (): Promise<boolean> => {
+    if (await freeTierFallbackHealthy()) return false;
+    if (shouldUseGeminiFreeSemantic()) return !(await freePrimaryServing()) && !(await groqRoutesServing());
+    if (shouldUseGroqSemantic()) return !(await groqRoutesServing());
+    const geminiBucketFullByOrg = async (): Promise<Map<string, boolean>> => {
+      const now = Date.now();
+      if (geminiBucketPressureCache && now - geminiBucketPressureCache.at < GEMINI_BUCKET_PRESSURE_CACHE_MS) {
+        return geminiBucketPressureCache.value;
+      }
+      const value = new Map<string, boolean>();
+      for (const route of configuredGeminiRoutes()) {
+        const org = geminiRouteOrg(route);
+        if (value.has(org)) continue;
+        // Fail open: a bucket read failure must not stall discovery.
+        const full = await isGeminiOrgBucketFull(org, now).catch(() => false);
+        value.set(org, full);
+      }
+      geminiBucketPressureCache = { at: now, value };
+      return value;
+    };
+    const geminiRoutes = configuredGeminiRoutes();
+    const geminiCooling = geminiRoutes.length > 0
+      ? await (async () => {
+          const buckets = await geminiBucketFullByOrg();
+          return allRoutesCoolingDown(await Promise.all(geminiRoutes.map(async route => {
+            const org = geminiRouteOrg(route);
+            return (await isGeminiOrgCooldownActive(org)) || buckets.get(org) === true;
+          })));
+        })()
+      : await isGeminiSemanticCooldownActive();
+    if (!geminiCooling) return false;
+    if (process.env.SEMANTIC_PROVIDER_FORCE_GEMINI === 'true') return true;
+    return !(await groqRoutesServing());
+  };
+  let semanticCapacityProbe: Promise<ProviderCapacityStatus> | null = null;
+  let takenCapacityProbe: ProviderCapacityProbe | null = null;
+  const semanticCapacity = async (): Promise<boolean> => {
+    if (!semanticGateNeeded) return true;
+    if (geminiFreeSelectedForGate) {
+      if (await freePrimaryServing()) return true;
+      if (!(await groqRoutesServing())) return false;
+      // Fall through: the Groq fallback must also pass the durable circuit.
+    } else if (await freeTierFallbackHealthy()) {
+      return true;
+    }
+    // Resolve lazily, only when this tick is about to offer a semantic job
+    // type. Taking the one-shot probe lease on a tick that never claims
+    // semantic work would block the real probe for the lease duration.
+    if (!semanticCapacityProbe) {
+      semanticCapacityProbe = getSemanticCapacityStatus(semanticCapacityAccounts);
+    }
+    const status = await semanticCapacityProbe;
+    if (status.probe && status.probeAccount) takenCapacityProbe = status.probeAccount;
+    return status.available;
+  };
+  const semanticJobTypes = new Set<string>([
+    CLASSIFICATION_JOB_TYPE,
+    ADMISSION_VERIFICATION_JOB_TYPE,
+    'PROCESS_DISCOVERED_CHANNEL',
+    'ENRICH_CHANNEL',
+    'POST_APPROVAL_ENRICH',
+    'FORCE_REVIEW_RESCAN',
+    'RESOLVE_STAGED_CANDIDATE',
+  ]);
+  const releaseUnusedCapacityProbe = async (jobType?: string): Promise<void> => {
+    if (!takenCapacityProbe) return;
+    if (jobType && semanticJobTypes.has(jobType)) return;
+    const probe = takenCapacityProbe;
+    takenCapacityProbe = null;
+    await releaseProviderCapacityProbe(probe).catch(error => {
+      console.warn('[ProviderCapacity] Failed to release an unused probe lease:', String(error?.message || error));
+    });
+  };
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
   // ENRICH_CHANNEL: every such job runs the full evidence pipeline. Under the
@@ -1865,7 +1999,9 @@ export async function processNextSearchJob(
     const groqCooldownActive = groqRoutes.length > 0
       ? allRoutesCoolingDown(await Promise.all(groqRoutes.map(async route => groqFallbackCoolingDown(await isGroqOrgCooldownActive(groqRouteOrg(route)), groqOrgCooldownRemainingMs(groqRouteOrg(route))))))
       : (groqSelected ? await isGroqSemanticCooldownActive() : false);
-    const geminiFreeCooldownActive = geminiFreeSelected ? await isGeminiFreeSemanticCooldownActive() : false;
+    const geminiFreeCooldownActive = geminiFreeSelected
+      ? (await isGeminiFreeSemanticCooldownActive()) || geminiFreeCredentialExhausted()
+      : false;
     let groqFallbackConfigured = false;
     let groqFallbackCooldownActive = false;
     if (!groqSelected && !geminiFreeSelected && geminiCooldownActive) {
@@ -1888,7 +2024,7 @@ export async function processNextSearchJob(
       : 0;
     const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
     enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable;
-    if ((enrichmentFullyClaimable || enrichmentProbe) && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
+    if ((enrichmentFullyClaimable || enrichmentProbe || (geminiFreeSelected && await groqRoutesServing())) && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
       claimableTypes.push('ENRICH_CHANNEL');
       // Classification jobs require the semantic decision and remain gated
       // while every semantic route is cooling. ENRICH is allowed as a bounded
@@ -1897,18 +2033,18 @@ export async function processNextSearchJob(
     }
     // Classification and process lanes are separate from ENRICH backfill, so
     // their own overrides must be accepted outside the ENRICH-only block.
-    if (enrichmentFullyClaimable && claimableOverride?.includes(CLASSIFICATION_JOB_TYPE)) {
+    if (claimableOverride?.includes(CLASSIFICATION_JOB_TYPE) && !(await semanticRoutesCooling()) && await semanticCapacity()) {
       claimableTypes.push(CLASSIFICATION_JOB_TYPE);
     }
     // Dedicated process lane: separate worker capacity removes classification
-    // starvation, while the semantic-availability gate prevents a defer storm.
-    // This must sit outside the ENRICH_CHANNEL-only block above so a
+    // starvation, while the same semantic-availability gate prevents a defer
+    // storm. This must sit outside the ENRICH_CHANNEL-only block above so a
     // process-only override can claim its job type.
-    if (enrichmentFullyClaimable && claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL')) {
+    if (claimableOverride?.includes('PROCESS_DISCOVERED_CHANNEL') && !(await semanticRoutesCooling()) && await semanticCapacity()) {
       claimableTypes.push('PROCESS_DISCOVERED_CHANNEL');
     }
   }
-  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION'))) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
+  if (!qStatus.channelProcessing.isPaused && admissionSemanticClaimable && (!claimableOverride || claimableOverride.includes('VERIFY_CHANNEL_ADMISSION')) && !(await semanticRoutesCooling()) && await semanticCapacity()) claimableTypes.push('VERIFY_CHANNEL_ADMISSION');
   if (!qStatus.channelProcessing.isPaused && (!claimableOverride || claimableOverride.includes('RESOLVE_STAGED_CANDIDATE'))) claimableTypes.push('RESOLVE_STAGED_CANDIDATE');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('POST_APPROVAL_ENRICH')) claimableTypes.push('POST_APPROVAL_ENRICH');
   if (!qStatus.channelProcessing.isPaused && claimableOverride?.includes('FORCE_REVIEW_RESCAN')) claimableTypes.push('FORCE_REVIEW_RESCAN');
@@ -1937,11 +2073,14 @@ export async function processNextSearchJob(
     if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
     if(control.rowCount&&!control.rows[0].ai_paused&&(!claimableOverride||claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')))claimableTypes.push('AI_ADJUDICATE_CANDIDATE');
   }
-  if (claimableTypes.length === 0) return false;
+  if (claimableTypes.length === 0) { await releaseUnusedCapacityProbe(); return false; }
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
   const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS], enrichProbeOnly);
-  if (!job) return false;
+  if (!job) { await releaseUnusedCapacityProbe(); return false; }
+  // A probe is permission for semantic work only. If this tick claimed a
+  // search/enrichment job instead, release the lease immediately.
+  await releaseUnusedCapacityProbe(job.type);
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
   return withExecutionTrace(traceId, async()=>{

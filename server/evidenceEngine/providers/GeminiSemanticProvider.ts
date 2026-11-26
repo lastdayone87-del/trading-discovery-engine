@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { appendProviderCallEvent } from '../../db';
 import { executeProviderCall, getGeminiOrgSemanticCooldownExpiry, ProviderCallError, resolveGeminiRouteId } from '../../providerResilience';
+import { recordProviderCapacityExhausted } from '../../providerCapacityState';
 import { calibrateSemanticConfidence, SEMANTIC_CALIBRATION_VERSION } from '../semanticCalibration';
 import type { EvidenceCategory, EvidenceFieldRef, EvidenceItem, EvidenceProvider, LayeredKnowledgeContext, RawChannelInput } from '../types';
 import { abortedByDeadline } from './abortReason';
@@ -186,6 +187,7 @@ export async function runGeminiRouteFailover<T>(
 ): Promise<T> {
   const isCooling = opts?.isOrgCooling ?? (() => false);
   let lastError: unknown;
+  let unauthorizedFailures = 0;
   const tried = new Set<GeminiRoute>();
   // Stable order, healthy accounts first: configured order is preserved
   // within each group, so single-account deployments behave as before.
@@ -227,7 +229,17 @@ export async function runGeminiRouteFailover<T>(
         // A rejected credential belongs to one key/project, not to every key
         // that shares its quota label: sibling keys may still serve. Only the
         // failing route is marked tried.
-        if (!ordered.some(candidate => !tried.has(candidate))) throw error;
+        const reasons = Array.isArray(error.providerReasons) ? error.providerReasons : [];
+        if (reasons.includes('PROVIDER_ROUTE_UNAUTHORIZED')) unauthorizedFailures++;
+        if (!ordered.some(candidate => !tried.has(candidate))) {
+          // One rejected key must not block its siblings, but a pool where
+          // every configured route rejected its credential cannot recover
+          // without rotation. Mark it so the provider can open a pool block.
+          if (unauthorizedFailures >= ordered.length) {
+            Object.assign(error, { allRoutesUnauthorized: true });
+          }
+          throw error;
+        }
         continue;
       }
       if (!(error instanceof ProviderCallError) || !error.retryable) throw error;
@@ -308,7 +320,31 @@ export function defaultClient(): SemanticModelClient | undefined {
         }
         throw error;
       }
-    }, { isOrgCooling: orgId => coolingOrgs.has(orgId), signal });
+    }, { isOrgCooling: orgId => coolingOrgs.has(orgId), signal }).catch(async (error: unknown) => {
+      // Single-key rejection is route-scoped and handled by failover. When
+      // every configured key is rejected, block each configured account so
+      // semantic jobs park instead of consuming retry attempts.
+      if ((error as { allRoutesUnauthorized?: unknown })?.allRoutesUnauthorized === true) {
+        const resumeAt = Date.now() + 24 * 60 * 60_000;
+        let persistedResumeAt = resumeAt;
+        for (const org of [...new Set(configuredGeminiRoutes().map(geminiRouteOrg))]) {
+          try {
+            persistedResumeAt = Math.max(persistedResumeAt, await recordProviderCapacityExhausted({
+              provider: 'gemini',
+              scopeKey: org,
+              operation: '*',
+              state: 'BLOCKED',
+              reasonCode: 'PROVIDER_ROUTE_UNAUTHORIZED',
+              resumeAt,
+            }));
+          } catch {
+            // The error marker below still parks the job if persistence fails.
+          }
+        }
+        Object.assign(error, { retryAt: persistedResumeAt, providerCapacityExhausted: true });
+      }
+      throw error;
+    });
     return JSON.parse(response.text || '{}');
   }};
 }

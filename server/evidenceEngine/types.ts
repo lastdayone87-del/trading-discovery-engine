@@ -329,6 +329,15 @@ export interface ProviderExecutionReport {
    * non-failure reports and legacy callers.
    */
   orgId?: string;
+  /**
+   * A real upstream quota/credential failure opened the provider circuit for
+   * this account. Carried through the report so an enrichment failure can park
+   * the job until the provider's reset instead of consuming the generic
+   * transient-retry budget.
+   */
+  providerCapacityExhausted?: boolean;
+  /** Epoch milliseconds when the failed provider account may serve again. */
+  retryAt?: number;
 }
 
 export interface EvidenceCollectionReport {

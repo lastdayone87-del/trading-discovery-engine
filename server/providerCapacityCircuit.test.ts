@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+test('semantic claim gate and provider circuit are wired', () => {
+  const queue = readFileSync(new URL('./queueManager.ts', import.meta.url), 'utf8');
+  const dbCore = readFileSync(new URL('./dbCore.ts', import.meta.url), 'utf8');
+  const resilience = readFileSync(new URL('./providerResilience.ts', import.meta.url), 'utf8');
+  const groqProvider = readFileSync(new URL('./evidenceEngine/providers/GroqSemanticProvider.ts', import.meta.url), 'utf8');
+  assert.match(queue, /getSemanticCapacityStatus/);
+  assert.match(queue, /await semanticCapacity\(\)/);
+  assert.match(queue, /getSemanticCapacityStatus\(semanticCapacityAccounts\)/);
+  assert.match(queue, /admissionSemanticClaimable && \(!claimableOverride \|\| claimableOverride\.includes\('VERIFY_CHANNEL_ADMISSION'\)\) && !\(await semanticRoutesCooling\(\)\)/);
+  assert.match(queue, /claimableOverride\.includes\('ENRICH_CHANNEL'\)/);
+  assert.match(queue, /releaseUnusedCapacityProbe\(\)/);
+  assert.match(queue, /claimableOverride\?\.includes\('PROCESS_DISCOVERED_CHANNEL'\) && !\(await semanticRoutesCooling\(\)\) && await semanticCapacity\(\)/);
+  assert.match(queue, /scopeKey: geminiRouteOrg\(route\)/);
+  assert.match(queue, /scopeKey: groqRouteOrg\(route\)/);
+  assert.match(dbCore, /providerCapacityExhausted/);
+  assert.match(dbCore, /RETRYING_WITHOUT_ATTEMPT/);
+  assert.match(resilience, /recordProviderCapacityExhausted/);
+  assert.match(resilience, /recordProviderCapacitySuccess/);
+  assert.match(resilience, /typed\.quotaScope==='DAILY'/);
+  assert.match(resilience, /nextPacificMidnightMs/);
+  assert.match(resilience, /providerCapacityExhausted:true/);
+  assert.match(groqProvider, /persistGroqCapacityEvent/);
+  assert.match(groqProvider, /recordProviderCapacityExhausted/);
+  assert.match(groqProvider, /recordProviderCapacitySuccess/);
+  assert.match(groqProvider, /groqCooldownDeferral/);
+});

@@ -4304,8 +4304,8 @@ export async function resolveGeminiOrgSemanticCooldownExpiryMs(orgId:string,nowM
  */
 export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=Date.now()):Promise<number|undefined>{
   const windowRaw=process.env.GEMINI_ORG_RATE_WINDOW_MS;
-  const windowMs=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
-  if(!Number.isFinite(windowMs)||windowMs<=0)return undefined;
+  const parsedWindow=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  const windowMs=Number.isFinite(parsedWindow)&&parsedWindow>0?parsedWindow:60000;
   try{
     const db=await getDb();
     const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at > now() - ($2::int * interval '1 millisecond') ORDER BY occurred_at ASC LIMIT 1`,[orgId,Math.floor(windowMs)]);
@@ -4315,6 +4315,27 @@ export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=D
     const expiry=oldestMs+windowMs;
     return expiry>nowMs?expiry:undefined;
   }catch{return undefined;}
+}
+/**
+ * True when the account's rolling token bucket is at its configured call cap.
+ * A recent call alone is not pressure; the count must reach the same cap used
+ * by acquireGeminiCapacity.
+ */
+export async function isGeminiOrgBucketFull(orgId:string,nowMs:number=Date.now()):Promise<boolean>{
+  const windowRaw=process.env.GEMINI_ORG_RATE_WINDOW_MS;
+  const parsedWindow=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  const windowMs=Number.isFinite(parsedWindow)&&parsedWindow>0?parsedWindow:60000;
+  const maxRaw=String(process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE ?? '').trim();
+  const parsedMax=maxRaw===''?10:Number(maxRaw);
+  // Match geminiCapacityConfig(): blank/negative/garbage falls back to 10;
+  // an explicit 0 disables the bucket.
+  const maxCalls=Number.isFinite(parsedMax)&&parsedMax>=0?parsedMax:10;
+  if(maxCalls<=0)return false;
+  try{
+    const db=await getDb();
+    const res=await db.query(`SELECT count(*)::int AS n FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at > now() - ($2::int * interval '1 millisecond')`,[orgId,Math.floor(windowMs)]);
+    return Number(res.rows[0]?.n||0)>=maxCalls;
+  }catch{return false;}
 }
 /**
  * Pool-wide Groq semantic cooldown expiry from persisted provider_call_events:
@@ -4426,6 +4447,13 @@ export function decideJobFailure(error:any,attempts:number,maxAttempts:number,no
     };
   }
   if(failureCode==='INVESTIGATION_DEADLINE_EXCEEDED')return {disposition:'FAILED'};
+  // Provider-capacity circuit: the row's reset time is authoritative and may
+  // be many hours away. Park without consuming an attempt or applying the
+  // generic six-hour transient-age terminal rule.
+  if((error as any)?.providerCapacityExhausted===true){
+    const capacityResumeAt=Number((error as any)?.retryAt);
+    return {disposition:'RETRYING_WITHOUT_ATTEMPT',runAfter:Number.isFinite(capacityResumeAt)&&capacityResumeAt>now?capacityResumeAt:now+60_000};
+  }
   if(isRetryableInfrastructureFailure(error)){
     if(now-firstFailureAt>=MAX_TRANSIENT_RETRY_AGE_MS)return {disposition:'FAILED',operationallyBlocked:true};
     const retryAt=Number(error?.retryAt);
