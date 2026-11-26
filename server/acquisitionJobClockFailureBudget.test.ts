@@ -104,7 +104,7 @@ test('flag on preserves the genuine first-failure anchor for transient failures'
   }
 });
 
-test('flag on suspends the transient anchor during provider-capacity parking', async () => {
+test('flag on clears the transient anchor during provider-capacity parking', async () => {
   process.env[ACQUISITION_JOB_CLOCK_V2_ENABLED_ENV] = 'true';
   try {
     const now = Date.UTC(2026, 10, 6, 12, 0, 0);
@@ -123,8 +123,7 @@ test('flag on suspends the transient anchor during provider-capacity parking', a
     assert.equal(disposition, 'RETRYING_WITHOUT_ATTEMPT');
     const transition = db.queries.find(query => query.sql.startsWith('UPDATE jobs SET status='));
     assert.ok(transition, 'failJob must transition the job row');
-    assert.match(transition!.sql, /first_transient_failure_at=CASE WHEN \$5::boolean/);
-    assert.match(transition!.sql, /first_transient_failure_at\+GREATEST\(\$3::timestamptz-now\(\)/);
+    assert.match(transition!.sql, /first_transient_failure_at=CASE WHEN \$5::boolean THEN NULL/);
     assert.equal(transition!.values?.[2], new Date(retryAt).toISOString());
     assert.equal(transition!.values?.[3], null, 'parking must not start a new transient anchor');
     assert.equal(transition!.values?.[4], true);

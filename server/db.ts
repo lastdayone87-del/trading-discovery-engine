@@ -143,7 +143,9 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
   const capacityLease=clockV2&&isCapacityLeaseFailure(error);
   // A durable provider-capacity park is also a wait, not acquisition work: it
   // must neither start a transient anchor nor let the parked interval age an
-  // existing one toward the six-hour terminal ceiling.
+  // existing one toward the six-hour terminal ceiling. The clock-immutability
+  // trigger permits clearing the anchor but not moving it, so parking clears it
+  // and the next genuine failure starts a fresh window.
   const providerCapacityParking=error?.providerCapacityExhausted===true;
   const retryableInfrastructure=isRetryableInfrastructureFailure(error);
   const firstFailureAt=capacityLease||providerCapacityParking?now:resolveTransientFailureAnchor(error,first_transient_failure_at,now);
@@ -234,7 +236,7 @@ export async function failJob(jobId:string,error:any,deps?:{db?:JobFailureDb;now
       const transitioned=await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=CASE WHEN ${capacityParked} THEN now()+interval '6 hours' ELSE $3 END,terminal_failure_class=NULL,capacity_deferrals=capacity_deferrals+1,capacity_wait_started_at=COALESCE(capacity_wait_started_at,now()),parked_reason=CASE WHEN ${capacityParked} THEN 'CAPACITY_WAIT' ELSE parked_reason END,parked_at=CASE WHEN ${capacityParked} THEN now() ELSE parked_at END,${capacityLeaseRefreshSetSql('$4')} WHERE id=$1 AND status='PROCESSING' AND ($5::text IS NULL OR locked_by=$5) AND ($6::int IS NULL OR attempts=$6) RETURNING id`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),String(CAPACITY_LEASE_DURATION_MS),locked_by??null,attempts]);
       if(!transitioned.rowCount)return null;
     }else{
-      const transitioned=await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,terminal_failure_class=NULL,first_transient_failure_at=CASE WHEN $5::boolean THEN CASE WHEN first_transient_failure_at IS NULL THEN NULL ELSE first_transient_failure_at+GREATEST($3::timestamptz-now(),interval '0') END ELSE COALESCE(first_transient_failure_at,$4::timestamptz) END,updated_at=now() WHERE id=$1 AND status='PROCESSING' AND ($6::text IS NULL OR locked_by=$6) AND ($7::int IS NULL OR attempts=$7) RETURNING id`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),transientAnchor,providerCapacityParking,locked_by??null,attempts]);
+      const transitioned=await db.query(`UPDATE jobs SET status='PENDING',attempts=GREATEST(0,attempts-1),last_error=$2,locked_by=NULL,locked_at=NULL,run_after=$3,terminal_failure_class=NULL,first_transient_failure_at=CASE WHEN $5::boolean THEN NULL ELSE COALESCE(first_transient_failure_at,$4::timestamptz) END,updated_at=now() WHERE id=$1 AND status='PROCESSING' AND ($6::text IS NULL OR locked_by=$6) AND ($7::int IS NULL OR attempts=$7) RETURNING id`,[jobId,persistedMessage,new Date(runAfter!).toISOString(),transientAnchor,providerCapacityParking,locked_by??null,attempts]);
       if(!transitioned.rowCount)return null;
     }
   }else if(disposition==='FAILED'){

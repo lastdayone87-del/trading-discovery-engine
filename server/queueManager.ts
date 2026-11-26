@@ -188,7 +188,7 @@ import { processFeaturedChannelInspectionJob } from './featuredChannelAdapterWor
 import { processCountryBoundaryReprocessJob } from './countryBoundaryRecovery';
 import { QuotaAllocationExhaustedError } from './quotaCapacity';
 import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemanticCooldownActive, isGroqOrgCooldownActive, isGeminiFreeSemanticCooldownActive } from './providerResilience';
-import { getSemanticCapacityStatus } from './providerCapacityState';
+import { getSemanticCapacityStatus, releaseProviderCapacityProbe, type ProviderCapacityProbe, type ProviderCapacityStatus } from './providerCapacityState';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
 import { shouldUseGeminiFreeSemantic, configuredGeminiFreeRoutes } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
@@ -1865,7 +1865,8 @@ export async function processNextSearchJob(
       }
     }
   }
-  let semanticCapacityProbe: Promise<{ available: boolean }> | null = null;
+  let semanticCapacityProbe: Promise<ProviderCapacityStatus> | null = null;
+  let takenCapacityProbe: ProviderCapacityProbe | null = null;
   const semanticCapacity = async (): Promise<boolean> => {
     if (!semanticGateNeeded || geminiFreeSelectedForGate) return true;
     if (geminiFreeFallbackForGate && !(await isGeminiFreeSemanticCooldownActive())) return true;
@@ -1875,7 +1876,19 @@ export async function processNextSearchJob(
     if (!semanticCapacityProbe) {
       semanticCapacityProbe = getSemanticCapacityStatus(semanticCapacityAccounts);
     }
-    return (await semanticCapacityProbe).available;
+    const status = await semanticCapacityProbe;
+    if (status.probe && status.probeAccount) takenCapacityProbe = status.probeAccount;
+    return status.available;
+  };
+  const semanticJobTypes = new Set<string>([CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL']);
+  const releaseUnusedCapacityProbe = async (jobType?: string): Promise<void> => {
+    if (!takenCapacityProbe) return;
+    if (jobType && semanticJobTypes.has(jobType)) return;
+    const probe = takenCapacityProbe;
+    takenCapacityProbe = null;
+    await releaseProviderCapacityProbe(probe).catch(error => {
+      console.warn('[ProviderCapacity] Failed to release an unused probe lease:', String(error?.message || error));
+    });
   };
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('SEARCH_YOUTUBE'))) claimableTypes.push('SEARCH_YOUTUBE');
   if (!qStatus.searchJobs.isPaused && (!claimableOverride || claimableOverride.includes('MANUAL_SEARCH_PAGE'))) claimableTypes.push('MANUAL_SEARCH_PAGE');
@@ -1978,11 +1991,14 @@ export async function processNextSearchJob(
     if(control.rowCount&&!control.rows[0].scoring_paused&&(!claimableOverride||claimableOverride.includes('SCORE_CANDIDATES')))claimableTypes.push('SCORE_CANDIDATES');
     if(control.rowCount&&!control.rows[0].ai_paused&&(!claimableOverride||claimableOverride.includes('AI_ADJUDICATE_CANDIDATE')))claimableTypes.push('AI_ADJUDICATE_CANDIDATE');
   }
-  if (claimableTypes.length === 0) return false;
+  if (claimableTypes.length === 0) { await releaseUnusedCapacityProbe(); return false; }
 
   const browserBlockedRetryPatterns = browserCapabilityIsUnavailable() ? ['%BROWSER_RUNTIME_UNAVAILABLE%'] : undefined;
   const job = await claimNextJob(workerId, claimableTypes, browserBlockedRetryPatterns, ['RECONCILIATION_REQUIRED'], [...CORPUS_CLAIM_BUDGET_GUARDS, ...RESOLUTION_CLAIM_BUDGET_GUARDS], enrichProbeOnly);
-  if (!job) return false;
+  if (!job) { await releaseUnusedCapacityProbe(); return false; }
+  // A probe is permission for semantic work only. If this tick claimed a
+  // search/enrichment job instead, release the lease immediately.
+  await releaseUnusedCapacityProbe(job.type);
   const investigationId=String(job.payload?.investigationId||''),investigationStepId=String(job.payload?.investigationStepId||'');
   const traceId=String(job.payload?.traceId||'');
   return withExecutionTrace(traceId, async()=>{

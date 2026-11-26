@@ -1,10 +1,18 @@
 export type ProviderCapacityName = 'HEALTHY' | 'EXHAUSTED' | 'PROBING' | 'BLOCKED';
 
+export interface ProviderCapacityProbe {
+  provider: 'gemini' | 'groq';
+  scopeKey: string;
+  operation: string;
+}
+
 export interface ProviderCapacityStatus {
   available: boolean;
   probe: boolean;
   resumeAt: number | null;
   reason: string | null;
+  /** The exact row leased when `probe` is true. */
+  probeAccount?: ProviderCapacityProbe;
 }
 
 export interface ProviderCapacityAccount {
@@ -109,22 +117,50 @@ export async function recordProviderCapacitySuccess(input: {
   scopeKey: string;
   operation: string;
   /** When the successful call started. A later failure must not be cleared. */
-  observedAt?: number | string;
+  observedAt: number | string;
 }, dbOverride?: CapacityDb): Promise<void> {
-  const observedAtMs = input.observedAt == null ? NaN : new Date(input.observedAt).getTime();
+  const observedAtMs = new Date(input.observedAt).getTime();
   const observedAt = Number.isFinite(observedAtMs) ? new Date(observedAtMs).toISOString() : null;
   const client = await db(dbOverride);
+  // A reset that has passed is authoritative on the database clock. Before
+  // that, a success may still close the row only when its call started well
+  // after the failure was recorded; the 30-second band absorbs application/
+  // database clock skew for calls that were in flight during the failure.
   const result = await client.query(
     `UPDATE provider_capacity_state
         SET state='HEALTHY', resume_at=NULL, probe_lease_until=NULL,
             last_success_at=now(), updated_at=now(), generation=generation+1
       WHERE provider=$1 AND scope_key=$2 AND (operation=$3 OR operation='*')
         AND state <> 'HEALTHY'
-        AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)`,
+        AND (
+          resume_at IS NULL OR resume_at <= now()
+          OR ($4::timestamptz IS NOT NULL AND observed_at <= $4::timestamptz - interval '30 seconds')
+        )`,
     [input.provider, input.scopeKey, input.operation, observedAt],
   );
   // A no-op update (already healthy, or an older success racing a newer
   // failure) must not churn the shared capacity cache.
+  if (result.rowCount) invalidate();
+}
+
+/**
+ * Return an unused probe lease to the parked state. Called when a worker wins
+ * the reset probe but claims no semantic job (or a non-semantic one), so an
+ * idle lane cannot block recovery for the rest of the lease.
+ */
+export async function releaseProviderCapacityProbe(
+  probe: ProviderCapacityProbe,
+  dbOverride?: CapacityDb,
+): Promise<void> {
+  const client = await db(dbOverride);
+  const result = await client.query(
+    `UPDATE provider_capacity_state
+        SET state='EXHAUSTED', probe_lease_until=NULL, updated_at=now()
+      WHERE provider=$1 AND scope_key=$2 AND operation=$3
+        AND state='PROBING'
+        AND probe_lease_until IS NOT NULL AND probe_lease_until > now()`,
+    [probe.provider, probe.scopeKey, probe.operation],
+  );
   if (result.rowCount) invalidate();
 }
 
@@ -218,7 +254,8 @@ export async function getSemanticCapacityStatus(
                FROM provider_capacity_state s
                JOIN eligible_blocks a
                  ON a.provider=s.provider AND a.scope_key=s.scope_key AND a.operation=s.operation
-              WHERE s.state IN ('EXHAUSTED','PROBING')
+              WHERE s.operation IN ('*','multilingual-semantic-classification')
+                AND s.state IN ('EXHAUSTED','PROBING')
                 AND (s.resume_at IS NULL OR s.resume_at <= now())
                 AND (s.probe_lease_until IS NULL OR s.probe_lease_until <= now())
               ORDER BY COALESCE(s.resume_at, to_timestamp(0)), s.provider, s.scope_key
@@ -235,7 +272,18 @@ export async function getSemanticCapacityStatus(
           [blockerJson, PROBE_LEASE_MS],
         );
         if (probe.rowCount) {
-          value = { available: true, probe: true, resumeAt: null, reason: 'PROBE' };
+          const leased = probe.rows[0];
+          value = {
+            available: true,
+            probe: true,
+            resumeAt: null,
+            reason: 'PROBE',
+            probeAccount: {
+              provider: leased.provider as 'gemini' | 'groq',
+              scopeKey: String(leased.scope_key),
+              operation: String(leased.operation),
+            },
+          };
         }
         if (!value.probe) {
           const resumeTimes = blockers

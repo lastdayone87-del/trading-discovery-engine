@@ -7,6 +7,7 @@ import {
   getSemanticCapacityStatus,
   recordProviderCapacityExhausted,
   recordProviderCapacitySuccess,
+  releaseProviderCapacityProbe,
   resetProviderCapacityCacheForTests,
   type ProviderCapacityAccount,
 } from './providerCapacityState';
@@ -64,11 +65,18 @@ maybe('capacity state parks until reset, allows exactly one probe, and closes on
   await db.query(`UPDATE provider_capacity_state SET resume_at=now()-interval '1 second' WHERE provider='gemini' AND scope_key='gemini-project-1'`);
   resetProviderCapacityCacheForTests();
   const probe = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
-  assert.deepEqual(probe, { available: true, probe: true, resumeAt: null, reason: 'PROBE' });
+  assert.deepEqual(probe, { available: true, probe: true, resumeAt: null, reason: 'PROBE', probeAccount: { provider: 'gemini', scopeKey: 'gemini-project-1', operation: '*' } });
   const noSecondProbe = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(noSecondProbe.available, false, 'only one worker may hold the probe lease');
+  await releaseProviderCapacityProbe(probe.probeAccount!, db);
+  resetProviderCapacityCacheForTests();
+  assert.equal(
+    (await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).probe,
+    true,
+    'an unused probe lease must be released for the next worker',
+  );
 
-  await recordProviderCapacitySuccess({ provider: 'gemini', scopeKey: 'gemini-project-1', operation: 'multilingual-semantic-classification' }, db);
+  await recordProviderCapacitySuccess({ provider: 'gemini', scopeKey: 'gemini-project-1', operation: 'multilingual-semantic-classification', observedAt: Date.now() }, db);
   resetProviderCapacityCacheForTests();
   const healthy = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
   assert.equal(healthy.available, true);
@@ -91,7 +99,7 @@ maybe('a blocked credential route remains unavailable until success or operator 
   resetProviderCapacityCacheForTests();
   const blocked = await getSemanticCapacityStatus([groq('groq-org-1')], Date.now(), db);
   assert.equal(blocked.available, false);
-  await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: 'groq-org-1', operation: '*' }, db);
+  await recordProviderCapacitySuccess({ provider: 'groq', scopeKey: 'groq-org-1', operation: '*', observedAt: Date.now() + 60_000 }, db);
   resetProviderCapacityCacheForTests();
   assert.equal((await getSemanticCapacityStatus([groq('groq-org-1')], Date.now(), db)).available, true);
 });
@@ -123,11 +131,8 @@ maybe("a daily '*' failure overrides a stale healthy operation row", async () =>
   const db = requirePool();
   await db.query(`DELETE FROM provider_capacity_state`);
   resetProviderCapacityCacheForTests();
-  await recordProviderCapacitySuccess({
-    provider: 'gemini',
-    scopeKey: 'gemini-project-1',
-    operation: 'multilingual-semantic-classification',
-  }, db);
+  await db.query(`INSERT INTO provider_capacity_state(provider,scope_key,operation,state)
+                  VALUES ('gemini','gemini-project-1','multilingual-semantic-classification','HEALTHY')`);
   await recordProviderCapacityExhausted({
     provider: 'gemini',
     scopeKey: 'gemini-project-1',
@@ -143,6 +148,7 @@ maybe("a daily '*' failure overrides a stale healthy operation row", async () =>
     provider: 'gemini',
     scopeKey: 'gemini-project-1',
     operation: 'multilingual-semantic-classification',
+    observedAt: Date.now() + 60_000,
   }, db);
   resetProviderCapacityCacheForTests();
   assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);
@@ -229,7 +235,7 @@ maybe('an older success cannot clear a newer failure', async () => {
     provider: 'gemini',
     scopeKey: 'gemini-project-1',
     operation: 'multilingual-semantic-classification',
-    observedAt: Date.now() + 1_000,
+    observedAt: Date.now() + 60_000,
   }, db);
   resetProviderCapacityCacheForTests();
   assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);

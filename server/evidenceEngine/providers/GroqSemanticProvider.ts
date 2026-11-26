@@ -1430,7 +1430,30 @@ export function defaultClient(
       isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0,
       signal,
       maxContentFailures: Math.max(1, Math.floor(Number(process.env.GROQ_JSON_VALIDATION_MAX_ROUTES || '2')) || 2),
-    }).catch((error: unknown) => {
+    }).catch(async (error: unknown) => {
+      // Every configured key rejected is a pool-wide credential outage, not a
+      // single-key rejection. Open BLOCKED rows for each org so semantic jobs
+      // park instead of consuming retry attempts.
+      if (error instanceof ProviderCallError && error.errorClass === 'CREDENTIALS_EXHAUSTED'
+        && (error.providerReasons || []).includes('PROVIDER_ROUTE_UNAUTHORIZED')) {
+        const resumeAt = Date.now() + 24 * 60 * 60_000;
+        let persistedResumeAt = resumeAt;
+        for (const route of configuredGroqRoutes()) {
+          try {
+            persistedResumeAt = Math.max(persistedResumeAt, await recordProviderCapacityExhausted({
+              provider: 'groq',
+              scopeKey: groqRouteOrg(route),
+              operation: '*',
+              state: 'BLOCKED',
+              reasonCode: 'PROVIDER_ROUTE_UNAUTHORIZED',
+              resumeAt,
+            }));
+          } catch {
+            // The local marker below still parks the job if persistence fails.
+          }
+        }
+        Object.assign(error, { retryAt: persistedResumeAt, providerCapacityExhausted: true });
+      }
       // The failover surfaces only the last route's error. Attach the earliest
       // reset across every failed account so an enrichment job does not park
       // for 24 hours behind a blocked last route when another org recovers in
