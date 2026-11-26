@@ -1,3 +1,5 @@
+import { domainToUnicode } from 'node:url';
+
 /**
  * Central multilingual community lexicon.
  *
@@ -134,10 +136,14 @@ export function decodeCommunityUrl(value: string): string {
  * must not make an unrelated destination look like a community page. */
 export function decodeCommunityUrlPath(value: string): string {
   try {
-    const parsed = new URL(value);
-    return `${decodeCommunityUrl(parsed.hostname)} ${decodeCommunityUrl(parsed.pathname)}`;
+    // A base accepts relative references from rendered-control callers while
+    // still discarding their query/fragment text.
+    const parsed = new URL(value, 'https://placeholder.invalid');
+    let host = parsed.hostname;
+    try { host = domainToUnicode(host); } catch { /* keep punycode */ }
+    return `${decodeCommunityUrl(host)} ${decodeCommunityUrl(parsed.pathname)}`;
   } catch {
-    return decodeCommunityUrl(value);
+    return decodeCommunityUrl(value.split(/[?#]/, 1)[0]);
   }
 }
 

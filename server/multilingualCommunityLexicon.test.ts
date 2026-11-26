@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { shouldFollowDestination } from './destinationPolicy';
+import { communityNavigationScore } from './inspector';
 import {
   MULTILINGUAL_CONTROL_HINTS,
   MULTILINGUAL_PATH_HINTS,
@@ -67,6 +68,17 @@ test('invite labels and concatenated slugs open unknown hosts', () => {
     });
     assert.equal(decision.eligible, true, slug);
   }
+});
+
+test('IDN hostnames and relative paths are matched without query text', () => {
+  const idn = new URL('https://communauté.example/page').toString();
+  const decision = shouldFollowDestination({
+    url: idn,
+    currentUrl: 'https://creator.example/',
+  });
+  assert.equal(decision.eligible, true);
+  assert.equal(communityNavigationScore('/page?next=discord', ''), 0);
+  assert.ok(communityNavigationScore('/community', '') > 0);
 });
 
 test('ordinary URL substrings are not community evidence', () => {

@@ -753,16 +753,16 @@ test('revealed same-origin planner admits only post-interaction generic links', 
 test('cross-origin planner carries visible anchor text for generic paths', () => {
   const currentUrl = 'https://creator.example/';
   const admitted = planRenderedCrossOriginEnqueues({
-    candidates: [{ url: 'https://community.example/go', text: 'Join the private members community' }],
+    candidates: [{ url: 'https://outside.example/go', text: 'Join the private members community' }],
     currentUrl,
     alreadyVisited: new Set(),
     queued: new Set(),
   });
-  assert.deepEqual(admitted.admitted, ['https://community.example/go']);
+  assert.deepEqual(admitted.admitted, ['https://outside.example/go']);
   assert.equal(admitted.irrelevant, 0);
 
   const noLabel = planRenderedCrossOriginEnqueues({
-    candidates: [{ url: 'https://community.example/go', text: '' }],
+    candidates: [{ url: 'https://outside.example/go', text: '' }],
     currentUrl,
     alreadyVisited: new Set(),
     queued: new Set(),
