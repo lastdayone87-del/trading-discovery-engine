@@ -573,6 +573,13 @@ export function renderedPopupWaitTimeoutMs(
 export const COMMUNITY_HINTS = MULTILINGUAL_CONTROL_HINTS;
 
 /**
+ * URL-slug fallback. Path segments concatenate words (`/vipintraders`,
+ * `/tradingroom`), so token-boundary anchor matching alone would miss them.
+ * Kept to distinctive community terms; generic prose words stay out.
+ */
+const URL_COMMUNITY_HINTS = /(?:discord|community|join|members?|membership|group|private|vip|trading[-_ ]?(?:room|floor|club)|signals?|skool|whop|circle|patreon)/i;
+
+/**
  * Interactive controls that can reveal content only through interaction:
  * links, buttons, ARIA buttons/tabs/menu items, popup triggers, native
  * disclosures (`summary`), and collapsed accordion triggers. The selector is
@@ -605,7 +612,7 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
-  return COMMUNITY_HINTS.test(rawUrl);
+  return COMMUNITY_HINTS.test(rawUrl) || URL_COMMUNITY_HINTS.test(rawUrl);
 }
 
 /**

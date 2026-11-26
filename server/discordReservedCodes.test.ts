@@ -5,6 +5,7 @@ import {
   candidateFromNativeInvite,
   extractDiscordCandidates,
 } from './discordCandidates';
+import { validateDiscordInvite } from './discordValidator';
 
 function codes(text: string): string[] {
   return extractDiscordCandidates(text)
@@ -48,6 +49,40 @@ test('structural Discord application routes remain excluded', () => {
     nativeInviteCode: 'login',
     sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
   }), null);
+});
+
+test('admitted codes reach live validation instead of being rejected as reserved', async () => {
+  const fetched: string[] = [];
+  for (const code of ['store', 'channels', 'support', 'template']) {
+    const result = await validateDiscordInvite(code, {
+      maxAttempts: 1,
+      retryDelayMs: 0,
+      emitProviderEvent: async () => {},
+      fetchImpl: (async (input) => {
+        fetched.push(String(input));
+        return new Response(JSON.stringify({ code: 10006, message: 'Unknown Invite' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }) as typeof fetch,
+    });
+    assert.notEqual(result.operationalOutcome, 'INVALID_LOCATOR', code);
+    assert.ok(fetched.at(-1)?.includes(`/invites/${code}`), code);
+  }
+});
+
+test('structural routes are still rejected before any Discord request', async () => {
+  let calls = 0;
+  const result = await validateDiscordInvite('login', {
+    maxAttempts: 1,
+    emitProviderEvent: async () => {},
+    fetchImpl: (async () => {
+      calls += 1;
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch,
+  });
+  assert.equal(result.operationalOutcome, 'INVALID_LOCATOR');
+  assert.equal(calls, 0);
 });
 
 test('the reserved route set is deliberately narrow and documented', () => {

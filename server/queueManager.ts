@@ -4846,6 +4846,12 @@ export async function inspectAndValidateChannel(
     // the next attempt reuses the same window instead of skipping it. The
     // current retry job's payload is updated too: its remaining durable
     // attempts reload that payload rather than going through enqueue again.
+    if(inspection.retryDirective)inspection.retryDirective={...inspection.retryDirective,clickOffsets:inspection.nextClickOffsets};
+    if(executionMarker?.jobId&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length){
+      await persistCommunityRetryClickOffsets(executionMarker.jobId,inspection.nextClickOffsets).catch(error=>{
+        console.warn(JSON.stringify({event:'community_retry_click_offsets_persist_failed',jobId:executionMarker.jobId,channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
+      });
+    }
     // Public YouTube surfaces are a separate high-yield acquisition path.
     // Run only for TRADING_CONFIRMED channels with no recorded/just-found
     // invite, behind a canary setting, so quota and parser load stay bounded
@@ -4890,12 +4896,6 @@ export async function inspectAndValidateChannel(
           }));
         }
       }
-    }
-    if(inspection.retryDirective)inspection.retryDirective={...inspection.retryDirective,clickOffsets:inspection.nextClickOffsets};
-    if(executionMarker?.jobId&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length){
-      await persistCommunityRetryClickOffsets(executionMarker.jobId,inspection.nextClickOffsets).catch(error=>{
-        console.warn(JSON.stringify({event:'community_retry_click_offsets_persist_failed',jobId:executionMarker.jobId,channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
-      });
     }
     if(inspection.acquisitionOutcomes?.length){
       // A claimed ledger row carries the surface that owns its work key. The

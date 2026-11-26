@@ -43,6 +43,8 @@ export interface YouTubeCommunityPostSnapshot {
 export interface YouTubeSurfaceSnapshot {
   pinnedComment?: string;
   pinnedVideoId?: string;
+  /** True only when the channel owner authored the pinned comment. */
+  pinnedCommentCreator?: boolean;
   comments: YouTubeCommentSnapshot[];
   olderDescriptions: YouTubeDescriptionSnapshot[];
   communityPosts: YouTubeCommunityPostSnapshot[];
@@ -78,9 +80,13 @@ export interface YouTubeSurfaceClient {
 
 /** Production adapter. Dynamic import keeps the YouTube parser and its
  * initialization cost out of workers that never touch these surfaces. */
-export async function createYouTubeSurfaceClient(): Promise<YouTubeSurfaceClient> {
+export async function createYouTubeSurfaceClient(timeoutMs = 15_000): Promise<YouTubeSurfaceClient> {
   const { Innertube } = await import('youtubei.js');
-  const yt: any = await Innertube.create({ lang: 'en', location: 'US' });
+  // Client construction performs network/session setup in some Innertube
+  // versions. Bound it so a stuck initialization cannot hold the inspection
+  // open before the collector's own deadline starts.
+  const yt: any = await withTimeout(Innertube.create({ lang: 'en', location: 'US' }), timeoutMs);
+  if (!yt) throw new Error('YouTube client initialization timed out');
   return {
     getChannel: (channelId: string) => yt.getChannel(channelId),
     getComments: (videoId: string, sort?: string) => yt.getComments(videoId, sort),
@@ -111,8 +117,11 @@ function textOf(value: unknown): string {
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    // Attach a rejection handler even when the timer wins the race: a late
+    // rejection from an abandoned Innertube call must not become an unhandled
+    // rejection that takes the worker down.
     return await Promise.race([
-      promise,
+      promise.catch(() => null as T | null),
       new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); }),
     ]);
   } finally {
@@ -165,13 +174,13 @@ export async function collectYouTubeSurfaceSnapshot(
     let feed: any = await withTimeout(channel.getVideos?.(), callTimeout());
     let pages = 0;
     while (feed && pages < settings.maxVideoPages && !expired()) {
+      pages += 1;
       for (const video of feed.videos || []) {
         const id = video?.content_id || video?.id;
         if (typeof id === 'string' && id) videoIds.push(id);
       }
-      if (!feed.has_continuation) break;
+      if (!feed.has_continuation || pages >= settings.maxVideoPages) break;
       feed = await withTimeout(feed.getContinuation?.(), callTimeout());
-      pages += 1;
     }
   } catch { /* video inventory is best-effort */ }
 
@@ -186,6 +195,7 @@ export async function collectYouTubeSurfaceSnapshot(
         if (parsed.pinned && !snapshot.pinnedComment) {
           snapshot.pinnedComment = parsed.text;
           snapshot.pinnedVideoId = videoId;
+          snapshot.pinnedCommentCreator = parsed.owner;
         }
         // Authorship is preserved: only creator-authored comments may become
         // RECENT_VIDEO_DESCRIPTIONS evidence. Viewer comments use the
@@ -212,13 +222,13 @@ export async function collectYouTubeSurfaceSnapshot(
       let feed: any = await withTimeout(channel.getCommunity(), callTimeout());
       let pages = 0;
       while (feed && pages < settings.maxCommunityPages && !expired()) {
+        pages += 1;
         for (const post of feed.posts || []) {
           const text = textOf(post?.content).trim();
           if (text) snapshot.communityPosts.push({ text, postId: String(post?.id || '') });
         }
-        if (!feed.has_continuation) break;
+        if (!feed.has_continuation || pages >= settings.maxCommunityPages) break;
         feed = await withTimeout(feed.getContinuation?.(), callTimeout());
-        pages += 1;
       }
     } catch { /* Community tab may be unavailable */ }
   }
@@ -274,9 +284,12 @@ export function candidatesFromYouTubeSnapshot(
   const out: DiscordCandidate[] = [];
   const source = (suffix: string) => `youtube:channel:${channelId}:${suffix}`;
   if (snapshot.pinnedComment) {
+    // A pinned comment can be authored by a viewer. Only an owner-authored
+    // pin may use the creator-owned PINNED_COMMENT surface; a viewer pin is
+    // still discovery evidence but cannot claim creator ownership.
     out.push(...extractDiscordCandidates(
       snapshot.pinnedComment,
-      'PINNED_COMMENT',
+      snapshot.pinnedCommentCreator === true ? 'PINNED_COMMENT' : 'YOUTUBE_COMMENTS',
       source(`video:${snapshot.pinnedVideoId || 'unknown'}:pinned-comment`),
     ));
   }

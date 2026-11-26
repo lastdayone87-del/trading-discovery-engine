@@ -37,3 +37,7 @@ test('rejoins bounded tag-fragmented invite text', () => {
   assert.deepEqual(codes('<p>Join disc<span>ord</span>.gg/TAGSPLIT</p>'), ['TAGSPLIT']);
   assert.deepEqual(codes('<p>Join discord<span>.gg</span>/TAGDOT</p>'), ['TAGDOT']);
 });
+
+test('block-level markup between host and path is not a protected invite', () => {
+  assert.deepEqual(codes('discord.gg<div>/NOTACODE</div>'), []);
+});

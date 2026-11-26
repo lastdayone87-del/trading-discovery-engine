@@ -113,11 +113,13 @@ export function decodeInviteObfuscation(text:string):string{
     .replace(/&#x0*26;|&#0*38;/gi,'&')
     // Bounded tag-fragment rejoin: `disc<span>ord</span>.gg/CODE` and
     // `discord<span>.gg</span>/CODE` are common "protect link" patterns.
-    // The tag body is capped so a hostile document cannot turn this into an
+    // Only inline formatting tags are allowed, so ordinary markup such as
+    // `discord.gg<div>/path` cannot be turned into a fake invite. The tag
+    // body is capped so a hostile document cannot turn this into an
     // unbounded HTML parser inside extraction.
-    .replace(/\bdisc\s*<[^>]{0,120}>\s*ord/gi,'discord')
-    .replace(/discord\s*<[^>]{0,120}>\s*\.\s*gg/gi,'discord.gg')
-    .replace(/discord\.gg\s*<[^>]{0,120}>\s*\/\s*/gi,'discord.gg/')
+    .replace(/\bdisc\s*<\/?(?:span|b|i|strong|em|small|wbr|a|u|mark|font)(?:\s[^>]{0,120})?>\s*ord/gi,'discord')
+    .replace(/discord\s*<\/?(?:span|b|i|strong|em|small|wbr|a|u|mark|font)(?:\s[^>]{0,120})?>\s*\.\s*gg/gi,'discord.gg')
+    .replace(/discord\.gg\s*<\/?(?:span|b|i|strong|em|small|wbr|a|u|mark|font)(?:\s[^>]{0,120})?>\s*\/\s*/gi,'discord.gg/')
     .replace(/discord\s+dot\s+(gg|com|app)/gi,'discord.$1')
     .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*gg/gi,'discord.gg')
     .replace(/discord\s*[\[(]\s*dot\s*[\])]\s*gg/gi,'discord.gg')

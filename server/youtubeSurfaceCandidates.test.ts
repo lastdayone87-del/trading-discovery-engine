@@ -46,6 +46,7 @@ test('collects pinned, top, older, Community and playlist text with bounds', asy
   });
 
   assert.equal(snapshot.pinnedComment, 'Pinned https://discord.gg/PINNED-video-1');
+  assert.equal(snapshot.pinnedCommentCreator, true);
   assert.ok(snapshot.comments.some(value => value.text.includes('TOP')));
   assert.equal(snapshot.comments.find(value => value.text.includes('TOP'))?.creator, false);
   assert.equal(snapshot.olderDescriptions.length, 2);
@@ -53,10 +54,67 @@ test('collects pinned, top, older, Community and playlist text with bounds', asy
   assert.equal(snapshot.playlists.length, 1);
 });
 
+test('continuation fetching is bounded by the configured page cap', async () => {
+  let videoFeedCalls = 0;
+  let communityFeedCalls = 0;
+  const videoFeed = (page: number): any => {
+    videoFeedCalls += 1;
+    return {
+      videos: [{ content_id: `video-${page}` }],
+      has_continuation: true,
+      getContinuation: async () => videoFeed(page + 1),
+    };
+  };
+  const communityFeed = (page: number): any => {
+    communityFeedCalls += 1;
+    return {
+      posts: [{ content: text(`post-${page}`) }],
+      has_continuation: true,
+      getContinuation: async () => communityFeed(page + 1),
+    };
+  };
+  const channel = {
+    has_community: true,
+    getVideos: async () => videoFeed(1),
+    getCommunity: async () => communityFeed(1),
+    getPlaylists: async () => ({ playlists: [] }),
+  };
+  const client: YouTubeSurfaceClient = {
+    getChannel: async () => channel,
+    getComments: async () => ({ contents: [] }),
+    getBasicInfo: async () => ({}),
+  };
+  await collectYouTubeSurfaceSnapshot('channel-1', client, {
+    maxVideoPages: 2,
+    maxCommunityPages: 1,
+    maxCommentVideos: 0,
+    maxOlderDescriptions: 0,
+    maxPlaylists: 0,
+    perCallTimeoutMs: 1_000,
+    maxTotalMs: 5_000,
+  });
+  assert.equal(videoFeedCalls, 2, 'initial video page plus one continuation only');
+  assert.equal(communityFeedCalls, 1, 'Community is capped at its first page');
+});
+
+test('a rejected Innertube call is contained instead of becoming unhandled', async () => {
+  const client: YouTubeSurfaceClient = {
+    getChannel: async () => {
+      throw new Error('network down');
+    },
+    getComments: async () => ({ contents: [] }),
+    getBasicInfo: async () => ({}),
+  };
+  const snapshot = await collectYouTubeSurfaceSnapshot('channel-1', client);
+  assert.deepEqual(snapshot.comments, []);
+  assert.deepEqual(snapshot.olderDescriptions, []);
+});
+
 test('builds and merges candidates from every YouTube surface', () => {
   const snapshot: YouTubeSurfaceSnapshot = {
     pinnedComment: 'https://discord.gg/PINNED',
     pinnedVideoId: 'video-pinned',
+    pinnedCommentCreator: true,
     comments: [
       { text: 'https://discord.gg/TOPCOMMENT', videoId: 'video-1', creator: false },
       { text: 'https://discord.gg/CREATORCOMMENT', videoId: 'video-1', creator: true },
@@ -88,6 +146,21 @@ test('builds and merges candidates from every YouTube surface', () => {
   assert.equal(merged.foundInvite, 'STATIC');
 });
 
+test('a viewer-authored pinned comment is not creator-owned evidence', () => {
+  const snapshot: YouTubeSurfaceSnapshot = {
+    pinnedComment: 'https://discord.gg/VIEWERPIN',
+    pinnedVideoId: 'video-1',
+    pinnedCommentCreator: false,
+    comments: [],
+    olderDescriptions: [],
+    communityPosts: [],
+    playlists: [],
+  };
+  const candidate = candidatesFromYouTubeSnapshot(snapshot, 'channel-1')[0];
+  assert.equal(candidate?.sourceSurface, 'YOUTUBE_COMMENTS');
+  assert.notEqual(candidate?.ownershipStatus, 'CREATOR_OWNED');
+});
+
 test('viewer comments never become creator-owned through repetition', () => {
   const snapshot: YouTubeSurfaceSnapshot = {
     comments: [
@@ -115,20 +188,16 @@ test('YouTube canary selection is deterministic and bounded', () => {
 
 test('the overall deadline bounds a slow YouTube surface collection', async () => {
   const client: YouTubeSurfaceClient = {
-    getChannel: async () => new Promise(resolve => setTimeout(() => resolve({}), 50)),
+    // Never resolves: only the deadline timer can make the collector return.
+    getChannel: () => new Promise(() => {}),
     getComments: async () => ({ contents: [] }),
     getBasicInfo: async () => ({ basic_info: {} }),
   };
-  const startedAt = Date.now();
   const snapshot = await collectYouTubeSurfaceSnapshot('channel-1', client, {
-    maxTotalMs: 5,
-    perCallTimeoutMs: 50,
+    maxTotalMs: 10,
+    perCallTimeoutMs: 10,
   });
   assert.deepEqual(snapshot, { comments: [], olderDescriptions: [], communityPosts: [], playlists: [] });
-  // The 5 ms deadline is intentionally tiny; allow event-loop scheduling
-  // slack while still proving the collector returns instead of waiting for the
-  // 50 ms surface promise.
-  assert.ok(Date.now() - startedAt < 1_000, 'collection exceeded the overall deadline');
 });
 
 test('a failed surface degrades to an empty snapshot instead of throwing', async () => {

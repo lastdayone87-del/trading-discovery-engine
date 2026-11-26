@@ -30,7 +30,7 @@
  * ELIGIBLE (legacy behavior byte-identical).
  */
 import { assessCrawlAdmission } from './communitySurfacePolicy';
-import { MULTILINGUAL_CONTROL_HINTS } from './multilingualCommunityLexicon';
+import { MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { canonicalSiteIdentity } from './siteIdentity';
 
 export type RelevanceTier = 'BLOCK' | 'DEMOTE' | 'ELIGIBLE';
@@ -75,7 +75,9 @@ export interface RelevanceDecision {
   policyVersion: string;
 }
 
-const COMMUNITY_HINT = MULTILINGUAL_CONTROL_HINTS;
+// Strong community evidence only. Generic paid/access/subscribe tokens must
+// not make an otherwise irrelevant URL fail open in relevance triage.
+const COMMUNITY_HINT = MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE;
 const MESSAGING_HOSTS = new Set([
   't.me', 'www.t.me', 'telegram.me', 'www.telegram.me', 'telegram.dog', 'www.telegram.dog',
   'wa.me', 'www.wa.me', 'whatsapp.com', 'www.whatsapp.com', 'chat.whatsapp.com',

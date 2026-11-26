@@ -635,7 +635,8 @@ export type ProfilerRedirectFailure =
   | 'DNS_TIMEOUT'
   | 'REDIRECT_LOOP'
   | 'REDIRECT_LIMIT'
-  | 'CROSS_ORIGIN_REDIRECT';
+  | 'CROSS_ORIGIN_REDIRECT'
+  | 'ROBOTS_DISALLOWED';
 
 export interface ProfilerTransportFailure {
   name: string;
@@ -666,6 +667,10 @@ export interface ProfilerFetchOptions {
   /** When set, reject a redirect before contacting it if its resolved origin
    * differs. Used by same-origin iframe traversal. */
   allowedRedirectOrigin?: string;
+  /** Async pre-contact gate for every redirect target. Returning false stops
+   * the chain before the target is requested; used by robots enforcement so a
+   * Disallow rule cannot be bypassed by an allowed seed redirecting into it. */
+  shouldFollowRedirect?: (targetUrl: string) => Promise<boolean>;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -991,6 +996,24 @@ export async function fetchProfilerUrl(
           redirectRejected: true,
           rejectedRedirect: nextUrl,
           redirectFailure: redirectFailureFor(decision.reason),
+        };
+      }
+      // Pre-contact robots gate runs only after the destination has passed
+      // the public-address/DNS guard, so a private redirect target never
+      // triggers a robots.txt lookup. A false result stops the chain before
+      // the target is requested.
+      if (options.shouldFollowRedirect && !(await options.shouldFollowRedirect(nextUrl))) {
+        await cancelRedirectBody(response);
+        return {
+          status: response.status,
+          contentType: response.headers.get('content-type') || '',
+          text: '',
+          truncated: false,
+          finalUrl: response.url || currentUrl,
+          redirectsFollowed,
+          redirectRejected: true,
+          rejectedRedirect: nextUrl,
+          redirectFailure: 'ROBOTS_DISALLOWED',
         };
       }
       if (redirectsFollowed.length >= maxHops) {

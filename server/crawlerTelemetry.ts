@@ -55,6 +55,12 @@ export const CRAWL_DROP_REASONS = [
    */
   'robots-disallowed',
   /**
+   * The per-crawl Crawl-delay budget was exhausted before this URL could be
+   * requested. The page was deliberately not fetched and coverage remains
+   * incomplete; this is a bounded-pacing skip, not a robots Disallow rule.
+   */
+  'robots-delay-budget',
+  /**
    * A fetched URL returned an image/font/script/media content type. It was
    * screened after fetch and did not consume the static page/exploration
    * budget; documents and HTML remain counted normally.

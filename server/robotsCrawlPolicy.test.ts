@@ -135,6 +135,58 @@ test('a robots-disallowed seed is not escalated to the rendered tier', async () 
   }
 });
 
+test('a redirect into a disallowed path is stopped before contact', async () => {
+  const previous = process.env.CRAWLER_ROBOTS_ENFORCEMENT;
+  process.env.CRAWLER_ROBOTS_ENFORCEMENT = 'true';
+  const requested: string[] = [];
+  try {
+    const result = await crawl('https://creator.example/allowed', (async (input) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.endsWith('/robots.txt')) {
+        return new Response('User-agent: *\nDisallow: /private\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+      }
+      if (url === 'https://creator.example/allowed') {
+        return new Response('', { status: 302, headers: { location: '/private/discord' } });
+      }
+      return new Response('<a href="https://discord.gg/MUSTNOTFETCH">Discord</a>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch);
+    assert.deepEqual(result.candidates, []);
+    assert.equal(requested.includes('https://creator.example/private/discord'), false);
+    assert.equal(result.observations[0]?.failureClass, 'ROBOTS_DISALLOWED');
+  } finally {
+    if (previous === undefined) delete process.env.CRAWLER_ROBOTS_ENFORCEMENT;
+    else process.env.CRAWLER_ROBOTS_ENFORCEMENT = previous;
+  }
+});
+
+test('a disallowed child does not suppress a separate root block escalation', async () => {
+  const { isExternalBlockEscalation } = await import('./inspector');
+  const blocked = (requestedUrl: string, failureClass: string) => ({
+    requestedUrl,
+    rootUrl: 'https://linktr.ee/creator',
+    outcome: 'ACQUISITION_FAILED',
+    retryable: true,
+    httpStatus: 403,
+    failureClass,
+    detail: '',
+    observedAt: '',
+    surface: 'CREATOR_WEBSITES',
+    required: false,
+  } as any);
+  assert.equal(isExternalBlockEscalation({
+    outcome: 'PARTIALLY_INSPECTED',
+    observations: [
+      blocked('https://linktr.ee/private', 'ROBOTS_DISALLOWED'),
+      blocked('https://linktr.ee/creator', 'HTTP_ERROR'),
+    ],
+  }, 'https://linktr.ee/creator'), true, 'the root 403 still justifies escalation');
+  assert.equal(isExternalBlockEscalation({
+    outcome: 'PARTIALLY_INSPECTED',
+    observations: [blocked('https://linktr.ee/creator', 'ROBOTS_DISALLOWED')],
+  }, 'https://linktr.ee/creator'), false, 'a disallowed root is terminal');
+});
+
 test('crawl path allows a creator page when robots returns 403', async () => {
   const previous = process.env.CRAWLER_ROBOTS_ENFORCEMENT;
   process.env.CRAWLER_ROBOTS_ENFORCEMENT = 'true';

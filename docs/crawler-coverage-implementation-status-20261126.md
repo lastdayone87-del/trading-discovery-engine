@@ -31,7 +31,7 @@
 | Check | Result |
 |---|---|
 | TypeScript (`npm run lint`) | **pass** |
-| Targeted extraction/navigation/YouTube/robots tests | **39/39 pass** |
+| Targeted extraction/navigation/YouTube/robots/validation tests | **pass** (runs expanded as review findings were fixed) |
 | Browser/rendered/queue source-contract tests | **158/158 pass** |
 | Multilingual/lexicon tests | **pass** |
 | Crawler exploration/robots/content/YouTube | **pass** |
@@ -42,7 +42,8 @@
 
 - **Viewer comments were becoming creator-owned evidence.** Comments now carry
   author ownership and real video IDs; viewer comments use `YOUTUBE_COMMENTS`
-  and cannot earn creator-description ownership points.
+  and cannot earn creator-description ownership points. The same rule applies
+  to a pinned comment authored by a viewer.
 - **Robots-disallowed seeds still escalated to browser.** `ROBOTS_DISALLOWED`
   is now a static terminal barrier, excluded from external-block escalation,
   and checked before same-origin iframe fetches.
@@ -54,6 +55,34 @@
   observations as well as native codes.
 - **Paid-community fallback was unreachable.** `premium platform` / `paid
   server` again qualifies through the platform/server context.
+- **Validation still rejected the newly admitted codes.** `discordValidator`
+  now imports the same structural route set as extraction; `store`, `channels`,
+  `support`, `template` and the other 12 live-valid codes reach the Discord API
+  instead of failing as `INVALID_LOCATOR` before any request.
+- **Redirects bypassed robots.** Redirect targets are now gated before contact;
+  a target blocked by Disallow or by the per-crawl Crawl-delay budget is
+  recorded as `ROBOTS_DISALLOWED` and is never parsed for invite codes.
+- **Disallowed children consumed destination budget.** Robots is checked before
+  `destinationBudget.reserve`, so a policy skip cannot starve an allowed page.
+- **Crawl-delay could stall an inspection.** Pacing is per origin, not before
+  every request, and bounded to 10s per crawl; skipped URLs are counted as
+  `robots-delay-budget` and keep coverage incomplete.
+- **Child assets could exceed the fetch cap.** Asset fetches now have their own
+  page-cap budget, so they still do not consume document slots but cannot grow
+  total child fetches without bound.
+- **Ordinary substrings and markup produced false community/invite evidence.**
+  Latin lexicon terms now require token boundaries while keeping common
+  inflections; generic access terms moved to weak; `club` is weak while
+  `trading club` stays strong; tag-fragment rejoin accepts only inline
+  formatting tags. Hyphenated paths are normalized before matching.
+- **YouTube pagination fetched an extra page.** Video and Community loops count
+  the first page and stop at the cap. Timed-out Innertube promises are guarded
+  against unhandled rejection, and client initialization is bounded.
+- **A failed fetch with invite evidence still reported failure.** It now records
+  `FOUND`, is non-retryable, and does not trigger a render/retry for the same
+  bytes.
+- **Frontier canary keyed on the raw seed.** It now buckets by canonical site
+  identity so scheme/www/path variants of one site receive one treatment.
 
 ### Review corrections made during this batch
 
@@ -89,6 +118,8 @@ and arbitrary app routes are explicitly deferred, not treated as covered.
 | PDF parsing / OCR / closed shadow | Deferred/out of scope unless new measured evidence |
 | Site-profiler/ladder 5% canary | Frontier 5% canary implemented; profiler/ladder still controlled by existing flags |
 | Full 100-site browser V4 | Requires browser infrastructure; YouTube 100 + render 19 + fixtures are the current evidence |
+| Cross-process robots pacing | Crawl-delay is coordinated per crawl/process, not across every worker process; robots enforcement remains canary-gated |
+| True cancellation of timed-out YouTube calls | Innertube has no generic abort surface here; late rejections are contained, but an abandoned request may still finish at the network layer |
 | Production deployment | Not yet; code is on the branch |
 
 ---

@@ -1018,7 +1018,7 @@ test('a later strong label admits a URL whose first anchor is weak', () => {
   const plan = planRenderedCrossOriginEnqueues({
     candidates: [
       { url: 'https://outside.example/go', text: 'About', sourceUrl: 'https://creator.example/' },
-      { url: 'https://outside.example/go', text: 'Club', sourceUrl: 'https://creator.example/home' },
+      { url: 'https://outside.example/go', text: 'Community', sourceUrl: 'https://creator.example/home' },
     ],
     currentUrl: 'https://creator.example/home',
     alreadyVisited: new Set(),

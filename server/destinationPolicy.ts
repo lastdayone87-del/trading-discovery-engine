@@ -140,7 +140,9 @@ export function shouldFollowDestination(input: {
   // community surface. Anchor text remains the primary user-visible signal.
   let pathname = input.url;
   try { pathname = new URL(input.url).pathname || '/'; } catch { /* admission already validated */ }
-  const text = `${pathname} ${input.anchorText || ''}`;
+  // Path separators are normalized so the space-delimited lexicon matches
+  // hyphenated/underscored URLs (`/trading-room` -> `trading room`).
+  const text = `${pathname.replace(/[-_/]+/g, ' ')} ${input.anchorText || ''}`;
   const knownHost = isKnownCommunityDestinationHost(host);
   const strongEvidence = hasStrongCommunityEvidence(text);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);

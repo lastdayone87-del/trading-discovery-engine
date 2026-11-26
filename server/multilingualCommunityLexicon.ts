@@ -14,79 +14,94 @@
 export const MULTILINGUAL_STRONG_COMMUNITY_TERMS: readonly string[] = [
   // English / platform identities
   'discord', 'community', 'join', 'member', 'members', 'membership', 'vip',
-  'group', 'private', 'trading room', 'trading floor', 'chat', 'club',
+  'group', 'private', 'trading room', 'trading floor', 'trading club', 'chat',
   'signal', 'signals', 'academy', 'mastermind', 'mentor',
   'whop', 'skool', 'circle', 'patreon',
   // German
   'beitreten', 'mitglied', 'mitglieder', 'gemeinschaft', 'gruppe', 'privat',
-  'signale', 'zugang', 'community',
+  'signale', 'community',
   // French
   'communauté', 'communaute', 'rejoindre', 'adhérer', 'adherer', 'membre', 'membres', 'groupe',
-  'privé', 'prive', 'signaux', 'accès', 'acces', 'salon',
+  'privé', 'prive', 'signaux', 'salon',
   // Dutch
   'gemeenschap', 'lid worden', 'leden', 'groep', 'privé', 'prive',
-  'signalen', 'toegang',
+  'signalen',
   // Danish
   'fællesskab', 'faellesskab', 'deltag', 'medlem', 'medlemmer', 'gruppe',
-  'signaler', 'adgang',
+  'signaler',
   // Norwegian
   'fellesskap', 'bli med', 'medlem', 'medlemmer', 'gruppe', 'signaler',
-  'tilgang',
   // Swedish
   'gemenskap', 'gå med', 'ga med', 'medlem', 'medlemmar', 'grupp',
-  'signaler', 'åtkomst', 'atkomst',
+  'signaler',
   // Arabic
   'ديسكورد', 'مجتمع', 'انضم', 'عضو', 'أعضاء', 'مجموعة', 'خاص', 'دردشة',
-  'إشارات', 'وصول',
+  'إشارات',
   // Chinese
-  '社区', '社群', '加入', '会员', '成员', '群组', '私密', '聊天', '信号', '访问',
+  '社区', '社群', '加入', '会员', '成员', '群组', '私密', '聊天', '信号',
   // Irish
-  'pobal', 'comhphobal', 'páirt a ghlacadh', 'pairt a ghlacadh', 'ball',
-  'baill', 'grúpa', 'grupa', 'príobháideach', 'priobhaideach', 'comhrá',
-  'comhra', 'comharthaí', 'comharthai', 'rochtain',
+  'pobal', 'comhphobal', 'páirt a ghlacadh', 'pairt a ghlacadh',
+  'grúpa', 'grupa', 'príobháideach', 'priobhaideach', 'comhrá',
+  'comhra', 'comharthaí', 'comharthai',
   // Luxembourgish
   'communautéit', 'communautit', 'matmaachen', 'member', 'memberen',
-  'grupp', 'privat', 'signaler', 'zougang',
+  'grupp', 'privat', 'signaler',
   // Extra high-volume languages
   'comunidad', 'unirse', 'miembro', 'grupo', 'privado', 'señales', 'senales',
-  'acceso', 'comunidade', 'entrar', 'membro', 'privado', 'sinais', 'acesso',
+  'comunidade', 'membro', 'privado', 'sinais',
   'comunità', 'comunita', 'unisciti', 'membro', 'gruppo', 'privato',
-  'segnali', 'accesso', 'コミュニティ', '参加', 'メンバー', 'グループ',
-  'プライベート', 'チャット', 'シグナル', 'アクセス',
+  'segnali', 'コミュニティ', '参加', 'メンバー', 'グループ',
+  'プライベート', 'チャット', 'シグナル',
 ];
 
 export const MULTILINGUAL_WEAK_COMMUNITY_TERMS: readonly string[] = [
   // English
-  'links', 'social', 'contact', 'about', 'resources', 'support',
+  'links', 'social', 'contact', 'about', 'resources', 'support', 'access', 'club',
   // German
-  'links', 'kontakt', 'über uns', 'uber uns', 'ressourcen', 'hilfe',
+  'links', 'kontakt', 'über uns', 'uber uns', 'ressourcen', 'hilfe', 'zugang',
   // French
-  'liens', 'contact', 'à propos', 'a propos', 'ressources', 'aide',
+  'liens', 'contact', 'à propos', 'a propos', 'ressources', 'aide', 'accès', 'acces',
   // Dutch
-  'links', 'contact', 'over ons', 'bronnen', 'hulp',
+  'links', 'contact', 'over ons', 'bronnen', 'hulp', 'toegang',
   // Danish
-  'links', 'kontakt', 'om os', 'ressourcer', 'hjælp', 'hjaelp',
+  'links', 'kontakt', 'om os', 'ressourcer', 'hjælp', 'hjaelp', 'adgang',
   // Norwegian
-  'lenker', 'kontakt', 'om oss', 'ressurser', 'hjelp',
+  'lenker', 'kontakt', 'om oss', 'ressurser', 'hjelp', 'tilgang',
   // Swedish
   'länkar', 'lankar', 'kontakt', 'om oss', 'resurser', 'hjälp', 'hjalp',
+  'åtkomst', 'atkomst',
   // Arabic
-  'روابط', 'اتصل', 'حول', 'موارد', 'دعم',
+  'روابط', 'اتصل', 'حول', 'موارد', 'دعم', 'وصول',
   // Chinese
-  '链接', '联系', '关于', '资源', '支持',
+  '链接', '联系', '关于', '资源', '支持', '访问',
   // Irish
   'naisc', 'teagmháil', 'teagmhail', 'fúinn', 'fuinn', 'acmhainní', 'acmhainni', 'tacaíocht', 'tacaiocht',
+  'ball', 'baill', 'rochtain',
   // Luxembourgish
-  'linken', 'kontakt', 'iwwer eis', 'ressourcen', 'ënnerstëtzung', 'ennerstetzung',
+  'linken', 'kontakt', 'iwwer eis', 'ressourcen', 'ënnerstëtzung', 'ennerstetzung', 'zougang',
   // Extra
-  'enlaces', 'contacto', 'sobre nosotros', 'recursos', 'ayuda',
-  'links', 'contato', 'sobre', 'recursos', 'ajuda',
-  'link', 'contatto', 'chi siamo', 'risorse', 'supporto',
-  'リンク', 'お問い合わせ', '概要', 'リソース', 'サポート',
+  'enlaces', 'contacto', 'sobre nosotros', 'recursos', 'ayuda', 'acceso',
+  'links', 'contato', 'sobre', 'recursos', 'ajuda', 'acesso', 'entrar',
+  'link', 'contatto', 'chi siamo', 'risorse', 'supporto', 'accesso',
+  'リンク', 'お問い合わせ', '概要', 'リソース', 'サポート', 'アクセス',
 ];
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const LATIN_TERM = /^[\p{Script=Latin}\p{N}\s'’\-_.&]+$/u;
+
+function termPattern(term: string): string {
+  const escaped = escapeRegex(term);
+  // Non-Latin scripts use no word boundaries: CJK terms are not
+  // space-delimited and Arabic commonly attaches prefixes/suffixes.
+  if (!LATIN_TERM.test(term)) return escaped;
+  // Start boundary prevents ordinary English words from matching inside
+  // larger ones (`remember` -> member, `football` -> ball, `chatgpt` -> chat).
+  // A small suffix set keeps common inflections (joining, members, clubs)
+  // without opening arbitrary substrings. Property escapes cover accents.
+  return `(?<![\\p{L}\\p{N}])${escaped}(?:s|es|ed|ing)?(?![\\p{L}\\p{N}])`;
 }
 
 function termRegex(terms: readonly string[]): RegExp {
@@ -94,7 +109,7 @@ function termRegex(terms: readonly string[]): RegExp {
   // single-word substrings (e.g. "trading room" before "room").
   const unique = [...new Set(terms.map(term => term.trim().toLowerCase()).filter(Boolean))]
     .sort((a, b) => b.length - a.length);
-  return new RegExp(`(?:${unique.map(escapeRegex).join('|')})`, 'i');
+  return new RegExp(`(?:${unique.map(termPattern).join('|')})`, 'iu');
 }
 
 export const MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE = termRegex(MULTILINGUAL_STRONG_COMMUNITY_TERMS);

@@ -137,7 +137,7 @@ test('telemetry constructors carry drops and scroll usage', () => {
 
 test('static exploration bound is 12 with destination-budget drop accounting', () => {
   const source = readFileSync(new URL('./inspector.ts', import.meta.url), 'utf8');
-  assert.match(source, /while\(queue\.length&&explored<explorationLimits\.pageCap\)/);
+  assert.match(source, /while\(queue\.length&&explored<explorationLimits\.pageCap&&assetFetches<explorationLimits\.pageCap\)/);
   for (const marker of [
     "countUnique('invalid-protocol'",
     "shouldFollowDestination(",
@@ -153,7 +153,7 @@ test('static exploration bound is 12 with destination-budget drop accounting', (
   ]) {
     assert.ok(source.includes(marker), `missing static wiring: ${marker}`);
   }
-  assert.equal(CRAWL_DROP_REASONS.length, 19, 'asset/robots exclusions extend the closed taxonomy additively');
+  assert.equal(CRAWL_DROP_REASONS.length, 20, 'asset/robots/pacing exclusions extend the closed taxonomy additively');
   assert.ok(CRAWL_DROP_REASONS.includes('destination-budget'));
   assert.ok(CRAWL_DROP_REASONS.includes('frame-slice'));
 });

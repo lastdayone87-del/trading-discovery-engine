@@ -29,6 +29,8 @@ test('a readable 403 body retains invite evidence', async () => {
     { status: 403, headers: { 'content-type': 'text/html' } },
   )) as typeof fetch);
   assert.equal(result.candidates[0]?.nativeInviteCode, 'FORBIDDENBODY');
+  assert.equal(result.observations[0]?.outcome, 'FOUND');
+  assert.equal(result.observations[0]?.retryable, false);
 });
 
 test('a child 404 body is scanned without becoming terminal-root evidence', async () => {

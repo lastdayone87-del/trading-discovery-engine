@@ -36,6 +36,34 @@ test('localized join/community CTAs open a cross-origin community destination', 
   }
 });
 
+test('ordinary words do not become community evidence through substrings', () => {
+  for (const phrase of ['remember', 'football club', 'chatgpt', 'groupon', 'privacy policy', 'market access']) {
+    assert.equal(hasMultilingualStrongCommunityEvidence(phrase), false, phrase);
+  }
+  assert.equal(hasMultilingualStrongCommunityEvidence('members'), true);
+  assert.equal(hasMultilingualStrongCommunityEvidence('joining'), true);
+});
+
+test('hyphenated multilingual paths still match the lexicon', () => {
+  const decision = shouldFollowDestination({
+    url: 'https://hub.example/trading-room',
+    currentUrl: 'https://creator.example/',
+  });
+  assert.equal(decision.eligible, true);
+  assert.equal(decision.reason, 'community-evidence');
+});
+
+test('generic access terms no longer open an unknown host alone', () => {
+  for (const phrase of ['acceso', 'accès', 'zugang', 'access']) {
+    const decision = shouldFollowDestination({
+      url: 'https://hub.example/x',
+      currentUrl: 'https://creator.example/',
+      anchorText: phrase,
+    });
+    assert.equal(decision.eligible, false, phrase);
+  }
+});
+
 test('paid community wording still qualifies with a platform/server context', () => {
   for (const phrase of ['paid server', 'premium platform', 'members area server']) {
     const decision = shouldFollowDestination({
