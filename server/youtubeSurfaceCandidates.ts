@@ -78,6 +78,19 @@ export interface YouTubeSurfaceClient {
   getPlaylist?(playlistId: string): Promise<any>;
 }
 
+/** Local, player-less session options used by the production adapter. They
+ * keep initialization fast because channel/comments/Community reads do not
+ * need the JS player or a remote InnerTube config. Exported so the contract is
+ * testable without a network call. */
+export const YOUTUBE_SURFACE_SESSION_OPTIONS = {
+  lang: 'en',
+  location: 'US',
+  retrieve_player: false,
+  retrieve_innertube_config: false,
+  generate_session_locally: true,
+  enable_session_cache: false,
+} as const;
+
 /** Production adapter. Dynamic import keeps the YouTube parser and its
  * initialization cost out of workers that never touch these surfaces. */
 export async function createYouTubeSurfaceClient(timeoutMs = 15_000): Promise<YouTubeSurfaceClient> {
@@ -96,15 +109,7 @@ export async function createYouTubeSurfaceClient(timeoutMs = 15_000): Promise<Yo
   // open before the collector's own deadline starts.
   const yt: any = await withTimeout(
     Innertube.create({
-      lang: 'en',
-      location: 'US',
-      // Comments/channel/Community reads do not need the JS player or a
-      // remote InnerTube config. Generating the session locally keeps
-      // initialization fast and avoids a startup timeout on slow egress.
-      retrieve_player: false,
-      retrieve_innertube_config: false,
-      generate_session_locally: true,
-      enable_session_cache: false,
+      ...YOUTUBE_SURFACE_SESSION_OPTIONS,
       fetch: boundedFetch,
     }),
     timeoutMs,
