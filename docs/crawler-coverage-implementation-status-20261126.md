@@ -35,8 +35,9 @@
 | Browser/rendered/queue source-contract tests | **158/158 pass** |
 | Multilingual/lexicon tests | **pass** |
 | Crawler exploration/robots/content/YouTube | **pass** |
-| Full suite, first run | 5,704 tests: 5,380 pass, 67 fail; 3 failures were caused by this batch (`static exploration bound`, `skipped navigable anchors`, `structural navigation`) and were fixed |
-| Full suite, second run | 5,708 tests: **5,388 pass, 63 fail**, 257 skipped; no modified crawler/extraction test is in the remaining failure set. The 63 are unrelated legacy/DB/source-text failures in modules such as quarantine, query lifecycle, release audits, and `viteConfig` |
+| Full suite, final rebased run | 5,729 tests: **5,409 pass, 63 fail**, 257 skipped. No modified crawler/extraction/YouTube/robots test is in the failure set; the 63 are pre-existing/environmental legacy DB/source-text failures (quarantine, query lifecycle, release audits, `viteConfig`) |
+| Failure-set comparison vs `origin/main` `f0aa55b3` | Every final failure name reproduces on the unmodified baseline in targeted runs (48 baseline-file failures + 13 in the six missed files + 3 in `scopePromotedDiscovery`); no branch-only failure. The two `youtubeInnertubeProvider` timing failures seen under full-suite load pass when run alone (44/44) |
+| Targeted rebased review suite | **231/231 pass** across extraction, reserved codes, validation, obfuscation, collisions, multilingual, robots, exploration, content types, failure bodies, YouTube, rendered enqueue and queue source contracts |
 
 ### Review bot findings fixed before merge
 
