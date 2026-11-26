@@ -31,6 +31,20 @@ test('a readable 403 body retains invite evidence', async () => {
   assert.equal(result.candidates[0]?.nativeInviteCode, 'FORBIDDENBODY');
 });
 
+test('a child 404 body is scanned without becoming terminal-root evidence', async () => {
+  const result = await crawl('https://public.example/', (async (input) => {
+    const url = String(input);
+    if (url === 'https://public.example/') {
+      return new Response('<a href="/missing">Community</a>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    return new Response('<html><a href="https://discord.gg/CHILD404">Discord</a></html>', {
+      status: 404,
+      headers: { 'content-type': 'text/html' },
+    });
+  }) as typeof fetch);
+  assert.equal(result.candidates[0]?.nativeInviteCode, 'CHILD404');
+});
+
 test('a redirect target is scanned even when the final fetch is blocked', async () => {
   const result = await crawl('https://public.example/go', (async (input) => {
     const url = String(input);

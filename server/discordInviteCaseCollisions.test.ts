@@ -24,6 +24,13 @@ test('detects distinct raw codes that share the lowercase canonical identity', (
   assert.deepEqual(collisions[0]?.codes.sort(), ['AbC123', 'abc123']);
 });
 
+test('detects case variants preserved in merged observations', () => {
+  const merged = mergeDiscordCandidates([candidate('AbC123'), candidate('abc123')]);
+  const collisions = detectDiscordInviteCaseCollisions(merged);
+  assert.equal(collisions.length, 1);
+  assert.deepEqual(collisions[0]?.codes.sort(), ['AbC123', 'abc123']);
+});
+
 test('does not report ordinary duplicates or distinct codes', () => {
   assert.deepEqual(detectDiscordInviteCaseCollisions([candidate('SameCode'), candidate('SameCode')]), []);
   assert.deepEqual(detectDiscordInviteCaseCollisions([candidate('alpha'), candidate('beta')]), []);

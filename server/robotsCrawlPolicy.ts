@@ -90,7 +90,11 @@ export class RobotsCrawlPolicy {
     }
     let evaluation;
     try {
-      evaluation = evaluateRobotsForPath(policy.parsed, PROFILER_USER_AGENT, parsedUrl.pathname || '/');
+      evaluation = evaluateRobotsForPath(
+        policy.parsed,
+        PROFILER_USER_AGENT,
+        `${parsedUrl.pathname || '/'}${parsedUrl.search || ''}`,
+      );
     } catch {
       return { allowed: true, reason: 'UNKNOWN', crawlDelayMs: 0 };
     }

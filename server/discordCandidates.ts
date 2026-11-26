@@ -224,6 +224,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   else if(surfaces.has('RECENT_VIDEO_DESCRIPTIONS')){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
   else if(surfaces.has('SOCIAL_PROFILES')){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
   else if(surfaces.has('CREATOR_WEBSITES')){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
+  else if(surfaces.has('YOUTUBE_COMMENTS')){score+=0;reasons.push('VIEWER_COMMENT_SURFACE');}
 
   // A channel external link is a creator-controlled surface. Explicit extraction
   // is enough corroboration to cross the creator-owned gate unless contradictory
@@ -305,13 +306,19 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
 export interface DiscordInviteCaseCollision {canonicalCode:string;codes:string[]}
 export function detectDiscordInviteCaseCollisions(items:DiscordCandidate[]):DiscordInviteCaseCollision[]{
   const byCanonical=new Map<string,Set<string>>();
-  for(const item of items){
-    const code=item.nativeInviteCode;
-    if(!code)continue;
+  const add=(code:string|null|undefined)=>{
+    if(!code)return;
     const canonical=discordInviteCodeOf(code);
-    if(!canonical)continue;
+    if(!canonical)return;
     if(!byCanonical.has(canonical))byCanonical.set(canonical,new Set());
     byCanonical.get(canonical)!.add(code);
+  };
+  for(const item of items){
+    add(item.nativeInviteCode);
+    // A merged candidate keeps observations from both surfaces. Inspect raw
+    // locators too, because mergeDiscordCandidates collapses the candidate
+    // native code before this detector runs.
+    for(const observation of item.observations||[])add(extractDiscordInviteCodeRaw(observation.rawLocator));
   }
   return [...byCanonical.entries()]
     .filter(([,codes])=>codes.size>1)

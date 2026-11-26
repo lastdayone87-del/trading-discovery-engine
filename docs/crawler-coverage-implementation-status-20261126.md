@@ -38,6 +38,23 @@
 | Full suite, first run | 5,704 tests: 5,380 pass, 67 fail; 3 failures were caused by this batch (`static exploration bound`, `skipped navigable anchors`, `structural navigation`) and were fixed |
 | Full suite, second run | 5,708 tests: **5,388 pass, 63 fail**, 257 skipped; no modified crawler/extraction test is in the remaining failure set. The 63 are unrelated legacy/DB/source-text failures in modules such as quarantine, query lifecycle, release audits, and `viteConfig` |
 
+### Review bot findings fixed before merge
+
+- **Viewer comments were becoming creator-owned evidence.** Comments now carry
+  author ownership and real video IDs; viewer comments use `YOUTUBE_COMMENTS`
+  and cannot earn creator-description ownership points.
+- **Robots-disallowed seeds still escalated to browser.** `ROBOTS_DISALLOWED`
+  is now a static terminal barrier, excluded from external-block escalation,
+  and checked before same-origin iframe fetches.
+- **Robots query rules were ignored.** The evaluator now receives pathname +
+  query string.
+- **Child 404 bodies lost invites.** Child 404/410 bodies are read under a
+  bounded extraction scan without becoming terminal-root evidence.
+- **Case collision detector ran after merge.** It now inspects retained raw
+  observations as well as native codes.
+- **Paid-community fallback was unreachable.** `premium platform` / `paid
+  server` again qualifies through the platform/server context.
+
 ### Review corrections made during this batch
 
 - Fixed recursive `callTimeout()` introduced by a perl substitution in the YouTube collector; added an overall deadline test.

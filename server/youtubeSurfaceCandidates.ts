@@ -24,12 +24,29 @@ import {
   type DiscordCandidate,
 } from './discordCandidates';
 
+export interface YouTubeCommentSnapshot {
+  text: string;
+  videoId: string;
+  creator: boolean;
+}
+
+export interface YouTubeDescriptionSnapshot {
+  text: string;
+  videoId: string;
+}
+
+export interface YouTubeCommunityPostSnapshot {
+  text: string;
+  postId: string;
+}
+
 export interface YouTubeSurfaceSnapshot {
   pinnedComment?: string;
-  comments: string[];
-  olderDescriptions: string[];
-  communityPosts: string[];
-  playlists: string[];
+  pinnedVideoId?: string;
+  comments: YouTubeCommentSnapshot[];
+  olderDescriptions: YouTubeDescriptionSnapshot[];
+  communityPosts: YouTubeCommunityPostSnapshot[];
+  playlists: Array<{ text: string; playlistId: string }>;
 }
 
 export interface YouTubeSurfaceLimits {
@@ -166,11 +183,15 @@ export async function collectYouTubeSurfaceSnapshot(
       for (const item of comments?.contents || []) {
         const parsed = commentText(item?.comment ?? item);
         if (!parsed.text) continue;
-        if (parsed.pinned && !snapshot.pinnedComment) snapshot.pinnedComment = parsed.text;
-        // Keep creator comments first; all top comments are still retained
-        // for extraction because a creator may post an invite in a reply.
-        if (parsed.owner) snapshot.comments.unshift(parsed.text);
-        else snapshot.comments.push(parsed.text);
+        if (parsed.pinned && !snapshot.pinnedComment) {
+          snapshot.pinnedComment = parsed.text;
+          snapshot.pinnedVideoId = videoId;
+        }
+        // Authorship is preserved: only creator-authored comments may become
+        // RECENT_VIDEO_DESCRIPTIONS evidence. Viewer comments use the
+        // distinct YOUTUBE_COMMENTS surface and cannot gain creator ownership
+        // through repetition.
+        snapshot.comments.push({ text: parsed.text, videoId, creator: parsed.owner });
       }
     } catch { /* comments may be disabled */ }
   }
@@ -181,7 +202,7 @@ export async function collectYouTubeSurfaceSnapshot(
     try {
       const info: any = await withTimeout(client.getBasicInfo(videoId), callTimeout());
       const description = textOf(info?.basic_info?.description || info?.secondary_info?.description).trim();
-      if (description) snapshot.olderDescriptions.push(description);
+      if (description) snapshot.olderDescriptions.push({ text: description, videoId });
     } catch { /* one failed description does not stop the surface */ }
   }
 
@@ -193,7 +214,7 @@ export async function collectYouTubeSurfaceSnapshot(
       while (feed && pages < settings.maxCommunityPages && !expired()) {
         for (const post of feed.posts || []) {
           const text = textOf(post?.content).trim();
-          if (text) snapshot.communityPosts.push(text);
+          if (text) snapshot.communityPosts.push({ text, postId: String(post?.id || '') });
         }
         if (!feed.has_continuation) break;
         feed = await withTimeout(feed.getContinuation?.(), callTimeout());
@@ -215,20 +236,20 @@ export async function collectYouTubeSurfaceSnapshot(
             ? await withTimeout(client.getPlaylist(id), callTimeout())
             : null;
           const description = textOf(full?.info?.description).trim();
-          if (description) snapshot.playlists.push(description);
+          if (description) snapshot.playlists.push({ text: description, playlistId: id });
           for (const item of (full?.items || []).slice(0, 20)) {
             const text = textOf(item?.description || item?.title).trim();
-            if (text) snapshot.playlists.push(text);
+            if (text) snapshot.playlists.push({ text, playlistId: id });
           }
         } catch { /* playlist may be private/deleted */ }
       }
     } catch { /* playlist tab may be unavailable */ }
   }
 
-  snapshot.comments = [...new Set(snapshot.comments)].slice(0, 40);
-  snapshot.olderDescriptions = [...new Set(snapshot.olderDescriptions)].slice(0, settings.maxOlderDescriptions);
-  snapshot.communityPosts = [...new Set(snapshot.communityPosts)].slice(0, 20);
-  snapshot.playlists = [...new Set(snapshot.playlists)].slice(0, 20);
+  snapshot.comments = [...new Map(snapshot.comments.map(comment => [`${comment.videoId}\u0000${comment.text}`, comment])).values()].slice(0, 40);
+  snapshot.olderDescriptions = [...new Map(snapshot.olderDescriptions.map(description => [description.videoId, description])).values()].slice(0, settings.maxOlderDescriptions);
+  snapshot.communityPosts = [...new Map(snapshot.communityPosts.map(post => [post.postId || post.text, post])).values()].slice(0, 20);
+  snapshot.playlists = [...new Map(snapshot.playlists.map(playlist => [`${playlist.playlistId}\u0000${playlist.text}`, playlist])).values()].slice(0, 20);
   return snapshot;
 }
 
@@ -253,19 +274,46 @@ export function candidatesFromYouTubeSnapshot(
   const out: DiscordCandidate[] = [];
   const source = (suffix: string) => `youtube:channel:${channelId}:${suffix}`;
   if (snapshot.pinnedComment) {
-    out.push(...extractDiscordCandidates(snapshot.pinnedComment, 'PINNED_COMMENT', source('pinned-comment')));
+    out.push(...extractDiscordCandidates(
+      snapshot.pinnedComment,
+      'PINNED_COMMENT',
+      source(`video:${snapshot.pinnedVideoId || 'unknown'}:pinned-comment`),
+    ));
   }
   for (let i = 0; i < snapshot.comments.length; i++) {
-    out.push(...extractDiscordCandidates(snapshot.comments[i], 'RECENT_VIDEO_DESCRIPTIONS', source(`top-comment-${i + 1}`)));
+    const comment = snapshot.comments[i];
+    // Viewer comments are retained for discovery but can never contribute
+    // creator-video ownership points. Only the creator's own comments use the
+    // creator-description surface.
+    out.push(...extractDiscordCandidates(
+      comment.text,
+      comment.creator ? 'RECENT_VIDEO_DESCRIPTIONS' : 'YOUTUBE_COMMENTS',
+      source(`video:${comment.videoId || 'unknown'}:comment:${i + 1}`),
+    ));
   }
   for (let i = 0; i < snapshot.olderDescriptions.length; i++) {
-    out.push(...extractDiscordCandidates(snapshot.olderDescriptions[i], 'RECENT_VIDEO_DESCRIPTIONS', source(`older-description-${i + 1}`)));
+    const description = snapshot.olderDescriptions[i];
+    out.push(...extractDiscordCandidates(
+      description.text,
+      'RECENT_VIDEO_DESCRIPTIONS',
+      source(`video:${description.videoId || 'unknown'}:older-description:${i + 1}`),
+    ));
   }
   for (let i = 0; i < snapshot.communityPosts.length; i++) {
-    out.push(...extractDiscordCandidates(snapshot.communityPosts[i], 'RECENT_VIDEO_DESCRIPTIONS', source(`community-post-${i + 1}`)));
+    const post = snapshot.communityPosts[i];
+    out.push(...extractDiscordCandidates(
+      post.text,
+      'RECENT_VIDEO_DESCRIPTIONS',
+      source(`community-post:${post.postId || i + 1}`),
+    ));
   }
   for (let i = 0; i < snapshot.playlists.length; i++) {
-    out.push(...extractDiscordCandidates(snapshot.playlists[i], 'RECENT_VIDEO_DESCRIPTIONS', source(`playlist-${i + 1}`)));
+    const playlist = snapshot.playlists[i];
+    out.push(...extractDiscordCandidates(
+      playlist.text,
+      'RECENT_VIDEO_DESCRIPTIONS',
+      source(`playlist:${playlist.playlistId || i + 1}:${i + 1}`),
+    ));
   }
   return mergeDiscordCandidates(out.filter(candidate => !!candidate.nativeInviteCode));
 }

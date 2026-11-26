@@ -85,8 +85,8 @@ coverage is much lower because of reachability and throughput:
 5. **YouTube surfaces are materially under-read.** Creator-owned live invites
    were found in a **pinned comment** and in **non-pinned comments/older video
    descriptions** that production never recorded. A targeted 10-channel sample
-   found 3 globally new live invites; a random 30-channel sample found 1 globally
-   new live Community-post invite (3.3%). Community posts are public and
+   found 3 globally new live invites; a random 90-channel sample found 3 globally
+   new live Community-post invites (3.3%). Community posts are public and
    paginated; comments and older uploads are public too.
 6. **Reserved-code rejection is a confirmed false negative.** 16 of 26 codes in
    the `reserved` set are valid live Discord invites (`store`, `home`, `about`,
@@ -515,7 +515,8 @@ capacity remains the largest structural blocker; first-invite/GATE global yield
 is lower than the mechanism alone suggested.
 
 1. **GAP-13 + GAP-28 — YouTube comments/pinned/Community/older** (strongest
-   measured yield: 3 global new live/10 targeted; 1/30 random; pinned dead).
+   measured yield: 3 global new live/10 targeted; 3/90 random; 6/100 total;
+   pinned dead).
 2. **GAP-29 — browser capacity architecture** (largest structural loss: 11,111
    saturated; 63,941 unrendered; 64/h; hard 2-slot cap; 47-day pass; real render
    sample 0/19 global new).

@@ -151,7 +151,7 @@ export interface InspectionResult {
   communityIntent?: CommunityIntentEvidence[];
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
-export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'PINNED_COMMENT'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
+export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'PINNED_COMMENT'|'YOUTUBE_COMMENTS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
 
 /**
  * Content types that carry readable document text. XHTML/XML/Atom/RSS were
@@ -447,7 +447,7 @@ function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): 
   return resolveHost ?? defaultDnsResolve;
 }
 
-async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
+async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
   // The end-to-end budget starts before the admission lookup. The lookup gets
   // only the remaining slice, and the following fetch gets what is left after
@@ -507,7 +507,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
       // evidence is never terminal evidence). Child-page 404s are never used
       // by the terminal barrier, so they keep the pre-existing body-
       // suppression behavior.
-      if(probeTerminalNotFoundBody&&(response.status===404||response.status===410)){
+      if((probeTerminalNotFoundBody||scanFailureBody)&&(response.status===404||response.status===410)){
         const type=contentType.toLowerCase();
         const charset=/charset\s*=\s*"?([^";]+)/i.exec(type)?.[1]?.trim()||'';
         // The probe reader decodes UTF-8 only. UTF-16/32 bodies would hide
@@ -518,7 +518,7 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
       if(response.status<200||response.status>=300)return false;
       return isTextualDocumentContentType(contentType);
     },
-    ...(probeTerminalNotFoundBody?{terminalNotFoundBodyMaxChars:64_000,terminalNotFoundBodyTimeoutMs:1_500}:{}),
+    ...((probeTerminalNotFoundBody||scanFailureBody)?{terminalNotFoundBodyMaxChars:64_000,terminalNotFoundBodyTimeoutMs:1_500}:{}),
   });
   if(!fetched){
     const timedOut=transportFailure?.name==='AbortError'||Date.now()-fetchStartedAt>=9900;
@@ -915,6 +915,15 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
         const frameAdmission=assessCrawlAdmission(absolute);
         if(!frameAdmission.eligible){drops.countUnique('admission-rejected',absolute);continue;}
         visitedFrameUrls.add(normalized);
+        if(robotsPolicy){
+          const frameRobots=await robotsPolicy.decide(absolute);
+          if(!frameRobots.allowed){
+            drops.countUnique('robots-disallowed',absolute);
+            logDetails.push(`[iframe] robots.txt disallowed ${absolute}`);
+            continue;
+          }
+          await respectRobotsDelay(frameRobots);
+        }
         iframeDocumentsInspected++;
         const iframeAcquired=await fetchExternalPage(absolute,fetchImpl,resolveHost,false,currentOrigin);
         if(!iframeAcquired.page){seedCeiling??='frame-slice';drops.count('frame-slice');logDetails.push(`[iframe] same-origin frame unavailable: ${absolute}`);continue;}
@@ -994,7 +1003,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       }
       await respectRobotsDelay(robots);
     }
-    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected)drops.count('asset-content-type');else explored++;if(subAcquired.observation)observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined})});if(!subPage){
+    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected)drops.count('asset-content-type');else explored++;if(subAcquired.observation)observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined})});if(!subPage){
       const failureCandidates=extractDiscordCandidates(`${subAcquired.observation?.finalUrl||next.url}\n${subAcquired.failureText||''}`,surface,next.url).filter(candidate=>candidate.nativeInviteCode);
       if(failureCandidates.length)discovered.push(...failureCandidates);
       if(frontierOn){
@@ -1210,7 +1219,7 @@ export function isExternalBlockEscalation(crawlRes: Pick<ExternalDiscordCrawlRes
     const status=Number(observation.httpStatus||0);
     const failureClass=String(observation.failureClass||'').toUpperCase();
     if(observation.staticNotFoundBodyConfirmed||observation.staticTerminalNotFound)return false;
-    if(['SSRF_BLOCKED','INVALID_REDIRECT','REDIRECT_LOOP','REDIRECT_LIMIT','UNSUPPORTED_CONTENT_TYPE'].includes(failureClass))return false;
+    if(['SSRF_BLOCKED','ROBOTS_DISALLOWED','INVALID_REDIRECT','REDIRECT_LOOP','REDIRECT_LIMIT','UNSUPPORTED_CONTENT_TYPE'].includes(failureClass))return false;
     if(['TRANSIENT_HTTP','RATE_LIMIT','TIMEOUT','NETWORK_FAILURE'].includes(failureClass))return true;
     return failureClass==='HTTP_ERROR'&&[401,403,406,408,425,429,451].includes(status);
   });
@@ -2480,7 +2489,9 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
     communityIntentCount: crawlRes.communityIntent?.length || 0,
   });
   if (staticNotFoundBarrier) markConfirmedStaticTerminalNotFound({ seedUrl: item.url, observations: crawlRes.observations });
-  const staticTerminalBarrier = staticSsrfBarrier || staticNotFoundBarrier || (loginSemantics && crawlRes.observations.some(o =>
+  const robotsBarrier = crawlRes.observations.some(o =>
+    o.requestedUrl === item.url && String(o.failureClass || '') === 'ROBOTS_DISALLOWED');
+  const staticTerminalBarrier = staticSsrfBarrier || staticNotFoundBarrier || robotsBarrier || (loginSemantics && crawlRes.observations.some(o =>
     (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
     (String(o.failureClass || '') === LOGIN_WALL_FAILURE_CLASS ||
      String(o.failureClass || '') === PAYWALL_FAILURE_CLASS ||
@@ -2595,7 +2606,9 @@ export async function runChannelInspection(channelData:{enableDebug?:boolean;cha
       communityIntentCount: crawlRes.communityIntent?.length || 0,
     });
     if (socialNotFoundBarrier) markConfirmedStaticTerminalNotFound({ seedUrl: item.url, observations: crawlRes.observations });
-    const socialTerminalBarrier = socialSsrfBarrier || socialNotFoundBarrier || (socialLoginSemantics && crawlRes.observations.some(o =>
+    const socialRobotsBarrier = crawlRes.observations.some(o =>
+      o.requestedUrl === item.url && String(o.failureClass || '') === 'ROBOTS_DISALLOWED');
+    const socialTerminalBarrier = socialSsrfBarrier || socialNotFoundBarrier || socialRobotsBarrier || (socialLoginSemantics && crawlRes.observations.some(o =>
       (o.outcome === 'PARTIALLY_INSPECTED' || o.outcome === 'ACQUISITION_FAILED') &&
       (String(o.failureClass || '') === 'LOGIN_WALL' ||
        String(o.failureClass || '') === 'PAYWALL_WALL' ||

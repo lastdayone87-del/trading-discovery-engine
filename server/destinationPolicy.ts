@@ -92,8 +92,11 @@ export function isKnownCommunityDestinationHost(host: string): boolean {
 
 function hasStrongCommunityEvidence(text: string): boolean {
   if (STRONG_COMMUNITY_EVIDENCE.test(text)) return true;
+  // Paid/access wording becomes qualifying only with a platform/server
+  // context. The multilingual strong regex is already the first check, so
+  // this fallback must keep the original platform/server terms.
   return STRONG_PAID_COMMUNITY_EVIDENCE.test(text)
-    && MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE.test(text);
+    && /(?:platform|server)/i.test(text);
 }
 
 /**

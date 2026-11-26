@@ -36,6 +36,17 @@ test('localized join/community CTAs open a cross-origin community destination', 
   }
 });
 
+test('paid community wording still qualifies with a platform/server context', () => {
+  for (const phrase of ['paid server', 'premium platform', 'members area server']) {
+    const decision = shouldFollowDestination({
+      url: 'https://hub.example/x',
+      currentUrl: 'https://creator.example/',
+      anchorText: phrase,
+    });
+    assert.equal(decision.eligible, true, phrase);
+  }
+});
+
 test('localized weak navigation labels do not open an unknown host alone', () => {
   for (const phrase of ['Kontakt', 'Liens', '关于', 'Teagmháil', 'Kontakt']) {
     const decision = shouldFollowDestination({

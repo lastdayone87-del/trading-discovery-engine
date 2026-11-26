@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { crawlExternalLinks } from './inspector';
+import { runChannelInspectionForTest } from './testCrawlHelpers';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
 
 const resolver = async (): Promise<string[]> => ['93.184.216.1'];
@@ -11,6 +12,15 @@ function fetchRobots(body: string, status = 200): typeof fetch {
     headers: { 'content-type': 'text/plain' },
   })) as typeof fetch;
 }
+
+test('query-specific Disallow rules are matched with the query string', async () => {
+  const policy = new RobotsCrawlPolicy(
+    fetchRobots('User-agent: *\nDisallow: /search?q=discord\n'),
+    resolver,
+  );
+  assert.equal((await policy.decide('https://creator.example/search?q=discord')).allowed, false);
+  assert.equal((await policy.decide('https://creator.example/search?q=other')).allowed, true);
+});
 
 test('explicit Disallow and Crawl-delay are enforced', async () => {
   const policy = new RobotsCrawlPolicy(
@@ -87,6 +97,38 @@ test('crawl path enforces explicit Disallow and records a policy exclusion', asy
     assert.equal(pageFetched, false);
     assert.equal(result.observations[0]?.failureClass, 'ROBOTS_DISALLOWED');
     assert.equal(result.candidates.length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.CRAWLER_ROBOTS_ENFORCEMENT;
+    else process.env.CRAWLER_ROBOTS_ENFORCEMENT = previous;
+  }
+});
+
+test('a robots-disallowed seed is not escalated to the rendered tier', async () => {
+  const previous = process.env.CRAWLER_ROBOTS_ENFORCEMENT;
+  process.env.CRAWLER_ROBOTS_ENFORCEMENT = 'true';
+  let renderedCalls = 0;
+  try {
+    await runChannelInspectionForTest({
+      channelId: 'UC_ROBOTS_BARRIER',
+      channelName: 'Robots Barrier',
+      channelBio: 'Trading education creator with an official website and community links.',
+      channelLinks: ['https://creator.example/private'],
+      videoDescriptions: ['one', 'two', 'three', 'four', 'five'],
+      videoDescriptionsAuthoritative: true,
+      creatorLikelyTrading: true,
+      externalFetchImpl: (async (input) => {
+        const url = String(input);
+        if (url.endsWith('/robots.txt')) {
+          return new Response('User-agent: *\nDisallow: /private\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+        }
+        return new Response('<a href="https://discord.gg/MUSTNOTRENDER">Discord</a>', { status: 200, headers: { 'content-type': 'text/html' } });
+      }) as typeof fetch,
+      renderedFallback: async () => {
+        renderedCalls += 1;
+        return { foundInvite: null, inspectedPages: 1, scrolls: 0, clicks: 0, complete: true, retryable: false, detail: 'stub', candidates: [], telemetry: { mode: 'RENDERED' } } as any;
+      },
+    });
+    assert.equal(renderedCalls, 0);
   } finally {
     if (previous === undefined) delete process.env.CRAWLER_ROBOTS_ENFORCEMENT;
     else process.env.CRAWLER_ROBOTS_ENFORCEMENT = previous;

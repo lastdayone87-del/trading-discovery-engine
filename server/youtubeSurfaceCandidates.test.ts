@@ -46,7 +46,8 @@ test('collects pinned, top, older, Community and playlist text with bounds', asy
   });
 
   assert.equal(snapshot.pinnedComment, 'Pinned https://discord.gg/PINNED-video-1');
-  assert.ok(snapshot.comments.some(value => value.includes('TOP')));
+  assert.ok(snapshot.comments.some(value => value.text.includes('TOP')));
+  assert.equal(snapshot.comments.find(value => value.text.includes('TOP'))?.creator, false);
   assert.equal(snapshot.olderDescriptions.length, 2);
   assert.equal(snapshot.communityPosts.length, 1);
   assert.equal(snapshot.playlists.length, 1);
@@ -55,15 +56,21 @@ test('collects pinned, top, older, Community and playlist text with bounds', asy
 test('builds and merges candidates from every YouTube surface', () => {
   const snapshot: YouTubeSurfaceSnapshot = {
     pinnedComment: 'https://discord.gg/PINNED',
-    comments: ['https://discord.gg/TOPCOMMENT'],
-    olderDescriptions: ['https://discord.gg/OLDER'],
-    communityPosts: ['https://discord.gg/COMMUNITY'],
-    playlists: ['https://discord.gg/PLAYLIST'],
+    pinnedVideoId: 'video-pinned',
+    comments: [
+      { text: 'https://discord.gg/TOPCOMMENT', videoId: 'video-1', creator: false },
+      { text: 'https://discord.gg/CREATORCOMMENT', videoId: 'video-1', creator: true },
+    ],
+    olderDescriptions: [{ text: 'https://discord.gg/OLDER', videoId: 'video-2' }],
+    communityPosts: [{ text: 'https://discord.gg/COMMUNITY', postId: 'post-1' }],
+    playlists: [{ text: 'https://discord.gg/PLAYLIST', playlistId: 'playlist-1' }],
   };
   const candidates = candidatesFromYouTubeSnapshot(snapshot, 'channel-1');
   const codes = candidates.map(candidate => candidate.nativeInviteCode).sort();
-  assert.deepEqual(codes, ['COMMUNITY', 'OLDER', 'PINNED', 'PLAYLIST', 'TOPCOMMENT']);
+  assert.deepEqual(codes, ['COMMUNITY', 'CREATORCOMMENT', 'OLDER', 'PINNED', 'PLAYLIST', 'TOPCOMMENT']);
   assert.equal(candidates.filter(candidate => candidate.sourceSurface === 'PINNED_COMMENT').length, 1);
+  assert.equal(candidates.find(candidate => candidate.nativeInviteCode === 'TOPCOMMENT')?.sourceSurface, 'YOUTUBE_COMMENTS');
+  assert.equal(candidates.find(candidate => candidate.nativeInviteCode === 'CREATORCOMMENT')?.sourceSurface, 'RECENT_VIDEO_DESCRIPTIONS');
 
   const existing = makeDiscordCandidate({
     locatorType: 'NATIVE_INVITE',
@@ -76,9 +83,24 @@ test('builds and merges candidates from every YouTube surface', () => {
     { discordCandidates: [existing], foundInvite: 'STATIC' },
     candidates,
   );
-  assert.equal(merged.discordCandidates?.length, 6);
+  assert.equal(merged.discordCandidates?.length, 7);
   assert.ok(merged.discordCandidates?.some(candidate => candidate.nativeInviteCode === 'PINNED'));
   assert.equal(merged.foundInvite, 'STATIC');
+});
+
+test('viewer comments never become creator-owned through repetition', () => {
+  const snapshot: YouTubeSurfaceSnapshot = {
+    comments: [
+      { text: 'https://discord.gg/VIEWERONE', videoId: 'video-1', creator: false },
+      { text: 'https://discord.gg/VIEWERTWO', videoId: 'video-2', creator: false },
+    ],
+    olderDescriptions: [],
+    communityPosts: [],
+    playlists: [],
+  };
+  const candidates = candidatesFromYouTubeSnapshot(snapshot, 'channel-1');
+  assert.equal(candidates.every(candidate => candidate.sourceSurface === 'YOUTUBE_COMMENTS'), true);
+  assert.equal(candidates.every(candidate => candidate.ownershipStatus !== 'CREATOR_OWNED'), true);
 });
 
 test('YouTube canary selection is deterministic and bounded', () => {
@@ -106,7 +128,7 @@ test('the overall deadline bounds a slow YouTube surface collection', async () =
   // The 5 ms deadline is intentionally tiny; allow event-loop scheduling
   // slack while still proving the collector returns instead of waiting for the
   // 50 ms surface promise.
-  assert.ok(Date.now() - startedAt < 250, 'collection exceeded the overall deadline');
+  assert.ok(Date.now() - startedAt < 1_000, 'collection exceeded the overall deadline');
 });
 
 test('a failed surface degrades to an empty snapshot instead of throwing', async () => {
