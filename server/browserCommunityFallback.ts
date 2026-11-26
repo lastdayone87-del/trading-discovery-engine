@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
 import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { MULTILINGUAL_CONTROL_HINTS } from './multilingualCommunityLexicon';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
@@ -569,7 +570,7 @@ export function renderedPopupWaitTimeoutMs(
   return Math.min(cap, remaining);
 }
 
-export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
+export const COMMUNITY_HINTS = MULTILINGUAL_CONTROL_HINTS;
 
 /**
  * Interactive controls that can reveal content only through interaction:

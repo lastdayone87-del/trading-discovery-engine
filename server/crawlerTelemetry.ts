@@ -48,6 +48,18 @@ export const CRAWL_DROP_REASONS = [
    * different cap already claimed `ceiling`.
    */
   'response-cap',
+  /**
+   * An explicit robots.txt Disallow rule excluded this URL. This is a
+   * compliance/policy exclusion, not an unavailable-robots block: 4xx, 403,
+   * 429 and unreachable robots.txt remain allowed (UNKNOWN).
+   */
+  'robots-disallowed',
+  /**
+   * A fetched URL returned an image/font/script/media content type. It was
+   * screened after fetch and did not consume the static page/exploration
+   * budget; documents and HTML remain counted normally.
+   */
+  'asset-content-type',
 ] as const;
 export type CrawlDropReason = typeof CRAWL_DROP_REASONS[number];
 export function isCrawlDropReason(value: unknown): value is CrawlDropReason {

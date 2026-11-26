@@ -1,4 +1,8 @@
 import { assessCrawlAdmission, isKnownBrokerOrExchangeHost } from './communitySurfacePolicy';
+import {
+  MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE,
+  MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
+} from './multilingualCommunityLexicon';
 
 /**
  * Evidence-driven navigation destination policy.
@@ -56,11 +60,11 @@ const COMMUNITY_PLATFORM_HOSTS = [
  * strong only together with a community/platform context so a generic
  * "apply now" or "premium plan" link cannot open an arbitrary new host.
  */
-export const STRONG_COMMUNITY_EVIDENCE = /(?:discord|community|join|invite|member|membership|vip|group|private|trading[-_ ]?(?:room|floor)|chat|club|signal|academy|mastermind|mentor|whop|skool|circle|patreon)/i;
+export const STRONG_COMMUNITY_EVIDENCE = MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE;
 export const STRONG_PAID_COMMUNITY_EVIDENCE = /(?:premium|paid|subscribe|subscription|access|apply|waitlist|members?[-_ ]?area)/i;
 /** Generic creator-site navigation. Eligible same-origin, never enough to
  * justify opening an unknown cross-origin host by itself. */
-export const WEAK_COMMUNITY_EVIDENCE = /(?:links?|social|contact|about|resources|support)/i;
+export const WEAK_COMMUNITY_EVIDENCE = MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE;
 const AFFILIATE_HINT = /(?:\/|[?&_-])(?:ref(?:erral)?|affiliate|partner|parrainage|cpa|campaign|promo|coupon)(?:\/|=|[?&_-]|$)/i;
 
 export type DestinationReason =
@@ -89,7 +93,7 @@ export function isKnownCommunityDestinationHost(host: string): boolean {
 function hasStrongCommunityEvidence(text: string): boolean {
   if (STRONG_COMMUNITY_EVIDENCE.test(text)) return true;
   return STRONG_PAID_COMMUNITY_EVIDENCE.test(text)
-    && /(?:discord|community|members?|platform|whop|skool|circle|patreon|server)/i.test(text);
+    && MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE.test(text);
 }
 
 /**

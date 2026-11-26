@@ -30,6 +30,7 @@
  * ELIGIBLE (legacy behavior byte-identical).
  */
 import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { MULTILINGUAL_CONTROL_HINTS } from './multilingualCommunityLexicon';
 import { canonicalSiteIdentity } from './siteIdentity';
 
 export type RelevanceTier = 'BLOCK' | 'DEMOTE' | 'ELIGIBLE';
@@ -74,7 +75,7 @@ export interface RelevanceDecision {
   policyVersion: string;
 }
 
-const COMMUNITY_HINT = /(?:discord|community|join|members?|membership|group|private|vip|trading[-_ ]?(?:room|floor)|chat|links?)/i;
+const COMMUNITY_HINT = MULTILINGUAL_CONTROL_HINTS;
 const MESSAGING_HOSTS = new Set([
   't.me', 'www.t.me', 'telegram.me', 'www.telegram.me', 'telegram.dog', 'www.telegram.dog',
   'wa.me', 'www.wa.me', 'whatsapp.com', 'www.whatsapp.com', 'chat.whatsapp.com',

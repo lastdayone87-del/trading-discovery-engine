@@ -202,7 +202,14 @@ import { canContinueCommunityInspectionAfterDegradedManualClassification } from 
 import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, FOUND_GAP_RETRYABLE_FAILURE_CLASSES, buildCommunityRetryJobMetadata, isAttemptFreeCommunityFailure, attemptFreeDiscordValidation, communityRetryDirectiveOwnsDurableWork, retryAtFromUnknown, retryReasonFromError, type CommunityRetryDirective} from './communityRetryPolicy';
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
-import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, detectDiscordInviteCaseCollisions, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import {
+  candidatesFromYouTubeSnapshot,
+  collectYouTubeSurfaceSnapshot,
+  createYouTubeSurfaceClient,
+  isYouTubeSurfaceCanarySelected,
+  mergeYouTubeSurfaceCandidates,
+} from './youtubeSurfaceCandidates';
 import { processPendingStagedCandidates } from './candidateStaging';
 import { normalizeCommunityWorkUrl } from './communityAcquisitionWorkLedger';
 import {
@@ -4839,6 +4846,51 @@ export async function inspectAndValidateChannel(
     // the next attempt reuses the same window instead of skipping it. The
     // current retry job's payload is updated too: its remaining durable
     // attempts reload that payload rather than going through enqueue again.
+    // Public YouTube surfaces are a separate high-yield acquisition path.
+    // Run only for TRADING_CONFIRMED channels with no recorded/just-found
+    // invite, behind a canary setting, so quota and parser load stay bounded
+    // and zero-invite creators are prioritized.
+    if (
+      inspection
+      && channel.trading_status === 'TRADING_CONFIRMED'
+      && !channel.discord_invite
+      && !inspection.foundInvite
+      && !(inspection.discordCandidates || []).length
+    ) {
+      // Read the canary settings only for eligible zero-invite channels so
+      // ordinary inspections do not pay two settings queries.
+      let youtubeExpansionEnabled = false;
+      let youtubeCanaryBasisPoints = 500;
+      try {
+        youtubeExpansionEnabled = await getAppSetting('youtube_surface_expansion_enabled', 'false') === 'true';
+        const configuredBasisPoints = Number(await getAppSetting('youtube_surface_expansion_basis_points', '500'));
+        youtubeCanaryBasisPoints = Number.isFinite(configuredBasisPoints) ? configuredBasisPoints : 500;
+      } catch { /* a settings read must never block the inspection */ }
+      if (youtubeExpansionEnabled && isYouTubeSurfaceCanarySelected(channel.channel_id, youtubeCanaryBasisPoints)) {
+        try {
+          const client = await createYouTubeSurfaceClient();
+          const snapshot = await collectYouTubeSurfaceSnapshot(channel.channel_id, client);
+          const youtubeCandidates = candidatesFromYouTubeSnapshot(snapshot, channel.channel_id);
+          if (youtubeCandidates.length) {
+            inspection = mergeYouTubeSurfaceCandidates(inspection, youtubeCandidates);
+            console.info(JSON.stringify({
+              event: 'youtube_surface_candidates_retained',
+              channelId: channel.channel_id,
+              candidates: youtubeCandidates.length,
+              codes: youtubeCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
+              timestamp: new Date().toISOString(),
+            }));
+          }
+        } catch (error) {
+          console.warn(JSON.stringify({
+            event: 'youtube_surface_expansion_failed',
+            channelId: channel.channel_id,
+            error: error instanceof Error ? error.message : String(error),
+            timestamp: new Date().toISOString(),
+          }));
+        }
+      }
+    }
     if(inspection.retryDirective)inspection.retryDirective={...inspection.retryDirective,clickOffsets:inspection.nextClickOffsets};
     if(executionMarker?.jobId&&inspection.nextClickOffsets&&Object.keys(inspection.nextClickOffsets).length){
       await persistCommunityRetryClickOffsets(executionMarker.jobId,inspection.nextClickOffsets).catch(error=>{
@@ -4949,6 +5001,10 @@ export async function inspectAndValidateChannel(
     // orchestration (persist, claim, delete losers) is injectable for tests;
     // production passes the real implementations below.
     const structuredCandidates=(inspection.discordCandidates||[]).filter(candidate=>!!discordInviteCodeOf(candidate.nativeInviteCode));
+    const caseCollisions=detectDiscordInviteCaseCollisions(structuredCandidates);
+    if(caseCollisions.length){
+      console.warn(JSON.stringify({event:'discord_case_collision_detected',channelId:channel.channel_id,collisions:caseCollisions,timestamp:new Date().toISOString()}));
+    }
     const executedCandidateIds=[...new Set(structuredCandidates.map(candidate=>candidate.candidateId).filter(Boolean))];
     let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
     if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));

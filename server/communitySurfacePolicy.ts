@@ -1,4 +1,5 @@
 import { isPublicIpAddress } from './publicDestination';
+import { MULTILINGUAL_CONTROL_HINTS } from './multilingualCommunityLexicon';
 
 export interface CommunitySurfaceCandidate {
   url: string;
@@ -69,7 +70,7 @@ export const MESSAGING_PREVIEW_HOSTS = new Set([
   'chat.whatsapp.com',
 ]);
 
-const COMMUNITY_HINT = /(?:discord|community|join|members?|membership|group|private|vip|trading[-_ ]?(?:room|floor)|chat|links?)/i;
+const COMMUNITY_HINT = MULTILINGUAL_CONTROL_HINTS;
 const AFFILIATE_HINT = /(?:\/|[?&_-])(?:ref(?:erral)?|affiliate|partner|parrainage|cpa|campaign|promo|coupon)(?:\/|=|[?&_-]|$)/i;
 
 function hostOf(raw: string): string {
