@@ -37,6 +37,15 @@ test('explicit Disallow and Crawl-delay are enforced', async () => {
   assert.equal(denied.reason, 'DISALLOWED');
 });
 
+test('Crawl-delay closes its user-agent group before a following bot group', async () => {
+  const policy = new RobotsCrawlPolicy(
+    fetchRobots('User-agent: *\nCrawl-delay: 5\n\nUser-agent: bot\nDisallow: /private\n'),
+    resolver,
+  );
+  assert.equal((await policy.decide('https://creator.example/private')).allowed, true);
+  assert.equal((await policy.decide('https://creator.example/public')).allowed, true);
+});
+
 test('403, 429, 5xx and unreachable robots are unavailable, not a block', async () => {
   for (const status of [403, 429, 500]) {
     const policy = new RobotsCrawlPolicy(fetchRobots('', status), resolver);
@@ -107,8 +116,9 @@ test('a robots-disallowed seed is not escalated to the rendered tier', async () 
   const previous = process.env.CRAWLER_ROBOTS_ENFORCEMENT;
   process.env.CRAWLER_ROBOTS_ENFORCEMENT = 'true';
   let renderedCalls = 0;
+  let pageFetched = false;
   try {
-    await runChannelInspectionForTest({
+    const result = await runChannelInspectionForTest({
       channelId: 'UC_ROBOTS_BARRIER',
       channelName: 'Robots Barrier',
       channelBio: 'Trading education creator with an official website and community links.',
@@ -121,6 +131,7 @@ test('a robots-disallowed seed is not escalated to the rendered tier', async () 
         if (url.endsWith('/robots.txt')) {
           return new Response('User-agent: *\nDisallow: /private\n', { status: 200, headers: { 'content-type': 'text/plain' } });
         }
+        pageFetched = true;
         return new Response('<a href="https://discord.gg/MUSTNOTRENDER">Discord</a>', { status: 200, headers: { 'content-type': 'text/html' } });
       }) as typeof fetch,
       renderedFallback: async () => {
@@ -128,6 +139,8 @@ test('a robots-disallowed seed is not escalated to the rendered tier', async () 
         return { foundInvite: null, inspectedPages: 1, scrolls: 0, clicks: 0, complete: true, retryable: false, detail: 'stub', candidates: [], telemetry: { mode: 'RENDERED' } } as any;
       },
     });
+    assert.equal(pageFetched, false, 'the disallowed seed must not be fetched');
+    assert.ok(result.acquisitionOutcomes?.some(outcome => outcome.requestedUrl === 'https://creator.example/private' && outcome.failureClass === 'ROBOTS_DISALLOWED'), 'the policy exclusion must be persisted as an observation');
     assert.equal(renderedCalls, 0);
   } finally {
     if (previous === undefined) delete process.env.CRAWLER_ROBOTS_ENFORCEMENT;

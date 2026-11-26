@@ -25,14 +25,18 @@ test('collects pinned, top, older, Community and playlist text with bounds', asy
     }),
     getPlaylists: async () => ({ playlists: [{ content_id: 'playlist-1' }] }),
   };
+  let commentCalls = 0;
   const client: YouTubeSurfaceClient & { getPlaylist: (id: string) => Promise<any> } = {
     getChannel: async () => channel,
-    getComments: async (videoId) => ({
+    getComments: async (videoId) => {
+      commentCalls += 1;
+      return ({
       contents: [
         { comment: { content: text(`Pinned https://discord.gg/PINNED-${videoId}`), is_pinned: true, author_is_channel_owner: true } },
         { comment: { content: text('Top comment https://discord.gg/TOP'), is_pinned: false, author_is_channel_owner: false } },
       ],
-    }),
+      });
+    },
     getBasicInfo: async (videoId) => ({ basic_info: { description: `Older ${videoId} https://discord.gg/OLDER` } }),
     getPlaylist: async () => ({ info: { description: 'Playlist https://discord.gg/PLAYLIST' }, items: [] }),
   };
@@ -49,6 +53,7 @@ test('collects pinned, top, older, Community and playlist text with bounds', asy
   assert.equal(snapshot.pinnedCommentCreator, true);
   assert.ok(snapshot.comments.some(value => value.text.includes('TOP')));
   assert.equal(snapshot.comments.find(value => value.text.includes('TOP'))?.creator, false);
+  assert.equal(commentCalls, 1, 'maxCommentVideos bounds comment fetches');
   assert.equal(snapshot.olderDescriptions.length, 2);
   assert.equal(snapshot.communityPosts.length, 1);
   assert.equal(snapshot.playlists.length, 1);
@@ -110,6 +115,22 @@ test('a rejected Innertube call is contained instead of becoming unhandled', asy
   assert.deepEqual(snapshot.olderDescriptions, []);
 });
 
+test('a rejection after the per-call timeout stays contained', async () => {
+  const client: YouTubeSurfaceClient = {
+    getChannel: () => new Promise((_, reject) => setTimeout(() => reject(new Error('late network error')), 25)),
+    getComments: async () => ({ contents: [] }),
+    getBasicInfo: async () => ({}),
+  };
+  const snapshot = await collectYouTubeSurfaceSnapshot('channel-1', client, {
+    maxTotalMs: 10,
+    perCallTimeoutMs: 5,
+  });
+  assert.deepEqual(snapshot.comments, []);
+  // Let the abandoned promise reject; the guarded timeout must not surface an
+  // unhandledRejection to the test runner.
+  await new Promise(resolve => setTimeout(resolve, 40));
+});
+
 test('builds and merges candidates from every YouTube surface', () => {
   const snapshot: YouTubeSurfaceSnapshot = {
     pinnedComment: 'https://discord.gg/PINNED',
@@ -146,6 +167,22 @@ test('builds and merges candidates from every YouTube surface', () => {
   assert.equal(merged.foundInvite, 'STATIC');
 });
 
+test('playlist item text is not creator-description evidence', () => {
+  const snapshot: YouTubeSurfaceSnapshot = {
+    comments: [],
+    olderDescriptions: [],
+    communityPosts: [],
+    playlists: [
+      { text: 'https://discord.gg/PLAYLISTDESC', playlistId: 'p1', creatorWritten: true },
+      { text: 'https://discord.gg/PLAYLISTITEM', playlistId: 'p1', creatorWritten: false },
+    ],
+  };
+  const candidates = candidatesFromYouTubeSnapshot(snapshot, 'channel-1');
+  assert.equal(candidates.find(candidate => candidate.nativeInviteCode === 'PLAYLISTDESC')?.sourceSurface, 'RECENT_VIDEO_DESCRIPTIONS');
+  assert.equal(candidates.find(candidate => candidate.nativeInviteCode === 'PLAYLISTITEM')?.sourceSurface, 'YOUTUBE_PLAYLIST_ITEMS');
+  assert.notEqual(candidates.find(candidate => candidate.nativeInviteCode === 'PLAYLISTITEM')?.ownershipStatus, 'CREATOR_OWNED');
+});
+
 test('a viewer-authored pinned comment is not creator-owned evidence', () => {
   const snapshot: YouTubeSurfaceSnapshot = {
     pinnedComment: 'https://discord.gg/VIEWERPIN',
@@ -165,7 +202,7 @@ test('viewer comments never become creator-owned through repetition', () => {
   const snapshot: YouTubeSurfaceSnapshot = {
     comments: [
       { text: 'https://discord.gg/VIEWERONE', videoId: 'video-1', creator: false },
-      { text: 'https://discord.gg/VIEWERTWO', videoId: 'video-2', creator: false },
+      { text: 'https://discord.gg/VIEWERONE', videoId: 'video-2', creator: false },
     ],
     olderDescriptions: [],
     communityPosts: [],
@@ -179,11 +216,11 @@ test('viewer comments never become creator-owned through repetition', () => {
 test('YouTube canary selection is deterministic and bounded', () => {
   assert.equal(isYouTubeSurfaceCanarySelected('channel-a', 0), false);
   assert.equal(isYouTubeSurfaceCanarySelected('channel-a', 10_000), true);
-  const first = isYouTubeSurfaceCanarySelected('channel-a', 5_000);
-  assert.equal(isYouTubeSurfaceCanarySelected('channel-a', 5_000), first);
+  const first = isYouTubeSurfaceCanarySelected('channel-a', 500);
+  assert.equal(isYouTubeSurfaceCanarySelected('channel-a', 500), first);
   let selected = 0;
-  for (let index = 0; index < 2_000; index++) if (isYouTubeSurfaceCanarySelected(`c-${index}`, 5_000)) selected++;
-  assert.ok(selected > 700 && selected < 1_300, `5% canary selected ${selected}/2000`);
+  for (let index = 0; index < 2_000; index++) if (isYouTubeSurfaceCanarySelected(`c-${index}`, 500)) selected++;
+  assert.ok(selected > 70 && selected < 130, `5% canary selected ${selected}/2000`);
 });
 
 test('the overall deadline bounds a slow YouTube surface collection', async () => {

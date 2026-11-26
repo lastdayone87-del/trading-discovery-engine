@@ -55,9 +55,21 @@ test('binary media stays unsupported', async () => {
 });
 
 test('an image/font/script response does not consume the static page budget', async () => {
-  const previous = process.env.CRAWLER_PAGE_CAP;
-  process.env.CRAWLER_PAGE_CAP = '1';
+  const previous = {
+    pages: process.env.CRAWLER_PAGE_CAP,
+    queue: process.env.CRAWLER_QUEUE_CAP,
+  };
+  // Six assets plus seven documents. If assets consume the 12-page budget,
+  // the final `/invite` document is never fetched; with asset screening it is
+  // reached because only documents count toward `explored`.
+  process.env.CRAWLER_PAGE_CAP = '12';
+  process.env.CRAWLER_QUEUE_CAP = '13';
   try {
+    const rootLinks = [
+      ...Array.from({ length: 6 }, (_, index) => `<a href="/asset/${index}">Community</a>`),
+      ...Array.from({ length: 6 }, (_, index) => `<a href="/doc/${index}">Community</a>`),
+      '<a href="/invite">Community</a>',
+    ].join('');
     const result = await crawlExternalLinks(
       ['https://public.example/'],
       [],
@@ -65,13 +77,16 @@ test('an image/font/script response does not consume the static page budget', as
       (async (input) => {
         const url = String(input);
         if (url === 'https://public.example/') {
-          return new Response(
-            '<a href="/asset">Discord</a><a href="/invite">Community</a>',
-            { status: 200, headers: { 'content-type': 'text/html' } },
-          );
+          return new Response(rootLinks, { status: 200, headers: { 'content-type': 'text/html' } });
         }
-        if (url === 'https://public.example/asset') {
+        if (url.startsWith('https://public.example/asset/')) {
           return new Response('binary', { status: 200, headers: { 'content-type': 'image/png' } });
+        }
+        if (url.startsWith('https://public.example/doc/')) {
+          return new Response('<html><body>No invite</body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          });
         }
         if (url === 'https://public.example/invite') {
           return new Response('<a href="https://discord.gg/ASSETBUDGET">Discord</a>', {
@@ -93,8 +108,11 @@ test('an image/font/script response does not consume the static page budget', as
       publicResolver,
     );
     assert.equal(result.candidates[0]?.nativeInviteCode, 'ASSETBUDGET');
+    assert.ok((result.observations.find(observation => observation.failureClass === 'UNSUPPORTED_CONTENT_TYPE')?.telemetry?.dropReasons?.['asset-content-type'] || 0) > 0);
   } finally {
-    if (previous === undefined) delete process.env.CRAWLER_PAGE_CAP;
-    else process.env.CRAWLER_PAGE_CAP = previous;
+    if (previous.pages === undefined) delete process.env.CRAWLER_PAGE_CAP;
+    else process.env.CRAWLER_PAGE_CAP = previous.pages;
+    if (previous.queue === undefined) delete process.env.CRAWLER_QUEUE_CAP;
+    else process.env.CRAWLER_QUEUE_CAP = previous.queue;
   }
 });

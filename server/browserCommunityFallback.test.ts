@@ -960,6 +960,26 @@ function routeLike(
   };
 }
 
+test('route guard tells the policy whether a request is a document navigation', async () => {
+  const seen: Array<string | undefined> = [];
+  let continued = 0;
+  const guard = createRenderedRouteGuard({ unrouteAll: async () => {} }, {
+    isAllowed: async (_url, resourceType) => {
+      seen.push(resourceType);
+      return true;
+    },
+    onBlocked: () => {},
+  });
+  const route: RenderedRouteLike = {
+    request: () => ({ url: () => 'https://public.example/', resourceType: () => 'document' }),
+    abort: async () => {},
+    continue: async () => { continued += 1; },
+  };
+  await guard.handler(route);
+  assert.deepEqual(seen, ['document']);
+  assert.equal(continued, 1);
+});
+
 test('route guard treats an in-flight target-closed rejection as benign and cleans up once', async () => {
   const unhandled: unknown[] = [];
   const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };

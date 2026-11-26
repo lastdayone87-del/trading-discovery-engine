@@ -1,6 +1,6 @@
 # Crawler Invite-Discovery Coverage — Gap Register & Investigation Report
 
-**Status:** INVESTIGATION PASS 2 COMPLETE — **no implementation is authorized by this document**
+**Status:** INVESTIGATION PASS 3 COMPLETE — Phase 0/1 implementation is on `feat/crawler-coverage-remediation`; deployment is governed by the remediation plan and implementation-status document
 **Date opened:** 2026-11-26
 **Last updated:** 2026-11-26
 **Scope:** Site navigation reach and Discord-invite recall ("despite where it is"),
@@ -114,14 +114,14 @@ coverage is much lower because of reachability and throughput:
 
 | Item | Verified value |
 |---|---|
-| Host | Coolify `45.94.58.135`, project `my-first-project`, env `production` |
-| App container | `7zp5h5tz4dkjteaag4phxyme-20261126T052736` |
+| Host | Coolify production host (**redacted**; see internal runbook) |
+| App container | **redacted**; see internal runbook |
 | Image / `SOURCE_COMMIT` | `1bf93568...` |
 | Branch | `main` |
 | Schema | 210 (`210_provider_capacity_state.sql`, applied 05:34:53 UTC) |
 | App containers | one; no alternate crawler service |
-| DB container | `4anodpyfvgjn9ybl2jqs9eoa`, IP `10.0.1.2:5432` (doc says `10.0.1.5`; stale) |
-| DB access | `muse_readonly`, `transaction_read_only=on`, statement timeout 60s |
+| DB container | **redacted**; see internal runbook |
+| DB access | read-only account (**redacted**), `transaction_read_only=on`, statement timeout 60s |
 
 `/api/version` returns `commitSha:"unknown"`, `buildTimeSource:"startup"`.
 The image tag and `SOURCE_COMMIT` confirm the revision; the app's build-info
@@ -232,7 +232,7 @@ New corrections to the earlier report:
 | GAP-08 | Generic shorteners weak-anchor dropped | `bit.ly` fixture **missed**; shorteners are recognised but not resolved pre-admission | **CONFIRMED** | P2 | Gemini |
 | GAP-09 | Sitemap/profiler/JSON-LD/frontier off by default | production: all three settings absent → false; only legacy navigation active | **CONFIRMED** | P1 | New |
 | GAP-10 | `creatorLikelyTrading` render gate | 7 UNCERTAIN no-match/no-render sites; 37 non-confirmed failed/partial no-render; live sample of 3 found no invite; V4 random/zero sample did not add; mechanism confirmed, measured yield low | **CONFIRMED (mechanism); yield low** | P3 | New |
-| GAP-11 | First-invite suppression | 170 TRADING_CONFIRMED FOUND sites with no rendered attempt; fixture proves second rendered invite lost; V4 11-site live sample: **0 globally new live**, 2 sites exposed 3 live codes already owned by another channel; creator-level completeness still real | **CONFIRMED (mechanism); global yield 0/10** | P2 | New |
+| GAP-11 | First-invite suppression | 170 TRADING_CONFIRMED FOUND sites with no rendered attempt; fixture proves second rendered invite lost; V4 11-site live sample: **0 globally new live**, 2 sites exposed 3 live codes already owned by another channel; creator-level completeness still real | **CONFIRMED (mechanism); global yield 0/11** | P2 | New |
 | GAP-12 | `<area>`, `<object>/<embed>`, `rel=me` not navigated | anchor scan `a[href]`; object/embed counted only; structured inventory flag-gated | **OPEN** | P3 | New |
 | GAP-13 | YouTube surfaces under-read | 10 newest only; targeted 10-channel sample: 3 globally new live (comments/pinned/older); random 90-channel sample: 3 globally new live (Community posts; 3.3%); 440 posts/444 comments/440 older descriptions in random sample; 6/100 total; production `PINNED_COMMENT=0` | **CONFIRMED** | P1 | New |
 
@@ -255,7 +255,7 @@ New corrections to the earlier report:
 | GAP-26 | Settle timing may miss late content | inspect on load/scroll/click; no final quiet-period scan | **NEEDS-PROOF** | P3 | New |
 | GAP-27 | `robots.txt` not enforced on crawl | profiler records state; crawler does not gate | **OUT-OF-SCOPE (compliance)** | — | New |
 | **GAP-28** | **Pinned-comment surface is dead code** | no producer for `pinnedComment`; production `PINNED_COMMENT=0`; live creator pinned invite `wjXSpHeJCm` (`is_pinned:true`, `author_is_channel_owner:true`) missed | **CONFIRMED** | P1 | New |
-| **GAP-29** | **Browser admission starvation** | 11,111 `GATE_SATURATED`; 83% render sites 0 pages; avg 0.25 pages; only 214 COMPLETE; 64/h, 72/h emergency, 2 slots, 90s wait; `MAX_BROWSER_RUNTIME_CONCURRENCY=2` hard code cap; 63,941 creator-website rows never rendered; 73,040-row one-pass at 64/h = ~47 days; host 4 cores/7.8 GB, app+browser ~1–1.3 GB per slot; V4 GATE sample 0 invites / 5 sites (2 zero-page, 3 bounded) | **CONFIRMED** | P0/P1 | New |
+| **GAP-29** | **Browser admission starvation** | 11,111 `GATE_SATURATED`; 83% render sites 0 pages; avg 0.25 pages; only 214 COMPLETE; 64/h, 72/h emergency, 2 slots, 90s wait; `MAX_BROWSER_RUNTIME_CONCURRENCY=2` hard code cap; 63,941 creator-website rows never rendered; 73,040-row one-pass at 64/h = ~47 days; co-located host sizing redacted (see internal runbook), app+browser ~1–1.3 GB per slot; V4 GATE sample 0 invites / 5 sites (2 zero-page, 3 bounded) | **CONFIRMED** | P0/P1 | New |
 | **GAP-30** | **Rendered control filter and click budget** | 153,560 controls enumerated; 120,429 **hint-rejected (78.4%)**; 46,864 evidence controls; 1,632 clicked (3.5%); 19,754 skipped; 1,551 failed | **CONFIRMED** | P1 | New |
 | **GAP-31** | **Asset URLs consume crawl budget** | 2,937 unsupported-content observations across 1,613 sites; most are images/CSS/JS (image/avif 482, png 122, JS 29, CSS 67); static average 3.7 pages/site, so wasted slots are material | **CONFIRMED** | P2 | New |
 | **GAP-32** | **Build identity not wired** | `/api/version` `commitSha:"unknown"` despite `SOURCE_COMMIT`; deployed revision only discoverable from image tag | **CONFIRMED** | P3 (observability) | New |
@@ -580,7 +580,7 @@ Allowed decisions: `IMPLEMENT`, `DEFER`, `REJECT`, `ACCEPT AS LIMIT`, `NOT REPRO
 The browser runs used the production image (`1bf93568`), real Chromium, the
 production crawler, `crossOriginEnqueue` baseline off / expanded on, and the
 governor disabled **only inside the disposable container** to measure yield.
-The host is 4 cores/7.8 GB; a one-slot, 1.5-CPU, 2 GB container was used.
+The co-located host sizing is redacted (see internal runbook); a one-slot, 1.5-CPU, 2 GB container was used.
 
 The three C sites rendered with the gate bypassed produced **0 invites** (2
 bounded, 1 complete). Together with the 5 GATE sites and 11 first-invite sites,
@@ -658,11 +658,11 @@ creator is already known to use Discord; it is not a population estimate.
 | Measured baseline render time | ~11–112s; ~55s typical |
 | Measured expanded render time | ~16–166s; ~100s typical |
 | Browser memory observed | ~1.0–1.3 GB per active crawler; Crawlee warned at 512–768 MB |
-| Host | 4 cores, 7.8 GB RAM; app ~1.2 GB; DB bursty; cannot support >2–3 browser slots safely |
+| Host | Sizing redacted (see internal runbook); app ~1.2 GB; DB bursty; cannot support >2–3 browser slots safely |
 
 **Architecture implication:** the current process cannot reach the workload by
 raising the env var. `MAX_BROWSER_RUNTIME_CONCURRENCY=2` is a code constant, and
-the host has no memory/CPU headroom. A dedicated browser worker pool/service is
+the co-located host has no memory/CPU headroom (sizing redacted). A dedicated browser worker pool/service is
 required for weekly or better refresh; monthly refresh needs at least ~3
 expanded workers, weekly ~12, daily ~32–48.
 

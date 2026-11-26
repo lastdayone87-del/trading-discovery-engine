@@ -91,6 +91,8 @@ export const CEILING_KINDS = [
   'frame-slice',
   /** Frontier stopping-arbiter halt (see frontier-yield-stop above). */
   'frontier-yield',
+  /** Per-crawl Crawl-delay budget ended coverage before a request. */
+  'robots-delay-budget',
 ] as const;
 export type CeilingKind = typeof CEILING_KINDS[number];
 export function isCeilingKind(value: unknown): value is CeilingKind {

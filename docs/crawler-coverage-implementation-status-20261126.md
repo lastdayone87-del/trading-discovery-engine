@@ -16,7 +16,7 @@
 | Obfuscation | Bounded Base64, ROT13, double-percent, `\u002e`, `&period;`, `discord dot gg`, and bounded tag-fragment rejoin; decoded candidates marked `OBFUSCATED_NATIVE` | `server/discordCandidates.ts`, `server/discordObfuscationDecoding.test.ts` |
 | Case collisions | Added deterministic collision detection/logging; current registry/merge collapse is pinned as a documented limitation until a schema-level case-preserving claim is approved | `server/discordCandidates.ts`, `server/queueManager.ts`, `server/discordInviteCaseCollisions.test.ts` |
 | XHTML/XML/RSS | 2xx `application/xhtml+xml`, `application/xml`, `text/xml`, `+xml`, JSON and plain text are readable; binary/PDF still rejected | `server/inspector.ts`, `server/crawlContentTypeCoverage.test.ts` |
-| Redirect/failure invites | Scans redirect final URLs and readable 401/403/404 bodies for invite evidence before recording failure | `server/inspector.ts`, `server/crawlFailureInvite.test.ts` |
+| Redirect/failure invites | Scans redirect final URLs and readable 401/403/404/410 bodies for invite evidence before recording failure; seed 404/410 probing is terminal, child probing is limited to community-scored targets | `server/inspector.ts`, `server/crawlFailureInvite.test.ts` |
 | Multilingual lexicon | Central 17-country / supported-language lexicon for strong/weak community terms, wired into static navigation, destination policy, relevance, and rendered control matching | `server/multilingualCommunityLexicon.ts`, tests; `server/inspector.ts`, `destinationPolicy.ts`, `communitySurfacePolicy.ts`, `acquisitionRelevance.ts`, `browserCommunityFallback.ts` |
 | Asset hygiene | Image/font/audio/video/CSS/JS/octet-stream responses do not consume the static page/exploration budget; counted as `asset-content-type` | `server/inspector.ts`, `server/crawlerTelemetry.ts`, `server/crawlContentTypeCoverage.test.ts` |
 | Robots | Cached RFC 9309 policy: explicit Disallow enforced, Crawl-delay bounded to 30s, 4xx/403/429/5xx/unreachable/malformed treated as UNKNOWN/allow; disabled by default, enabled by `CRAWLER_ROBOTS_ENFORCEMENT=true` | `server/robotsCrawlPolicy.ts`, tests; `server/inspector.ts` |
@@ -36,7 +36,7 @@
 | Multilingual/lexicon tests | **pass** |
 | Crawler exploration/robots/content/YouTube | **pass** |
 | Full suite, final rebased run | 5,729 tests: **5,409 pass, 63 fail**, 257 skipped. No modified crawler/extraction/YouTube/robots test is in the failure set; the 63 are pre-existing/environmental legacy DB/source-text failures (quarantine, query lifecycle, release audits, `viteConfig`) |
-| Failure-set comparison vs `origin/main` `f0aa55b3` | Every final failure name reproduces on the unmodified baseline in targeted runs (48 baseline-file failures + 13 in the six missed files + 3 in `scopePromotedDiscovery`); no branch-only failure. The two `youtubeInnertubeProvider` timing failures seen under full-suite load pass when run alone (44/44) |
+| Failure-set comparison vs `origin/main` `f0aa55b3` | Every final failure name reproduces on the unmodified baseline in targeted runs (48 names from the baseline file set, including the file-level `viteConfig` entry, plus 13 from six missed files and 3 from `scopePromotedDiscovery`); no branch-only failure. The 63 test failures plus the file-level entry account for the 64-name comparison. The two `youtubeInnertubeProvider` timing failures seen under full-suite load pass when run alone (44/44) |
 | Targeted rebased review suite | **231/231 pass** across extraction, reserved codes, validation, obfuscation, collisions, multilingual, robots, exploration, content types, failure bodies, YouTube, rendered enqueue and queue source contracts |
 
 ### Review bot findings fixed before merge
@@ -79,9 +79,10 @@
 - **YouTube pagination fetched an extra page.** Video and Community loops count
   the first page and stop at the cap. Timed-out Innertube promises are guarded
   against unhandled rejection, and client initialization is bounded.
-- **A failed fetch with invite evidence still reported failure.** It now records
-  `FOUND`, is non-retryable, and does not trigger a render/retry for the same
-  bytes.
+- **A failed seed fetch with invite evidence still reported failure.** The root
+  observation now records `FOUND`, is non-retryable, and does not trigger a
+  render/retry for the same bytes. Child failure observations keep their HTTP
+  status; their bodies are scanned only for community-scored targets.
 - **Frontier canary keyed on the raw seed.** It now buckets by canonical site
   identity so scheme/www/path variants of one site receive one treatment.
 

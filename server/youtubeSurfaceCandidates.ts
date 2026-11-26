@@ -48,7 +48,7 @@ export interface YouTubeSurfaceSnapshot {
   comments: YouTubeCommentSnapshot[];
   olderDescriptions: YouTubeDescriptionSnapshot[];
   communityPosts: YouTubeCommunityPostSnapshot[];
-  playlists: Array<{ text: string; playlistId: string }>;
+  playlists: Array<{ text: string; playlistId: string; creatorWritten?: boolean }>;
 }
 
 export interface YouTubeSurfaceLimits {
@@ -82,17 +82,29 @@ export interface YouTubeSurfaceClient {
  * initialization cost out of workers that never touch these surfaces. */
 export async function createYouTubeSurfaceClient(timeoutMs = 15_000): Promise<YouTubeSurfaceClient> {
   const { Innertube } = await import('youtubei.js');
+  // Innertube has no per-call abort surface, but it accepts a fetch
+  // implementation. Give every underlying HTTP request a hard deadline so a
+  // timed-out high-level call cannot leave a socket/parser request alive
+  // indefinitely.
+  const requestTimeoutMs = Math.max(1_000, Math.min(30_000, timeoutMs));
+  const boundedFetch = ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, {
+    ...init,
+    signal: init?.signal ?? AbortSignal.timeout(requestTimeoutMs),
+  })) as typeof fetch;
   // Client construction performs network/session setup in some Innertube
   // versions. Bound it so a stuck initialization cannot hold the inspection
   // open before the collector's own deadline starts.
-  const yt: any = await withTimeout(Innertube.create({ lang: 'en', location: 'US' }), timeoutMs);
+  const yt: any = await withTimeout(
+    Innertube.create({ lang: 'en', location: 'US', fetch: boundedFetch }),
+    timeoutMs,
+  );
   if (!yt) throw new Error('YouTube client initialization timed out');
   return {
     getChannel: (channelId: string) => yt.getChannel(channelId),
     getComments: (videoId: string, sort?: string) => yt.getComments(videoId, sort),
     getBasicInfo: async (videoId: string) => {
       const basic: any = await yt.getBasicInfo(videoId);
-      if (basic?.basic_info?.description) return basic;
+      if (basic?.basic_info?.short_description || basic?.basic_info?.description) return basic;
       // BasicInfo sometimes omits the description; fall back to the full
       // watch page only for videos that need it.
       try { return await yt.getInfo(videoId); } catch { return basic; }
@@ -116,14 +128,22 @@ function textOf(value: unknown): string {
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Attach a rejection handler even when the timer wins the race: a late
+  // rejection from an abandoned Innertube call must not become an unhandled
+  // rejection. Immediate rejections still propagate so telemetry can report
+  // the real cause instead of a misleading timeout.
+  const guarded = promise.then(
+    value => ({ kind: 'value' as const, value }),
+    error => ({ kind: 'error' as const, error }),
+  );
+  const timed = new Promise<{ kind: 'timeout' }>(resolve => {
+    timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+  });
   try {
-    // Attach a rejection handler even when the timer wins the race: a late
-    // rejection from an abandoned Innertube call must not become an unhandled
-    // rejection that takes the worker down.
-    return await Promise.race([
-      promise.catch(() => null as T | null),
-      new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), timeoutMs); }),
-    ]);
+    const result = await Promise.race([guarded, timed]);
+    if (result.kind === 'timeout') return null;
+    if (result.kind === 'error') throw result.error;
+    return result.value;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -176,7 +196,7 @@ export async function collectYouTubeSurfaceSnapshot(
     while (feed && pages < settings.maxVideoPages && !expired()) {
       pages += 1;
       for (const video of feed.videos || []) {
-        const id = video?.content_id || video?.id;
+        const id = video?.content_id || video?.id || video?.video_id;
         if (typeof id === 'string' && id) videoIds.push(id);
       }
       if (!feed.has_continuation || pages >= settings.maxVideoPages) break;
@@ -201,7 +221,9 @@ export async function collectYouTubeSurfaceSnapshot(
         // RECENT_VIDEO_DESCRIPTIONS evidence. Viewer comments use the
         // distinct YOUTUBE_COMMENTS surface and cannot gain creator ownership
         // through repetition.
-        snapshot.comments.push({ text: parsed.text, videoId, creator: parsed.owner });
+        const entry = { text: parsed.text, videoId, creator: parsed.owner };
+        if (parsed.owner) snapshot.comments.unshift(entry);
+        else snapshot.comments.push(entry);
       }
     } catch { /* comments may be disabled */ }
   }
@@ -211,7 +233,7 @@ export async function collectYouTubeSurfaceSnapshot(
     if (expired()) break;
     try {
       const info: any = await withTimeout(client.getBasicInfo(videoId), callTimeout());
-      const description = textOf(info?.basic_info?.description || info?.secondary_info?.description).trim();
+      const description = textOf(info?.basic_info?.short_description || info?.basic_info?.description || info?.secondary_info?.description).trim();
       if (description) snapshot.olderDescriptions.push({ text: description, videoId });
     } catch { /* one failed description does not stop the surface */ }
   }
@@ -246,10 +268,13 @@ export async function collectYouTubeSurfaceSnapshot(
             ? await withTimeout(client.getPlaylist(id), callTimeout())
             : null;
           const description = textOf(full?.info?.description).trim();
-          if (description) snapshot.playlists.push({ text: description, playlistId: id });
+          if (description) snapshot.playlists.push({ text: description, playlistId: id, creatorWritten: true });
           for (const item of (full?.items || []).slice(0, 20)) {
             const text = textOf(item?.description || item?.title).trim();
-            if (text) snapshot.playlists.push({ text, playlistId: id });
+            // Playlist items can be another channel's videos; their text is
+            // not creator-written evidence even though the creator curated
+            // the list.
+            if (text) snapshot.playlists.push({ text, playlistId: id, creatorWritten: false });
           }
         } catch { /* playlist may be private/deleted */ }
       }
@@ -324,7 +349,7 @@ export function candidatesFromYouTubeSnapshot(
     const playlist = snapshot.playlists[i];
     out.push(...extractDiscordCandidates(
       playlist.text,
-      'RECENT_VIDEO_DESCRIPTIONS',
+      playlist.creatorWritten === false ? 'YOUTUBE_PLAYLIST_ITEMS' : 'RECENT_VIDEO_DESCRIPTIONS',
       source(`playlist:${playlist.playlistId || i + 1}:${i + 1}`),
     ));
   }

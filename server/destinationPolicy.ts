@@ -1,6 +1,7 @@
 import { assessCrawlAdmission, isKnownBrokerOrExchangeHost } from './communitySurfacePolicy';
 import {
   MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE,
+  MULTILINGUAL_URL_COMMUNITY_EVIDENCE,
   MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
 } from './multilingualCommunityLexicon';
 
@@ -140,11 +141,14 @@ export function shouldFollowDestination(input: {
   // community surface. Anchor text remains the primary user-visible signal.
   let pathname = input.url;
   try { pathname = new URL(input.url).pathname || '/'; } catch { /* admission already validated */ }
-  // Path separators are normalized so the space-delimited lexicon matches
-  // hyphenated/underscored URLs (`/trading-room` -> `trading room`).
-  const text = `${pathname.replace(/[-_/]+/g, ' ')} ${input.anchorText || ''}`;
+  // Path and anchor separators are normalized so the space-delimited lexicon
+  // matches hyphenated/underscored URLs and CTAs (`Trading-Room`).
+  const text = `${pathname.replace(/[-_/]+/g, ' ')} ${String(input.anchorText || '').replace(/[-_/]+/g, ' ')}`;
   const knownHost = isKnownCommunityDestinationHost(host);
-  const strongEvidence = hasStrongCommunityEvidence(text);
+  // Concatenated URL slugs (`/vipintraders`) are legitimate community
+  // evidence even when token boundaries prevent an anchor-style match.
+  const strongEvidence = hasStrongCommunityEvidence(text)
+    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathname);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);
   const eligible = sameOrigin
     || Boolean(input.structuredNominated)

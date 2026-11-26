@@ -192,7 +192,12 @@ export function parseRobotsTxt(text: string): ParsedRobots {
     } else if (key === 'crawl-delay') {
       // Voluntary politeness input only (not part of RFC 9309); surfaced
       // separately, never a correctness requirement. Parsed per group below.
-      if (current) (current as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw = value;
+      // It still closes a group: a following User-agent must not merge into a
+      // Crawl-delay-only wildcard group and inherit that bot's rules.
+      if (current) {
+        currentHasRules = true;
+        (current as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw = value;
+      }
     } else {
       // Unknown records (including vendor extensions) are ignored without
       // affecting defined-record parsing, per RFC 9309.
@@ -636,7 +641,9 @@ export type ProfilerRedirectFailure =
   | 'REDIRECT_LOOP'
   | 'REDIRECT_LIMIT'
   | 'CROSS_ORIGIN_REDIRECT'
-  | 'ROBOTS_DISALLOWED';
+  | 'ROBOTS_DISALLOWED'
+  | 'ROBOTS_DELAY_BUDGET'
+  | 'REDIRECT_TIMEOUT';
 
 export interface ProfilerTransportFailure {
   name: string;
@@ -667,10 +674,11 @@ export interface ProfilerFetchOptions {
   /** When set, reject a redirect before contacting it if its resolved origin
    * differs. Used by same-origin iframe traversal. */
   allowedRedirectOrigin?: string;
-  /** Async pre-contact gate for every redirect target. Returning false stops
-   * the chain before the target is requested; used by robots enforcement so a
-   * Disallow rule cannot be bypassed by an allowed seed redirecting into it. */
-  shouldFollowRedirect?: (targetUrl: string) => Promise<boolean>;
+  /** Async pre-contact gate for every redirect target. A non-allow result
+   * stops the chain before the target is requested; used by robots
+   * enforcement so a Disallow rule or exhausted pacing budget cannot be
+   * bypassed by an allowed seed redirecting into it. */
+  shouldFollowRedirect?: (targetUrl: string) => Promise<'allow' | 'disallow' | 'budget'>;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -1000,21 +1008,31 @@ export async function fetchProfilerUrl(
       }
       // Pre-contact robots gate runs only after the destination has passed
       // the public-address/DNS guard, so a private redirect target never
-      // triggers a robots.txt lookup. A false result stops the chain before
-      // the target is requested.
-      if (options.shouldFollowRedirect && !(await options.shouldFollowRedirect(nextUrl))) {
-        await cancelRedirectBody(response);
-        return {
-          status: response.status,
-          contentType: response.headers.get('content-type') || '',
-          text: '',
-          truncated: false,
-          finalUrl: response.url || currentUrl,
-          redirectsFollowed,
-          redirectRejected: true,
-          rejectedRedirect: nextUrl,
-          redirectFailure: 'ROBOTS_DISALLOWED',
-        };
+      // triggers a robots.txt lookup. The gate is bounded by the fetch's
+      // remaining wall-clock budget; expiry is a retryable timeout.
+      if (options.shouldFollowRedirect) {
+        const remainingMs = Math.max(0, startedAt + timeoutMs - Date.now());
+        let gateTimer: ReturnType<typeof setTimeout> | undefined;
+        const decision = remainingMs <= 0
+          ? 'timeout' as const
+          : await Promise.race([
+              options.shouldFollowRedirect(nextUrl),
+              new Promise<'timeout'>(resolve => { gateTimer = setTimeout(() => resolve('timeout'), remainingMs); }),
+            ]).finally(() => { if (gateTimer) clearTimeout(gateTimer); });
+        if (decision !== 'allow') {
+          await cancelRedirectBody(response);
+          return {
+            status: response.status,
+            contentType: response.headers.get('content-type') || '',
+            text: '',
+            truncated: false,
+            finalUrl: response.url || currentUrl,
+            redirectsFollowed,
+            redirectRejected: true,
+            rejectedRedirect: nextUrl,
+            redirectFailure: decision === 'timeout' ? 'REDIRECT_TIMEOUT' : decision === 'budget' ? 'ROBOTS_DELAY_BUDGET' : 'ROBOTS_DISALLOWED',
+          };
+        }
       }
       if (redirectsFollowed.length >= maxHops) {
         // Hop budget exhausted on an otherwise-allowed chain: stop at the

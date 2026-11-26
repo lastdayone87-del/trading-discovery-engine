@@ -26,6 +26,7 @@ import {
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
 import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
+import { paceRobotsOrigin } from './robotsPacing';
 import { isCrawlerCanarySelected, resolveCrawlerExplorationLimits } from './crawlerExplorationLimits';
 import { CRAWLER_MAX_REDIRECT_HOPS, extractHeadDiscovery, fetchProfilerUrl, isSiteProfilerEnabled, runSiteProfiler, type ProfilerTransportFailure } from './siteProfiler';
 import {COMMUNITY_ACQUISITION_REQUIRED, COMMUNITY_RETRY_REASON, clampRetryAtTimestamp, communityAcquisitionRetryDirective, isCommunityRetryableObservation, retryAtFromUnknown, type CommunityRetryDirective} from './communityRetryPolicy';
@@ -151,7 +152,7 @@ export interface InspectionResult {
   communityIntent?: CommunityIntentEvidence[];
 }
 export type ExternalAcquisitionStatus='FOUND'|'INSPECTED_NO_MATCH'|'PARTIALLY_INSPECTED'|'ACQUISITION_FAILED';
-export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'PINNED_COMMENT'|'YOUTUBE_COMMENTS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
+export type AcquisitionSurface='YOUTUBE_ABOUT'|'RECENT_VIDEO_DESCRIPTIONS'|'PINNED_COMMENT'|'YOUTUBE_COMMENTS'|'YOUTUBE_PLAYLIST_ITEMS'|'CHANNEL_EXTERNAL_LINKS'|'CREATOR_WEBSITES'|'SOCIAL_PROFILES'|'DISCORD_VALIDATION';
 
 /**
  * Content types that carry readable document text. XHTML/XML/Atom/RSS were
@@ -165,7 +166,7 @@ function isTextualDocumentContentType(value:string):boolean{
     || type.includes('application/xhtml+xml')
     || type.includes('application/xml')
     || type.includes('text/xml')
-    || type.includes('+xml')
+    || (type.includes('+xml') && !type.startsWith('image/'))
     || type.includes('json')
     || type.includes('text/plain');
 }
@@ -449,7 +450,7 @@ function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): 
   return resolveHost ?? defaultDnsResolve;
 }
 
-async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false,beforeRedirect?:((targetUrl:string)=>Promise<boolean>)|undefined):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
+async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false,beforeRedirect?:((targetUrl:string)=>Promise<'allow'|'disallow'|'budget'>)|undefined):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
   // The end-to-end budget starts before the admission lookup. The lookup gets
   // only the remaining slice, and the following fetch gets what is left after
@@ -552,7 +553,11 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
       case 'CROSS_ORIGIN_REDIRECT':
         return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:false,httpStatus:fetched.status,failureClass:'INVALID_REDIRECT',detail:`Blocked cross-origin redirect before contact${target}`}};
       case 'ROBOTS_DISALLOWED':
-        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'PARTIALLY_INSPECTED',retryable:false,httpStatus:fetched.status,failureClass:'ROBOTS_DISALLOWED',detail:`Redirect target not contacted (robots Disallow or crawl-delay budget)${target}`}};
+        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'PARTIALLY_INSPECTED',retryable:false,httpStatus:fetched.status,failureClass:'ROBOTS_DISALLOWED',detail:`Redirect target disallowed by robots.txt; target not contacted${target}`}};
+      case 'ROBOTS_DELAY_BUDGET':
+        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'PARTIALLY_INSPECTED',retryable:true,httpStatus:fetched.status,failureClass:'ROBOTS_DELAY_BUDGET',detail:`Redirect target not contacted: per-crawl Crawl-delay budget exhausted${target}`}};
+      case 'REDIRECT_TIMEOUT':
+        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:true,httpStatus:fetched.status,failureClass:'TIMEOUT',detail:`Redirect robots decision exceeded the remaining fetch deadline${target}`}};
     }
   }
   if(fetched.redirectRejected){
@@ -682,34 +687,25 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
   // to the same host, not a pause before every fetch. The first request is
   // immediate; later ones wait only for the remaining interval, so a 30s
   // Crawl-delay cannot multiply into minutes across a bounded page queue.
-  const robotsLastRequestAt=new Map<string,number>();
   // A single site may publish Crawl-delay: 30; waiting that interval for
-  // every child would stall one inspection for minutes. The per-crawl budget
-  // keeps pacing compliant while bounding the total added latency. When the
-  // budget is exhausted the URL is not fetched and coverage stays incomplete.
-  const MAX_ROBOTS_DELAY_PER_CRAWL_MS=10_000;
-  let robotsDelaySpentMs=0;
+  // every child would stall one inspection for minutes. Pacing is shared
+  // process-wide per origin, while each crawl keeps a 10s delay budget. When
+  // the budget is exhausted the URL is not fetched and coverage stays
+  // incomplete.
+  const robotsBudget={spentMs:0};
   const respectRobotsDelay=async(rawUrl:string,decision:{crawlDelayMs:number}):Promise<boolean>=>{
     if(!robotsPolicy||decision.crawlDelayMs<=0)return true;
     let origin:string;
     try{origin=new URL(rawUrl).origin;}catch{return true;}
-    const now=Date.now(),last=robotsLastRequestAt.get(origin)||0;
-    const wait=Math.max(0,Math.min(decision.crawlDelayMs,last+decision.crawlDelayMs-now));
-    if(wait>0){
-      if(robotsDelaySpentMs+wait>MAX_ROBOTS_DELAY_PER_CRAWL_MS)return false;
-      robotsDelaySpentMs+=wait;
-      await new Promise(resolve=>setTimeout(resolve,wait));
-    }
-    robotsLastRequestAt.set(origin,Date.now());
-    return true;
+    return paceRobotsOrigin(origin,decision.crawlDelayMs,robotsBudget);
   };
   // Redirect targets must clear the same policy before contact; otherwise an
   // allowed seed could redirect into a Disallow path and bypass enforcement.
-  const robotsPermit=async(target:string):Promise<boolean>=>{
-    if(!robotsPolicy)return true;
+  const robotsPermit=async(target:string):Promise<'allow'|'disallow'|'budget'>=>{
+    if(!robotsPolicy)return 'allow';
     const decision=await robotsPolicy.decide(target);
-    if(!decision.allowed)return false;
-    return respectRobotsDelay(target,decision);
+    if(!decision.allowed)return 'disallow';
+    return (await respectRobotsDelay(target,decision))?'allow':'budget';
   };
   let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];const communityIntents:CommunityIntentEvidence[]=[];
   // Shared-visit pre-seeding (v2 L1): terminal-success finals inspected by an
@@ -758,13 +754,13 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       const robots=await robotsPolicy.decide(url);
       if(!robots.allowed){
         drops.countUnique('robots-disallowed',url);
-        observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:false,failureClass:'ROBOTS_DISALLOWED',detail:`robots.txt Disallow matched ${robots.matchedRule||'(path)'}; URL not fetched`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});
+        observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:false,failureClass:'ROBOTS_DISALLOWED',detail:`robots.txt Disallow matched ${robots.matchedRule||'(path)'}; URL not fetched`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,dropReasons:drops.snapshot()})});
         logDetails.push(`[robots] disallowed by ${robots.matchedRule||'explicit rule'}: ${url}`);
         continue;
       }
       if(!(await respectRobotsDelay(url,robots))){
-        drops.count('robots-delay-budget');
-        observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'ROBOTS_DELAY_BUDGET',detail:'Per-crawl Crawl-delay budget exhausted before the seed request; coverage is incomplete',observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});
+        drops.count('robots-delay-budget');seedCeiling??='robots-delay-budget';
+        observations.push({requestedUrl:url,finalUrl:url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:true,failureClass:'ROBOTS_DELAY_BUDGET',detail:'Per-crawl Crawl-delay budget exhausted before the seed request; coverage is incomplete',observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,ceiling:'robots-delay-budget',dropReasons:drops.snapshot()})});
         logDetails.push(`[robots] Crawl-delay budget exhausted; seed not fetched: ${url}`);
         continue;
       }
@@ -850,13 +846,14 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       if(failureCandidates.length){seedFound=true;discovered.push(...failureCandidates);}
       if(acquired.observation){
         if(acquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',acquired.observation.finalUrl||url);
+        if(acquired.observation.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(acquired.observation.detail))drops.count('asset-content-type');
         // Invite evidence makes the acquisition a FOUND outcome even though
         // the page fetch itself failed: a retry or render would only re-read
         // the same bytes. The original failure detail is retained.
         const observation=failureCandidates.length
           ? {...acquired.observation,outcome:'FOUND' as const,retryable:false,detail:`Retained ${failureCandidates.length} invite candidate(s) from a failed response (${acquired.observation.detail})`}
           : acquired.observation;
-        observations.push({...observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected})});
+        observations.push({...observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,dropReasons:drops.snapshot()})});
         fetchFailure=observation;
       }
     }
@@ -974,11 +971,13 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
           const frameRobots=await robotsPolicy.decide(absolute);
           if(!frameRobots.allowed){
             drops.countUnique('robots-disallowed',absolute);
+            seedCeiling??='frame-slice';drops.count('frame-slice');
             logDetails.push(`[iframe] robots.txt disallowed ${absolute}`);
             continue;
           }
           if(!(await respectRobotsDelay(absolute,frameRobots))){
             drops.count('robots-delay-budget');
+            seedCeiling??='robots-delay-budget';
             logDetails.push(`[iframe] Crawl-delay budget exhausted; frame not fetched: ${absolute}`);
             continue;
           }
@@ -1061,19 +1060,21 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       const robots=await robotsPolicy.decide(next.url);
       if(!robots.allowed){
         drops.countUnique('robots-disallowed',next.url);
-        observations.push({requestedUrl:next.url,finalUrl:next.url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:false,failureClass:'ROBOTS_DISALLOWED',detail:`robots.txt Disallow matched ${robots.matchedRule||'(path)'}; URL not fetched`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0})});
+        observations.push({requestedUrl:next.url,finalUrl:next.url,wrapperUrl,surface,required,rootUrl:url,outcome:'PARTIALLY_INSPECTED',retryable:false,failureClass:'ROBOTS_DISALLOWED',detail:`robots.txt Disallow matched ${robots.matchedRule||'(path)'}; URL not fetched`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed:0,pagesInspected:0,dropReasons:drops.snapshot()})});
         continue;
       }
       if(!(await respectRobotsDelay(next.url,robots))){
         drops.count('robots-delay-budget');
-        seedCeiling??='exploration-limit';
+        seedCeiling??='robots-delay-budget';
         logDetails.push(`[robots] Crawl-delay budget exhausted; child not fetched: ${next.url}`);
         continue;
       }
     }
     const reservation=destinationBudget.reserve(next.url,next.from||url);if(!reservation.admitted){seedCeiling??='exploration-limit';drops.count('destination-budget');logDetails.push(`Destination budget (${reservation.reason}): skipped ${next.url}; seed coverage remains incomplete.`);continue;}
-    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined})});}if(!subPage){
-      const failureCandidates=subAcquired.observation?.failureClass!=='ROBOTS_DISALLOWED'
+    visited.add(next.url);logDetails.push(`Prioritized website crawl depth ${next.depth}: ${next.url}`);const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
+      // Child error bodies can contain shared footers. Only scan when the
+      // child was nominated as a community-relevant navigation target.
+      const failureCandidates=subAcquired.observation?.failureClass!=='ROBOTS_DISALLOWED'&&next.score>0
         ? extractDiscordCandidates(`${subAcquired.observation?.finalUrl||next.url}\n${subAcquired.failureText||''}`,surface,next.url).filter(candidate=>candidate.nativeInviteCode)
         : [];
       if(failureCandidates.length)discovered.push(...failureCandidates);
@@ -1094,7 +1095,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       frontierYieldHistory.push(childYield);frontierEvidenceUnits+=childYield;
       await frontierRecordCoverage(next.url,childYield>0?'FOUND':(subPage.truncated?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH'),'HTTP_STATIC',childYield);
       await frontierAdmitChildren(children,next.depth);
-    }if(next.depth>=explorationLimits.maxDepth){const seenChildren=new Set<string>();const unvisitedChildren=children.filter(child=>{if(seenChildren.has(child.url))return false;seenChildren.add(child.url);return !visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'');});if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else{const bestChild=new Map<string,{url:string;score:number;from?:string}>();for(const child of children){const prior=bestChild.get(child.url);if(!prior||child.score>prior.score)bestChild.set(child.url,child);}const duplicateChildren=Math.max(0,children.length-bestChild.size);if(duplicateChildren>0)drops.count('duplicate',duplicateChildren);for(const child of [...bestChild.values()])if((!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'')))queue.push({...child,depth:next.depth+1});}}
+    }if(next.depth>=explorationLimits.maxDepth){const seenChildren=new Set<string>();const unvisitedChildren=children.filter(child=>{if(seenChildren.has(child.url))return false;seenChildren.add(child.url);return !visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??'');});if(unvisitedChildren.length>0){seedCeiling??='depth-limit';drops.count('depth-limit',unvisitedChildren.length);}}else{const bestChild=new Map<string,{url:string;score:number;from?:string}>();for(const child of children){const prior=bestChild.get(child.url);if(!prior||child.score>prior.score)bestChild.set(child.url,child);}const duplicateChildren=Math.max(0,children.length-bestChild.size);if(duplicateChildren>0)drops.count('duplicate',duplicateChildren);const uniqueChildren=[...bestChild.values()].filter(child=>!visited.has(child.url)&&!sharedVisited.has(sharedKey(child.url)??''));const room=Math.max(0,explorationLimits.queueCap-queue.length);queue.push(...uniqueChildren.slice(0,room).map(child=>({...child,depth:next.depth+1})));const overflow=Math.max(0,uniqueChildren.length-room);if(overflow>0){seedCeiling??='queue-cap';drops.count('queue-cap',overflow);}}}
     if(queue.some(item=>!visited.has(item.url)))seedCeiling??='exploration-limit';const leftoverUnvisited=queue.filter(item=>!visited.has(item.url)).length;if(leftoverUnvisited>0)drops.count('exploration-limit',leftoverUnvisited);
     if(wrapperCandidate){const nativeForSeed=discovered.slice(beforeSeed).filter(candidate=>candidate.nativeInviteCode);if(nativeForSeed.length){discovered.splice(beforeSeed,discovered.length-beforeSeed,...preserveResolvedWrapperProvenance(wrapperCandidate,nativeForSeed));}}
     const foundForSeed=seedFound||discovered.length>beforeSeed;
@@ -1138,7 +1139,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // browser escalation still only per existing policy (no silent expensive
     // acquisition).
     const partialFlag = r6Options?.partialStaticRetry ?? true;
-    const staticCeilingKinds = new Set(['queue-cap', 'depth-limit', 'exploration-limit', 'response-cap', 'control-slice', 'frame-slice', 'frontier-yield']);
+    const staticCeilingKinds = new Set(['queue-cap', 'depth-limit', 'exploration-limit', 'response-cap', 'control-slice', 'frame-slice', 'frontier-yield', 'robots-delay-budget']);
     const staticGapRetryable = partialFlag && !foundForSeed && !confirmedBarrier && !!seedCeiling && staticCeilingKinds.has(String(seedCeiling));
     const seedOutcome:ExternalAcquisitionStatus=foundForSeed?'FOUND':(seedCeiling||confirmedBarrier)?'PARTIALLY_INSPECTED':'INSPECTED_NO_MATCH';const sharedRootAttribution=sharedRoot?`Shared static root evidence from ${sharedRoot.bySeed}; `:'';observations.push({requestedUrl:url,finalUrl:page.finalUrl,wrapperUrl,surface,required,rootUrl:url,outcome:seedOutcome,retryable:confirmedBarrier?false:(staticGapRetryable?true:false),httpStatus:200,failureClass:confirmedBarrier?barrierClass:(staticGapRetryable?STATIC_BUDGET_GAP_FAILURE_CLASS:''),detail:`${sharedRootAttribution}${foundForSeed?`Discord candidate(s) retained while inspecting root plus ${explored} prioritized page(s)`:confirmedLogin?`Login wall confirmed at ${page.finalUrl}; absence is not confirmed, no further identical retry`:confirmedPaywall?`Paywall confirmed at ${page.finalUrl}; absence is not confirmed, no further identical retry`:seedCeiling?`Root plus ${explored} prioritized page(s) inspected without a Discord invite; crawl budget exhausted before full coverage${truncatedResponse?'; response truncated at the bounded-response cap before full coverage':''}`:`Root page plus ${explored} prioritized same-origin community/navigation page(s) inspected without a Discord invite`}`,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:seedCeiling,dropReasons:drops.snapshot(),...(seedExperimentAttribution?{experimentAttribution:{...seedExperimentAttribution,...(seedCeiling==='frontier-yield'?{stoppingReason:'frontier-yield-stop'}:{})}}:{})}),...(sharedRoot?{sharedEvidenceFrom:sharedRoot.bySeed}:{})});
     if(frontierOn){

@@ -46,11 +46,25 @@ test('ordinary words do not become community evidence through substrings', () =>
 
 test('hyphenated multilingual paths still match the lexicon', () => {
   const decision = shouldFollowDestination({
-    url: 'https://hub.example/trading-room',
+    url: 'https://hub.example/comunidad-privada',
     currentUrl: 'https://creator.example/',
   });
   assert.equal(decision.eligible, true);
   assert.equal(decision.reason, 'community-evidence');
+});
+
+test('invite labels and concatenated slugs open unknown hosts', () => {
+  const label = shouldFollowDestination({
+    url: 'https://hub.example/x',
+    currentUrl: 'https://creator.example/',
+    anchorText: 'Get an invite',
+  });
+  assert.equal(label.eligible, true, 'invite');
+  const slug = shouldFollowDestination({
+    url: 'https://unknown.example/vipintraders',
+    currentUrl: 'https://creator.example/',
+  });
+  assert.equal(slug.eligible, true, 'vipintraders');
 });
 
 test('generic access terms no longer open an unknown host alone', () => {
@@ -85,6 +99,13 @@ test('localized weak navigation labels do not open an unknown host alone', () =>
     assert.equal(decision.eligible, false, phrase);
     assert.equal(decision.reason, 'no-community-evidence', phrase);
   }
+});
+
+test('rendered control regex keeps the Unicode flag and token boundaries', () => {
+  assert.ok(MULTILINGUAL_CONTROL_HINTS.flags.includes('u'));
+  assert.equal(MULTILINGUAL_CONTROL_HINTS.test('ChatGPT'), false);
+  assert.equal(MULTILINGUAL_CONTROL_HINTS.test('Remember'), false);
+  assert.equal(MULTILINGUAL_CONTROL_HINTS.test('members'), true);
 });
 
 test('lexicon is exposed to rendered control and static path matching', () => {

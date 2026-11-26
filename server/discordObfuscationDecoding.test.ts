@@ -27,6 +27,14 @@ test('decodes double-encoded percent, unicode, entity and dot forms', () => {
 test('does not invent invites from arbitrary Base64 or rotated text', () => {
   assert.deepEqual(codes('aGVsbG8gd29ybGQgaGVsbG8='), []);
   assert.deepEqual(codes('This is ordinary prose without a community URL.'), []);
+  // `qvfpbeq` is the rotated "discord" marker, so this exercises the ROT13
+  // negative path rather than skipping the decoder entirely.
+  assert.deepEqual(codes('qvfpbeq vf abg na vaivgr'), []);
+});
+
+test('decodes UTF-8 Base64 payloads containing an invite', () => {
+  const encoded = Buffer.from('Присоединяйтесь https://discord.gg/UTF8BASE64', 'utf8').toString('base64');
+  assert.deepEqual(codes(`token ${encoded}`), ['UTF8BASE64']);
 });
 
 test('preserves case across decoded variants', () => {
@@ -40,4 +48,9 @@ test('rejoins bounded tag-fragmented invite text', () => {
 
 test('block-level markup between host and path is not a protected invite', () => {
   assert.deepEqual(codes('discord.gg<div>/NOTACODE</div>'), []);
+});
+
+test('inline void tags and closing tags in protected links are rejoined', () => {
+  assert.deepEqual(codes('discord.gg<br />/BRTAG'), ['BRTAG']);
+  assert.deepEqual(codes('discord.gg<span>/</span>CLOSEDTAG'), ['CLOSEDTAG']);
 });

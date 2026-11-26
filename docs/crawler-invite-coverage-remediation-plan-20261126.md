@@ -1,6 +1,6 @@
 # Crawler Invite-Discovery Remediation Plan — Evidence-Based Architecture and Rollout
 
-**Status:** PROPOSED — **no implementation, deployment, or production configuration change is authorized**
+**Status:** PHASE 0/1 IMPLEMENTED ON BRANCH — deployment/configuration remains gated by the canary plan below; browser-service provisioning is deferred
 **Date:** 2026-11-26
 **Evidence baseline:** `docs/crawler-invite-coverage-gap-register-20261126.md` (32 gaps, V4 pass 3)
 **Production at review:** Coolify `main` `1bf93568`, schema 210 (redeployed twice during the review)
@@ -125,8 +125,9 @@ No item is approved by this document.
 
 - `MAX_BROWSER_RUNTIME_CONCURRENCY = 2` is a **code constant**; raising the env
   var does nothing.
-- The production host has 4 cores/7.8 GB; app + DB + one browser already use
-  ~3.4 GB and 2.5+ cores; a second slot is possible, not 8–16.
+- The co-located production host has limited CPU/RAM headroom (exact sizing in
+  the internal runbook); app + DB + one browser already consume most of it; a
+  second slot is possible, not 8–16.
 - Browser memory measured ~1.0–1.3 GB per active crawler; 8 workers need
   8–12 GB; 16 need 16–24 GB.
 - The browser tier must scale independently of the API/DB; otherwise one crawl
@@ -182,8 +183,9 @@ case-preserving/validation boundary and prevents duplicate owner races.
 
 ### 3.5 YouTube acquisition service
 
-- Pinned comment: `commentThreads.list` (or Innertube) with `is_pinned` /
-  `author_is_channel_owner`; pass to the existing inspector.
+- Pinned comment: use Innertube, which exposes `is_pinned` /
+  `author_is_channel_owner`; the official `commentThreads.list` does not expose
+  those fields. Pass authorship-qualified text to the existing inspector.
 - Top comments: first 1–2 pages, sorted top/newest; creator comments prioritized.
 - Older uploads: uploads playlist pagination, not a 100-unit `search.list` per
   10 videos; scan descriptions for videos 11–N.
@@ -271,7 +273,8 @@ At the current 64/h, a single pass of 73,040 rows takes **~47 days**; the
 **16 vCPU / 32 GB** (or 3× 8 vCPU/16 GB nodes with 4 workers each), capable of
 ~430–580 expanded renders/hour. This supports weekly refresh and clears the
 63,941-row backlog in ~5–6 days after cutover. Autoscale to 24–32 workers for
-daily/backfill bursts. Do not attempt this on the current 4-core/7.8 GB host.
+daily/backfill bursts. Do not attempt this on the current co-located host
+(sizing in the internal runbook).
 
 ### 4.4 Queue and database
 
@@ -287,10 +290,10 @@ daily/backfill bursts. Do not attempt this on the current 4-core/7.8 GB host.
 ### 4.5 Why not simply remove limits
 
 Removing the governor without capacity would:
-- overload the 4-core host and starve API/admission/DB;
+- overload the co-located host and starve API/admission/DB;
 - increase timeouts and zero-page runs;
 - increase host/domain blocking and duplicate work;
-- risk OOM (browser ~1.1–1.3 GB; host already at 3.4 GB used).
+- risk OOM (browser ~1.1–1.3 GB; the co-located host already has limited headroom).
 
 Scale the browser tier first, then raise per-job budgets and control exploration.
 
@@ -301,7 +304,7 @@ Scale the browser tier first, then raise per-job budgets and control exploration
 ### WS1 — Dedicated browser capacity (GAP-29, GAP-06)
 
 **Evidence:** 11,111 saturated sites; 83% zero pages; 63,941 unrendered website
-rows; 64/h; 2-slot hard code cap; 47-day pass; host 4 cores/7.8 GB. V4 rendered
+rows; 64/h; 2-slot hard code cap; 47-day pass; co-located host sizing redacted. V4 rendered
 5 saturated sites with the governor disabled: **0 live invites, 2 zero-page, 3
 bounded**. Across the full real render sample (A+B+C) the measured global-new
 live yield is **0/19**. Capacity alone does not guarantee an invite; it removes

@@ -90,6 +90,17 @@ const ALTERNATIVE_INVITE_HOST='(?:dsc\\.gg|discord\\.me|discord\\.io)';
 // The code capture must end at a real token boundary: a longer
 // code-alphabet run is not an invite (`a`×129 must not truncate to `a`×128).
 const INVITE_CODE_CAPTURE='([A-Za-z0-9_-]{2,128})(?![A-Za-z0-9_-])';
+// Inline/void tags used by "protect link" markup. Block tags are excluded so
+// ordinary page structure cannot become an invite. Optional trailing slash
+// handles XHTML/self-closing forms such as `<br />`.
+const INLINE_TAG_PATTERN='<\\/?(?:span|b|i|strong|em|small|wbr|br|a|u|mark|font)(?:\\s[^>]{0,120})?\\s*\\/?>';
+const TAG_FRAGMENT_REJOIN:Array<[RegExp,string]>=[
+  [new RegExp(`\\bdisc\\s*${INLINE_TAG_PATTERN}\\s*ord`,'gi'),'discord'],
+  [new RegExp(`discord\\s*${INLINE_TAG_PATTERN}\\s*\\.\\s*gg`,'gi'),'discord.gg'],
+  // Consume an optional closing inline tag after the slash before the code.
+  [new RegExp(`discord\\.gg\\s*${INLINE_TAG_PATTERN}\\s*\\/\\s*(?:${INLINE_TAG_PATTERN}\\s*)?`,'gi'),'discord.gg/'],
+];
+
 /** Decode the bounded obfuscation forms that still name a real invite:
  * escaped slashes/colons/percent forms, numeric HTML entities, zero-width
  * format characters, and bracketed dot separators (`discord[.]gg`). Only
@@ -110,16 +121,13 @@ export function decodeInviteObfuscation(text:string):string{
     .replace(/&#x0*2e;|&#0*46;/gi,'.')
     .replace(/&#x0*3a;|&#0*58;/gi,':')
     .replace(/&#x0*2f;|&#0*47;/gi,'/')
-    .replace(/&#x0*26;|&#0*38;/gi,'&')
-    // Bounded tag-fragment rejoin: `disc<span>ord</span>.gg/CODE` and
-    // `discord<span>.gg</span>/CODE` are common "protect link" patterns.
-    // Only inline formatting tags are allowed, so ordinary markup such as
-    // `discord.gg<div>/path` cannot be turned into a fake invite. The tag
-    // body is capped so a hostile document cannot turn this into an
-    // unbounded HTML parser inside extraction.
-    .replace(/\bdisc\s*<\/?(?:span|b|i|strong|em|small|wbr|a|u|mark|font)(?:\s[^>]{0,120})?>\s*ord/gi,'discord')
-    .replace(/discord\s*<\/?(?:span|b|i|strong|em|small|wbr|a|u|mark|font)(?:\s[^>]{0,120})?>\s*\.\s*gg/gi,'discord.gg')
-    .replace(/discord\.gg\s*<\/?(?:span|b|i|strong|em|small|wbr|a|u|mark|font)(?:\s[^>]{0,120})?>\s*\/\s*/gi,'discord.gg/')
+    .replace(/&#x0*26;|&#0*38;/gi,'&');
+  // Bounded tag-fragment rejoin: `disc<span>ord</span>.gg/CODE` and
+  // `discord<span>.gg</span>/CODE` are common "protect link" patterns. The
+  // tag body is capped so a hostile document cannot turn this into an
+  // unbounded HTML parser inside extraction.
+  for(const [pattern,replacement] of TAG_FRAGMENT_REJOIN)decoded=decoded.replace(pattern,replacement);
+  decoded=decoded
     .replace(/discord\s+dot\s+(gg|com|app)/gi,'discord.$1')
     .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*gg/gi,'discord.gg')
     .replace(/discord\s*[\[(]\s*dot\s*[\])]\s*gg/gi,'discord.gg')
@@ -127,7 +135,7 @@ export function decodeInviteObfuscation(text:string):string{
   // Two bounded percent passes decode double-encoded forms (`%252F` -> `%2F`
   // -> `/`) without unbounded recursive decoding. `%25` must run first in each
   // pass so the exposed escape is decoded in the same pass.
-  for(let pass=0;pass<3;pass++){
+  for(let pass=0;pass<2;pass++){
     const next=decoded
       .replace(/%25/gi,'%')
       .replace(/%2f/gi,'/')
@@ -226,6 +234,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   else if(surfaces.has('RECENT_VIDEO_DESCRIPTIONS')){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
   else if(surfaces.has('SOCIAL_PROFILES')){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
   else if(surfaces.has('CREATOR_WEBSITES')){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
+  else if(surfaces.has('YOUTUBE_PLAYLIST_ITEMS')){score+=20;reasons.push('CURATED_PLAYLIST_ITEM');}
   else if(surfaces.has('YOUTUBE_COMMENTS')){score+=0;reasons.push('VIEWER_COMMENT_SURFACE');}
 
   // A channel external link is a creator-controlled surface. Explicit extraction
@@ -366,7 +375,10 @@ function boundedBase64Variants(text:string):string[]{
     const token=match[0].replace(/-/g,'+').replace(/_/g,'/');
     try{
       const decoded=Buffer.from(token,'base64').toString('utf8');
-      if(/discord/i.test(decoded)&&/^[\x09\x0A\x0D\x20-\x7E]+$/.test(decoded))out.push(decoded);
+      // Allow UTF-8 letters/punctuation; reject binary/control payloads and
+      // replacement-character noise rather than requiring ASCII.
+      const hasControl=/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/.test(decoded);
+      if(/discord/i.test(decoded)&&!hasControl)out.push(decoded);
     }catch{/* malformed base64 is ignored */ }
   }
   return out;
