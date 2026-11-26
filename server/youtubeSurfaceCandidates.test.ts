@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
 import { makeDiscordCandidate } from './discordCandidates';
 import {
@@ -11,6 +12,14 @@ import {
 } from './youtubeSurfaceCandidates';
 
 const text = (value: string) => ({ toString: () => value });
+
+test('production Innertube client uses a fast local session', () => {
+  const source = fs.readFileSync(new URL('./youtubeSurfaceCandidates.ts', import.meta.url), 'utf8');
+  assert.match(source, /retrieve_player: false/);
+  assert.match(source, /retrieve_innertube_config: false/);
+  assert.match(source, /generate_session_locally: true/);
+  assert.match(source, /enable_session_cache: false/);
+});
 
 test('collects pinned, top, older, Community and playlist text with bounds', async () => {
   const channel = {

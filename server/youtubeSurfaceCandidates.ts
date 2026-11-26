@@ -95,7 +95,18 @@ export async function createYouTubeSurfaceClient(timeoutMs = 15_000): Promise<Yo
   // versions. Bound it so a stuck initialization cannot hold the inspection
   // open before the collector's own deadline starts.
   const yt: any = await withTimeout(
-    Innertube.create({ lang: 'en', location: 'US', fetch: boundedFetch }),
+    Innertube.create({
+      lang: 'en',
+      location: 'US',
+      // Comments/channel/Community reads do not need the JS player or a
+      // remote InnerTube config. Generating the session locally keeps
+      // initialization fast and avoids a startup timeout on slow egress.
+      retrieve_player: false,
+      retrieve_innertube_config: false,
+      generate_session_locally: true,
+      enable_session_cache: false,
+      fetch: boundedFetch,
+    }),
     timeoutMs,
   );
   if (!yt) throw new Error('YouTube client initialization timed out');
