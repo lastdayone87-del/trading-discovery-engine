@@ -143,14 +143,26 @@ test('rate-limited free route failure surfaces without cross-route burst', async
 test('all rejected free routes block the pool until a later success', async () => {
   resetGeminiFreeCooldownForTests();
   const routes = [{ id: 'gemini-free-1', key: 'k1' }, { id: 'gemini-free-2', key: 'k2' }];
-  await assert.rejects(runGeminiFreeRouteFailover(routes, async () => {
-    throw new ProviderCallError('Provider rejected the route credential.', 'TRANSIENT', true, {
-      status: 401,
-      routeScoped: true,
-      providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
-    });
-  }));
-  assert.equal(geminiFreeCredentialExhausted(Date.now()), true);
+  let failure: any;
+  await assert.rejects(async () => {
+    try {
+      await runGeminiFreeRouteFailover(routes, async () => {
+        throw new ProviderCallError('Provider rejected the route credential.', 'TRANSIENT', true, {
+          status: 401,
+          routeScoped: true,
+          providerReasons: ['PROVIDER_ROUTE_UNAUTHORIZED'],
+        });
+      });
+    } catch (error) {
+      failure = error;
+      throw error;
+    }
+  }, /rejected the route credential/);
+  assert.equal(failure?.providerCapacityExhausted, true);
+  const now = Date.now();
+  assert.ok(Number(failure?.retryAt) > now, 'the tripping job must carry a future retry');
+  assert.ok(Number(failure?.retryAt) <= now + 5 * 60_000, 'the job must not park for the full credential block');
+  assert.equal(geminiFreeCredentialExhausted(now), true);
   const value = await runGeminiFreeRouteFailover(routes, async () => 'ok');
   assert.equal(value, 'ok');
   assert.equal(geminiFreeCredentialExhausted(Date.now()), false, 'a successful call must clear the credential block');

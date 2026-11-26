@@ -2023,7 +2023,7 @@ export async function processNextSearchJob(
       : 0;
     const enrichmentProbe = probeTimeAllowed && probeStagesAvailable > 0;
     enrichProbeOnly = enrichmentProbe && !enrichmentFullyClaimable;
-    if ((enrichmentFullyClaimable || enrichmentProbe) && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
+    if ((enrichmentFullyClaimable || enrichmentProbe || (geminiFreeSelected && await groqRoutesServing())) && await semanticCapacity() && (!claimableOverride || claimableOverride.includes('ENRICH_CHANNEL'))) {
       claimableTypes.push('ENRICH_CHANNEL');
       // Classification jobs require the semantic decision and remain gated
       // while every semantic route is cooling. ENRICH is allowed as a bounded

@@ -4304,8 +4304,8 @@ export async function resolveGeminiOrgSemanticCooldownExpiryMs(orgId:string,nowM
  */
 export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=Date.now()):Promise<number|undefined>{
   const windowRaw=process.env.GEMINI_ORG_RATE_WINDOW_MS;
-  const windowMs=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
-  if(!Number.isFinite(windowMs)||windowMs<=0)return undefined;
+  const parsedWindow=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  const windowMs=Number.isFinite(parsedWindow)&&parsedWindow>0?parsedWindow:60000;
   try{
     const db=await getDb();
     const res=await db.query(`SELECT occurred_at FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at > now() - ($2::int * interval '1 millisecond') ORDER BY occurred_at ASC LIMIT 1`,[orgId,Math.floor(windowMs)]);
@@ -4323,10 +4323,14 @@ export async function resolveGeminiOrgBucketExpiryMs(orgId:string,nowMs:number=D
  */
 export async function isGeminiOrgBucketFull(orgId:string,nowMs:number=Date.now()):Promise<boolean>{
   const windowRaw=process.env.GEMINI_ORG_RATE_WINDOW_MS;
-  const windowMs=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  const parsedWindow=windowRaw===undefined||String(windowRaw).trim()===''?60000:Number(windowRaw);
+  const windowMs=Number.isFinite(parsedWindow)&&parsedWindow>0?parsedWindow:60000;
   const maxRaw=String(process.env.GEMINI_ORG_MAX_CALLS_PER_MINUTE ?? '').trim();
-  const maxCalls=maxRaw===''?10:Number(maxRaw);
-  if(!Number.isFinite(windowMs)||windowMs<=0||!Number.isFinite(maxCalls)||maxCalls<=0)return false;
+  const parsedMax=maxRaw===''?10:Number(maxRaw);
+  // Match geminiCapacityConfig(): blank/negative/garbage falls back to 10;
+  // an explicit 0 disables the bucket.
+  const maxCalls=Number.isFinite(parsedMax)&&parsedMax>=0?parsedMax:10;
+  if(maxCalls<=0)return false;
   try{
     const db=await getDb();
     const res=await db.query(`SELECT count(*)::int AS n FROM provider_call_events WHERE provider='gemini' AND request_metadata->>'geminiOrg'=$1 AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true' AND occurred_at > now() - ($2::int * interval '1 millisecond')`,[orgId,Math.floor(windowMs)]);
