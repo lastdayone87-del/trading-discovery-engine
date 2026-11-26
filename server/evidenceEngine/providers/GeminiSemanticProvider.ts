@@ -168,6 +168,19 @@ export interface GeminiRouteFailoverOptions {
   isOrgCooling?: (orgId: string) => boolean;
   /** Caller cancellation: no route may start after this signal aborts. */
   signal?: AbortSignal;
+  /**
+   * Stable per-job key used to choose the first healthy account. Without it,
+   * failover starts at the configured order (legacy behavior).
+   */
+  rotationKey?: string;
+}
+
+/** Deterministic spread across independent accounts for concurrent jobs. */
+export function geminiRouteRotationStart(key: string | undefined, length: number): number {
+  if (!key || length <= 1) return 0;
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  return hash % length;
 }
 
 function failoverCancelled(signal?: AbortSignal): ProviderCallError {
@@ -189,11 +202,17 @@ export async function runGeminiRouteFailover<T>(
   let lastError: unknown;
   let unauthorizedFailures = 0;
   const tried = new Set<GeminiRoute>();
-  // Stable order, healthy accounts first: configured order is preserved
-  // within each group, so single-account deployments behave as before.
-  const ordered = [...routes].sort(
-    (a, b) => Number(isCooling(geminiRouteOrg(a))) - Number(isCooling(geminiRouteOrg(b))),
-  );
+  // Healthy accounts first; independent jobs start at different healthy
+  // accounts so one project cannot absorb every call and hit the semantic
+  // attempt deadline before failover reaches its siblings.
+  const healthy = routes.filter(route => !isCooling(geminiRouteOrg(route)));
+  const cooling = routes.filter(route => isCooling(geminiRouteOrg(route)));
+  const start = geminiRouteRotationStart(opts?.rotationKey, healthy.length);
+  const ordered = [
+    ...healthy.slice(start),
+    ...healthy.slice(0, start),
+    ...cooling,
+  ];
   for (const route of ordered) {
     if (opts?.signal?.aborted) {
       if (abortedByDeadline(opts.signal)) {
@@ -320,7 +339,14 @@ export function defaultClient(): SemanticModelClient | undefined {
         }
         throw error;
       }
-    }, { isOrgCooling: orgId => coolingOrgs.has(orgId), signal }).catch(async (error: unknown) => {
+    }, {
+      isOrgCooling: orgId => coolingOrgs.has(orgId),
+      signal,
+      rotationKey: observability?.jobId
+        || observability?.runId
+        || observability?.requestMetadata?.channelId
+        || observability?.requestMetadata?.queryRunId,
+    }).catch(async (error: unknown) => {
       // Single-key rejection is route-scoped and handled by failover. When
       // every configured key is rejected, block each configured account so
       // semantic jobs park instead of consuming retry attempts.

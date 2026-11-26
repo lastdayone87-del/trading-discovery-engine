@@ -120,6 +120,20 @@ test('rate-limited Gemini route failure surfaces without cross-route burst',asyn
   assert.deepEqual(calls,['gemini-1']);
 });
 
+test('independent jobs start at different healthy Gemini accounts',async()=>{
+  const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
+  const routes=[1,2,3].map(n=>({id:`gemini-${n}`,key:`hidden-${n}`}));
+  const starts:string[]=[];
+  for(const rotationKey of ['job-1','job-2','job-3','job-4','job-5','job-6','job-7','job-8']){
+    const result=await runGeminiRouteFailover(routes,async route=>{
+      starts.push(route.id);
+      return route.id;
+    },{rotationKey});
+    assert.equal(result,starts[starts.length-1]);
+  }
+  assert.equal(new Set(starts).size,3,'all healthy projects must receive traffic');
+});
+
 test('transient transport failure still advances to the next authorized route',async()=>{
   const {runGeminiRouteFailover}=await import('./GeminiSemanticProvider');
   const calls:string[]=[];
