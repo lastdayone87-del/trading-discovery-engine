@@ -1880,7 +1880,15 @@ export async function processNextSearchJob(
     if (status.probe && status.probeAccount) takenCapacityProbe = status.probeAccount;
     return status.available;
   };
-  const semanticJobTypes = new Set<string>([CLASSIFICATION_JOB_TYPE, ADMISSION_VERIFICATION_JOB_TYPE, 'PROCESS_DISCOVERED_CHANNEL']);
+  const semanticJobTypes = new Set<string>([
+    CLASSIFICATION_JOB_TYPE,
+    ADMISSION_VERIFICATION_JOB_TYPE,
+    'PROCESS_DISCOVERED_CHANNEL',
+    'ENRICH_CHANNEL',
+    'POST_APPROVAL_ENRICH',
+    'FORCE_REVIEW_RESCAN',
+    'RESOLVE_STAGED_CANDIDATE',
+  ]);
   const releaseUnusedCapacityProbe = async (jobType?: string): Promise<void> => {
     if (!takenCapacityProbe) return;
     if (jobType && semanticJobTypes.has(jobType)) return;
