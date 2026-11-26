@@ -9,6 +9,11 @@ on:
       - 'server/queueManager.ts'
       - 'server/manualSearchStore.ts'
       - 'server/quotaReservationIndex.postgres.test.ts'
+      - 'server/providerEventIndexes.test.ts'
+      - 'server/providerEventIndexes.postgres.test.ts'
+      - 'server/db/migrations/209_provider_event_indexes.sql'
+      - 'server/providerResilience.ts'
+      - 'server/providerResilience.test.ts'
       - 'server/db/migrations/207_quota_reservation_active_index.sql'
       - 'server/db/migrations/208_quota_reservation_consumed_index.sql'
       - '.github/workflows/quota-reservation-locking.yml'
@@ -32,6 +37,7 @@ jobs:
         run: >-
           node --import tsx --test
           server/dbCore.quota.test.ts
+          server/providerEventIndexes.test.ts
       - name: TypeScript validation
         run: npm run lint
 
@@ -54,6 +60,7 @@ jobs:
           --health-retries 12
     env:
       QUOTA_RESERVATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_quota_reservations
+      PROVIDER_EVENT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tde_quota_reservations
       PGSSL: disable
       NODE_ENV: test
     steps:
@@ -67,3 +74,4 @@ jobs:
         run: >-
           node --import tsx --test
           server/quotaReservationIndex.postgres.test.ts
+          server/providerEventIndexes.postgres.test.ts

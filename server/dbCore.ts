@@ -926,6 +926,74 @@ async function ensureQuotaReservationConsumedIndex(client: { query: (text: strin
   await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON public.quota_reservations (reserved_at) INCLUDE (allocation, units) WHERE status='CONSUMED'`);
 }
 
+/** Provider-call ledger indexes used by the per-account capacity gate and the
+ * query-run completion accounting. The local capacity-deferral echoes are
+ * excluded from the Gemini/Groq indexes; otherwise a provider outage grows the
+ * index with rows that can never answer a capacity question. */
+const PROVIDER_EVENT_INDEXES = [
+  {
+    name: 'idx_provider_events_gemini_active_org_time',
+    create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_gemini_active_org_time ON public.provider_call_events ((request_metadata->>'geminiOrg'), occurred_at DESC) WHERE provider='gemini' AND COALESCE(request_metadata->>'geminiCapacityDeferral','') <> 'true'`,
+    keyCount: 2,
+    keyDefinition: "USING btree (((request_metadata ->> 'geminiOrg'::text)), occurred_at DESC)",
+    predicate: "((provider = 'gemini'::text) AND (COALESCE((request_metadata ->> 'geminiCapacityDeferral'::text), ''::text) <> 'true'::text))",
+  },
+  {
+    name: 'idx_provider_events_groq_rate_org_time',
+    create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_groq_rate_org_time ON public.provider_call_events ((request_metadata->>'groqOrg'), occurred_at DESC) WHERE provider='groq' AND status='RATE_LIMITED' AND COALESCE(request_metadata->>'groqCooldownDeferral','') <> 'true'`,
+    keyCount: 2,
+    keyDefinition: "USING btree (((request_metadata ->> 'groqOrg'::text)), occurred_at DESC)",
+    predicate: "((provider = 'groq'::text) AND (status = 'RATE_LIMITED'::text) AND (COALESCE((request_metadata ->> 'groqCooldownDeferral'::text), ''::text) <> 'true'::text))",
+  },
+  {
+    name: 'idx_provider_events_rate_provider_time',
+    create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_rate_provider_time ON public.provider_call_events (provider, occurred_at DESC) WHERE status='RATE_LIMITED'`,
+    keyCount: 2,
+    keyDefinition: "USING btree (provider, occurred_at DESC)",
+    predicate: "(status = 'RATE_LIMITED'::text)",
+  },
+  {
+    name: 'idx_provider_events_run_id',
+    create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_provider_events_run_id ON public.provider_call_events (run_id, provider, operation, status) WHERE run_id IS NOT NULL`,
+    keyCount: 4,
+    keyDefinition: "USING btree (run_id, provider, operation, status)",
+    predicate: "(run_id IS NOT NULL)",
+  },
+] as const;
+
+export async function ensureProviderEventIndexes(client: { query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount?: number | null }> }): Promise<void> {
+  const target = await client.query(`SELECT to_regclass('public.provider_call_events') AS oid`);
+  const tableOid = target.rows[0]?.oid;
+  if (!tableOid) return;
+  for (const index of PROVIDER_EVENT_INDEXES) {
+    const existing = await client.query(`
+      SELECT c.oid, i.indisvalid, i.indisready, i.indisunique, i.indnkeyatts,
+             i.indpred IS NOT NULL AS has_predicate,
+             CASE WHEN to_regclass('public.provider_call_events') IS NULL THEN false
+                  ELSE i.indrelid = to_regclass('public.provider_call_events') END AS correct_table,
+             pg_get_expr(i.indpred, i.indrelid) AS predicate,
+             pg_get_indexdef(i.indexrelid) AS definition
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+       WHERE c.oid = to_regclass('public.${index.name}')
+    `);
+    const row = existing.rows[0];
+    const definition = String(row?.definition || '');
+    const predicate = String(row?.predicate || '');
+    const correct = row?.correct_table === true
+      && row?.indisunique === false
+      && row?.has_predicate === true
+      && Number(row?.indnkeyatts) === index.keyCount
+      && definition.includes(index.keyDefinition)
+      && predicate === index.predicate;
+    if (row?.indisvalid && row?.indisready && correct) continue;
+    if (row?.oid) {
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS public.${index.name}`);
+    }
+    await client.query(index.create);
+  }
+}
+
 /**
  * Migration 185 indexes the mature saturation sweep. Build both indexes
  * concurrently before the transactional migration loop; migration 185 only
@@ -1012,6 +1080,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (!migration207.rowCount) await ensureQuotaReservationActiveIndex(client);
     const migration208 = await client.query('SELECT 1 FROM schema_migrations WHERE version=208');
     if (!migration208.rowCount) await ensureQuotaReservationConsumedIndex(client);
+    const migration209 = await client.query('SELECT 1 FROM schema_migrations WHERE version=209');
+    if (!migration209.rowCount) await ensureProviderEventIndexes(client);
     const files = fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort();
     const versions=new Map<number,string>();
     for(const file of files){const version=Number(file.split('_')[0]);const previous=versions.get(version);if(previous)throw new Error(`Duplicate migration version ${version}: ${previous} and ${file}`);versions.set(version,file);}
@@ -1041,6 +1111,8 @@ export async function runMigrations(): Promise<Array<{ version: number; name: st
     if (quotaReservationIndexMigration.rowCount) await ensureQuotaReservationActiveIndex(client);
     const quotaReservationConsumedIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=208');
     if (quotaReservationConsumedIndexMigration.rowCount) await ensureQuotaReservationConsumedIndex(client);
+    const providerEventIndexMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=209');
+    if (providerEventIndexMigration.rowCount) await ensureProviderEventIndexes(client);
     const cdlMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=161');
     if (cdlMigration.rowCount) await ensureCdlHotTableIndexes(client);
     const acquisitionReliabilityMigration = await client.query('SELECT 1 FROM schema_migrations WHERE version=178');

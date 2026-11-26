@@ -241,3 +241,4 @@ test('a per-minute declared reset still applies when it extends past the fixed c
   }, config);
   assert.equal(decision.action, 'DEFER');
 });
+
