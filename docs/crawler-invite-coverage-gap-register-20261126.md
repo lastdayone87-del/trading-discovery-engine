@@ -38,6 +38,10 @@ Rules:
 | 2026-11-26 ~05:27 | `1bf93568` | 210 | second external redeploy during review |
 
 `SOURCE_COMMIT=1bf93568...`, `COOLIFY_BRANCH=main`, `NODE_ENV=production`.
+
+Post-review implementation update: production advanced to `f0aa55b3` (Gemini
+route rotation; crawler files unchanged, schema 210). The remediation branch was
+rebased onto that revision before deployment.
 A diff of every crawler file across these revisions is empty. `4f592c02` added
 provider index work to `dbCore.ts`; `1bf93568` changed `queueManager.ts` semantic
 provider-capacity gating (149 lines), not invite extraction or navigation. The

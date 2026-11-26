@@ -2,7 +2,7 @@
 
 **Status:** IMPLEMENTATION IN PROGRESS — code/test verification; **not yet deployed**
 **Date:** 2026-11-26
-**Branch:** `feat/crawler-coverage-remediation` (from production `1bf93568`)
+**Branch:** `feat/crawler-coverage-remediation` (rebased onto production `f0aa55b3`; review baseline was `1bf93568`)
 **References:** gap register and remediation plan in the same directory
 
 ---
@@ -126,9 +126,11 @@ and arbitrary app routes are explicitly deferred, not treated as covered.
 
 ## 5. Deployment status
 
-Production remains `1bf93568` / schema 210. No production code or config was changed.
-`/api/version` will report `SOURCE_COMMIT` **after** this branch is deployed;
-until then it still returns `commitSha:"unknown"`.
+Production advanced during implementation to `f0aa55b3` (Gemini route rotation;
+schema 210; crawler files unchanged). The branch was rebased onto it. No
+production code or config was changed by this work yet. `/api/version` will
+report `SOURCE_COMMIT` **after** this branch is deployed; until then the
+deployed image still reports `commitSha:"unknown"`.
 
 ---
 
@@ -136,7 +138,7 @@ until then it still returns `commitSha:"unknown"`.
 
 1. Run the full suite on the merge commit; triage any remaining failures.
 2. Deploy Phase 0/1 with all new behavior flags off by default.
-3. Verify `/api/version` reports `1bf93568`-descended commit.
+3. Verify `/api/version` reports the deployed merge commit after `f0aa55b3`.
 4. Enable YouTube surface canary at 5% (`youtube_surface_expansion_enabled=true`,
    `youtube_surface_expansion_basis_points=500`) and measure live-new yield.
 5. Enable `CRAWLER_ROBOTS_ENFORCEMENT=true` in canary and verify explicit
