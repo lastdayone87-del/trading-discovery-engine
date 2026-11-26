@@ -235,6 +235,36 @@ maybe('an older success cannot clear a newer failure', async () => {
   assert.equal((await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db)).available, true);
 });
 
+maybe('an expired operation row cannot probe past a future daily block', async () => {
+  const db = requirePool();
+  await db.query(`DELETE FROM provider_capacity_state`);
+  resetProviderCapacityCacheForTests();
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: 'multilingual-semantic-classification',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_MINUTE',
+    resumeAt: Date.now() - 60_000,
+  }, db);
+  await recordProviderCapacityExhausted({
+    provider: 'gemini',
+    scopeKey: 'gemini-project-1',
+    operation: '*',
+    state: 'EXHAUSTED',
+    reasonCode: 'PROVIDER_QUOTA_DAILY',
+    resumeAt: Date.now() + 6 * 60 * 60_000,
+  }, db);
+  resetProviderCapacityCacheForTests();
+  const status = await getSemanticCapacityStatus([gemini('gemini-project-1')], Date.now(), db);
+  assert.equal(status.available, false);
+  assert.equal(status.probe, false, 'the expired operation row must not bypass the daily block');
+  const exact = await db.query(
+    `SELECT state FROM provider_capacity_state WHERE provider='gemini' AND scope_key='gemini-project-1' AND operation='multilingual-semantic-classification'`,
+  );
+  assert.equal(exact.rows[0].state, 'EXHAUSTED');
+});
+
 after(async () => {
   if (!pool) return;
   try { await pool.query(`DROP TABLE IF EXISTS provider_capacity_state`); } finally { await pool.end(); }

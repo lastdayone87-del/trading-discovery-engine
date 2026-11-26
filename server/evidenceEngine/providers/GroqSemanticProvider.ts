@@ -1227,6 +1227,9 @@ export function defaultClient(
       const remainingMs = Math.max(0, Math.min(...configuredGroqRoutes().map(route => groqOrgDisabledRemainingMs(groqRouteOrg(route)))));
       throw groqPoolDisabledError(remainingMs);
     }
+    // Reset hints from every failed route in this failover, not only the last
+    // one thrown. The job should wake when any failed account can serve again.
+    const routeFailureResets: number[] = [];
     const response = await runGroqRouteFailover(routes, async route => {
       const started = Date.now();
       const orgId = groqRouteOrg(route);
@@ -1405,6 +1408,10 @@ export function defaultClient(
             Object.assign(typed, { retryAt: resumeAt, providerCapacityExhausted: true });
           }
         }
+        if ((typed as { providerCapacityExhausted?: unknown }).providerCapacityExhausted === true) {
+          const parkedUntil = Number((typed as { retryAt?: unknown }).retryAt);
+          if (Number.isFinite(parkedUntil) && parkedUntil > 0) routeFailureResets.push(parkedUntil);
+        }
         await emit({
           ...base, status: statusFor(typed), latencyMs: Date.now() - started,
           actualCost: 0, errorClass: typed.errorClass, occurredAt: new Date().toISOString(),
@@ -1423,6 +1430,18 @@ export function defaultClient(
       isOrgCooling: orgId => groqOrgCooldownRemainingMs(orgId) > 0,
       signal,
       maxContentFailures: Math.max(1, Math.floor(Number(process.env.GROQ_JSON_VALIDATION_MAX_ROUTES || '2')) || 2),
+    }).catch((error: unknown) => {
+      // The failover surfaces only the last route's error. Attach the earliest
+      // reset across every failed account so an enrichment job does not park
+      // for 24 hours behind a blocked last route when another org recovers in
+      // a minute.
+      if (routeFailureResets.length && error && typeof error === 'object') {
+        Object.assign(error, {
+          retryAt: Math.min(...routeFailureResets),
+          providerCapacityExhausted: true,
+        });
+      }
+      throw error;
     });
     return response;
   }};

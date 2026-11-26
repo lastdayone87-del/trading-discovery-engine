@@ -366,9 +366,18 @@ test('provider-capacity reset time survives the operational wrapper and parks be
   assert.ok(error);
   assert.equal((error as unknown as { providerCapacityExhausted?: boolean }).providerCapacityExhausted, true);
   assert.equal((error as unknown as { retryAt?: number }).retryAt, retryAt);
-  const decision = decideJobFailure(error, 4, 4, now);
+  const decision = decideJobFailure(error, 4, 4, now, now - 7 * 60 * 60_000);
   assert.equal(decision.disposition, 'RETRYING_WITHOUT_ATTEMPT');
   assert.equal(decision.runAfter, retryAt, 'jobs must park until the provider reset, not consume attempts');
+});
+
+test('route credential failures survive the operational reason filter', () => {
+  for (const reason of ['PROVIDER_AUTH_FAILED', 'PROVIDER_PERMISSION_DENIED', 'PROVIDER_ROUTE_UNAUTHORIZED']) {
+    const r = report(true, [reason], 'SUFFICIENT');
+    const error = enrichmentOperationalFailure(r, true, false);
+    assert.ok(error, `${reason} must not be dropped as non-operational`);
+    assert.ok(error!.providerReasons.includes(reason));
+  }
 });
 
 test('a successful fallback is never blocked by a capacity marker on the failed primary', () => {

@@ -191,7 +191,7 @@ import { isGeminiSemanticCooldownActive, isGeminiOrgCooldownActive, isGroqSemant
 import { getSemanticCapacityStatus } from './providerCapacityState';
 import { shouldUseGroqSemantic, configuredGroqRoutes, groqOrgCooldownRemainingMs, groqRouteOrg } from './evidenceEngine/providers/GroqSemanticProvider';
 import { configuredGeminiRoutes, geminiRouteOrg } from './evidenceEngine/providers/GeminiSemanticProvider';
-import { shouldUseGeminiFreeSemantic } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
+import { shouldUseGeminiFreeSemantic, configuredGeminiFreeRoutes } from './evidenceEngine/providers/GeminiFreeSemanticProvider';
 import { recordExecutionStage, withExecutionTrace } from './executionTrace';
 import { recordNomination } from './candidateAdmission/store';
 import {recordAdmissionShadow} from './candidateAdmission/shadowEvaluator';
@@ -1847,6 +1847,13 @@ export async function processNextSearchJob(
   // mirrors the enrichment cooldown gate below, so an explicit Groq-only or
   // Gemini-free deployment never consults an ineligible provider's circuit.
   const geminiFreeSelectedForGate = semanticGateNeeded && shouldUseGeminiFreeSemantic();
+  // Free-tier Gemini is also appended as a keyed fallback when another
+  // provider is primary. If it is configured and not cooling, the semantic
+  // chain still has a serving route even when every paid Gemini/Groq circuit
+  // is open, so the claim gate must not park admission/classification.
+  const geminiFreeFallbackForGate = semanticGateNeeded && !geminiFreeSelectedForGate
+    && process.env.SEMANTIC_PROVIDER_FORCE_GEMINI !== 'true'
+    && configuredGeminiFreeRoutes().length > 0;
   const semanticCapacityAccounts: Array<{ provider: 'gemini' | 'groq'; scopeKey: string }> = [];
   if (semanticGateNeeded && !geminiFreeSelectedForGate) {
     if (shouldUseGroqSemantic()) {
@@ -1861,6 +1868,7 @@ export async function processNextSearchJob(
   let semanticCapacityProbe: Promise<{ available: boolean }> | null = null;
   const semanticCapacity = async (): Promise<boolean> => {
     if (!semanticGateNeeded || geminiFreeSelectedForGate) return true;
+    if (geminiFreeFallbackForGate && !(await isGeminiFreeSemanticCooldownActive())) return true;
     // Resolve lazily, only when this tick is about to offer a semantic job
     // type. Taking the one-shot probe lease on a tick that never claims
     // semantic work would block the real probe for the lease duration.

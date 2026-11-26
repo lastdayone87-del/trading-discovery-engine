@@ -203,23 +203,25 @@ export async function getSemanticCapacityStatus(
         // One statement, one row lock: concurrent callers serialize on the
         // candidate row. The loser re-checks the lease after the winner
         // commits and finds no eligible row, so exactly one caller receives
-        // the reset probe even across processes.
-        const configuredJson = JSON.stringify(
-          [...configured.values()].map(account => ({ provider: account.provider, scope_key: account.scopeKey })),
+        // the reset probe even across processes. Only the effective blocker
+        // for each account is eligible: an expired minute row must never
+        // bypass a future daily ('*') failure or a BLOCKED account.
+        const blockerJson = JSON.stringify(
+          blockers.map(row => ({ provider: row.provider, scope_key: row.scope_key, operation: row.operation })),
         );
         const probe = await client.query(
-          `WITH eligible_accounts AS (
-             SELECT provider, scope_key
-               FROM jsonb_to_recordset($1::jsonb) AS x(provider text, scope_key text)
+          `WITH eligible_blocks AS (
+             SELECT provider, scope_key, operation
+               FROM jsonb_to_recordset($1::jsonb) AS x(provider text, scope_key text, operation text)
            ), candidate AS (
              SELECT s.provider, s.scope_key, s.operation
                FROM provider_capacity_state s
-               JOIN eligible_accounts a
-                 ON a.provider=s.provider AND a.scope_key=s.scope_key
+               JOIN eligible_blocks a
+                 ON a.provider=s.provider AND a.scope_key=s.scope_key AND a.operation=s.operation
               WHERE s.state IN ('EXHAUSTED','PROBING')
                 AND (s.resume_at IS NULL OR s.resume_at <= now())
                 AND (s.probe_lease_until IS NULL OR s.probe_lease_until <= now())
-              ORDER BY (s.operation='*') DESC, COALESCE(s.resume_at, to_timestamp(0)), s.provider, s.scope_key
+              ORDER BY COALESCE(s.resume_at, to_timestamp(0)), s.provider, s.scope_key
               LIMIT 1
               FOR UPDATE OF s
            )
@@ -230,7 +232,7 @@ export async function getSemanticCapacityStatus(
              FROM candidate c
             WHERE s.provider=c.provider AND s.scope_key=c.scope_key AND s.operation=c.operation
             RETURNING s.provider, s.scope_key, s.operation`,
-          [configuredJson, PROBE_LEASE_MS],
+          [blockerJson, PROBE_LEASE_MS],
         );
         if (probe.rowCount) {
           value = { available: true, probe: true, resumeAt: null, reason: 'PROBE' };
