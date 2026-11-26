@@ -81,6 +81,16 @@ test('IDN hostnames and relative paths are matched without query text', () => {
   assert.ok(communityNavigationScore('/community', '') > 0);
 });
 
+test('ambiguous host labels do not qualify a host on their own', () => {
+  for (const host of ['circle.example', 'join.example', 'signal.example']) {
+    const decision = shouldFollowDestination({
+      url: `https://${host}/page`,
+      currentUrl: 'https://creator.example/',
+    });
+    assert.equal(decision.eligible, false, host);
+  }
+});
+
 test('ordinary URL substrings are not community evidence', () => {
   for (const slug of ['remember', 'groupon', 'privateer']) {
     const decision = shouldFollowDestination({

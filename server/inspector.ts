@@ -20,8 +20,10 @@ import { fetchLiveYouTubeChannelData, parseAboutPageMetadataFromHtml } from './y
 import { resolveDocumentBaseUrlFromRoot, stripBaseElements } from './documentBase';
 import {effectiveAcquisitionOutcomes,hasMessagingBridgeEvidence,isDiscordCommunityAcquisitionSurface,isDotlessHostnameUrl,isMessagingPreviewUrl,isAuxiliaryTriageCandidate,isAuxiliaryForOutcome,acquisitionOwnershipUrl,isPageAssetInfrastructureUrl,rankCommunitySurfaces,scoreCommunitySurface,assessCrawlAdmission,recoverTruncatedQueryToRoot,isPossiblyTruncatedPath} from './communitySurfacePolicy';
 import {
-  communityUrlEvidence,
+  decodeCommunityHost,
+  decodeCommunityPath,
   decodeCommunityUrl,
+  MULTILINGUAL_HOST_COMMUNITY_EVIDENCE,
   MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE,
   MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
 } from './multilingualCommunityLexicon';
@@ -389,12 +391,12 @@ const CROSS_DOMAIN_COMMUNITY_HOSTS = new Set(['linktr.ee','www.linktr.ee','beaco
 export function communityNavigationScore(href:string,label:string):number {
   // Normalize URL separators so space-delimited lexicon phrases match
   // hyphenated paths (`/trading-room` -> `trading room`).
-  const haystack=`${communityUrlEvidence(href)} ${decodeCommunityUrl(label)}`.toLowerCase().replace(/[-_/]+/g,' ');
+  const haystack=`${decodeCommunityPath(href)} ${decodeCommunityUrl(label)}`.toLowerCase().replace(/[-_/]+/g,' ');
   // One pass per tier, not one pass per lexicon term. The lexicon is
   // multilingual and large; per-anchor substring loops would be a material
   // static-crawl cost.
   if(haystack.includes('discord'))return 100;
-  if(COMMUNITY_PATH_HINTS.test(haystack))return 50;
+  if(COMMUNITY_PATH_HINTS.test(haystack)||MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(decodeCommunityHost(href)))return 50;
   if(MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE.test(haystack))return 10;
   return 0;
 }

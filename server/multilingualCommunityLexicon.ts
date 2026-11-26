@@ -149,6 +149,34 @@ export function decodeCommunityUrlPath(value: string): string {
 
 export const communityUrlEvidence = decodeCommunityUrlPath;
 
+/** Decoded pathname only. Relative references are accepted; query/fragment
+ * text is discarded. */
+export function decodeCommunityPath(value: string): string {
+  try {
+    return decodeCommunityUrl(new URL(value, 'https://placeholder.invalid').pathname);
+  } catch {
+    return decodeCommunityUrl(value.split(/[?#]/, 1)[0]);
+  }
+}
+
+/** Decoded, Unicode hostname for host-only evidence. */
+export function decodeCommunityHost(value: string): string {
+  try {
+    return decodeCommunityUrl(domainToUnicode(new URL(value).hostname));
+  } catch {
+    return '';
+  }
+}
+
+/** Distinctive community terms allowed to qualify a hostname on their own.
+ * Ambiguous platform/brand words (`circle`, `join`, `signal`, `group`, etc.)
+ * remain path/label-only evidence so unrelated hosts do not consume crawl
+ * slots. */
+export const MULTILINGUAL_HOST_COMMUNITY_EVIDENCE = new RegExp(
+  '(?:^|\\.)(?:discord|community|invites?|trading[-_ ]?(?:room|floor|club)|comunidad|comunidade|communaut[eé]|gemeinschaft|gemeenschap|fellesskap|gemenskap|pobal|comhphobal|communautéit|comunità)(?:\\.|$)',
+  'i',
+);
+
 export const MULTILINGUAL_URL_COMMUNITY_EVIDENCE = new RegExp(
   '(?:^|[/._-])(?:'
   + '(?:discord|community|join|invites?|vip|trading[-_ ]?(?:room|floor|club)|signals?|skool|whop|circle|patreon|comunidad|comunidade|communaut[eé]|gemeinschaft|gemeenschap|fellesskap|gemenskap|pobal|comhphobal|communautéit|comunità)'
