@@ -8,7 +8,7 @@
 
 export interface BuildInfo {
   commitSha: string;
-  commitSource: 'RAILWAY_GIT_COMMIT_SHA' | 'GIT_COMMIT' | 'SOURCE_VERSION' | 'unknown';
+  commitSource: 'SOURCE_COMMIT' | 'RAILWAY_GIT_COMMIT_SHA' | 'GIT_COMMIT' | 'SOURCE_VERSION' | 'unknown';
   buildTime: string;
   buildTimeSource: 'BUILD_TIME' | 'startup';
 }
@@ -17,6 +17,10 @@ const SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
 
 function pickSha(env: NodeJS.ProcessEnv): { commitSha: string; commitSource: BuildInfo['commitSource'] } {
   const candidates = [
+    // Coolify sets SOURCE_COMMIT on the running container. Prefer the
+    // deployment's explicit source commit over CI-only variables so
+    // /api/version always identifies the image that is actually serving.
+    ['SOURCE_COMMIT', env.SOURCE_COMMIT],
     ['RAILWAY_GIT_COMMIT_SHA', env.RAILWAY_GIT_COMMIT_SHA],
     ['GIT_COMMIT', env.GIT_COMMIT],
     ['SOURCE_VERSION', env.SOURCE_VERSION],

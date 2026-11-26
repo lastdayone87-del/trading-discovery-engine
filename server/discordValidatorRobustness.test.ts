@@ -42,8 +42,9 @@ for (const raw of [
   });
 }
 
-// Reserved/short locators are terminal but never valid and never dead.
-for (const raw of ['invite', 'about', 'x']) {
+// Structural routes and too-short values are terminal but never valid and
+// never dead. `about` (and the other live-valid words) now reach Discord.
+for (const raw of ['invite', 'login', 'x']) {
   test(`reserved/short locator '${raw}' is INVALID_LOCATOR without validity or death`, async () => {
     const result = await validateDiscordInvite(raw, opts(async () => json({}, 200)));
     assert.equal(result.operationalOutcome, 'INVALID_LOCATOR');

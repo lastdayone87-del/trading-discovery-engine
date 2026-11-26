@@ -30,6 +30,7 @@
  * ELIGIBLE (legacy behavior byte-identical).
  */
 import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { decodeCommunityHost, decodeCommunityPath, MULTILINGUAL_HOST_COMMUNITY_EVIDENCE, MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { canonicalSiteIdentity } from './siteIdentity';
 
 export type RelevanceTier = 'BLOCK' | 'DEMOTE' | 'ELIGIBLE';
@@ -74,7 +75,9 @@ export interface RelevanceDecision {
   policyVersion: string;
 }
 
-const COMMUNITY_HINT = /(?:discord|community|join|members?|membership|group|private|vip|trading[-_ ]?(?:room|floor)|chat|links?)/i;
+// Strong community evidence only. Generic paid/access/subscribe tokens must
+// not make an otherwise irrelevant URL fail open in relevance triage.
+const COMMUNITY_HINT = MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE;
 const MESSAGING_HOSTS = new Set([
   't.me', 'www.t.me', 'telegram.me', 'www.telegram.me', 'telegram.dog', 'www.telegram.dog',
   'wa.me', 'www.wa.me', 'whatsapp.com', 'www.whatsapp.com', 'chat.whatsapp.com',
@@ -194,7 +197,8 @@ export function extractRelevanceSignals(input: {
       contextMatches: input.contextMatches === true,
       kind,
       platformFamily,
-      communityHint: COMMUNITY_HINT.test(`${path} ${input.url}`),
+      communityHint: COMMUNITY_HINT.test(decodeCommunityPath(input.url).replace(/[-_/]+/g, ' '))
+        || MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(decodeCommunityHost(input.url)),
       creatorCanonical: canonicalSet.has(host) || canonicalSet.has(registrable),
       wrapperPresent: typeof input.wrapperUrl === 'string' && input.wrapperUrl.length > 0,
       admissionEligible,

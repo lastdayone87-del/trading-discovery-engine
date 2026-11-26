@@ -192,7 +192,12 @@ export function parseRobotsTxt(text: string): ParsedRobots {
     } else if (key === 'crawl-delay') {
       // Voluntary politeness input only (not part of RFC 9309); surfaced
       // separately, never a correctness requirement. Parsed per group below.
-      if (current) (current as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw = value;
+      // It still closes a group: a following User-agent must not merge into a
+      // Crawl-delay-only wildcard group and inherit that bot's rules.
+      if (current) {
+        currentHasRules = true;
+        (current as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw = value;
+      }
     } else {
       // Unknown records (including vendor extensions) are ignored without
       // affecting defined-record parsing, per RFC 9309.
@@ -207,26 +212,50 @@ export function parseRobotsTxt(text: string): ParsedRobots {
  * token beats an earlier shorter one); the `*` group applies only when no
  * product token matches. Returns nulls (unknown, never negative) when no
  * group applies. */
+function mergeRobotsGroups(groups: RobotsGroup[]): RobotsGroup {
+  const merged: RobotsGroup = { agents: [], allow: [], disallow: [] };
+  let maxDelay = Number.NEGATIVE_INFINITY;
+  for (const group of groups) {
+    for (const agent of group.agents) if (!merged.agents.includes(agent)) merged.agents.push(agent);
+    merged.allow.push(...group.allow);
+    merged.disallow.push(...group.disallow);
+    const raw = (group as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw;
+    const seconds = Number(raw);
+    if (raw !== undefined && Number.isFinite(seconds) && seconds > maxDelay) maxDelay = seconds;
+  }
+  if (maxDelay !== Number.NEGATIVE_INFINITY) {
+    (merged as RobotsGroup & { crawlDelayRaw?: string }).crawlDelayRaw = String(maxDelay);
+  }
+  return merged;
+}
+
 export function evaluateRobotsForPath(
   parsed: ParsedRobots,
   userAgent: string,
   path: string,
 ): RobotsEvaluation {
   const agent = userAgent.toLowerCase();
-  let group: RobotsGroup | null = null;
+  // RFC 9309 allows the same user-agent to appear in multiple groups; their
+  // rules must be combined. Selecting only the first wildcard group would let
+  // a later duplicate `User-agent: *` Disallow be ignored.
   let bestSpecificity = -1;
+  const specific: RobotsGroup[] = [];
   for (const candidate of parsed.groups) {
     for (const token of candidate.agents) {
       if (token === '*') continue;
       if (agent !== token && !agent.startsWith(token)) continue;
       if (token.length > bestSpecificity) {
         bestSpecificity = token.length;
-        group = candidate;
+        specific.length = 0;
+        specific.push(candidate);
+      } else if (token.length === bestSpecificity && !specific.includes(candidate)) {
+        specific.push(candidate);
       }
     }
   }
-  if (!group) group = parsed.groups.find(g => g.agents.includes('*')) || null;
-  if (!group) return { allowed: null, crawlDelaySeconds: null, matchedRule: null };
+  const selected = specific.length ? specific : parsed.groups.filter(g => g.agents.includes('*'));
+  if (!selected.length) return { allowed: null, crawlDelaySeconds: null, matchedRule: null };
+  const group = mergeRobotsGroups(selected);
   const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Specificity for longest-match ordering: literal octets actually
   // constraining the path. A bare `/*` (one literal octet) never outranks a
@@ -635,7 +664,10 @@ export type ProfilerRedirectFailure =
   | 'DNS_TIMEOUT'
   | 'REDIRECT_LOOP'
   | 'REDIRECT_LIMIT'
-  | 'CROSS_ORIGIN_REDIRECT';
+  | 'CROSS_ORIGIN_REDIRECT'
+  | 'ROBOTS_DISALLOWED'
+  | 'ROBOTS_DELAY_BUDGET'
+  | 'REDIRECT_TIMEOUT';
 
 export interface ProfilerTransportFailure {
   name: string;
@@ -666,6 +698,15 @@ export interface ProfilerFetchOptions {
   /** When set, reject a redirect before contacting it if its resolved origin
    * differs. Used by same-origin iframe traversal. */
   allowedRedirectOrigin?: string;
+  /** Async pre-contact gate for every redirect target. A non-allow result
+   * stops the chain before the target is requested; used by robots
+   * enforcement so a Disallow rule or exhausted pacing budget cannot be
+   * bypassed by an allowed seed redirecting into it. */
+  shouldFollowRedirect?: (targetUrl: string) => Promise<'allow' | 'disallow' | 'budget'>;
+  /** Called immediately before each guarded fetch, with the URL actually
+   * contacted, so pacing can record request-start time rather than permit
+   * time. */
+  onRequestStart?: (targetUrl: string) => void;
 }
 
 /** Maximum redirect hops per profiler inventory fetch. Conservative:
@@ -908,6 +949,7 @@ export async function fetchProfilerUrl(
     for (;;) {
       redirectsFollowed.push(currentUrl);
       visited.add(currentUrl);
+      options.onRequestStart?.(currentUrl);
       const response = await guardedFetch(currentUrl, {
         signal: controller.signal,
         headers,
@@ -992,6 +1034,34 @@ export async function fetchProfilerUrl(
           rejectedRedirect: nextUrl,
           redirectFailure: redirectFailureFor(decision.reason),
         };
+      }
+      // Pre-contact robots gate runs only after the destination has passed
+      // the public-address/DNS guard, so a private redirect target never
+      // triggers a robots.txt lookup. The gate is bounded by the fetch's
+      // remaining wall-clock budget; expiry is a retryable timeout.
+      if (options.shouldFollowRedirect) {
+        const remainingMs = Math.max(0, startedAt + timeoutMs - Date.now());
+        let gateTimer: ReturnType<typeof setTimeout> | undefined;
+        const decision = remainingMs <= 0
+          ? 'timeout' as const
+          : await Promise.race([
+              options.shouldFollowRedirect(nextUrl),
+              new Promise<'timeout'>(resolve => { gateTimer = setTimeout(() => resolve('timeout'), remainingMs); }),
+            ]).finally(() => { if (gateTimer) clearTimeout(gateTimer); });
+        if (decision !== 'allow') {
+          await cancelRedirectBody(response);
+          return {
+            status: response.status,
+            contentType: response.headers.get('content-type') || '',
+            text: '',
+            truncated: false,
+            finalUrl: response.url || currentUrl,
+            redirectsFollowed,
+            redirectRejected: true,
+            rejectedRedirect: nextUrl,
+            redirectFailure: decision === 'timeout' ? 'REDIRECT_TIMEOUT' : decision === 'budget' ? 'ROBOTS_DELAY_BUDGET' : 'ROBOTS_DISALLOWED',
+          };
+        }
       }
       if (redirectsFollowed.length >= maxHops) {
         // Hop budget exhausted on an otherwise-allowed chain: stop at the

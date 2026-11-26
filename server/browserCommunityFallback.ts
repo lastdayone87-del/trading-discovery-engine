@@ -1,7 +1,10 @@
 import * as cheerio from 'cheerio';
 import { resolveDocumentBaseUrlFromRoot } from './documentBase';
 import { assessCrawlAdmission } from './communitySurfacePolicy';
+import { decodeCommunityHost, decodeCommunityPath, MULTILINGUAL_CONTROL_HINTS, MULTILINGUAL_HOST_COMMUNITY_EVIDENCE, MULTILINGUAL_URL_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { shouldFollowDestination, DISCORD_DESTINATION_HOSTS } from './destinationPolicy';
+import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
+import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
 import { assessPublicDestination, type DnsResolver } from './publicDestination';
 import { candidateFromNativeInvite, extractDiscordCandidates, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
 import { browserLaunchOptions, browserRuntimeConcurrency, classifyBrowserFailure, isBrowserRuntimeFailure, markBrowserCapabilityReady, markBrowserCapabilityUnavailable, withBrowserRuntimeLease, type BrowserFailureClass } from './browserCapability';
@@ -569,7 +572,7 @@ export function renderedPopupWaitTimeoutMs(
   return Math.min(cap, remaining);
 }
 
-export const COMMUNITY_HINTS = /discord|community|join|chat|member|membership|vip|group|private|trading.?room|links?|social|contact|about|whop|skool|circle|patreon|premium|paid|subscribe|signals?|mentor|access/i;
+export const COMMUNITY_HINTS = MULTILINGUAL_CONTROL_HINTS;
 
 /**
  * Interactive controls that can reveal content only through interaction:
@@ -604,7 +607,12 @@ export function isTelegramPostPermalink(rawUrl: string): boolean {
 
 export function shouldEnqueueRenderedCommunityLink(rawUrl: string): boolean {
   if (isTelegramPostPermalink(rawUrl)) return false;
-  return COMMUNITY_HINTS.test(rawUrl);
+  const pathText = decodeCommunityPath(rawUrl);
+  const normalized = pathText.replace(/[-_/]+/g, ' ');
+  return COMMUNITY_HINTS.test(pathText)
+    || COMMUNITY_HINTS.test(normalized)
+    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathText)
+    || MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(decodeCommunityHost(rawUrl));
 }
 
 /**
@@ -1167,9 +1175,11 @@ export function resolveUnexaminedPopupTargets(
  */
 export function enumerateRenderedControlNodes(
   nodes: Element[],
-  pattern: string,
+  pattern: string | { pattern: string; flags?: string },
 ): RenderedControlEnumeration {
-  const re = new RegExp(pattern, 'i');
+  const source = typeof pattern === 'string' ? pattern : pattern.pattern;
+  const flags = typeof pattern === 'string' ? 'i' : (pattern.flags || 'i');
+  const re = new RegExp(source, flags);
   const hintMatched: RenderedControlTarget[] = [];
   const recovered: RenderedControlTarget[] = [];
   const disclosures: RenderedControlTarget[] = [];
@@ -3636,6 +3646,9 @@ export function resolveRenderedCompletionState(input: {
    */
   coverageReason?: RenderedCoverageReason;
   coverageRetryable?: boolean;
+  /** Deterministic robots policy block: incomplete, but retry cannot change
+   * the same policy decision. */
+  policyBlocked?: boolean;
 }): { complete: boolean; queueComplete: boolean; retryable: boolean; failureClass: 'NO_PAGE_PROCESSED' | undefined } {
   // Processed means actual successfully inspected page evidence — a request
   // merely starting (admitted but never inspected) is zero-page evidence.
@@ -3674,7 +3687,8 @@ export function resolveRenderedCompletionState(input: {
   // context gaps stay visible without owning retry; budget/interaction/scroll
   // gaps are retryable.
   const coverageIncomplete = input.coverageReason !== undefined && input.coverageReason !== 'COMPLETE';
-  const incomplete = baseIncomplete || coverageIncomplete;
+  const policyIncomplete = input.policyBlocked === true;
+  const incomplete = baseIncomplete || coverageIncomplete || policyIncomplete;
   const retryable = baseIncomplete || (coverageIncomplete && input.coverageRetryable !== false);
   // `queueComplete` keeps the pre-coverage traversal verdict available so the
   // terminal stop attribution ("ran out of enqueueable links") does not
@@ -4249,7 +4263,7 @@ export interface RenderedRouteContextLike {
 interface RenderedRouteGuardOptions {
   /** Same public-destination check used by the crawl. A rejection is treated
    * as "not allowed" by the caller and therefore fails closed. */
-  isAllowed(rawUrl: string): Promise<boolean>;
+  isAllowed(rawUrl: string, resourceType?: string): Promise<boolean>;
   /** Called only when the destination policy rejects a network request. */
   onBlocked(): void;
   /** Optional safe sink for unexpected route failures. It must not throw and
@@ -4374,7 +4388,7 @@ export function createRenderedRouteGuard(
         await settleRenderedRoute(route, 'abort', undefined, options.onUnexpectedRouteError);
         return;
       }
-      if (!(await options.isAllowed(request.url()))) {
+      if (!(await options.isAllowed(request.url(), request.resourceType()))) {
         options.onBlocked();
         await settleRenderedRoute(route, 'abort', 'blockedbyclient', options.onUnexpectedRouteError);
         return;
@@ -4486,6 +4500,22 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
   // pages were lost to enqueue/click/budget rules. Attached to the result for
   // ledger persistence; never URLs or payloads.
   const drops = createDropCounter();
+  // Rendered document navigation must honor the same robots policy as the
+  // static tier. Subresources are not separate crawl targets and stay
+  // ungated; redirects and popups are covered because Chromium issues a new
+  // document request for each.
+  const renderedRobotsPolicy = isRobotsCrawlEnforcementEnabled()
+    ? new RobotsCrawlPolicy(fetch, limits.resolveHost)
+    : null;
+  const renderedRobotsBudget = { spentMs: 0 };
+  const renderedRobotsAllowed = async (rawUrl: string): Promise<'allow' | 'disallow' | 'budget'> => {
+    if (!renderedRobotsPolicy) return 'allow';
+    const decision = await renderedRobotsPolicy.decide(rawUrl);
+    if (!decision.allowed) return 'disallow';
+    let origin: string;
+    try { origin = new URL(rawUrl).origin; } catch { return 'allow'; }
+    return (await paceRobotsOrigin(origin, decision.crawlDelayMs, renderedRobotsBudget)) ? 'allow' : 'budget';
+  };
   const telemetry: BrowserFallbackTelemetry = {
     requestsStarted: 0,
     requestsFinished: 0,
@@ -4777,20 +4807,33 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
         // later connection attempt (DNS rebinding). This route check is
         // defense-in-depth; the loopback proxy started above pins the address
         // Chromium actually connects to.
-        const renderedRequestAllowed = (raw: string): Promise<boolean> => {
+        const renderedRequestAllowed = async (raw: string, resourceType?: string): Promise<boolean> => {
           let parsed: URL;
           try {
             parsed = new URL(raw);
           } catch {
-            return Promise.resolve(false);
+            return false;
           }
           if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
             // data:, blob:, about:, and similar are not network destinations.
-            return Promise.resolve(true);
+            return true;
           }
-          return assessPublicDestination(raw, limits.resolveHost)
-            .then(decision => decision.allowed)
-            .catch(() => false);
+          // Gate navigation and script-driven page requests (fetch/XHR), not
+          // passive subresources. A policy skip is recorded under the reason
+          // that actually occurred so pacing is not mislabeled as Disallow.
+          if (resourceType === 'document' || resourceType === 'fetch' || resourceType === 'xhr') {
+            const robots = await renderedRobotsAllowed(raw);
+            if (robots !== 'allow') {
+              drops.countUnique(robots === 'budget' ? 'robots-delay-budget' : 'robots-disallowed', raw);
+              return false;
+            }
+            markRobotsRequestStarted(raw);
+          }
+          try {
+            return (await assessPublicDestination(raw, limits.resolveHost)).allowed;
+          } catch {
+            return false;
+          }
         };
         // A context-wide route also covers popups. Redirects are enforced at
         // the loopback proxy on every new connection, so Chromium's redirect
@@ -5397,7 +5440,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             };
 
             const enumerateControls = async (): Promise<RenderedControlEnumeration> =>
-              page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll(enumerateRenderedControlNodes, COMMUNITY_HINTS.source);
+              page.locator(RENDERED_CONTROL_SELECTOR).evaluateAll(enumerateRenderedControlNodes, { pattern: COMMUNITY_HINTS.source, flags: COMMUNITY_HINTS.flags });
             // Per-page P0.2 denominators come from one coherent enumeration
             // snapshot (largest total; first wins ties) so the total and
             // hint-rejected arithmetic always describes the same snapshot.
@@ -6382,11 +6425,13 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
           timedOut || pageBudgetExhausted,
           retryableRequiredGapCount,
         );
+        const robotsDisallowed = (drops.snapshot()['robots-disallowed'] || 0) > 0;
+        const robotsDelayBudget = (drops.snapshot()['robots-delay-budget'] || 0) > 0;
         const coverageGapRetryable = interactionGap || timedOut || pageBudgetExhausted
           || scrollCapReachedStillGrowing || contextMeasurementAbandoned
-          || retryableRequiredGapCount > 0;
+          || retryableRequiredGapCount > 0 || robotsDelayBudget;
         const coverageRetryable = coverageGapRetryable || coverageReason === 'BOUNDED';
-        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,requiredWorkRemaining,coverageReason,coverageRetryable});
+        const completion=resolveRenderedCompletionState({inspectedPages,timedOut,telemetry,pageBudgetExhausted,interactionGap,requiredWorkRemaining:requiredWorkRemaining||robotsDelayBudget,coverageReason,coverageRetryable,policyBlocked:robotsDisallowed});
         const noPageProcessed=completion.failureClass==='NO_PAGE_PROCESSED';
         const zeroPageReason=resolveRenderedZeroPageReason({inspectedPages,timedOut,saturated:false,browserLaunchFailed:false,thrown:false,telemetry});
         if (zeroPageReason) telemetry.zeroPageReason=zeroPageReason;

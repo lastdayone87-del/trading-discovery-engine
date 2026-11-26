@@ -30,7 +30,16 @@ export interface DiscordCandidate {
   observations?:DiscordCandidateObservation[];
 }
 
-const reserved=new Set(['channels','guilds','store','download','nitro','login','register','api','widget','terms','privacy','branding','jobs','before','after','next','prev','index','home','about','contact','faq','support','invite','oauth2','template']);
+/**
+ * Structural exclusions only. These are Discord application routes that are
+ * not invite codes; they stay rejected so a route path can never claim a
+ * registry row before validation. The previous list also rejected 16 codes
+ * that the live Discord API serves as valid invites (`store`, `home`, `about`,
+ * `contact`, `support`, `channels`, `download`, `api`, `widget`, `terms`,
+ * `privacy`, `before`, `after`, `next`, `index`, `template`); those are now
+ * admitted and left to live validation, which remains the final authority.
+ */
+export const RESERVED_DISCORD_ROUTE_CODES=new Set(['guilds','nitro','login','register','branding','jobs','prev','faq','invite','oauth2']);
 const id=(value:object)=>createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,32);
 export const canonicalDiscordInviteId=(code:string)=>`discord:${String(code||'').trim().toLowerCase()}`;
 /** Canonical invite code shared by every layer that must agree on Discord
@@ -81,6 +90,17 @@ const ALTERNATIVE_INVITE_HOST='(?:dsc\\.gg|discord\\.me|discord\\.io)';
 // The code capture must end at a real token boundary: a longer
 // code-alphabet run is not an invite (`a`×129 must not truncate to `a`×128).
 const INVITE_CODE_CAPTURE='([A-Za-z0-9_-]{2,128})(?![A-Za-z0-9_-])';
+// Inline/void tags used by "protect link" markup. Block tags are excluded so
+// ordinary page structure cannot become an invite. Optional trailing slash
+// handles XHTML/self-closing forms such as `<br />`.
+const INLINE_TAG_PATTERN='<\\/?(?:span|b|i|strong|em|small|wbr|br|a|u|mark|font)(?:\\s[^>]{0,120})?\\s*\\/?>';
+const TAG_FRAGMENT_REJOIN:Array<[RegExp,string]>=[
+  [new RegExp(`\\bdisc\\s*${INLINE_TAG_PATTERN}\\s*ord`,'gi'),'discord'],
+  [new RegExp(`discord\\s*${INLINE_TAG_PATTERN}\\s*\\.\\s*gg`,'gi'),'discord.gg'],
+  // Consume an optional closing inline tag after the slash before the code.
+  [new RegExp(`discord\\.gg\\s*${INLINE_TAG_PATTERN}\\s*\\/\\s*(?:${INLINE_TAG_PATTERN}\\s*)?`,'gi'),'discord.gg/'],
+];
+
 /** Decode the bounded obfuscation forms that still name a real invite:
  * escaped slashes/colons/percent forms, numeric HTML entities, zero-width
  * format characters, and bracketed dot separators (`discord[.]gg`). Only
@@ -91,22 +111,42 @@ const INVITE_CODE_CAPTURE='([A-Za-z0-9_-]{2,128})(?![A-Za-z0-9_-])';
  * new host match, and plain string replacement cannot throw on malformed
  * percent sequences (unlike decodeURIComponent). */
 export function decodeInviteObfuscation(text:string):string{
-  return String(text||'')
+  let decoded=String(text||'')
     .replace(/[\u200B-\u200D\uFEFF\u2060]/g,'')
     .replace(/\\\/|\\u002f/gi,'/')
+    .replace(/\\u002e/gi,'.')
     .replace(/\\u003a/gi,':')
     .replace(/\\u0026/gi,'&')
-    .replace(/%2f/gi,'/')
-    .replace(/%3a/gi,':')
-    .replace(/%2d/gi,'-')
-    .replace(/%26/gi,'&')
+    .replace(/&period;/gi,'.')
     .replace(/&#x0*2e;|&#0*46;/gi,'.')
     .replace(/&#x0*3a;|&#0*58;/gi,':')
     .replace(/&#x0*2f;|&#0*47;/gi,'/')
-    .replace(/&#x0*26;|&#0*38;/gi,'&')
+    .replace(/&#x0*26;|&#0*38;/gi,'&');
+  // Bounded tag-fragment rejoin: `disc<span>ord</span>.gg/CODE` and
+  // `discord<span>.gg</span>/CODE` are common "protect link" patterns. The
+  // tag body is capped so a hostile document cannot turn this into an
+  // unbounded HTML parser inside extraction.
+  for(const [pattern,replacement] of TAG_FRAGMENT_REJOIN)decoded=decoded.replace(pattern,replacement);
+  decoded=decoded
+    .replace(/discord\s+dot\s+(gg|com|app)/gi,'discord.$1')
     .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*gg/gi,'discord.gg')
     .replace(/discord\s*[\[(]\s*dot\s*[\])]\s*gg/gi,'discord.gg')
     .replace(/discord\s*[\[(]\s*[.·•]\s*[\])]\s*(com|app)/gi,'discord.$1');
+  // Two bounded percent passes decode double-encoded forms (`%252F` -> `%2F`
+  // -> `/`) without unbounded recursive decoding. `%25` must run first in each
+  // pass so the exposed escape is decoded in the same pass.
+  for(let pass=0;pass<2;pass++){
+    const next=decoded
+      .replace(/%25/gi,'%')
+      .replace(/%2f/gi,'/')
+      .replace(/%3a/gi,':')
+      .replace(/%2d/gi,'-')
+      .replace(/%2e/gi,'.')
+      .replace(/%26/gi,'&');
+    if(next===decoded)break;
+    decoded=next;
+  }
+  return decoded;
 }
 /** Canonical invite code shared by every layer that must agree on Discord
  * invite identity (registry claims, choke-point filtering, tests). Accepts a
@@ -194,6 +234,8 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   else if(surfaces.has('RECENT_VIDEO_DESCRIPTIONS')){score+=65;reasons.push('DIRECT_CREATOR_VIDEO');}
   else if(surfaces.has('SOCIAL_PROFILES')){score+=55;reasons.push('CREATOR_SOCIAL_SURFACE');}
   else if(surfaces.has('CREATOR_WEBSITES')){score+=40;reasons.push('LINKED_WEBSITE_SURFACE');}
+  else if(surfaces.has('YOUTUBE_PLAYLIST_ITEMS')){score+=0;reasons.push('CURATED_PLAYLIST_ITEM');}
+  else if(surfaces.has('YOUTUBE_COMMENTS')){score+=0;reasons.push('VIEWER_COMMENT_SURFACE');}
 
   // A channel external link is a creator-controlled surface. Explicit extraction
   // is enough corroboration to cross the creator-owned gate unless contradictory
@@ -264,6 +306,36 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   return {ownershipStatus,ownershipConfidence:Math.min(100,Math.max(10,Math.abs(score))),ownershipReasons:reasons.length?Array.from(new Set(reasons)):['OWNERSHIP_EVIDENCE_INSUFFICIENT']};
 }
 
+/**
+ * Detect distinct raw invite codes that collapse under the lowercase
+ * canonical identity. This is telemetry/correctness evidence, not an
+ * admission decision: the registry is still keyed by the lowercase canonical
+ * code, so a true collision needs a schema-level case-preserving claim.
+ * Zero case-variant collisions were observed in the production sample; the
+ * detector makes any future occurrence visible instead of silently merging.
+ */
+export interface DiscordInviteCaseCollision {canonicalCode:string;codes:string[]}
+export function detectDiscordInviteCaseCollisions(items:DiscordCandidate[]):DiscordInviteCaseCollision[]{
+  const byCanonical=new Map<string,Set<string>>();
+  const add=(code:string|null|undefined)=>{
+    if(!code)return;
+    const canonical=discordInviteCodeOf(code);
+    if(!canonical)return;
+    if(!byCanonical.has(canonical))byCanonical.set(canonical,new Set());
+    byCanonical.get(canonical)!.add(code);
+  };
+  for(const item of items){
+    add(item.nativeInviteCode);
+    // A merged candidate keeps observations from both surfaces. Inspect raw
+    // locators too, because mergeDiscordCandidates collapses the candidate
+    // native code before this detector runs.
+    for(const observation of item.observations||[])add(extractDiscordInviteCodeRaw(observation.rawLocator));
+  }
+  return [...byCanonical.entries()]
+    .filter(([,codes])=>codes.size>1)
+    .map(([canonicalCode,codes])=>({canonicalCode,codes:[...codes]}));
+}
+
 export function mergeDiscordCandidates(items:DiscordCandidate[],input:{creatorName?:string;creatorWebsiteHosts?:string[]}={}):DiscordCandidate[]{
   const byCanonical=new Map<string,DiscordCandidate>();
   for(const item of items){
@@ -279,6 +351,39 @@ export function mergeDiscordCandidates(items:DiscordCandidate[],input:{creatorNa
   return Array.from(byCanonical.values()).sort((a,b)=>ownershipRank(b)-ownershipRank(a)||(b.ownershipConfidence||0)-(a.ownershipConfidence||0));
 }
 
+function rot13Text(value:string):string{
+  return value.replace(/[a-z]/gi,char=>{
+    const code=char.charCodeAt(0);
+    const base=code>=97?97:65;
+    return String.fromCharCode(base+((code-base+13)%26));
+  });
+}
+
+/**
+ * Bounded Base64 decoding. Only printable decoded payloads that explicitly
+ * contain `discord` are retained; arbitrary binary/token noise is discarded.
+ * The token cap prevents a hostile page from turning one extraction call into
+ * an unbounded decoder.
+ */
+function boundedBase64Variants(text:string):string[]{
+  const out:string[]=[];
+  const tokenPattern=/[A-Za-z0-9+/_-]{16,2048}={0,2}/g;
+  let match:RegExpExecArray|null;
+  let examined=0;
+  while((match=tokenPattern.exec(text))!==null&&examined<64){
+    examined++;
+    const token=match[0].replace(/-/g,'+').replace(/_/g,'/');
+    try{
+      const decoded=Buffer.from(token,'base64').toString('utf8');
+      // Allow UTF-8 letters/punctuation; reject binary/control payloads and
+      // replacement-character noise rather than requiring ASCII.
+      const hasControl=/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/.test(decoded);
+      if(/discord/i.test(decoded)&&!hasControl)out.push(decoded);
+    }catch{/* malformed base64 is ignored */ }
+  }
+  return out;
+}
+
 export function extractDiscordCandidates(text:string,sourceSurface:AcquisitionSurface='CHANNEL_EXTERNAL_LINKS',sourceUrl?:string):DiscordCandidate[]{
   if(!text)return [];
   const clean=decodeInviteObfuscation(text);
@@ -290,18 +395,28 @@ export function extractDiscordCandidates(text:string,sourceSurface:AcquisitionSu
   // invite-bearing snapshot until the crawl completes.
   const detach=(value:string):string=>Buffer.from(value,'utf8').toString('utf8');
   const push=(rawLocator:string,locatorType:DiscordLocatorType,code:string|undefined,confidence:'EXPLICIT'|'RESOLVED'|'HEURISTIC')=>{
-    if(code&&(code.length<2||code.length>128||reserved.has(code.toLowerCase())))return;
+    if(code&&(code.length<2||code.length>128||RESERVED_DISCORD_ROUTE_CODES.has(code.toLowerCase())))return;
     const ownLocator=detach(rawLocator);
     const ownCode=code===undefined?undefined:detach(code);
     const value=candidate({locatorType,sourceSurface,rawLocator:ownLocator,nativeInviteCode:ownCode,normalizedLocator:ownCode?`https://discord.gg/${ownCode}`:undefined,sourceUrl,extractionConfidence:confidence});
     if(!found.some(item=>item.candidateId===value.candidateId))found.push(value);
   };
-  const native=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}${NATIVE_INVITE_HOST}\\/${INVITE_CODE_CAPTURE}`,'gi');
-  for(let match;(match=native.exec(clean))!==null;){const code=sanitizeDiscordInviteCode(match[1]);if(code)push(match[0],'NATIVE_INVITE',code,'EXPLICIT');}
-  const alternative=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}${ALTERNATIVE_INVITE_HOST}\\/${INVITE_CODE_CAPTURE}`,'gi');
-  for(let match;(match=alternative.exec(clean))!==null;)push(match[0],'ALTERNATIVE_REDIRECT',undefined,'EXPLICIT');
-  const directory=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}disboard\\.org\\/server\\/${INVITE_CODE_CAPTURE}`,'gi');
-  for(let match;(match=directory.exec(clean))!==null;)push(match[0],'DIRECTORY_PAGE',undefined,'EXPLICIT');
+  const scan=(value:string,locatorType:DiscordLocatorType,confidence:'EXPLICIT'|'RESOLVED'|'HEURISTIC')=>{
+    const native=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}${NATIVE_INVITE_HOST}\\/${INVITE_CODE_CAPTURE}`,'gi');
+    for(let match;(match=native.exec(value))!==null;){const code=sanitizeDiscordInviteCode(match[1]);if(code)push(match[0],locatorType,code,confidence);}
+    const alternative=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}${ALTERNATIVE_INVITE_HOST}\\/${INVITE_CODE_CAPTURE}`,'gi');
+    for(let match;(match=alternative.exec(value))!==null;)push(match[0],'ALTERNATIVE_REDIRECT',undefined,confidence);
+    const directory=new RegExp(`${INVITE_HOST_BOUNDARY}${INVITE_PROTOCOL}disboard\\.org\\/server\\/${INVITE_CODE_CAPTURE}`,'gi');
+    for(let match;(match=directory.exec(value))!==null;)push(match[0],'DIRECTORY_PAGE',undefined,confidence);
+  };
+  scan(clean,'NATIVE_INVITE','EXPLICIT');
+  // ROT13 is only worth scanning when the source contains the rotated Discord
+  // marker (`qvfpbeq`); this avoids an O(n) transform on ordinary pages.
+  if(/qvfpbeq/i.test(clean)){
+    const rotated=rot13Text(clean);
+    if(/discord/i.test(rotated))scan(rotated,'OBFUSCATED_NATIVE','RESOLVED');
+  }
+  for(const decoded of boundedBase64Variants(clean))scan(decoded,'OBFUSCATED_NATIVE','RESOLVED');
   return found;
 }
 
@@ -313,7 +428,7 @@ export function candidateFromNativeInvite(input:{
   extractionConfidence?:DiscordCandidate['extractionConfidence'];
 }):DiscordCandidate|null{
   const code=sanitizeDiscordInviteCode(input.nativeInviteCode);
-  if(!code||reserved.has(code.toLowerCase()))return null;
+  if(!code||RESERVED_DISCORD_ROUTE_CODES.has(code.toLowerCase()))return null;
   const raw=input.rawLocator||`https://discord.gg/${code}`;
   return candidate({
     locatorType:'NATIVE_INVITE',

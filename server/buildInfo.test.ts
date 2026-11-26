@@ -4,13 +4,20 @@ import { resolveBuildInfo } from './buildInfo';
 
 test('commit SHA resolves from platform variables in priority order', () => {
   assert.deepEqual(
-    resolveBuildInfo({ RAILWAY_GIT_COMMIT_SHA: '714909a', GIT_COMMIT: 'aaaaaaa' }, () => '2026-09-12T00:00:00.000Z'),
+    resolveBuildInfo(
+      { SOURCE_COMMIT: '1BF93568A074A4A13E46B489D28AAE2A98025EB8', RAILWAY_GIT_COMMIT_SHA: '714909a', GIT_COMMIT: 'aaaaaaa' },
+      () => '2026-09-12T00:00:00.000Z',
+    ),
     {
-      commitSha: '714909a',
-      commitSource: 'RAILWAY_GIT_COMMIT_SHA',
+      commitSha: '1bf93568a074a4a13e46b489d28aae2a98025eb8',
+      commitSource: 'SOURCE_COMMIT',
       buildTime: '2026-09-12T00:00:00.000Z',
       buildTimeSource: 'startup',
     },
+  );
+  assert.equal(
+    resolveBuildInfo({ RAILWAY_GIT_COMMIT_SHA: '714909a', GIT_COMMIT: 'aaaaaaa' }, () => '2026-09-12T00:00:00.000Z').commitSource,
+    'RAILWAY_GIT_COMMIT_SHA',
   );
   assert.equal(
     resolveBuildInfo({ GIT_COMMIT: 'ABCDEF123456' }, () => '2026-09-12T00:00:00.000Z').commitSha,

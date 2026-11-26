@@ -48,6 +48,24 @@ export const CRAWL_DROP_REASONS = [
    * different cap already claimed `ceiling`.
    */
   'response-cap',
+  /**
+   * An explicit robots.txt Disallow rule excluded this URL. This is a
+   * compliance/policy exclusion, not an unavailable-robots block: 4xx, 403,
+   * 429 and unreachable robots.txt remain allowed (UNKNOWN).
+   */
+  'robots-disallowed',
+  /**
+   * The per-crawl Crawl-delay budget was exhausted before this URL could be
+   * requested. The page was deliberately not fetched and coverage remains
+   * incomplete; this is a bounded-pacing skip, not a robots Disallow rule.
+   */
+  'robots-delay-budget',
+  /**
+   * A fetched URL returned an image/font/script/media content type. It was
+   * screened after fetch and did not consume the static page/exploration
+   * budget; documents and HTML remain counted normally.
+   */
+  'asset-content-type',
 ] as const;
 export type CrawlDropReason = typeof CRAWL_DROP_REASONS[number];
 export function isCrawlDropReason(value: unknown): value is CrawlDropReason {
@@ -73,6 +91,8 @@ export const CEILING_KINDS = [
   'frame-slice',
   /** Frontier stopping-arbiter halt (see frontier-yield-stop above). */
   'frontier-yield',
+  /** Per-crawl Crawl-delay budget ended coverage before a request. */
+  'robots-delay-budget',
 ] as const;
 export type CeilingKind = typeof CEILING_KINDS[number];
 export function isCeilingKind(value: unknown): value is CeilingKind {

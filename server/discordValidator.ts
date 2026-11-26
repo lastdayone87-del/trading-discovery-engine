@@ -1,7 +1,7 @@
 import { DiscordStatus, type TradingStatus } from '../src/types';
 import { executeProviderCall, type ProviderCallError } from './providerResilience';
 import { appendProviderCallEvent } from './db';
-import type {DiscordOwnershipStatus} from './discordCandidates';
+import { RESERVED_DISCORD_ROUTE_CODES, type DiscordOwnershipStatus } from './discordCandidates';
 
 export interface DiscordEvidenceCoverage {
   inviteMetadata:'COMPLETED'|'FAILED';
@@ -188,11 +188,13 @@ export const DISCORD_UNEXPECTED_404_BOUNDED_OBSERVATIONS = 3;
 
 export async function validateDiscordInvite(inviteCode:string, options?:DiscordValidationOptions):Promise<DiscordValidationResult> {
   const cleanCode=inviteCode.replace(/^[\\/]+/,'').replace(/.*(?:discord\.gg|discord\.com\/invite|discordapp\.com\/invite|discord\.app\/invite)\//i,'').split(/[\?\#\/]/)[0].trim();
-  const RESERVED_WORDS=['channels','guilds','store','download','nitro','login','register','api','widget','terms','privacy','branding','jobs','before','after','next','prev','index','home','about','contact','faq','support','invite','oauth2','template'];
   const candidateInviteUrl=cleanCode?`https://discord.gg/${cleanCode}`:inviteCode;
   const attempts:DiscordCheckAttempt[]=[];
   const result=(value:Omit<DiscordValidationResult,'candidateInviteUrl'|'attempts'>):DiscordValidationResult=>({...value,candidateInviteUrl,attempts});
-  if(!cleanCode||cleanCode.length<2||RESERVED_WORDS.includes(cleanCode.toLowerCase())){
+  // Structural application routes only. Extraction uses the same shared set,
+  // so a code admitted there can never be rejected here as "reserved": the
+  // live Discord response is the final authority.
+  if(!cleanCode||cleanCode.length<2||RESERVED_DISCORD_ROUTE_CODES.has(cleanCode.toLowerCase())){
     attempts.push({attemptNumber:1,operationalOutcome:'INVALID_LOCATOR',retryable:false,reason:'Invalid or reserved invite code',checkedAt:new Date().toISOString()});
     return result({status:'UNCERTAIN',confidence:0,inviteUrl:null,relevanceReason:'Invalid or reserved invite code',operationalOutcome:'INVALID_LOCATOR',retryable:false,livenessStatus:'UNCERTAIN',relevanceStatus:'NOT_CHECKED',resolutionStatus:'UNRESOLVED',validationStatus:'COMPLETED'});
   }

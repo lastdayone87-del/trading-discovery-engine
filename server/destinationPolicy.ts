@@ -1,4 +1,12 @@
 import { assessCrawlAdmission, isKnownBrokerOrExchangeHost } from './communitySurfacePolicy';
+import {
+  decodeCommunityHost,
+  decodeCommunityPath,
+  MULTILINGUAL_HOST_COMMUNITY_EVIDENCE,
+  MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE,
+  MULTILINGUAL_URL_COMMUNITY_EVIDENCE,
+  MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
+} from './multilingualCommunityLexicon';
 
 /**
  * Evidence-driven navigation destination policy.
@@ -56,11 +64,11 @@ const COMMUNITY_PLATFORM_HOSTS = [
  * strong only together with a community/platform context so a generic
  * "apply now" or "premium plan" link cannot open an arbitrary new host.
  */
-export const STRONG_COMMUNITY_EVIDENCE = /(?:discord|community|join|invite|member|membership|vip|group|private|trading[-_ ]?(?:room|floor)|chat|club|signal|academy|mastermind|mentor|whop|skool|circle|patreon)/i;
+export const STRONG_COMMUNITY_EVIDENCE = MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE;
 export const STRONG_PAID_COMMUNITY_EVIDENCE = /(?:premium|paid|subscribe|subscription|access|apply|waitlist|members?[-_ ]?area)/i;
 /** Generic creator-site navigation. Eligible same-origin, never enough to
  * justify opening an unknown cross-origin host by itself. */
-export const WEAK_COMMUNITY_EVIDENCE = /(?:links?|social|contact|about|resources|support)/i;
+export const WEAK_COMMUNITY_EVIDENCE = MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE;
 const AFFILIATE_HINT = /(?:\/|[?&_-])(?:ref(?:erral)?|affiliate|partner|parrainage|cpa|campaign|promo|coupon)(?:\/|=|[?&_-]|$)/i;
 
 export type DestinationReason =
@@ -88,8 +96,11 @@ export function isKnownCommunityDestinationHost(host: string): boolean {
 
 function hasStrongCommunityEvidence(text: string): boolean {
   if (STRONG_COMMUNITY_EVIDENCE.test(text)) return true;
+  // Paid/access wording becomes qualifying only with a platform/server
+  // context. The multilingual strong regex is already the first check, so
+  // this fallback must keep the original platform/server terms.
   return STRONG_PAID_COMMUNITY_EVIDENCE.test(text)
-    && /(?:discord|community|members?|platform|whop|skool|circle|patreon|server)/i.test(text);
+    && /(?:platform|server)/i.test(text);
 }
 
 /**
@@ -133,9 +144,18 @@ export function shouldFollowDestination(input: {
   // community surface. Anchor text remains the primary user-visible signal.
   let pathname = input.url;
   try { pathname = new URL(input.url).pathname || '/'; } catch { /* admission already validated */ }
-  const text = `${pathname} ${input.anchorText || ''}`;
+  // Path and anchor separators are normalized so the space-delimited lexicon
+  // matches hyphenated/underscored URLs and CTAs (`Trading-Room`). Serialized
+  // URLs percent-encode accented terms; decode before matching.
+  const pathEvidence = decodeCommunityPath(input.url);
+  const hostEvidence = decodeCommunityHost(input.url);
+  const text = `${pathEvidence.replace(/[-_/]+/g, ' ')} ${String(input.anchorText || '').replace(/[-_/]+/g, ' ')}`;
   const knownHost = isKnownCommunityDestinationHost(host);
-  const strongEvidence = hasStrongCommunityEvidence(text);
+  // Concatenated URL slugs (`/vipintraders`) are legitimate community
+  // evidence even when token boundaries prevent an anchor-style match.
+  const strongEvidence = hasStrongCommunityEvidence(text)
+    || MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(hostEvidence)
+    || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathEvidence);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);
   const eligible = sameOrigin
     || Boolean(input.structuredNominated)
@@ -231,7 +251,7 @@ export function createDestinationBudget(input: {
    * of the external host. Without it, legacy same-origin behavior is retained. */
   seedUrl?: string;
 } = {}): {
-  reserve: (url: string, currentUrl: string) => { admitted: boolean; reason: 'same-origin' | 'admitted' | 'host-budget' | 'page-budget' };
+  reserve: (url: string, currentUrl: string) => { admitted: boolean; reason: 'same-origin' | 'admitted' | 'host-budget' | 'page-budget'; release?: () => void };
 } {
   const maxHosts = Math.max(1, Math.trunc(input.maxCrossOriginHosts ?? 3) || 3);
   const maxPages = Math.max(1, Math.trunc(input.maxPagesPerHost ?? 2) || 2);
@@ -267,7 +287,19 @@ export function createDestinationBudget(input: {
       }
       pages.add(key);
       pagesByHost.set(host, pages);
-      return { admitted: true, reason: 'admitted' as const };
+      const result = { admitted: true, reason: 'admitted' as const };
+      // Non-enumerable so existing deep-equality contracts stay stable while
+      // callers can still release a slot after a post-reservation policy skip
+      // (for example the Crawl-delay budget).
+      Object.defineProperty(result, 'release', {
+        enumerable: false,
+        value: () => {
+          const currentPages = pagesByHost.get(host);
+          if (!currentPages?.delete(key)) return;
+          if (currentPages.size === 0) pagesByHost.delete(host);
+        },
+      });
+      return result;
     },
   };
 }
