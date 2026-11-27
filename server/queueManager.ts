@@ -513,12 +513,45 @@ export async function admitInspectionDiscordCandidates(
     .filter(candidate => { const code = discordInviteCodeOf(candidate.nativeInviteCode); return !!code && want.has(code); })
     .map(candidate => candidate.candidateId)
     .filter(Boolean))];
-  const claimSources = new Map<string, { surface: string | null; url: string | null }>();
+  const claimSources = new Map<string, {
+    surface: string | null;
+    url: string | null;
+    sources: Array<{ sourceSurface: string | null; sourceUrl: string | null }>;
+  }>();
   for (const candidate of provisional) {
     const code = discordInviteCodeOf(candidate.nativeInviteCode);
-    if (code && !claimSources.has(code)) claimSources.set(code, { surface: candidate.sourceSurface || null, url: candidate.sourceUrl || null });
+    if (!code) continue;
+    const observations = candidate.observations?.length
+      ? candidate.observations
+      : [{ sourceSurface: candidate.sourceSurface, sourceUrl: candidate.sourceUrl }];
+    const sources = observations.map(observation => ({
+      sourceSurface: observation.sourceSurface || null,
+      sourceUrl: observation.sourceUrl || null,
+    }));
+    const existing = claimSources.get(code);
+    if (!existing) {
+      claimSources.set(code, {
+        surface: candidate.sourceSurface || null,
+        url: candidate.sourceUrl || null,
+        sources,
+      });
+      continue;
+    }
+    const keys = new Set(existing.sources.map(source => `${source.sourceSurface || ''}\u0000${source.sourceUrl || ''}`));
+    for (const source of sources) {
+      const key = `${source.sourceSurface || ''}\u0000${source.sourceUrl || ''}`;
+      if (!keys.has(key)) {
+        keys.add(key);
+        existing.sources.push(source);
+      }
+    }
   }
-  const inviteClaims = await deps.claim([...claimSources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  const inviteClaims = await deps.claim([...claimSources.entries()].map(([code, src]) => ({
+    code,
+    sourceSurface: src.surface,
+    sourceUrl: src.url,
+    sources: src.sources,
+  })), channelId);
   // Provenance only: owner ids of codes this inspection found but could not
   // claim. The code itself is deliberately not persisted on the affected
   // channel (no invite assignment, no candidate row).

@@ -89,14 +89,26 @@ maybe('claim retains every source relationship while keeping one registry row', 
   const db = await getDb();
   await db.query(`DELETE FROM discord_invite_sources WHERE canonical_code='rgtestmulti'`);
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestmulti'`);
-  await claimDiscordInvites([{code:'rgtestmulti',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'}], 'rgchan1');
+  await claimDiscordInvites([{
+    code:'rgtestmulti',
+    sourceSurface:'CREATOR_WEBSITES',
+    sourceUrl:'https://creator-a.test/',
+    sources:[
+      {sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'},
+      {sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/community'},
+      {sourceSurface:'YOUTUBE_ABOUT',sourceUrl:'https://youtube.test/channel/about'},
+      {sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'},
+    ],
+  }], 'rgchan1');
   await claimDiscordInvites([{code:'rgtestmulti',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://affiliate-b.test/'}], 'rgchan2');
   const registry = await db.query(`SELECT count(*)::int n FROM discord_invite_registry WHERE canonical_code='rgtestmulti'`);
   assert.equal(registry.rows[0].n, 1);
-  const sources = await db.query(`SELECT channel_id,source_url FROM discord_invite_sources WHERE canonical_code='rgtestmulti' ORDER BY channel_id`);
+  const sources = await db.query(`SELECT channel_id,source_surface,source_url FROM discord_invite_sources WHERE canonical_code='rgtestmulti' ORDER BY channel_id,source_surface,source_url`);
   assert.deepEqual(sources.rows, [
-    { channel_id: 'rgchan1', source_url: 'https://creator-a.test/' },
-    { channel_id: 'rgchan2', source_url: 'https://affiliate-b.test/' },
+    { channel_id: 'rgchan1', source_surface: 'CREATOR_WEBSITES', source_url: 'https://creator-a.test/' },
+    { channel_id: 'rgchan1', source_surface: 'CREATOR_WEBSITES', source_url: 'https://creator-a.test/community' },
+    { channel_id: 'rgchan1', source_surface: 'YOUTUBE_ABOUT', source_url: 'https://youtube.test/channel/about' },
+    { channel_id: 'rgchan2', source_surface: 'CREATOR_WEBSITES', source_url: 'https://affiliate-b.test/' },
   ]);
   await cleanup(db);
 });

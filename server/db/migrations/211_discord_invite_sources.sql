@@ -37,10 +37,10 @@ ON CONFLICT (canonical_code, channel_id, source_surface, source_url) DO NOTHING;
 INSERT INTO discord_invite_sources(canonical_code, channel_id, source_surface, source_url, first_seen_at, last_seen_at)
 SELECT code,
        channel_id,
-       COALESCE(source_surface, ''),
-       LEFT(COALESCE(source_url, ''), 2048),
-       discovered_at,
-       discovered_at
+       source_surface,
+       source_url,
+       MIN(discovered_at),
+       MAX(discovered_at)
 FROM (
   SELECT lower(
            split_part(
@@ -53,8 +53,8 @@ FROM (
            )
          ) AS code,
          channel_id,
-         source_surface,
-         source_url,
+         COALESCE(source_surface, '') AS source_surface,
+         LEFT(COALESCE(source_url, ''), 2048) AS source_url,
          discovered_at
   FROM discord_candidates
   WHERE normalized_locator ~* '^https?://(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+[^/[:space:]]'
@@ -63,5 +63,8 @@ WHERE code <> ''
   AND code NOT LIKE '% %'
   AND code NOT LIKE '%/%'
   AND length(code) BETWEEN 2 AND 128
+GROUP BY code, channel_id, source_surface, source_url
 ON CONFLICT (canonical_code, channel_id, source_surface, source_url)
-DO UPDATE SET last_seen_at = GREATEST(discord_invite_sources.last_seen_at, EXCLUDED.last_seen_at);
+DO UPDATE SET
+  first_seen_at = LEAST(discord_invite_sources.first_seen_at, EXCLUDED.first_seen_at),
+  last_seen_at = GREATEST(discord_invite_sources.last_seen_at, EXCLUDED.last_seen_at);

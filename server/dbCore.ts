@@ -296,7 +296,7 @@ export interface DiscordInviteClaim {code:string;admitted:boolean;firstChannelId
  * remains a truthful first-seen record — the owning channel's retry
  * rediscovers through the same-channel path and completes normally.
  */
-export async function claimDiscordInvites(items:Array<{code:string;sourceSurface?:string|null;sourceUrl?:string|null}>,channelId:string):Promise<DiscordInviteClaim[]>{
+export async function claimDiscordInvites(items:Array<{code:string;sourceSurface?:string|null;sourceUrl?:string|null;sources?:Array<{sourceSurface?:string|null;sourceUrl?:string|null}>}>,channelId:string):Promise<DiscordInviteClaim[]>{
   const seen=new Map<string,{surface:string|null;url:string|null}>();
   for(const item of items||[]){
     if(!item||typeof item.code!=='string'||!item.code)continue;
@@ -319,13 +319,27 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
   // that published the same invite keeps a durable source relationship. This
   // runs for winners and losers alike; a loser's candidate row is still
   // removed, so no duplicate validation is created.
-  await db.query(
-    `INSERT INTO discord_invite_sources(canonical_code,channel_id,source_surface,source_url,first_seen_at,last_seen_at)
-     SELECT code,$2,surface,LEFT(url,2048),now(),now()
-     FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
-     ON CONFLICT(canonical_code,channel_id,source_surface,source_url)
-     DO UPDATE SET last_seen_at=now()`,
-    [unique,channelId,unique.map(code=>seen.get(code)!.surface||''),unique.map(code=>seen.get(code)!.url||'')]);
+  const sourceRows=new Map<string,{code:string;surface:string;url:string}>();
+  for(const item of items||[]){
+    if(!item||typeof item.code!=='string'||!item.code)continue;
+    const sources=item.sources?.length?item.sources:[{sourceSurface:item.sourceSurface,sourceUrl:item.sourceUrl}];
+    for(const source of sources){
+      const surface=source.sourceSurface||'';
+      const url=source.sourceUrl||'';
+      const key=`${item.code}\u0000${surface}\u0000${url}`;
+      if(!sourceRows.has(key))sourceRows.set(key,{code:item.code,surface,url});
+    }
+  }
+  if(sourceRows.size){
+    const rows=[...sourceRows.values()];
+    await db.query(
+      `INSERT INTO discord_invite_sources(canonical_code,channel_id,source_surface,source_url,first_seen_at,last_seen_at)
+       SELECT code,$2,surface,LEFT(url,2048),now(),now()
+       FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
+       ON CONFLICT(canonical_code,channel_id,source_surface,source_url)
+       DO UPDATE SET last_seen_at=now()`,
+      [rows.map(row=>row.code),channelId,rows.map(row=>row.surface),rows.map(row=>row.url)]);
+  }
   return unique.map(code=>({code,admitted:won.has(code)||owners.get(code)===channelId,firstChannelId:won.has(code)?channelId:(owners.get(code)||null)}));
 }
 /** Releases the provisional first-seen registry claim after validation proves
