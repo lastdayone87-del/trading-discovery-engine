@@ -298,7 +298,7 @@ test('choke claims legacy foundInvite only when nothing admitted', async () => {
   };
   // Structured admitted: foundInvite code must NOT be claimed (no parking).
   await admitInspectionDiscordCandidates(
-    [{ candidateId: 'x', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', rawLocator: 'https://discord.gg/NEW1', normalizedLocator: 'https://discord.gg/new1', nativeInviteCode: 'NEW1', extractionConfidence: 'EXPLICIT' }] as never,
+    [{ candidateId: 'x', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://creator.test/new1', rawLocator: 'https://discord.gg/NEW1', normalizedLocator: 'https://discord.gg/new1', nativeInviteCode: 'NEW1', extractionConfidence: 'EXPLICIT' }] as never,
     'OTHER2',
     'chanX',
     deps as never,

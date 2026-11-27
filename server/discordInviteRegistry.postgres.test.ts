@@ -2,7 +2,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import type pg from 'pg';
-import { getDb, claimDiscordInvites } from './db';
+import { getDb, claimDiscordInvites, listDiscordInviteSources, releaseDiscordInviteClaim } from './db';
 
 const enabled = Boolean(process.env.DATABASE_URL);
 const maybe = enabled ? test : test.skip;
@@ -10,6 +10,7 @@ const CH = ['rgchan1', 'rgchan2', 'rgchan3'];
 type Db = Awaited<ReturnType<typeof getDb>>;
 
 async function cleanup(db: Db) {
+  await db.query(`DELETE FROM discord_invite_sources WHERE canonical_code LIKE 'rgtest%'`);
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code LIKE 'rgtest%'`);
   await db.query(`DELETE FROM discord_candidates WHERE channel_id = ANY($1)`, [CH]);
   await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [CH]);
@@ -82,6 +83,54 @@ maybe('same-channel reclaim admitted; first_seen_at immutable; claim creates no 
   const rows = await db.query(`SELECT count(*)::int n FROM discord_candidates WHERE normalized_locator LIKE '%rgtestghost%'`);
   assert.equal(rows.rows[0].n, 0);
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestghost'`);
+});
+
+maybe('claim retains every source relationship while keeping one registry row', async () => {
+  const db = await getDb();
+  await db.query(`DELETE FROM discord_invite_sources WHERE canonical_code='rgtestmulti'`);
+  await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestmulti'`);
+  await claimDiscordInvites([{
+    code:'rgtestmulti',
+    sourceSurface:'CREATOR_WEBSITES',
+    sourceUrl:'https://creator-a.test/',
+    sources:[
+      {sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'},
+      {sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/community'},
+      {sourceSurface:'YOUTUBE_ABOUT',sourceUrl:'https://youtube.test/channel/about'},
+      {sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'},
+    ],
+  }], 'rgchan1');
+  await claimDiscordInvites([{code:'rgtestmulti',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://affiliate-b.test/'}], 'rgchan2');
+  const registry = await db.query(`SELECT count(*)::int n FROM discord_invite_registry WHERE canonical_code='rgtestmulti'`);
+  assert.equal(registry.rows[0].n, 1);
+  const sources = await listDiscordInviteSources('rgtestmulti');
+  const orderedSources = sources.map(source => ({ channel_id: source.channelId, source_surface: source.sourceSurface, source_url: source.sourceUrl })).sort((a, b) => `${a.channel_id}|${a.source_surface}|${a.source_url}`.localeCompare(`${b.channel_id}|${b.source_surface}|${b.source_url}`));
+  assert.deepEqual(orderedSources, [
+    { channel_id: 'rgchan1', source_surface: 'CREATOR_WEBSITES', source_url: 'https://creator-a.test/' },
+    { channel_id: 'rgchan1', source_surface: 'CREATOR_WEBSITES', source_url: 'https://creator-a.test/community' },
+    { channel_id: 'rgchan1', source_surface: 'YOUTUBE_ABOUT', source_url: 'https://youtube.test/channel/about' },
+    { channel_id: 'rgchan2', source_surface: 'CREATOR_WEBSITES', source_url: 'https://affiliate-b.test/' },
+  ]);
+  await cleanup(db);
+});
+
+maybe('a non-trading or invalid first claim can be released without erasing sources', async () => {
+  const db = await getDb();
+  await db.query(`DELETE FROM discord_invite_sources WHERE canonical_code='rgtestrelease'`);
+  await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code='rgtestrelease'`);
+  await claimDiscordInvites([{code:'rgtestrelease',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'}], 'rgchan1');
+  assert.equal(await releaseDiscordInviteClaim('rgtestrelease', 'rgchan2'), false, 'non-owner cannot release');
+  assert.equal((await db.query(`SELECT count(*)::int n FROM discord_invite_registry WHERE canonical_code='rgtestrelease'`)).rows[0].n, 1);
+  await db.query(
+    `INSERT INTO discord_check_attempts(attempt_key,channel_id,invite_locator,semantic_status,operational_outcome,retryable,attempt_number,reason,checked_at,policy_version) VALUES('rg-release-later','rgchan1','https://discord.gg/rgtestrelease','ACTIVE','SUCCEEDED',false,1,'ok',now(),'discord-check-policy-v2') ON CONFLICT(attempt_key) DO NOTHING`,
+  );
+  assert.equal(await releaseDiscordInviteClaim('rgtestrelease', 'rgchan1', new Date(Date.now()-60_000).toISOString()), false,
+    'a later successful same-channel attempt blocks a stale rejection');
+  assert.equal(await releaseDiscordInviteClaim('rgtestrelease', 'rgchan1'), true);
+  assert.equal((await db.query(`SELECT count(*)::int n FROM discord_invite_registry WHERE canonical_code='rgtestrelease'`)).rows[0].n, 0);
+  const sources = await db.query(`SELECT channel_id FROM discord_invite_sources WHERE canonical_code='rgtestrelease'`);
+  assert.equal(sources.rowCount, 1, 'source provenance survives claim release');
+  await cleanup(db);
 });
 
 after(async () => {

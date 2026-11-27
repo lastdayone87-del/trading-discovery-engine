@@ -289,6 +289,10 @@ test('resource safety: a queued waiter is not promoted when memory degraded whil
 
 test('Dockerfile defaults match the validated browser-capacity configuration', () => {
   const dockerfile = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  assert.match(dockerfile, /CRAWLEE_MEMORY_MBYTES=3072\b/,
+    'Crawlee uses the host headroom instead of the old ~2 GB soft ceiling');
+  assert.match(dockerfile, /NODE_OPTIONS=--max-old-space-size=3072\b/,
+    'Node heap cap matches the measured 3 GB runtime headroom');
   assert.match(dockerfile, /BROWSER_RUNTIME_CONCURRENCY=2\b/,
     'the validated experiment config runs two memory-guarded browser slots');
   assert.match(dockerfile, /RENDERED_ADMISSION_NOMINAL_PER_HOUR=64\b/,

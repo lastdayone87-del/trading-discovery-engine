@@ -55,6 +55,26 @@ test('canonical domain corroborates but never decides ownership alone',()=>{
   assert.ok(corroborated.ownershipReasons?.includes('CREATOR_BRAND_DOMAIN_MATCH'));
 });
 
+test('affiliate links do not become creator-canonical website hosts',()=>{
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://myforexfunds.com/?wpam_id=64562']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://broker.example/?referrer=affiliate']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://broker.example/?referralCode=ABC']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://broker.example/?promo_code=ABC']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://inklyn.app/@apollo']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://flowmatrix-nt8.com/pages/pricing?utm_source=youtube']),['flowmatrix-nt8.com']);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://creator.example/?ref=youtube']),['creator.example'],
+    'ordinary campaign ref values do not erase a creator-owned host');
+});
+
+test('product and course paths are content types, not partner evidence',()=>{
+  const product=candidate('CREATOR_WEBSITES','https://creator.example/products/indicator');
+  const productOwnership=inferDiscordOwnership(product,{creatorName:'Atlas Trading',creatorWebsiteHosts:['creator.example']});
+  assert.equal(productOwnership.ownershipStatus,'UNCERTAIN');
+  assert.ok(!productOwnership.ownershipReasons?.includes('PARTNER_OR_AFFILIATE_SURFACE'));
+  const partner=candidate('CREATOR_WEBSITES','https://creator.example/broker-partner');
+  assert.equal(inferDiscordOwnership(partner,{creatorName:'Atlas Trading',creatorWebsiteHosts:['creator.example']}).ownershipStatus,'THIRD_PARTY');
+});
+
 test('third-party linked site without corroboration stays out of creator-owned',()=>{
   // A creator linking an ordinary third-party tools site must not promote
   // that site's Discord to creator-owned on the link alone.

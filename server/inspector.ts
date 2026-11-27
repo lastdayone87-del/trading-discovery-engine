@@ -401,6 +401,23 @@ export function communityNavigationScore(href:string,label:string):number {
   return 0;
 }
 
+const AFFILIATE_WEBSITE_QUERY_KEY = /^(?:wpam(?:_?id)?|aff(?:iliate)?(?:_?(?:id|code))?|ref(?:(?:erral|errer)(?:_?(?:id|code))?|_?(?:id|code))|partner(?:_?(?:id|code))?|promo_?code|coupon_?code|cpa|clickid|subid|irclickid)$/i;
+const LINK_HUB_PROFILE_PATH = /^\/@[^/]+\/?$/;
+/** A referral/affiliate link proves a business relationship, not ownership of
+ * the destination site. Link-in-bio profile URLs are likewise references to a
+ * shared platform profile, not the creator's canonical website. Exclude both
+ * from creator-canonical host derivation so an affiliate/broker page cannot
+ * become CREATOR_OWNED from the link alone. */
+function isNonCanonicalCreatorWebsiteLink(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (LINK_HUB_PROFILE_PATH.test(parsed.pathname)) return true;
+    for (const key of parsed.searchParams.keys()) {
+      if (AFFILIATE_WEBSITE_QUERY_KEY.test(key)) return true;
+    }
+    return false;
+  } catch { return true; }
+}
 /**
  * Derive creator-canonical website hosts from channel links for Discord
  * ownership inference. Uses the same normalized destinations acquisition
@@ -415,6 +432,7 @@ export function creatorWebsiteHostsFromLinks(links: Array<string | null | undefi
     if (!link || typeof link !== 'string') continue;
     const normalized = normalizeExternalUrl(link);
     if (!normalized || normalized.kind !== 'WEBSITE') continue;
+    if (isNonCanonicalCreatorWebsiteLink(normalized.url)) continue;
     let host = '';
     try { host = new URL(normalized.url).hostname.toLowerCase().replace(/^www\./, ''); } catch { continue; }
     if (!host.includes('.')) continue;

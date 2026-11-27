@@ -181,8 +181,8 @@ test('E10: loser cleanup runs on the DB clock with exact execution candidate ids
     executionNow: async () => { ops.push('now'); return '2026-10-19T00:00:00.000Z'; },
   };
   const candidates = [
-    { candidateId: 'test:WINNER', nativeInviteCode: 'winner', rawLocator: 'discord.gg/winner', normalizedLocator: 'https://discord.gg/winner', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', extractionConfidence: 'EXPLICIT' },
-    { candidateId: 'test:LOSER', nativeInviteCode: 'loser', rawLocator: 'discord.gg/loser', normalizedLocator: 'https://discord.gg/loser', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', extractionConfidence: 'EXPLICIT' },
+    { candidateId: 'test:WINNER', nativeInviteCode: 'winner', rawLocator: 'discord.gg/winner', normalizedLocator: 'https://discord.gg/winner', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://creator.test/winner', extractionConfidence: 'EXPLICIT' },
+    { candidateId: 'test:LOSER', nativeInviteCode: 'loser', rawLocator: 'discord.gg/loser', normalizedLocator: 'https://discord.gg/loser', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://creator.test/loser', extractionConfidence: 'EXPLICIT' },
   ] as DiscordCandidate[];
   const result = await admitInspectionDiscordCandidates(candidates, null, 'chanA', deps as never);
   assert.equal(result.discoveredInvite, 'winner');
@@ -612,6 +612,8 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   assert.match(db, /ORDER BY discovered_at ASC,candidate_id ASC LIMIT \$2 OFFSET \$3/);
   const queue = readSource('queueManager.ts');
   assert.match(queue, /event: 'discord_unowned_surface_candidates_deferred'/);
+  assert.match(queue, /releaseDiscordInviteClaim\(code,channel\.channel_id,checkedAt\)/);
+  assert.match(db, /INSERT INTO discord_invite_sources/);
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
   const claimIndex = queue.indexOf('await markSiteInspectionsClaimed(channel.channel_id,executedCandidateIds).catch');

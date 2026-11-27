@@ -259,7 +259,10 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
 
   const creatorName=String(input.creatorName||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const creatorParts=creatorIdentityParts(creatorName);
-  const partnerSignals=/affiliate|referral|sponsor|sponsored|partner|broker|course|product|parrain|refer\b|promo|discount/;
+  // `course`/`product` are content types, not relationship evidence: a
+  // creator's own product/course page often carries the community invite.
+  // Explicit affiliate/referral/sponsor/broker tokens still trigger the penalty.
+  const partnerSignals=/affiliate|referral|referrer|sponsor|sponsored|partner|broker|parrain|refer\b|promo|discount/;
   const provenanceText=observations.map(observation=>[
     observation.sourceUrl,
     observation.sourcePageUrl,
@@ -273,6 +276,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   for(const candidateUrl of candidateHosts){
     try{
       const parsed=new URL(candidateUrl),host=parsed.hostname.toLowerCase();
+      const subdomainLinkedHost=input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))||false;
       // A canonical-domain match corroborates ownership but can never decide it
       // alone: a channel link proves reference, not ownership (a linked broker,
       // tool, docs or sponsor page is a third-party surface). +30 keeps a
@@ -280,7 +284,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
       // cross-surface (+15) corroboration is also present. No break here
       // (unlike the branches below): brand/social identity may still corroborate
       // the same host. Awarded at most once.
-      if(!reasons.includes('CREATOR_CANONICAL_DOMAIN')&&input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=30;reasons.push('CREATOR_CANONICAL_DOMAIN');}
+      if(!reasons.includes('CREATOR_CANONICAL_DOMAIN')&&subdomainLinkedHost){score+=30;reasons.push('CREATOR_CANONICAL_DOMAIN');}
       if(creatorName){
         const compact=creatorName.replace(/\s+/g,''),hostCompact=host.replace(/[^a-z0-9]/g,'');
         // A brand-matching creator website was already intended as strong

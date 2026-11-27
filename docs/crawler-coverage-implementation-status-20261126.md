@@ -1,6 +1,6 @@
 # Crawler Coverage Remediation — Implementation Status (Phase 0/1)
 
-**Status:** DEPLOYED — PR #707 live on production at `54f93d1f`; follow-up monitoring in progress
+**Status:** DEPLOYED — PR #707 live at `54f93d1f`; correction PR #709 (relaxed website gate) is the deployment candidate
 **Date:** 2026-11-27 (updated)
 **Branch:** `main` (PR #707 merged; production deployment 2026-11-27T14:31Z)
 **References:** gap register and remediation plan in the same directory
@@ -163,9 +163,12 @@ Active production settings:
 
 ### PR #707 ownership guard
 
-- Static website claims require `CREATOR_OWNED` or a known community/link hub.
-  Viewer comments and curated playlist items are ignored when classifying the
-  provenance, so a docs page plus a viewer comment cannot bypass the guard.
+- PR #709 correction: static website claims no longer require
+  `CREATOR_OWNED`. Legitimate creator, affiliate, broker, prop-firm, partner
+  and trading-tool sites proceed to Discord-native relevance validation.
+  Obvious docs/wiki/app-store/reference hosts are excluded, and viewer comments
+  / curated playlist items remain non-claiming provenance. Ownership stays a
+  ranking/attribution factor.
 - External reference pages cannot hop to unrelated external hosts. Apex/www,
   HTTP/HTTPS, and port redirects stay first-party; a creator-authored `/join`
   redirect may hand off to a separate community domain, but after the crawl
@@ -211,9 +214,9 @@ container logs, from 2026-11-27T14:31Z through 15:00Z:
 - 0 new `discord_candidates` rows and 0 new registry claims.
 - 0 new docs/wiki/reference false claims.
 - No `youtube_surface_expansion_failed` events and no fatal/OOM events.
-- Rendered fallback logged a memory-pressure warning at about 2.0 GB, roughly
-  103% of the container's 1.985 GB limit; the process stayed up, but this
-  remains the main capacity constraint.
+- Rendered fallback hit Crawlee's ~2 GB soft ceiling and logged a memory
+  warning; the process stayed up. The app cgroup is unbounded and the host had
+  available headroom (sizing details remain in the internal runbook).
 - No net-new validated Discord invite was measured in this short window. The
   guard is deliberately deferring unowned static rows; genuine yield must be
   measured over a longer window before changing static depth or YouTube
@@ -230,3 +233,29 @@ container logs, from 2026-11-27T14:31Z through 15:00Z:
    with no docs/wiki/reference claims and measurable genuine static yield.
 5. A dedicated browser service remains blocked on infrastructure/spending
    approval; the observed ~2 GB rendered-fallback pressure supports that need.
+
+### 2026-11-27 correction after production review
+
+The first #707 rollout was too strict: a creator-linked custom-brand site with
+no YouTube-name match scored 70/`UNCERTAIN`, so its invite was deferred before
+validation and static website yield fell to zero. The corrected policy:
+
+- Website/affiliate/broker/prop-firm/partner discoveries are claimable and go
+  through Discord-native `TRADING_RELEVANT` vs non-trading validation.
+- Obvious reference/application hosts (`wikipedia.org`, `docs.*`, `wiki.*`,
+  Google Play/App Store/Chrome Web Store, GitHub/GitLab, Rentry) remain
+  excluded at destination-admission and static-claim time.
+- `externalPageHop` still confines off-site crawling to the creator seed.
+- Viewer comments and curated playlist items still cannot claim globally.
+- Non-trading/dead/invalid validation releases the provisional first-seen
+  registry claim, while every source relationship is retained in
+  `discord_invite_sources`.
+- Exact creator-linked hosts still corroborate ownership for ranking;
+  affiliate/referrer query links do not become canonical creator hosts.
+- The existing siteInspectionCache reuse/retry semantics are unchanged; the
+  relaxed website rows are finalized as claimed/discarded normally.
+
+Runtime headroom is raised from Crawlee's ~2 GB soft ceiling to 3 GB
+(`CRAWLEE_MEMORY_MBYTES=3072`, Node heap 3072 MB) after measuring production
+host headroom. Browser slots remain at 2; the existing memory-headroom lease
+still falls back to one slot on pressure.

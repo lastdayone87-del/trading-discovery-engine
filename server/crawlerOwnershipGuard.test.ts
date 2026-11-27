@@ -73,7 +73,7 @@ test('social-only candidates remain claimable without website evidence', async (
   assert.deepEqual(claimed, ['socialroom']);
 });
 
-test('static candidates without ownership evidence cannot claim the registry', async () => {
+test('reference-only static candidates stay deferred; creator and partner websites proceed', async () => {
   const falseCandidate = websiteCandidate('N8NDOCS', 'https://docs.n8n.io/integrations/');
   const falseOwned = { ...falseCandidate, ...inferDiscordOwnership(falseCandidate, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] }) };
   const mixedCandidate = websiteCandidate('MIXEDDOCS', 'https://docs.n8n.io/integrations/');
@@ -99,11 +99,30 @@ test('static candidates without ownership evidence cannot claim the registry', a
     removeLosers: async () => 0,
     executionNow: async () => new Date().toISOString(),
   };
-  const result = await admitInspectionDiscordCandidates([falseOwned, mixed, legitOwned] as never, null, 'chanX', deps as never);
-  assert.deepEqual(claimed, ['dmsclass']);
-  assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode), ['DMSCLASS']);
+  const affiliateCandidate = websiteCandidate('AFFILIATE', 'https://myforexfunds.com/contact-us/');
+  const affiliate = { ...affiliateCandidate, ...inferDiscordOwnership(affiliateCandidate, { creatorName: 'T For Trading', creatorWebsiteHosts: ['myforexfunds.com'] }) };
+  const propFirmCandidate = websiteCandidate('PROPFIRM', 'https://apextraderfunding.com/member/aff/go/test');
+  const propFirm = { ...propFirmCandidate, ...inferDiscordOwnership(propFirmCandidate, { creatorName: 'Apex Trader', creatorWebsiteHosts: ['apextraderfunding.com'] }) };
+  // A non-reference software community is not blocked at admission: the
+  // actual Discord relevance validation decides, and a non-trading result
+  // releases the provisional registry claim.
+  const softwareCandidate = websiteCandidate('SOFTWARE', 'https://community.n8n.io/');
+  const software = { ...softwareCandidate, ...inferDiscordOwnership(softwareCandidate, { creatorName: 'iOSCoding' }) };
+  const missingUrl = makeDiscordCandidate({
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CREATOR_WEBSITES',
+    rawLocator: 'https://discord.gg/MISSINGURL',
+    normalizedLocator: 'https://discord.gg/MISSINGURL',
+    nativeInviteCode: 'MISSINGURL',
+    extractionConfidence: 'EXPLICIT',
+    observations: [{ sourceSurface: 'CREATOR_WEBSITES', rawLocator: 'https://discord.gg/MISSINGURL', extractionConfidence: 'EXPLICIT' }],
+  });
+  const result = await admitInspectionDiscordCandidates([falseOwned, mixed, legitOwned, affiliate, propFirm, software, missingUrl] as never, null, 'chanX', deps as never);
+  assert.deepEqual(claimed.sort(), ['affiliate', 'dmsclass', 'propfirm', 'software']);
+  assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode).sort(), ['AFFILIATE', 'DMSCLASS', 'PROPFIRM', 'SOFTWARE']);
   assert.equal(persisted.includes(falseOwned.candidateId), false);
   assert.equal(persisted.includes(mixed.candidateId), false);
+  assert.equal(persisted.includes(missingUrl.candidateId), false, 'missing website provenance stays deferred');
 });
 
 test('third-party pages cannot open unrelated external hosts', () => {
@@ -129,6 +148,29 @@ test('third-party pages cannot open unrelated external hosts', () => {
     seedUrl: seed,
   });
   assert.equal(sameExternalOrigin.eligible, true);
+  for (const referenceUrl of [
+    'https://docs.n8n.io/integrations/',
+    'https://es.wikipedia.org/wiki/Portal:Comunidad',
+    'https://play.google.com/store/apps/details?id=com.example',
+    'https://chromewebstore.google.com/detail/x',
+    'https://github.com/UnionKeyHQ/firmware',
+  ]) {
+    const reference = shouldFollowDestination({
+      url: referenceUrl,
+      currentUrl: seed,
+      seedUrl: seed,
+      anchorText: 'Join the community',
+    });
+    assert.equal(reference.eligible, false, referenceUrl);
+    assert.equal(reference.reason, 'reference-host', referenceUrl);
+  }
+  const partnerSite = shouldFollowDestination({
+    url: 'https://myforexfunds.com/contact-us/',
+    currentUrl: seed,
+    seedUrl: seed,
+    anchorText: 'Join the trading community',
+  });
+  assert.equal(partnerSite.eligible, true, 'affiliate/prop-firm sites remain crawlable');
   const redirectedSeed = shouldFollowDestination({
     url: 'https://members.creator.example/join',
     currentUrl: 'https://www.creator.example/',
@@ -224,4 +266,18 @@ test('merged pre-click cross-origin links keep their source document', () => {
     maxEnqueues: 5,
   });
   assert.deepEqual(plan.admitted, [url], 'a creator-origin pre-click anchor is not reclassified against the post-click docs page');
+});
+
+test('creator-owned docs subdomains keep same-site navigation but block third-party docs', () => {
+  const docsSeed = new URL('https://docs.creator.example');
+  assert.equal(isAllowedChildRedirect(docsSeed, docsSeed, new URL('https://docs.creator.example/start')), true);
+  assert.equal(isAllowedChildRedirect(new URL('https://creator.example'), new URL('https://creator.example/'), new URL('https://docs.n8n.io/start')), false);
+  const dottedReference = shouldFollowDestination({
+    url: 'https://github.com./owner/repo',
+    currentUrl: 'https://creator.example/',
+    seedUrl: 'https://creator.example/',
+    anchorText: 'Join the community',
+  });
+  assert.equal(dottedReference.eligible, false);
+  assert.equal(dottedReference.reason, 'reference-host');
 });
