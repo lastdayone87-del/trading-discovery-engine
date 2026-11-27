@@ -667,6 +667,7 @@ export type ProfilerRedirectFailure =
   | 'CROSS_ORIGIN_REDIRECT'
   | 'ROBOTS_DISALLOWED'
   | 'ROBOTS_DELAY_BUDGET'
+  | 'EXTERNAL_PAGE_HOP'
   | 'REDIRECT_TIMEOUT';
 
 export interface ProfilerTransportFailure {
@@ -702,7 +703,7 @@ export interface ProfilerFetchOptions {
    * stops the chain before the target is requested; used by robots
    * enforcement so a Disallow rule or exhausted pacing budget cannot be
    * bypassed by an allowed seed redirecting into it. */
-  shouldFollowRedirect?: (targetUrl: string) => Promise<'allow' | 'disallow' | 'budget'>;
+  shouldFollowRedirect?: (targetUrl: string) => Promise<'allow' | 'disallow' | 'budget' | 'hop'>;
   /** Called immediately before each guarded fetch, with the URL actually
    * contacted, so pacing can record request-start time rather than permit
    * time. */
@@ -1059,7 +1060,7 @@ export async function fetchProfilerUrl(
             redirectsFollowed,
             redirectRejected: true,
             rejectedRedirect: nextUrl,
-            redirectFailure: decision === 'timeout' ? 'REDIRECT_TIMEOUT' : decision === 'budget' ? 'ROBOTS_DELAY_BUDGET' : 'ROBOTS_DISALLOWED',
+            redirectFailure: decision === 'timeout' ? 'REDIRECT_TIMEOUT' : decision === 'budget' ? 'ROBOTS_DELAY_BUDGET' : decision === 'hop' ? 'EXTERNAL_PAGE_HOP' : 'ROBOTS_DISALLOWED',
           };
         }
       }

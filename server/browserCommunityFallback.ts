@@ -2379,6 +2379,7 @@ export function isCrossHostnameStructuralNavigation(href: string, pageUrl: strin
 export function shouldEnqueueRenderedCrossOriginLink(input: {
   url: string;
   currentUrl: string;
+  seedUrl?: string;
   anchorText?: string;
 }): boolean {
   let current: URL;
@@ -2394,6 +2395,7 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
   return shouldFollowDestination({
     url: target.toString(),
     currentUrl: current.toString(),
+    seedUrl: input.seedUrl,
     anchorText: input.anchorText || '',
   }).eligible;
 }
@@ -2657,6 +2659,7 @@ export function collectRenderedCrossOriginCandidates(
 export function planRenderedCrossOriginEnqueues(input: {
   candidates: readonly RenderedCrossOriginCandidate[];
   currentUrl: string;
+  seedUrl?: string;
   alreadyVisited: ReadonlySet<string>;
   queued: ReadonlySet<string>;
   maxEnqueues?: number;
@@ -2750,6 +2753,7 @@ export function planRenderedCrossOriginEnqueues(input: {
     const decision = shouldFollowDestination({
       url,
       currentUrl: input.currentUrl,
+      seedUrl: input.seedUrl,
       anchorText: candidate.labels.join(' '),
     });
     if (!decision.eligible) {
@@ -2766,6 +2770,7 @@ export function planRenderedCrossOriginEnqueues(input: {
     }
     if (!shouldEnqueueRenderedCrossOriginLink({
       url,
+      seedUrl: input.seedUrl,
       // Each candidate keeps the origin of the document that produced it. A
       // click that navigates to another page must not retroactively make the
       // pre-click snapshot's cross-origin links look same-origin.
@@ -2958,6 +2963,7 @@ export function planRevealedSameOriginEnqueues(input: {
 export async function enqueueRenderedCrossOriginPass(input: {
   collect: () => Promise<RenderedCrossOriginCandidate[]>;
   currentUrl: string;
+  seedUrl?: string;
   alreadyVisited: ReadonlySet<string>;
   queued: Set<string>;
   maxEnqueues?: number;
@@ -2979,6 +2985,7 @@ export async function enqueueRenderedCrossOriginPass(input: {
   const plan = planRenderedCrossOriginEnqueues({
     candidates,
     currentUrl: input.currentUrl,
+    seedUrl: input.seedUrl,
     alreadyVisited: input.alreadyVisited,
     queued: input.queued,
     maxEnqueues: input.maxEnqueues,
@@ -5831,6 +5838,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 const plan = planRenderedCrossOriginEnqueues({
                   candidates,
                   currentUrl: page.url(),
+                  seedUrl,
                   alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                   queued: crossOriginQueued,
                   maxEnqueues: 0,
@@ -5850,6 +5858,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 const plan = planRenderedCrossOriginEnqueues({
                   candidates,
                   currentUrl: page.url(),
+                  seedUrl,
                   alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                   queued: crossOriginQueued,
                   maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size - crossOriginReserved.size,

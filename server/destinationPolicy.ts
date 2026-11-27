@@ -170,7 +170,10 @@ export function shouldFollowDestination(input: {
     try {
       const seedOrigin = new URL(input.seedUrl).origin;
       const currentOrigin = new URL(input.currentUrl).origin;
-      externalPageHop = currentOrigin !== seedOrigin;
+      const targetOrigin = new URL(input.url).origin;
+      // Returning to the creator's own host is always first-party, even when
+      // the current page is an external reference.
+      externalPageHop = currentOrigin !== seedOrigin && targetOrigin !== seedOrigin;
     } catch { externalPageHop = false; }
   }
   if (externalPageHop) {

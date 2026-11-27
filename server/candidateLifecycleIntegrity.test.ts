@@ -72,7 +72,7 @@ test('E1: a negative cache row that carries candidates is never reused (contradi
 
 test('E2: no-admission and all-losing executions finalize cache rows as DISCARDED', () => {
   const queue = readSource('queueManager.ts');
-  assert.match(queue, /const executedCandidateIds=\[\.\.\.new Set\(structuredCandidates\.map\(candidate=>candidate\.candidateId\)\.filter\(Boolean\)\)\]/);
+  assert.match(queue, /const executedCandidateIds=\[\.\.\.new Set\(structuredCandidates\.map\(candidate=>candidate\.candidateId\)\.filter\(Boolean\)\.filter\(candidateId=>!deferredCandidateIds\.has\(candidateId\)\)\)\]/);
   assert.match(queue, /if\(chokeAdmission\.candidates\.length\)await markSiteInspectionsClaimed\(channel\.channel_id,executedCandidateIds\)/);
   assert.match(queue, /else await markSiteInspectionsDiscarded\(channel\.channel_id,executedCandidateIds\)/);
   const db = readSource('dbCore.ts');
@@ -474,7 +474,7 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
   const claimIndex = queue.indexOf('await markSiteInspectionsClaimed(channel.channel_id,executedCandidateIds).catch');
-  const drainIndex = queue.indexOf('const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id).catch');
+  const drainIndex = queue.indexOf('const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id');
   assert.ok(claimIndex >= 0 && drainIndex > claimIndex, 'orphan drain follows the claim handshake');
   assert.match(db, /export async function markSiteInspectionsClaimed\(channelId: string, admittedCandidateIds: string\[\] = \[\]\)/);
   assert.match(db, /export async function markSiteInspectionsDiscarded\(channelId: string, discardedCandidateIds: string\[\] = \[\]\)/);
