@@ -330,9 +330,9 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
       const sources=item.sources?.length?item.sources:[{sourceSurface:item.sourceSurface,sourceUrl:item.sourceUrl}];
       for(const source of sources){
         const surface=source.sourceSurface||'';
-        // The primary key is btree-indexed; 512 characters keeps even
-        // multibyte URLs within PostgreSQL's index row bound.
-        const url=(source.sourceUrl||'').slice(0,512);
+        // The primary key is btree-indexed; 384 characters keeps even
+        // 4-byte UTF-8 URLs well within PostgreSQL's index row bound.
+        const url=(source.sourceUrl||'').slice(0,384);
         const key=`${item.code}\u0000${surface}\u0000${url}`;
         if(!sourceRows.has(key))sourceRows.set(key,{code:item.code,surface,url});
       }
@@ -355,6 +355,25 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
   }finally{
     client.release();
   }
+}
+/** Source relationships retained for a canonical invite, newest first. This is
+ * the attribution/audit read path; admission still uses the single registry
+ * owner so a shared invite is validated once. */
+export async function listDiscordInviteSources(canonicalCode:string):Promise<Array<{channelId:string;sourceSurface:string;sourceUrl:string;firstSeenAt:string;lastSeenAt:string}>>{
+  if(!canonicalCode)return[];
+  const db=await getDb();
+  const result=await db.query(
+    `SELECT channel_id,source_surface,source_url,first_seen_at,last_seen_at
+     FROM discord_invite_sources WHERE canonical_code=$1
+     ORDER BY last_seen_at DESC, channel_id ASC`,
+    [canonicalCode]);
+  return result.rows.map((row:any)=>({
+    channelId:String(row.channel_id),
+    sourceSurface:String(row.source_surface||''),
+    sourceUrl:String(row.source_url||''),
+    firstSeenAt:new Date(row.first_seen_at).toISOString(),
+    lastSeenAt:new Date(row.last_seen_at).toISOString(),
+  }));
 }
 /** Releases the provisional first-seen registry claim after validation proves
  * the invite is non-trading, dead, or invalid. Source relationships remain in

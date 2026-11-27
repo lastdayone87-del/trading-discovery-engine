@@ -25,7 +25,7 @@ INSERT INTO discord_invite_sources(canonical_code, channel_id, source_surface, s
 SELECT canonical_code,
        first_channel_id,
        COALESCE(first_source_surface, ''),
-       LEFT(COALESCE(first_source_url, ''), 512),
+       LEFT(COALESCE(first_source_url, ''), 384),
        first_seen_at,
        first_seen_at
 FROM discord_invite_registry
@@ -58,7 +58,7 @@ WITH candidate_sources AS (
            dc.channel_id,
            dc.normalized_locator,
            COALESCE(dc.source_surface, '') AS source_surface,
-           LEFT(COALESCE(dc.source_url, ''), 512) AS source_url,
+           LEFT(COALESCE(dc.source_url, ''), 384) AS source_url,
            dc.discovered_at
     FROM discord_candidates dc
     WHERE dc.normalized_locator ~* '^https?://(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+[^/[:space:]]'
