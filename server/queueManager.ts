@@ -502,13 +502,16 @@ export async function admitInspectionDiscordCandidates(
     && !claimableCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode);
   const effectiveFoundInvite = foundIsUnownedOnly ? null : foundInvite;
   if (deferredCandidates.length) {
-    console.info(JSON.stringify({
-      event: 'discord_unowned_surface_candidates_deferred',
+    const deferralEvent = {
       channelId,
       count: deferredCandidates.length,
       codes: deferredCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
       timestamp: new Date().toISOString(),
-    }));
+    };
+    console.info(JSON.stringify({ event: 'discord_unowned_surface_candidates_deferred', ...deferralEvent }));
+    // Transitional alias: existing dashboards and alerts still watch the old
+    // event name, so keep emitting both until consumers migrate.
+    console.info(JSON.stringify({ event: 'discord_unowned_candidates_deferred', ...deferralEvent }));
   }
   const toPersist = (list: DiscordCandidate[]) => list.map(candidate => ({
     candidateId: candidate.candidateId,
