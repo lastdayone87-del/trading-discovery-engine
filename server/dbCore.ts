@@ -305,53 +305,78 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
   const unique=[...seen.keys()];
   if(!unique.length||!channelId)return unique.map(code=>({code,admitted:false,firstChannelId:null}));
   const db=await getDb();
-  const claimed=await db.query(
-    `INSERT INTO discord_invite_registry(canonical_code,first_channel_id,first_seen_at,first_source_surface,first_source_url)
-     SELECT code,$2,now(),surface,url FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
-     ON CONFLICT(canonical_code) DO NOTHING RETURNING canonical_code`,
-    [unique,channelId,unique.map(code=>seen.get(code)!.surface),unique.map(code=>seen.get(code)!.url)]);
-  const won=new Set(claimed.rows.map((row:any)=>String(row.canonical_code)));
-  const existing=won.size===unique.length?[]:(await db.query(
-    `SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,
-    [unique])).rows;
-  const owners=new Map(existing.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
-  // Global dedupe keeps one registry row, but every creator/affiliate/business
-  // that published the same invite keeps a durable source relationship. This
-  // runs for winners and losers alike; a loser's candidate row is still
-  // removed, so no duplicate validation is created.
-  const sourceRows=new Map<string,{code:string;surface:string;url:string}>();
-  for(const item of items||[]){
-    if(!item||typeof item.code!=='string'||!item.code)continue;
-    const sources=item.sources?.length?item.sources:[{sourceSurface:item.sourceSurface,sourceUrl:item.sourceUrl}];
-    for(const source of sources){
-      const surface=source.sourceSurface||'';
-      const url=source.sourceUrl||'';
-      const key=`${item.code}\u0000${surface}\u0000${url}`;
-      if(!sourceRows.has(key))sourceRows.set(key,{code:item.code,surface,url});
+  // Registry claim and source retention commit atomically: a failed source
+  // write must never strand a first-seen claim with no recorded relationship.
+  const client=await db.connect();
+  try{
+    await client.query('BEGIN');
+    const claimed=await client.query(
+      `INSERT INTO discord_invite_registry(canonical_code,first_channel_id,first_seen_at,first_source_surface,first_source_url)
+       SELECT code,$2,now(),surface,url FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
+       ON CONFLICT(canonical_code) DO NOTHING RETURNING canonical_code`,
+      [unique,channelId,unique.map(code=>seen.get(code)!.surface),unique.map(code=>seen.get(code)!.url)]);
+    const won=new Set(claimed.rows.map((row:any)=>String(row.canonical_code)));
+    const existing=won.size===unique.length?[]:(await client.query(
+      `SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,
+      [unique])).rows;
+    const owners=new Map(existing.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
+    // Global dedupe keeps one registry row, but every creator/affiliate/business
+    // that published the same invite keeps a durable source relationship. This
+    // runs for winners and losers alike; a loser's candidate row is still
+    // removed, so no duplicate validation is created.
+    const sourceRows=new Map<string,{code:string;surface:string;url:string}>();
+    for(const item of items||[]){
+      if(!item||typeof item.code!=='string'||!item.code)continue;
+      const sources=item.sources?.length?item.sources:[{sourceSurface:item.sourceSurface,sourceUrl:item.sourceUrl}];
+      for(const source of sources){
+        const surface=source.sourceSurface||'';
+        // The primary key is btree-indexed; 512 characters keeps even
+        // multibyte URLs within PostgreSQL's index row bound.
+        const url=(source.sourceUrl||'').slice(0,512);
+        const key=`${item.code}\u0000${surface}\u0000${url}`;
+        if(!sourceRows.has(key))sourceRows.set(key,{code:item.code,surface,url});
+      }
     }
+    if(sourceRows.size){
+      const rows=[...sourceRows.values()];
+      await client.query(
+        `INSERT INTO discord_invite_sources(canonical_code,channel_id,source_surface,source_url,first_seen_at,last_seen_at)
+         SELECT code,$2,surface,url,now(),now()
+         FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
+         ON CONFLICT(canonical_code,channel_id,source_surface,source_url)
+         DO UPDATE SET last_seen_at=now()`,
+        [rows.map(row=>row.code),channelId,rows.map(row=>row.surface),rows.map(row=>row.url)]);
+    }
+    await client.query('COMMIT');
+    return unique.map(code=>({code,admitted:won.has(code)||owners.get(code)===channelId,firstChannelId:won.has(code)?channelId:(owners.get(code)||null)}));
+  }catch(error){
+    await client.query('ROLLBACK').catch(()=>undefined);
+    throw error;
+  }finally{
+    client.release();
   }
-  if(sourceRows.size){
-    const rows=[...sourceRows.values()];
-    await db.query(
-      `INSERT INTO discord_invite_sources(canonical_code,channel_id,source_surface,source_url,first_seen_at,last_seen_at)
-       SELECT code,$2,surface,LEFT(url,2048),now(),now()
-       FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
-       ON CONFLICT(canonical_code,channel_id,source_surface,source_url)
-       DO UPDATE SET last_seen_at=now()`,
-      [rows.map(row=>row.code),channelId,rows.map(row=>row.surface),rows.map(row=>row.url)]);
-  }
-  return unique.map(code=>({code,admitted:won.has(code)||owners.get(code)===channelId,firstChannelId:won.has(code)?channelId:(owners.get(code)||null)}));
 }
 /** Releases the provisional first-seen registry claim after validation proves
  * the invite is non-trading, dead, or invalid. Source relationships remain in
  * discord_invite_sources, and another channel/source may claim the canonical
- * code on its next inspection. Only the first claimant can release it. */
-export async function releaseDiscordInviteClaim(canonicalCode:string,channelId:string):Promise<boolean>{
+ * code on its next inspection. Only the first claimant can release it, and a
+ * later successful attempt for the same channel blocks a stale rejection from
+ * erasing the claim. */
+export async function releaseDiscordInviteClaim(canonicalCode:string,channelId:string,rejectedCheckedAt?:string|null):Promise<boolean>{
   if(!canonicalCode||!channelId)return false;
   const db=await getDb();
   const result=await db.query(
-    `DELETE FROM discord_invite_registry WHERE canonical_code=$1 AND first_channel_id=$2`,
-    [canonicalCode,channelId]);
+    `DELETE FROM discord_invite_registry r
+     WHERE r.canonical_code=$1
+       AND r.first_channel_id=$2
+       AND ($3::timestamptz IS NULL OR NOT EXISTS (
+         SELECT 1 FROM discord_check_attempts a
+         WHERE a.channel_id=$2
+           AND lower(split_part(regexp_replace(regexp_replace(COALESCE(a.resolved_locator,a.invite_locator), '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1))=$1
+           AND a.checked_at > $3::timestamptz
+           AND a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME')
+       ))`,
+    [canonicalCode,channelId,rejectedCheckedAt||null]);
   return (result.rowCount||0)>0;
 }
 /** Removes this channel's candidate rows for the given canonical codes.

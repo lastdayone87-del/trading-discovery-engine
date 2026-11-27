@@ -163,6 +163,10 @@ describe('reference/application host policy', () => {
       'https://play.google.com/store/apps/details?id=com.example',
       'https://chromewebstore.google.com/detail/x',
       'https://github.com/UnionKeyHQ/firmware',
+      'https://github.com./UnionKeyHQ/firmware',
+      'https://gist.github.com/example',
+      'https://itunes.apple.com/us/app/example/id1',
+      'https://apps.microsoft.com/detail/example',
       'https://rentry.co/what',
     ]) {
       assert.equal(isNonTradingReferenceOrApplicationUrl(url), true, url);

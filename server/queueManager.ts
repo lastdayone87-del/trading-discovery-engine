@@ -448,14 +448,15 @@ function isReferenceOnlyStaticCandidate(candidate: DiscordCandidate): boolean {
     : [{ sourceSurface: candidate.sourceSurface, sourceUrl: candidate.sourceUrl }];
   const controlledSurfaces = new Set(['YOUTUBE_ABOUT', 'CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'RECENT_VIDEO_DESCRIPTIONS']);
   if (observations.some(observation => controlledSurfaces.has(observation.sourceSurface))) return false;
+  if (candidate.ownershipStatus === 'CREATOR_OWNED') return false;
   const unownedSurfaces = new Set(['YOUTUBE_COMMENTS', 'YOUTUBE_PLAYLIST_ITEMS']);
   const provenance = observations.filter(observation => !unownedSurfaces.has(observation.sourceSurface));
   if (!provenance.length) return true;
   const websites = provenance.filter(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
   if (!websites.length || websites.length !== provenance.length) return false;
-  return websites.every(observation => observation.sourceUrl
-    ? isNonTradingReferenceOrApplicationUrl(observation.sourceUrl)
-    : false);
+  // Missing URL provenance cannot be classified as a legitimate website.
+  if (websites.some(observation => !observation.sourceUrl)) return true;
+  return websites.every(observation => isNonTradingReferenceOrApplicationUrl(observation.sourceUrl!));
 }
 
 export async function admitInspectionDiscordCandidates(
@@ -5262,7 +5263,7 @@ export async function inspectAndValidateChannel(
       // invite is a fallback, not a reason to suppress a stronger later invite.
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<{validation:Awaited<ReturnType<typeof validateDiscordInvite>>;candidate:typeof selectedCandidate}>=[];
-      const rejectedRegistryCodes:string[]=[];
+      const rejectedRegistryCodes:Array<{code:string;checkedAt:string|null}>=[];
       let currentCandidateNonTrading=false;
       for(const candidate of candidates){
         if(!candidate.nativeInviteCode)continue;
@@ -5287,9 +5288,9 @@ export async function inspectAndValidateChannel(
           priorProviderFailureObservations
         });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
-        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push({validation,candidate});rejectedRegistryCodes.push(discordInviteCodeOf(candidate.nativeInviteCode)||'');continue;}
+        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push({validation,candidate});rejectedRegistryCodes.push({code:discordInviteCodeOf(candidate.nativeInviteCode)||'',checkedAt:validation.attempts.at(-1)?.checkedAt||null});continue;}
         if(validation.operationalOutcome==='SUCCEEDED'&&validation.status==='NON_TRADING'){
-          rejectedRegistryCodes.push(discordInviteCodeOf(candidate.nativeInviteCode)||'');
+          rejectedRegistryCodes.push({code:discordInviteCodeOf(candidate.nativeInviteCode)||'',checkedAt:validation.attempts.at(-1)?.checkedAt||null});
           if(isSameSelectedDiscordCandidate(channel,candidate))currentCandidateNonTrading=true;
         }
         const rank=discordCandidateCompositeRank(candidate,validation);
@@ -5298,9 +5299,18 @@ export async function inspectAndValidateChannel(
       // Registry dedupe is provisional until Discord-native relevance is known.
       // Release a first-seen claim when this inspection proves the invite is
       // non-trading/dead/invalid; source relationships remain recorded.
-      for(const code of new Set(rejectedRegistryCodes.filter(Boolean))){
+      const rejectedByCode=new Map<string,{code:string;checkedAt:string|null}>();
+      for(const item of rejectedRegistryCodes){
+        if(!item.code)continue;
+        const previous=rejectedByCode.get(item.code);
+        if(!previous||(item.checkedAt||'')>(previous.checkedAt||''))rejectedByCode.set(item.code,item);
+      }
+      for(const {code,checkedAt} of rejectedByCode.values()){
+        // A currently successful same-code serving selection is stronger than
+        // a stale rejection from an overlapping inspection.
+        if(channel.discord_invite&&discordInviteCodeOf(channel.discord_invite)===code&&channel.discord_validation_status==='SUCCEEDED')continue;
         try{
-          const released=await releaseDiscordInviteClaim(code,channel.channel_id);
+          const released=await releaseDiscordInviteClaim(code,channel.channel_id,checkedAt);
           if(released)console.info(JSON.stringify({event:'discord_invite_claim_released',channelId:channel.channel_id,code,reason:'validated_non_trading_or_invalid',timestamp:new Date().toISOString()}));
         }catch(error){console.warn(JSON.stringify({event:'discord_invite_claim_release_failed',channelId:channel.channel_id,code,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));}
       }

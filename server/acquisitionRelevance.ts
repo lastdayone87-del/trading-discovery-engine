@@ -36,14 +36,13 @@ import { canonicalSiteIdentity } from './siteIdentity';
 const REFERENCE_OR_APPLICATION_HOSTS = new Set([
   'play.google.com',
   'apps.apple.com',
+  'itunes.apple.com',
+  'apps.microsoft.com',
   'chromewebstore.google.com',
   'addons.mozilla.org',
-  'github.com',
-  'gitlab.com',
   'rentry.co',
-  'wikipedia.org',
-  'wikimedia.org',
 ]);
+const REFERENCE_SUFFIX_HOSTS = ['github.com', 'gitlab.com', 'wikipedia.org', 'wikimedia.org'];
 const REFERENCE_SUBDOMAIN_LABELS = new Set(['docs', 'wiki']);
 
 /** Obvious non-community reference/application destinations. These are never
@@ -54,13 +53,14 @@ const REFERENCE_SUBDOMAIN_LABELS = new Set(['docs', 'wiki']);
 export function isNonTradingReferenceOrApplicationUrl(raw: string): boolean {
   let parsed: URL;
   try { parsed = new URL(raw); } catch { return false; }
-  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  // DNS is case-insensitive and a trailing dot is the same host. Normalize
+  // both before exact/suffix/label checks so escaped spellings cannot bypass.
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
   if (!host) return false;
   // Google Forms are creator/business evidence, unlike Google Docs.
   if (host === 'docs.google.com') return !parsed.pathname.startsWith('/forms/');
   if (REFERENCE_OR_APPLICATION_HOSTS.has(host)) return true;
-  if (host === 'wikipedia.org' || host.endsWith('.wikipedia.org')
-    || host === 'wikimedia.org' || host.endsWith('.wikimedia.org')) return true;
+  if (REFERENCE_SUFFIX_HOSTS.some(suffix => host === suffix || host.endsWith(`.${suffix}`))) return true;
   const firstLabel = host.split('.')[0];
   return REFERENCE_SUBDOMAIN_LABELS.has(firstLabel);
 }

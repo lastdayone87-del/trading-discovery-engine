@@ -12,6 +12,7 @@ type Db = Awaited<ReturnType<typeof getDb>>;
 async function cleanup(db: Db) {
   await db.query(`DELETE FROM discord_invite_sources WHERE canonical_code LIKE 'rgtest%'`);
   await db.query(`DELETE FROM discord_invite_registry WHERE canonical_code LIKE 'rgtest%'`);
+  await db.query(`DELETE FROM discord_check_attempts WHERE channel_id = ANY($1)`, [CH]);
   await db.query(`DELETE FROM discord_candidates WHERE channel_id = ANY($1)`, [CH]);
   await db.query(`DELETE FROM channels WHERE channel_id = ANY($1)`, [CH]);
 }
@@ -120,6 +121,11 @@ maybe('a non-trading or invalid first claim can be released without erasing sour
   await claimDiscordInvites([{code:'rgtestrelease',sourceSurface:'CREATOR_WEBSITES',sourceUrl:'https://creator-a.test/'}], 'rgchan1');
   assert.equal(await releaseDiscordInviteClaim('rgtestrelease', 'rgchan2'), false, 'non-owner cannot release');
   assert.equal((await db.query(`SELECT count(*)::int n FROM discord_invite_registry WHERE canonical_code='rgtestrelease'`)).rows[0].n, 1);
+  await db.query(
+    `INSERT INTO discord_check_attempts(attempt_key,channel_id,invite_locator,semantic_status,operational_outcome,retryable,attempt_number,reason,checked_at,policy_version) VALUES('rg-release-later','rgchan1','https://discord.gg/rgtestrelease','ACTIVE','SUCCEEDED',false,1,'ok',now(),'discord-check-policy-v2')`,
+  );
+  assert.equal(await releaseDiscordInviteClaim('rgtestrelease', 'rgchan1', new Date(Date.now()-60_000).toISOString()), false,
+    'a later successful same-channel attempt blocks a stale rejection');
   assert.equal(await releaseDiscordInviteClaim('rgtestrelease', 'rgchan1'), true);
   assert.equal((await db.query(`SELECT count(*)::int n FROM discord_invite_registry WHERE canonical_code='rgtestrelease'`)).rows[0].n, 0);
   const sources = await db.query(`SELECT channel_id FROM discord_invite_sources WHERE canonical_code='rgtestrelease'`);

@@ -46,9 +46,11 @@ export function isSameCreatorSite(first: URL, second: URL): boolean {
  * crawl leaves that site, only same-site or evidenced-community targets are
  * allowed, so an external docs/reference page cannot fan out to unknown hosts. */
 export function isAllowedChildRedirect(seed: URL, current: URL, target: URL): boolean {
+  // Same-site navigation wins even if the creator's own site uses a docs/wiki
+  // subdomain. Outbound redirects into third-party reference hosts stay blocked.
+  if (isSameCreatorSite(target, seed) || isSameCreatorSite(target, current)) return true;
   if (isNonTradingReferenceOrApplicationUrl(target.toString())) return false;
   if (isSameCreatorSite(current, seed)) return true;
-  if (isSameCreatorSite(target, seed) || isSameCreatorSite(target, current)) return true;
   // Off the creator's site, a redirect may only reach a known community
   // platform. A generic `/community` path on an unrelated host is not enough:
   // docs/reference pages routinely contain such links.
@@ -177,9 +179,15 @@ export function shouldFollowDestination(input: {
     }
   }
 
-  // Obvious reference/application hosts are never community destinations.
-  // Same-origin navigation inside a creator's own site remains allowed.
-  if (!sameOrigin && isNonTradingReferenceOrApplicationUrl(input.url)) {
+  // Obvious reference/application hosts are never community destinations,
+  // except when the target is the creator's own seed site (a creator may run
+  // their site on a docs/wiki subdomain). Same-origin navigation remains
+  // allowed too.
+  let sameSeedSite = false;
+  if (input.seedUrl) {
+    try { sameSeedSite = isSameCreatorSite(new URL(input.seedUrl), new URL(input.url)); } catch { sameSeedSite = false; }
+  }
+  if (!sameOrigin && !sameSeedSite && isNonTradingReferenceOrApplicationUrl(input.url)) {
     return { eligible: false, score: 0, reason: 'reference-host' };
   }
   const baseScore = Math.max(0, Number(input.baseScore) || 0);

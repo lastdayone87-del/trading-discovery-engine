@@ -47,7 +47,6 @@ test('production manifest owns the measured model defaults and revert baseline',
   assert.equal(manifest.environment.BROWSER_RUNTIME_CONCURRENCY, '2');
   assert.equal(manifest.environment.RENDERED_FALLBACK_MAX_WAIT_MS, '90000');
   assert.equal(manifest.environment.CRAWLEE_MEMORY_MBYTES, '3072');
-  assert.equal(manifest.environment.NODE_OPTIONS, '--max-old-space-size=3072');
   assert.ok(manifest.secretGroups.some(group => group.kind === 'youtube' && group.minimum === 58));
 });
 

@@ -401,15 +401,7 @@ export function communityNavigationScore(href:string,label:string):number {
   return 0;
 }
 
-/**
- * Derive creator-canonical website hosts from channel links for Discord
- * ownership inference. Uses the same normalized destinations acquisition
- * crawls (YouTube redirects unwrapped, tracking params stripped): only
- * WEBSITE-kind hosts qualify, shared/multi-tenant community hosts are
- * excluded (a link proves reference, never ownership), and a leading www.
- * is stripped so aliases match consistently on both comparison sides.
- */
-const AFFILIATE_WEBSITE_QUERY_KEY = /^(?:wpam(?:_id)?|aff(?:iliate)?(?:_id)?|ref(?:erral)?|partner(?:_id)?|promo(?:code)?|coupon|cpa|clickid|subid|irclickid)$/i;
+const AFFILIATE_WEBSITE_QUERY_KEY = /^(?:wpam(?:_?id)?|aff(?:iliate)?(?:_?(?:id|code))?|ref(?:(?:erral|errer)(?:_?(?:id|code))?|_?(?:id|code))|partner(?:_?(?:id|code))?|promo_?code|coupon_?code|cpa|clickid|subid|irclickid)$/i;
 const LINK_HUB_PROFILE_PATH = /^\/@[^/]+\/?$/;
 /** A referral/affiliate link proves a business relationship, not ownership of
  * the destination site. Link-in-bio profile URLs are likewise references to a
@@ -426,6 +418,14 @@ function isNonCanonicalCreatorWebsiteLink(url: string): boolean {
     return false;
   } catch { return true; }
 }
+/**
+ * Derive creator-canonical website hosts from channel links for Discord
+ * ownership inference. Uses the same normalized destinations acquisition
+ * crawls (YouTube redirects unwrapped, tracking params stripped): only
+ * WEBSITE-kind hosts qualify, shared/multi-tenant community hosts are
+ * excluded (a link proves reference, never ownership), and a leading www.
+ * is stripped so aliases match consistently on both comparison sides.
+ */
 export function creatorWebsiteHostsFromLinks(links: Array<string | null | undefined>): string[] {
   const hosts = new Set<string>();
   for (const link of links) {

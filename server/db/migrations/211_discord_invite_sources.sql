@@ -25,7 +25,7 @@ INSERT INTO discord_invite_sources(canonical_code, channel_id, source_surface, s
 SELECT canonical_code,
        first_channel_id,
        COALESCE(first_source_surface, ''),
-       LEFT(COALESCE(first_source_url, ''), 2048),
+       LEFT(COALESCE(first_source_url, ''), 512),
        first_seen_at,
        first_seen_at
 FROM discord_invite_registry
@@ -34,35 +34,48 @@ ON CONFLICT (canonical_code, channel_id, source_surface, source_url) DO NOTHING;
 -- Backfill candidate provenance (including historical same-code discoveries
 -- that were not the registry winner). Candidate URLs are bounded here so the
 -- primary-key btree entry stays within PostgreSQL's index row limit.
+WITH candidate_sources AS (
+  SELECT coded.code,
+         coded.channel_id,
+         coded.source_surface,
+         coded.source_url,
+         coded.discovered_at,
+         (SELECT MIN(ca.checked_at)
+          FROM discord_check_attempts ca
+          WHERE ca.channel_id = coded.channel_id
+            AND lower(COALESCE(ca.resolved_locator, ca.invite_locator)) = coded.normalized_locator) AS first_attempt_at
+  FROM (
+    SELECT lower(
+             split_part(
+               regexp_replace(
+                 regexp_replace(dc.normalized_locator, '[?#].*$', ''),
+                 '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+',
+                 ''
+               ),
+               '/', 1
+             )
+           ) AS code,
+           dc.channel_id,
+           dc.normalized_locator,
+           COALESCE(dc.source_surface, '') AS source_surface,
+           LEFT(COALESCE(dc.source_url, ''), 512) AS source_url,
+           dc.discovered_at
+    FROM discord_candidates dc
+    WHERE dc.normalized_locator ~* '^https?://(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+[^/[:space:]]'
+  ) coded
+  WHERE coded.code <> ''
+    AND coded.code NOT LIKE '% %'
+    AND coded.code NOT LIKE '%/%'
+    AND length(coded.code) BETWEEN 2 AND 128
+)
 INSERT INTO discord_invite_sources(canonical_code, channel_id, source_surface, source_url, first_seen_at, last_seen_at)
 SELECT code,
        channel_id,
        source_surface,
        source_url,
-       MIN(discovered_at),
+       MIN(LEAST(discovered_at, COALESCE(first_attempt_at, discovered_at))),
        MAX(discovered_at)
-FROM (
-  SELECT lower(
-           split_part(
-             regexp_replace(
-               regexp_replace(normalized_locator, '[?#].*$', ''),
-               '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+',
-               ''
-             ),
-             '/', 1
-           )
-         ) AS code,
-         channel_id,
-         COALESCE(source_surface, '') AS source_surface,
-         LEFT(COALESCE(source_url, ''), 2048) AS source_url,
-         discovered_at
-  FROM discord_candidates
-  WHERE normalized_locator ~* '^https?://(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+[^/[:space:]]'
-) coded
-WHERE code <> ''
-  AND code NOT LIKE '% %'
-  AND code NOT LIKE '%/%'
-  AND length(code) BETWEEN 2 AND 128
+FROM candidate_sources
 GROUP BY code, channel_id, source_surface, source_url
 ON CONFLICT (canonical_code, channel_id, source_surface, source_url)
 DO UPDATE SET
