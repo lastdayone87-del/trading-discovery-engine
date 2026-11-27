@@ -1,8 +1,8 @@
 # Crawler Coverage Remediation — Implementation Status (Phase 0/1)
 
-**Status:** IMPLEMENTATION IN PROGRESS — code/test verification; **not yet deployed**
-**Date:** 2026-11-26
-**Branch:** `feat/crawler-coverage-remediation` (rebased onto production `f0aa55b3`; review baseline was `1bf93568`)
+**Status:** DEPLOYED — PR #707 live on production at `54f93d1f`; follow-up monitoring in progress
+**Date:** 2026-11-27 (updated)
+**Branch:** `main` (PR #707 merged; production deployment 2026-11-27T14:31Z)
 **References:** gap register and remediation plan in the same directory
 
 ---
@@ -143,7 +143,7 @@ and arbitrary app routes are explicitly deferred, not treated as covered.
 | Full 100-site browser V4 | Requires browser infrastructure; YouTube 100 + render 19 + fixtures are the current evidence |
 | Cross-process robots pacing | Crawl-delay is coordinated per crawl/process, not across every worker process; robots enforcement remains canary-gated |
 | True cancellation of timed-out YouTube calls | Innertube has no generic abort surface here; late rejections are contained, but an abandoned request may still finish at the network layer |
-| Production deployment | Not yet; code is on the branch |
+| Production deployment | Complete for PR #707 (`54f93d1f`), deployed 2026-11-27T14:31Z; depth-3 remains deliberately off |
 
 ---
 
@@ -177,8 +177,9 @@ Active production settings:
 - Rendered cross-origin planning/clicking receives the original seed context,
   and merged pre-click candidates are classified against the document that
   produced them.
-- The legacy `discord_unowned_candidates_deferred` event is retained as an
-  alias of `discord_unowned_surface_candidates_deferred` for dashboards.
+- The deployed deferral event name is
+  `discord_unowned_surface_candidates_deferred`; the transient
+  `discord_unowned_candidates_deferred` rename was never shipped.
 
 ### Production false-positive cleanup
 
@@ -204,14 +205,15 @@ removed **37 false candidate rows**, **37 registry rows**, and cleared
 
 ### Initial post-deploy observation
 
-From 2026-11-27T14:31Z through 15:00Z:
+Measured from production PostgreSQL candidate/registry counts and the app
+container logs, from 2026-11-27T14:31Z through 15:00Z:
 
 - 0 new `discord_candidates` rows and 0 new registry claims.
 - 0 new docs/wiki/reference false claims.
 - No `youtube_surface_expansion_failed` events and no fatal/OOM events.
-- Rendered fallback logged a memory warning at approximately 2.0 GB used of a
-  1.985 GB limit; the process stayed up, but this remains the main capacity
-  constraint.
+- Rendered fallback logged a memory-pressure warning at about 2.0 GB, roughly
+  103% of the container's 1.985 GB limit; the process stayed up, but this
+  remains the main capacity constraint.
 - No net-new validated Discord invite was measured in this short window. The
   guard is deliberately deferring unowned static rows; genuine yield must be
   measured over a longer window before changing static depth or YouTube
@@ -219,9 +221,8 @@ From 2026-11-27T14:31Z through 15:00Z:
 
 ## 6. Next verification
 
-1. Continue monitoring `discord_unowned_surface_candidates_deferred` / the
-   legacy alias, new static claims, and genuine invite yield over a longer
-   production window.
+1. Continue monitoring `discord_unowned_surface_candidates_deferred`, new
+   static claims, and genuine invite yield over a longer production window.
 2. Keep robots enforcement on and static bounds at **2/12/12**.
 3. Keep YouTube surface expansion at **5%** until reliability, quota usage, and
    new-validated-invite yield justify an increase.
