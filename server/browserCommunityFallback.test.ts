@@ -1306,7 +1306,7 @@ test('cross-origin submission is deferred until after the post-click same-host p
   );
   assert.match(
     source,
-    /pursuableRenderedOverflowUrls\(collection\.overflowCandidates, currentUrl\)[\s\S]{0,120}?crossOriginOverflowEligible\.add\(url\)/,
+    /pursuableRenderedOverflowUrls\(collection\.overflowCandidates, currentUrl, seedUrl\)[\s\S]{0,120}?crossOriginOverflowEligible\.add\(url\)/,
     'overflow from every snapshot is merged into one URL-deduplicated set',
   );
   assert.match(

@@ -72,7 +72,7 @@ test('E1: a negative cache row that carries candidates is never reused (contradi
 
 test('E2: no-admission and all-losing executions finalize cache rows as DISCARDED', () => {
   const queue = readSource('queueManager.ts');
-  assert.match(queue, /const executedCandidateIds=\[\.\.\.new Set\(structuredCandidates\.map\(candidate=>candidate\.candidateId\)\.filter\(Boolean\)\)\]/);
+  assert.match(queue, /const executedCandidateIds=\[\.\.\.new Set\(structuredCandidates\.map\(candidate=>candidate\.candidateId\)\.filter\(Boolean\)\.filter\(candidateId=>!deferredCandidateIds\.has\(candidateId\)\)\)\]/);
   assert.match(queue, /if\(chokeAdmission\.candidates\.length\)await markSiteInspectionsClaimed\(channel\.channel_id,executedCandidateIds\)/);
   assert.match(queue, /else await markSiteInspectionsDiscarded\(channel\.channel_id,executedCandidateIds\)/);
   const db = readSource('dbCore.ts');
@@ -407,8 +407,8 @@ test('processing retry jobs persist click progress for their remaining attempts'
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {
   const orphans = [
-    { candidateId: 'orphan-free', rawLocator: 'discord.gg/free', normalizedLocator: 'https://discord.gg/free', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://site.example/', observations: [], canonicalCode: 'free', discoveredAt: '2026-10-18T00:00:00.000Z' },
-    { candidateId: 'orphan-taken', rawLocator: 'discord.gg/taken', normalizedLocator: 'https://discord.gg/taken', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://site.example/', observations: [], canonicalCode: 'taken', discoveredAt: '2026-10-18T00:00:01.000Z' },
+    { candidateId: 'orphan-free', rawLocator: 'discord.gg/free', normalizedLocator: 'https://discord.gg/free', locatorType: 'NATIVE_INVITE', sourceSurface: 'CHANNEL_EXTERNAL_LINKS', sourceUrl: 'https://youtube.test/channel/about', observations: [], canonicalCode: 'free', discoveredAt: '2026-10-18T00:00:00.000Z' },
+    { candidateId: 'orphan-taken', rawLocator: 'discord.gg/taken', normalizedLocator: 'https://discord.gg/taken', locatorType: 'NATIVE_INVITE', sourceSurface: 'CHANNEL_EXTERNAL_LINKS', sourceUrl: 'https://youtube.test/channel/about', observations: [], canonicalCode: 'taken', discoveredAt: '2026-10-18T00:00:01.000Z' },
   ];
   const removed: string[][] = [];
   const claims: string[] = [];
@@ -455,6 +455,145 @@ test('E6: orphan drain preserves the original invite casing and ownership eviden
   assert.deepEqual(result.discardedOwnerChannelIds, []);
 });
 
+test('E6: orphan drain defers rows without provenance instead of inventing a controlled surface', async () => {
+  let claimCalls = 0;
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async () => { claimCalls += 1; return []; },
+    list: async () => [{
+      candidateId: 'orphan-unprovenanced',
+      rawLocator: 'https://discord.gg/LEGACYROOM',
+      normalizedLocator: 'https://discord.gg/legacyroom',
+      locatorType: 'NATIVE_INVITE',
+      sourceSurface: null,
+      sourceUrl: null,
+      observations: [],
+      canonicalCode: 'legacyroom',
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never, 5, { creatorName: 'Some Creator', creatorWebsiteHosts: ['creator.example'] });
+  assert.equal(claimCalls, 0, 'unprovenanced rows never reach the global registry');
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.discardedOwnerChannelIds, []);
+  assert.deepEqual(removed, [], 'deferred rows stay available for a later inspection with real provenance');
+});
+
+test('E6: orphan drain does not re-claim an old unowned static row', async () => {
+  let claimCalls = 0;
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async () => { claimCalls += 1; return []; },
+    list: async () => [{
+      candidateId: 'orphan-docs',
+      rawLocator: 'https://discord.gg/N8NDOCS',
+      normalizedLocator: 'https://discord.gg/n8ndocs',
+      locatorType: 'NATIVE_INVITE',
+      sourceSurface: 'CREATOR_WEBSITES',
+      sourceUrl: 'https://docs.n8n.io/integrations/',
+      observations: [],
+      canonicalCode: 'n8ndocs',
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never, 5, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] });
+  assert.equal(claimCalls, 0, 'a docs-page orphan cannot claim the registry');
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(removed, []);
+});
+
+test('E6: deferred orphans cannot monopolize the recovery window', async () => {
+  const deferredRows = Array.from({ length: 25 }, (_, index) => ({
+    candidateId: `deferred-${index}`,
+    rawLocator: `https://discord.gg/DEFER${String(index).padStart(2, '0')}`,
+    normalizedLocator: `https://discord.gg/defer${String(index).padStart(2, '0')}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CREATOR_WEBSITES',
+    sourceUrl: 'https://docs.n8n.io/integrations/',
+    observations: [],
+    canonicalCode: `defer${String(index).padStart(2, '0')}`,
+    discoveredAt: `2026-10-18T00:00:${String(index).padStart(2, '0')}.000Z`,
+  }));
+  const laterRow = {
+    candidateId: 'later-claimable',
+    rawLocator: 'https://discord.gg/LATERROOM',
+    normalizedLocator: 'https://discord.gg/laterroom',
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    sourceUrl: 'https://youtube.test/channel/about',
+    observations: [],
+    canonicalCode: 'laterroom',
+    discoveredAt: '2026-10-18T00:01:00.000Z',
+  };
+  const offsets: number[] = [];
+  const claims: string[] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async (items: Array<{ code: string }>) => {
+      claims.push(...items.map(item => item.code));
+      return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanA' }));
+    },
+    list: async (_channelId: string, _limit?: number, offset = 0) => {
+      offsets.push(offset);
+      return offset === 0 ? deferredRows : offset === 25 ? [laterRow] : [];
+    },
+    removeOrphans: async () => 0,
+  } as never, 5, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] });
+  assert.deepEqual(offsets, [0, 25], 'the drain pages past the deferred window');
+  assert.deepEqual(claims, ['laterroom'], 'a later claimable orphan still reaches the registry');
+  assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode), ['LATERROOM']);
+});
+
+test('E6: no-code orphans are still cleaned up when no claimable codes remain', async () => {
+  let claimCalls = 0;
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async () => { claimCalls += 1; return []; },
+    list: async () => [{
+      candidateId: 'orphan-malformed',
+      rawLocator: 'https://discord.com/',
+      normalizedLocator: 'https://discord.com/',
+      locatorType: 'UNKNOWN',
+      sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+      sourceUrl: 'https://youtube.test/channel/about',
+      observations: [],
+      canonicalCode: null,
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never);
+  assert.equal(claimCalls, 0);
+  assert.deepEqual(removed, [['orphan-malformed']], 'unparseable residue is deleted without a registry claim');
+  assert.equal(result.removed, 1);
+});
+
+test('E6: claimable recovery is capped by unique code, not duplicate rows', async () => {
+  const claimableRows = [0, 0, 1, 2].map((index, rowIndex) => ({
+    candidateId: `claimable-${index}-${rowIndex}`,
+    rawLocator: `https://discord.gg/CLAIM${index}`,
+    normalizedLocator: `https://discord.gg/claim${index}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    sourceUrl: 'https://youtube.test/channel/about',
+    observations: [],
+    canonicalCode: `claim${index}`,
+    discoveredAt: `2026-10-18T00:00:0${index}.000Z`,
+  }));
+  const claimed: string[] = [];
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async (items: Array<{ code: string }>) => {
+      claimed.push(...items.map(item => item.code));
+      return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanA' }));
+    },
+    list: async () => claimableRows,
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never, 2);
+  assert.deepEqual(claimed.sort(), ['claim0', 'claim1'], 'the cap counts unique codes, so a duplicate does not crowd out claim1');
+  assert.equal(result.candidates.length, 2);
+  assert.deepEqual(removed, [['claimable-0-1']], 'the duplicate-code row is removed after the code is admitted');
+  assert.equal(result.removed, 1);
+});
+
 test('E6: drain is a no-op when no orphans exist', async () => {
   let claimCalls = 0;
   const result = await drainOrphanDiscordCandidates('chanA', {
@@ -470,11 +609,12 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   const db = readSource('dbCore.ts');
   assert.match(db, /candidate_status='DISCOVERED' AND validation_status='NOT_STARTED' AND selected IS NOT TRUE/);
   assert.match(db, /export async function deleteOrphanDiscordCandidates/);
+  assert.match(db, /ORDER BY discovered_at ASC,candidate_id ASC LIMIT \$2 OFFSET \$3/);
   const queue = readSource('queueManager.ts');
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
   const claimIndex = queue.indexOf('await markSiteInspectionsClaimed(channel.channel_id,executedCandidateIds).catch');
-  const drainIndex = queue.indexOf('const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id).catch');
+  const drainIndex = queue.indexOf('const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id');
   assert.ok(claimIndex >= 0 && drainIndex > claimIndex, 'orphan drain follows the claim handshake');
   assert.match(db, /export async function markSiteInspectionsClaimed\(channelId: string, admittedCandidateIds: string\[\] = \[\]\)/);
   assert.match(db, /export async function markSiteInspectionsDiscarded\(channelId: string, discardedCandidateIds: string\[\] = \[\]\)/);

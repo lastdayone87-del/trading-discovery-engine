@@ -28,7 +28,7 @@ import {
   MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
 } from './multilingualCommunityLexicon';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
-import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget } from './destinationPolicy';
+import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget, isKnownCommunityDestinationHost, isSameCreatorSite, isAllowedChildRedirect } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
 import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
 import { isCrawlerCanarySelected, mergeNavigationQueue, resolveCrawlerExplorationLimits } from './crawlerExplorationLimits';
@@ -387,7 +387,7 @@ async function fetchWithTimeout(url: string, depth = 0): Promise<{ html: string;
 }
 
 const COMMUNITY_PATH_HINTS = MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE;
-const CROSS_DOMAIN_COMMUNITY_HOSTS = new Set(['linktr.ee','www.linktr.ee','beacons.ai','www.beacons.ai','bio.link','www.bio.link','solo.to','www.solo.to','campsite.bio','www.campsite.bio','lnk.bio','www.lnk.bio','skool.com','www.skool.com','whop.com','www.whop.com','circle.so','www.circle.so','patreon.com','www.patreon.com']);
+const CROSS_DOMAIN_COMMUNITY_HOSTS = new Set(['linktr.ee','www.linktr.ee','beacons.ai','www.beacons.ai','bio.link','www.bio.link','solo.to','www.solo.to','campsite.bio','www.campsite.bio','lnk.bio','www.lnk.bio','stan.store','www.stan.store','skool.com','www.skool.com','whop.com','www.whop.com','circle.so','www.circle.so','patreon.com','www.patreon.com']);
 export function communityNavigationScore(href:string,label:string):number {
   // Normalize URL separators so space-delimited lexicon phrases match
   // hyphenated paths (`/trading-room` -> `trading room`).
@@ -454,7 +454,7 @@ function resolverForFetch(_fetchImpl: typeof fetch, resolveHost?: DnsResolver): 
   return resolveHost ?? defaultDnsResolve;
 }
 
-async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false,beforeRedirect?:((targetUrl:string)=>Promise<'allow'|'disallow'|'budget'>)|undefined,onRequestStart?:((targetUrl:string)=>void)|undefined):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
+async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:DnsResolver,probeTerminalNotFoundBody=false,allowedRedirectOrigin?:string,scanFailureBody=false,beforeRedirect?:((targetUrl:string,currentUrl?:string)=>Promise<'allow'|'disallow'|'budget'|'hop'>)|undefined,onRequestStart?:((targetUrl:string)=>void)|undefined):Promise<{page:{html:string;finalUrl:string;truncated:boolean}|null;observation?:Omit<ExternalAcquisitionObservation,'surface'|'required'|'observedAt'|'wrapperUrl'>;failureText?:string}> {
   const resolver=resolverForFetch(fetchImpl,resolveHost);
   // The end-to-end budget starts before the admission lookup. The lookup gets
   // only the remaining slice, and the following fetch gets what is left after
@@ -563,6 +563,8 @@ async function fetchExternalPage(url:string,fetchImpl:typeof fetch,resolveHost?:
         return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'PARTIALLY_INSPECTED',retryable:true,httpStatus:fetched.status,failureClass:'ROBOTS_DELAY_BUDGET',detail:`Redirect target not contacted: per-crawl Crawl-delay budget exhausted${target}`}};
       case 'REDIRECT_TIMEOUT':
         return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'ACQUISITION_FAILED',retryable:true,httpStatus:fetched.status,failureClass:'TIMEOUT',detail:`Redirect robots decision exceeded the remaining fetch deadline${target}`}};
+      case 'EXTERNAL_PAGE_HOP':
+        return {page:null,observation:{requestedUrl:url,finalUrl:fetched.finalUrl,outcome:'PARTIALLY_INSPECTED',retryable:false,httpStatus:fetched.status,failureClass:'EXTERNAL_PAGE_HOP',detail:`Third-party page redirect to an unrelated host was not followed${target}`}};
     }
   }
   if(fetched.redirectRejected){
@@ -712,6 +714,15 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     const decision=await robotsPolicy.decide(target);
     if(!decision.allowed)return 'disallow';
     return (await respectRobotsDelay(target,decision))?'allow':'budget';
+  };
+  const childRedirectPermit=async(seedUrl:string,currentChild:string,target:string,currentHop?:string):Promise<'allow'|'disallow'|'budget'|'hop'>=>{
+    // Decide the host-policy hop before touching robots.txt, so a target that
+    // will never be contacted does not generate a policy fetch.
+    try{
+      const seed=new URL(seedUrl), current=new URL(currentHop||currentChild), targetUrl=new URL(target);
+      if(!isAllowedChildRedirect(seed,current,targetUrl))return 'hop';
+    }catch{/* malformed redirect is handled by the transport guard */}
+    return robotsPermit(target);
   };
   let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];const communityIntents:CommunityIntentEvidence[]=[];
   // Shared-visit pre-seeding (v2 L1): terminal-success finals inspected by an
@@ -905,7 +916,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       // just the response URL, so a page served at /guide with
       // <base href="/community/"> and <a href="join"> visits /community/join.
       const documentBase=resolveDocumentBaseUrlFromRoot($,current.finalUrl,inheritedBase);
-      $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;let absolute:URL|null=null;try{absolute=new URL(href,documentBase);}catch{/* keep the raw href for candidate extraction and reject below */}const anchorCandidates=extractDiscordCandidates(`${absolute?absolute.toString():href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){seedFound=true;for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}if(!absolute){drops.countUnique('invalid-protocol',href);return;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());return;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});});
+      $('a[href]').each((_,el)=>{const href=($(el).attr('href')||'').trim(),label=$(el).text().trim();if(!href)return;let absolute:URL|null=null;try{absolute=new URL(href,documentBase);}catch{/* keep the raw href for candidate extraction and reject below */}const anchorCandidates=extractDiscordCandidates(`${absolute?absolute.toString():href} ${label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(anchorCandidates.length){seedFound=true;for(const candidate of anchorCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:label,sourcePageDepth:depth}));discovered.push(candidate);}return;}if(!absolute){drops.countUnique('invalid-protocol',href);return;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',href);return;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,seedUrl:page.finalUrl,anchorText:label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());return;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});});
       // The dynamic-target scanner also matches href values inside <base>
       // elements. Those values are resolution rules, not navigation targets;
       // remove exact base start tags with a single linear pass. This cannot
@@ -913,7 +924,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       // value, or rescan malformed unclosed markup.
       const dynamicHtml=stripBaseElements(current.html);
       const dynamicTargetValues=extractDynamicTargetValues(dynamicHtml);
-      for(const rawTarget of dynamicTargetValues){const target=rawTarget.trim();if(!target)continue;let absolute:URL|null=null;try{absolute=new URL(target,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(absolute?absolute.toString():target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){seedFound=true;discovered.push(...targetCandidates);continue;}if(!absolute){drops.countUnique('invalid-protocol',target);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:target,baseScore:communityNavigationScore(absolute.pathname+absolute.search,target)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
+      for(const rawTarget of dynamicTargetValues){const target=rawTarget.trim();if(!target)continue;let absolute:URL|null=null;try{absolute=new URL(target,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(absolute?absolute.toString():target,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){seedFound=true;discovered.push(...targetCandidates);continue;}if(!absolute){drops.countUnique('invalid-protocol',target);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',target);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,seedUrl:page.finalUrl,anchorText:target,baseScore:communityNavigationScore(absolute.pathname+absolute.search,target)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
       // M2a: static non-semantic controls. Only the closed literal allowlist
       // (meta refresh, formaction, strict location/open onclick) is eligible;
       // the extracted URL still passes the same admission, destination,
@@ -927,7 +938,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       const staticControls=staticControlTargetsFromDocument($,undefined,documentBase,dynamicTargets);
       if(staticControls.truncated>0){seedCeiling??='control-slice';drops.count('control-slice',staticControls.truncated);}
       if(staticControls.targets.length)logDetails.push(`[Static controls] ${staticControls.targets.length} approved literal control target(s) considered${staticControls.truncated?` (${staticControls.truncated} cut by the deterministic cap)`:''}.`);
-      for(const control of staticControls.targets){let absolute:URL|null=null;try{absolute=new URL(control.url,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(`${absolute?absolute.toString():control.url} ${control.label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){seedFound=true;for(const candidate of targetCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:control.label,sourcePageDepth:depth}));const existing=discovered.find(item=>item.candidateId===candidate.candidateId);if(existing){const merged=new Map([...(existing.observations||[]),...(candidate.observations||[])].map(obs=>[JSON.stringify([obs.sourceSurface,obs.sourceUrl||'',obs.rawLocator,obs.sourcePageUrl||'',obs.sourceAnchorText||'']),obs]));existing.observations=Array.from(merged.values());}else discovered.push(candidate);}continue;}if(!absolute){drops.countUnique('invalid-protocol',control.url);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',control.url);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,anchorText:control.label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,control.label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
+      for(const control of staticControls.targets){let absolute:URL|null=null;try{absolute=new URL(control.url,documentBase);}catch{/* keep the raw target for candidate extraction and reject below */}const targetCandidates=extractDiscordCandidates(`${absolute?absolute.toString():control.url} ${control.label}`,surface,current.finalUrl).filter(candidate=>candidate.nativeInviteCode);if(targetCandidates.length){seedFound=true;for(const candidate of targetCandidates){candidate.observations=(candidate.observations||[]).map(obs=>({...obs,sourceAnchorText:control.label,sourcePageDepth:depth}));const existing=discovered.find(item=>item.candidateId===candidate.candidateId);if(existing){const merged=new Map([...(existing.observations||[]),...(candidate.observations||[])].map(obs=>[JSON.stringify([obs.sourceSurface,obs.sourceUrl||'',obs.rawLocator,obs.sourcePageUrl||'',obs.sourceAnchorText||'']),obs]));existing.observations=Array.from(merged.values());}else discovered.push(candidate);}continue;}if(!absolute){drops.countUnique('invalid-protocol',control.url);continue;}absolute.hash='';if(!['http:','https:'].includes(absolute.protocol)){drops.countUnique('invalid-protocol',control.url);continue;}const decision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,seedUrl:page.finalUrl,anchorText:control.label,baseScore:communityNavigationScore(absolute.pathname+absolute.search,control.label)});if(!decision.eligible){drops.countUnique(decision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}navigation.push({url:absolute.toString(),score:decision.score,from:current.finalUrl});}
       // M4b: same-origin iframe content is inspected; cross-origin frames are
       // never traversed. Discord widget/server-page frame URLs (M4a) are
       // resolved through the approved public surface, not the frame document.
@@ -1015,7 +1026,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
           if(visited.has(candidate.url)){drops.countUnique('already-visited',candidate.url);continue;}
           const structuredAdmission=assessCrawlAdmission(candidate.url);if(!structuredAdmission.eligible){drops.countUnique('admission-rejected',candidate.url);continue;}
           const absolute=new URL(candidate.url);
-          const structuredDecision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,structuredNominated:true,baseScore:candidate.score});
+          const structuredDecision=shouldFollowDestination({url:absolute.toString(),currentUrl:current.finalUrl,seedUrl:page.finalUrl,structuredNominated:true,baseScore:candidate.score});
           if(!structuredDecision.eligible){drops.countUnique(structuredDecision.reason==='admission-rejected'?'admission-rejected':'cross-origin-disallowed',absolute.toString());continue;}
           navigation.push({url:absolute.toString(),score:structuredDecision.score,from:current.finalUrl});
         }
@@ -1085,7 +1096,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       logDetails.push(`[robots] Crawl-delay budget exhausted; child not fetched: ${next.url}`);
       continue;
     }
-    const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,robotsPermit,requestStartMarker),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
+    const subAcquired=await fetchExternalPage(next.url,fetchImpl,resolveHost,false,undefined,true,(target,currentHop)=>childRedirectPermit(page.finalUrl,next.url,target,currentHop),requestStartMarker),subPage=subAcquired.page;const assetRejected=!subPage&&subAcquired.observation?.failureClass==='UNSUPPORTED_CONTENT_TYPE'&&isAssetContentType(subAcquired.observation.detail);if(assetRejected){drops.count('asset-content-type');assetFetches++;}else explored++;if(subAcquired.observation){if(subAcquired.observation.failureClass==='ROBOTS_DISALLOWED')drops.countUnique('robots-disallowed',subAcquired.observation.finalUrl||next.url);observations.push({...subAcquired.observation,wrapperUrl,surface,required,rootUrl:url,observedAt:new Date().toISOString(),telemetry:staticCrawlerTelemetry({redirectsFollowed,pagesInspected,ceiling:subPage?.truncated?'response-cap':undefined,dropReasons:drops.snapshot()})});}if(!subPage){
       // Child error bodies can contain shared footers. Only scan when the
       // child was nominated as a community-relevant navigation target.
       const failureCandidates=subAcquired.observation?.failureClass!=='ROBOTS_DISALLOWED'&&next.score>0
@@ -1314,7 +1325,7 @@ export function isExternalBlockEscalation(crawlRes: Pick<ExternalDiscordCrawlRes
     const status=Number(observation.httpStatus||0);
     const failureClass=String(observation.failureClass||'').toUpperCase();
     if(observation.staticNotFoundBodyConfirmed||observation.staticTerminalNotFound)return false;
-    if(failureClass==='ROBOTS_DISALLOWED'||failureClass==='ROBOTS_DELAY_BUDGET')return false;
+    if(failureClass==='ROBOTS_DISALLOWED'||failureClass==='ROBOTS_DELAY_BUDGET'||failureClass==='EXTERNAL_PAGE_HOP')return false;
     if(['SSRF_BLOCKED','INVALID_REDIRECT','REDIRECT_LOOP','REDIRECT_LIMIT','UNSUPPORTED_CONTENT_TYPE'].includes(failureClass))return false;
     if(['TRANSIENT_HTTP','RATE_LIMIT','TIMEOUT','NETWORK_FAILURE'].includes(failureClass))return true;
     return failureClass==='HTTP_ERROR'&&[401,403,406,408,425,429,451].includes(status);

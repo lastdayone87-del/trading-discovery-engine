@@ -1493,7 +1493,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
   assert.match(source, /const evaluationWindow = ordered\.slice\(0, windowSize\)/, 'the evaluation window is applied after rotating the full matched pool');
   assert.match(source, /recordControlEnumeration\(firstEnumeration\)/);
   assert.match(source, /data-oc-control/);
-  assert.match(source, /partitionRenderedClickTargets\(\s*controls,\s*page\.url\(\),\s*limits\.maxClicksPerPage,\s*limits\.clickOffset,\s*undefined,\s*\{\s*crossOriginPursued: crossOriginPursuitActive\(\),\s*queuedDestinations: isQueuedDestination,\s*\},\s*\)/, 'the retry offset rotates the full pool before the cap and excludes queued destinations');
+  assert.match(source, /partitionRenderedClickTargets\(\s*controls,\s*page\.url\(\),\s*limits\.maxClicksPerPage,\s*limits\.clickOffset,\s*undefined,\s*\{\s*(?:seedUrl,\s*)?crossOriginPursued: crossOriginPursuitActive\(\),\s*queuedDestinations: isQueuedDestination,\s*\},\s*\)/, 'the retry offset rotates the full pool before the cap and excludes queued destinations');
   const reserveCrossOriginPos = source.indexOf('await enqueueCrossOrigin(false);');
   const submitCrossOriginPos = source.indexOf('await enqueueCrossOrigin();');
   const clickPlanPos = source.indexOf('const clickPlan = partitionRenderedClickTargets(');
@@ -1506,7 +1506,7 @@ test('rendered control coverage counts overflow and uses stable markers across D
     'the actual cross-origin submission is deferred until after interactions',
   );
   assert.match(source, /const pendingQueuedTargets = Math\.max\(0, clickTargets\.length - clickIndex - 1\)/, 'queued-but-unclicked controls consume the remaining budget');
-  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,\s*\{\s*crossOriginPursued: input\.crossOriginPursued,\s*queuedDestinations: input\.queuedDestinations,?\s*\},?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
+  assert.match(source, /const freshPlan = planRevealedRenderedClickTargets\(\s*unqueued,\s*input\.pageUrl\(\),\s*input\.maxClicksPerPage,\s*clickedThisPage,\s*pendingQueuedTargets,\s*input\.clickOffset,\s*\{\s*(?:seedUrl: input\.seedUrl,\s*)?crossOriginPursued: input\.crossOriginPursued,\s*queuedDestinations: input\.queuedDestinations,?\s*\},?\s*\)/, 'revealed controls are planned against the truly remaining slots and retry offset');
   assert.match(source, /clickLoop = await runRenderedClickLoop\(\{[\s\S]*?enumerate: enumerateControls,[\s\S]*?onEnumerated: recordControlEnumeration,?\s*\}\);/, 'the handler executes the extracted loop after every click');
   assert.doesNotMatch(source, /clickedThisPage < limits\.maxClicksPerPage && Date\.now\(\) - startedAt < limits\.totalTimeoutMs\) \{/, 'the old final-click guard must not return');
   assert.match(source, /freshDropped\+\+/, 're-enumerated controls beyond the remaining budget are counted as skipped');

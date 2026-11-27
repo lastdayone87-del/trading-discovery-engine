@@ -27,6 +27,8 @@ const LINK_HUB_HOSTS = new Set([
   'www.campsite.bio',
   'lnk.bio',
   'www.lnk.bio',
+  'stan.store',
+  'www.stan.store',
 ]);
 
 export const COMMUNITY_PLATFORM_HOSTS = new Set([

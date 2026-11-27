@@ -629,6 +629,20 @@ test('public redirect to public destination is followed to the final URL', async
   assert.deepEqual(requested, ['https://public.example/feed', 'https://cdn.example/asset']);
 });
 
+test('a hop-policy rejection is visible and never contacts the target', async () => {
+  const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
+    'https://public.example/feed': { status: 302, headers: { location: 'https://cdn.example/unrelated' } },
+    'https://cdn.example/unrelated': { status: 200, body: 'must not be requested' },
+  });
+  const fetched = await fetchProfilerUrl('https://public.example/feed', fetchImpl, 1000, 10_000, resolveHost, undefined, {
+    shouldFollowRedirect: async () => 'hop',
+  });
+  assert.equal(fetched!.redirectFailure, 'EXTERNAL_PAGE_HOP');
+  assert.equal(fetched!.redirectRejected, true);
+  assert.equal(fetched!.rejectedRedirect, 'https://cdn.example/unrelated');
+  assert.deepEqual(requested, ['https://public.example/feed']);
+});
+
 test('relative redirect Location resolves against the current URL', async () => {
   const { fetchImpl, requested, resolveHost } = makeRedirectHarness({
     'https://public.example/old': { status: 301, headers: { location: '/new' } },

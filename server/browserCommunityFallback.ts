@@ -2225,6 +2225,9 @@ export function sumRenderedPageContextCounts(
 }
 
 export interface RenderedAnchorClickSkipOptions {
+  /** Original crawl seed. Keeps the destination policy from treating an
+   * apex/www or HTTP/HTTPS redirect as an unrelated third-party page. */
+  seedUrl?: string;
   /** True while the bounded cross-origin pass will pursue eligible
    * destinations. Cross-host anchors are then enqueue-owned, not clicked. */
   crossOriginPursued?: boolean;
@@ -2295,6 +2298,7 @@ export function isSkippableNavigableAnchorClick(
     return !shouldEnqueueRenderedCrossOriginLink({
       url: absolute.toString(),
       currentUrl: page.toString(),
+      seedUrl: options.seedUrl,
       anchorText: target.text || '',
     });
   }
@@ -2379,6 +2383,7 @@ export function isCrossHostnameStructuralNavigation(href: string, pageUrl: strin
 export function shouldEnqueueRenderedCrossOriginLink(input: {
   url: string;
   currentUrl: string;
+  seedUrl?: string;
   anchorText?: string;
 }): boolean {
   let current: URL;
@@ -2394,6 +2399,7 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
   return shouldFollowDestination({
     url: target.toString(),
     currentUrl: current.toString(),
+    seedUrl: input.seedUrl,
     anchorText: input.anchorText || '',
   }).eligible;
 }
@@ -2408,8 +2414,9 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
 export function countPursuableRenderedOverflow(
   candidates: readonly RenderedCrossOriginCandidate[],
   currentUrl: string,
+  seedUrl?: string,
 ): number {
-  return pursuableRenderedOverflowUrls(candidates, currentUrl).size;
+  return pursuableRenderedOverflowUrls(candidates, currentUrl, seedUrl).size;
 }
 
 /**
@@ -2423,6 +2430,7 @@ export function countPursuableRenderedOverflow(
 export function pursuableRenderedOverflowUrls(
   candidates: readonly RenderedCrossOriginCandidate[],
   currentUrl: string,
+  seedUrl?: string,
 ): Set<string> {
   const urls = new Set<string>();
   for (const candidate of candidates) {
@@ -2438,6 +2446,7 @@ export function pursuableRenderedOverflowUrls(
     if (shouldEnqueueRenderedCrossOriginLink({
       url,
       currentUrl: candidate.sourceUrl || currentUrl,
+      seedUrl,
       anchorText: candidate.text || '',
     })) {
       urls.add(key);
@@ -2657,6 +2666,7 @@ export function collectRenderedCrossOriginCandidates(
 export function planRenderedCrossOriginEnqueues(input: {
   candidates: readonly RenderedCrossOriginCandidate[];
   currentUrl: string;
+  seedUrl?: string;
   alreadyVisited: ReadonlySet<string>;
   queued: ReadonlySet<string>;
   maxEnqueues?: number;
@@ -2749,7 +2759,12 @@ export function planRenderedCrossOriginEnqueues(input: {
     // eligible destination.
     const decision = shouldFollowDestination({
       url,
-      currentUrl: input.currentUrl,
+      // Evaluate against the document that produced this anchor. Pre-click
+      // candidates are merged with the post-click snapshot, so using the
+      // post-click page URL here would misclassify a creator-origin link as an
+      // external-page hop after navigation.
+      currentUrl: String(candidate.sourceUrl || input.currentUrl),
+      seedUrl: input.seedUrl,
       anchorText: candidate.labels.join(' '),
     });
     if (!decision.eligible) {
@@ -2766,6 +2781,7 @@ export function planRenderedCrossOriginEnqueues(input: {
     }
     if (!shouldEnqueueRenderedCrossOriginLink({
       url,
+      seedUrl: input.seedUrl,
       // Each candidate keeps the origin of the document that produced it. A
       // click that navigates to another page must not retroactively make the
       // pre-click snapshot's cross-origin links look same-origin.
@@ -2958,6 +2974,7 @@ export function planRevealedSameOriginEnqueues(input: {
 export async function enqueueRenderedCrossOriginPass(input: {
   collect: () => Promise<RenderedCrossOriginCandidate[]>;
   currentUrl: string;
+  seedUrl?: string;
   alreadyVisited: ReadonlySet<string>;
   queued: Set<string>;
   maxEnqueues?: number;
@@ -2979,6 +2996,7 @@ export async function enqueueRenderedCrossOriginPass(input: {
   const plan = planRenderedCrossOriginEnqueues({
     candidates,
     currentUrl: input.currentUrl,
+    seedUrl: input.seedUrl,
     alreadyVisited: input.alreadyVisited,
     queued: input.queued,
     maxEnqueues: input.maxEnqueues,
@@ -3324,6 +3342,8 @@ export interface RenderedClickLoopInput {
    * retry does not repeatedly select the same DOM-order subset of controls
    * revealed by a previous click. */
   clickOffset?: number;
+  /** Original crawl seed, used by the destination hop guard. */
+  seedUrl?: string;
   /** True while the bounded cross-origin pass will pursue eligible
    * destinations. Cross-host anchors are then enqueue-owned, not clicked. */
   crossOriginPursued?: boolean;
@@ -3485,6 +3505,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
           pendingQueuedTargets,
           input.clickOffset,
           {
+            seedUrl: input.seedUrl,
             crossOriginPursued: input.crossOriginPursued,
             queuedDestinations: input.queuedDestinations,
           },
@@ -5734,7 +5755,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // click that replaces the document must not erase the original
                 // page's unclassified destinations, and a destination seen in
                 // both snapshots must not be counted twice.
-                for (const url of pursuableRenderedOverflowUrls(collection.overflowCandidates, currentUrl)) {
+                for (const url of pursuableRenderedOverflowUrls(collection.overflowCandidates, currentUrl, seedUrl)) {
                   crossOriginOverflowEligible.add(url);
                 }
                 // A later snapshot can promote an earlier overflow destination
@@ -5831,6 +5852,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 const plan = planRenderedCrossOriginEnqueues({
                   candidates,
                   currentUrl: page.url(),
+                  seedUrl,
                   alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                   queued: crossOriginQueued,
                   maxEnqueues: 0,
@@ -5850,6 +5872,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 const plan = planRenderedCrossOriginEnqueues({
                   candidates,
                   currentUrl: page.url(),
+                  seedUrl,
                   alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                   queued: crossOriginQueued,
                   maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size - crossOriginReserved.size,
@@ -5866,6 +5889,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               await enqueueRenderedCrossOriginPass({
                 collect: async () => candidates,
                 currentUrl: page.url(),
+                seedUrl,
                 alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                 queued: crossOriginQueued,
                 maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
@@ -6011,6 +6035,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // retain it here before the click planner drops it; otherwise a
             // JS-inserted direct Discord/invite href would be lost entirely.
             retainSkippableAnchorEvidence(controls, page.url(), retain, {
+              seedUrl,
               crossOriginPursued: crossOriginPursuitActive(),
               queuedDestinations: isQueuedDestination,
             });
@@ -6026,6 +6051,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               limits.clickOffset,
               undefined,
               {
+                seedUrl,
                 crossOriginPursued: crossOriginPursuitActive(),
                 queuedDestinations: isQueuedDestination,
               },
@@ -6050,6 +6076,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             for (const control of controls) {
               if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
                 && !isSkippableNavigableAnchorClick(control, page.url(), {
+                  seedUrl,
                   crossOriginPursued: crossOriginPursuitActive(),
                   queuedDestinations: isQueuedDestination,
                 })) {
@@ -6133,6 +6160,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // a real navigation commits a new document and changes it.
                 documentIdentity: () => page.evaluate(() => performance.timeOrigin),
                 clickOffset: limits.clickOffset,
+                seedUrl,
                 crossOriginPursued: crossOriginPursuitActive(),
                 queuedDestinations: isQueuedDestination,
                 countedSkips: countedControlSkips,

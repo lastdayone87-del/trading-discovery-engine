@@ -25,6 +25,34 @@ import {
  * host, preserving protection against crawling arbitrary outbound links.
  */
 
+/** Host identity used for first-party redirect checks. Scheme, port, and a
+ * `www.` prefix must not turn an ordinary apex/www or HTTP/HTTPS redirect into
+ * a third-party hop. Parent/subdomain matching is deliberately excluded:
+ * on multi-tenant hosts such as `alice.substack.com`, treating the shared apex
+ * `substack.com` as the creator's own site would let unrelated pages hop. */
+function normalizedSiteHost(url: URL): string {
+  return url.hostname.toLowerCase().replace(/^www\./, '');
+}
+export function isSameCreatorSite(first: URL, second: URL): boolean {
+  const firstHost = normalizedSiteHost(first);
+  const secondHost = normalizedSiteHost(second);
+  return Boolean(firstHost && secondHost && firstHost === secondHost);
+}
+
+/** Redirect-host policy for a child page already admitted by the seed crawl.
+ * While the crawl is still on the creator's own site, the redirect is
+ * creator-authored and may hand off to a separate community domain. After the
+ * crawl leaves that site, only same-site or evidenced-community targets are
+ * allowed, so an external docs/reference page cannot fan out to unknown hosts. */
+export function isAllowedChildRedirect(seed: URL, current: URL, target: URL): boolean {
+  if (isSameCreatorSite(current, seed)) return true;
+  if (isSameCreatorSite(target, seed) || isSameCreatorSite(target, current)) return true;
+  // Off the creator's site, a redirect may only reach a known community
+  // platform. A generic `/community` path on an unrelated host is not enough:
+  // docs/reference pages routinely contain such links.
+  return isKnownCommunityDestinationHost(target.hostname);
+}
+
 const LINK_HUB_HOSTS = [
   'linktr.ee',
   'beacons.ai',
@@ -32,6 +60,7 @@ const LINK_HUB_HOSTS = [
   'solo.to',
   'campsite.bio',
   'lnk.bio',
+  'stan.store',
 ];
 
 /**
@@ -77,6 +106,7 @@ export type DestinationReason =
   | 'structured-nomination'
   | 'community-evidence'
   | 'no-community-evidence'
+  | 'external-page-hop'
   | 'admission-rejected';
 
 export interface DestinationDecision {
@@ -113,6 +143,12 @@ function hasStrongCommunityEvidence(text: string): boolean {
 export function shouldFollowDestination(input: {
   url: string;
   currentUrl?: string;
+  /** Original admitted creator seed. When the current page is already on a
+   * third-party host, unknown outbound hosts are not followed: only its own
+   * pages, known community/shortener hosts, and terminal Discord links stay
+   * eligible. This prevents docs/wiki pages from cascading into unrelated
+   * communities. */
+  seedUrl?: string;
   anchorText?: string;
   baseScore?: number;
   structuredNominated?: boolean;
@@ -157,6 +193,24 @@ export function shouldFollowDestination(input: {
     || MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(hostEvidence)
     || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathEvidence);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);
+  let externalPageHop = false;
+  if (input.seedUrl && input.currentUrl && !sameOrigin && !knownHost) {
+    try {
+      const seed = new URL(input.seedUrl);
+      const current = new URL(input.currentUrl);
+      const target = new URL(input.url);
+      // Apex/www and HTTP/HTTPS redirects are still the creator's site. Treat
+      // same-site subdomains as first-party, and allow returns to the creator
+      // host from an external reference page. Only a target unrelated to both
+      // the seed site and the current site is an external-page hop.
+      externalPageHop = !isSameCreatorSite(current, seed)
+        && !isSameCreatorSite(target, seed)
+        && !isSameCreatorSite(current, target);
+    } catch { externalPageHop = false; }
+  }
+  if (externalPageHop) {
+    return { eligible: false, score: 0, reason: 'external-page-hop' };
+  }
   const eligible = sameOrigin
     || Boolean(input.structuredNominated)
     || knownHost

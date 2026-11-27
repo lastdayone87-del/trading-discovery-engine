@@ -203,6 +203,7 @@ import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIR
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, detectDiscordInviteCaseCollisions, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, isUnownedSurfaceDiscordCandidate, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import { isKnownCommunityDestinationHost } from './destinationPolicy';
 import {
   candidatesFromYouTubeSnapshot,
   collectYouTubeSurfaceSnapshot,
@@ -434,6 +435,48 @@ export interface DiscordChokeDeps {
    * the deletion watermark shares the clock that wrote `discovered_at`. */
   executionNow(): Promise<string>;
 }
+/** Static website candidates need creator ownership evidence before they can
+ * claim the global registry. A candidate found only on a third-party docs,
+ * wiki, market-reference or aggregator page is not attributed to the creator
+ * merely because that page mentions Discord. Exact creator hosts and known
+ * community/link-hub platforms qualify; unknown subdomains of a linked site
+ * do not. */
+function isStaticWebsiteClaimEligible(candidate: DiscordCandidate): boolean {
+  // Legacy/test callers may not have run ownership inference yet. Preserve the
+  // historical fail-open behavior for those; production inspections always
+  // carry an explicit status before the choke point.
+  if (candidate.ownershipStatus === undefined) return true;
+  const observations = candidate.observations?.length
+    ? candidate.observations
+    : [{ sourceSurface: candidate.sourceSurface, sourceUrl: candidate.sourceUrl }];
+  if (candidate.ownershipStatus === 'CREATOR_OWNED') return true;
+  // Viewer comments and curated playlist items are not controlled surfaces.
+  // Ignore them when classifying the candidate's provenance so mixing a docs
+  // page with a viewer comment still applies the static-website guard instead
+  // of falling through a mixed-observation exemption.
+  const unownedSurfaces = new Set(['YOUTUBE_COMMENTS', 'YOUTUBE_PLAYLIST_ITEMS']);
+  const provenance = observations.filter(observation => !unownedSurfaces.has(observation.sourceSurface));
+  if (!provenance.length) return false;
+  // A creator-controlled surface is sufficient even when the aggregate
+  // ownership score is uncertain.
+  const controlledSurfaces = new Set(['YOUTUBE_ABOUT', 'CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'RECENT_VIDEO_DESCRIPTIONS']);
+  if (provenance.some(observation => controlledSurfaces.has(observation.sourceSurface))) return true;
+  // A directly linked social profile is creator-controlled enough to keep
+  // its invite unless ownership is explicitly third-party. Viewer comments do
+  // not change that classification.
+  if (candidate.ownershipStatus !== 'THIRD_PARTY'
+    && provenance.every(observation => observation.sourceSurface === 'SOCIAL_PROFILES')) return true;
+  const staticOnly = provenance.every(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
+  if (!staticOnly) return false;
+  for (const observation of provenance) {
+    try {
+      const host = new URL(observation.sourceUrl || '').hostname.toLowerCase().replace(/^www\./, '');
+      if (host && isKnownCommunityDestinationHost(host)) return true;
+    } catch { /* malformed provenance is not ownership */ }
+  }
+  return false;
+}
+
 export async function admitInspectionDiscordCandidates(
   structuredCandidates: DiscordCandidate[],
   foundInvite: string | null | undefined,
@@ -444,24 +487,26 @@ export async function admitInspectionDiscordCandidates(
     removeLosers: (targetChannelId, codes, candidateIds, onlyNewerThan) => deleteDiscordCandidates(targetChannelId, codes, candidateIds, onlyNewerThan),
     executionNow: () => getDbStatementNow(),
   },
-): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number; discardedOwnerChannelIds: string[] }> {
+): Promise<{ candidates: DiscordCandidate[]; discoveredInvite: string | null; discardedCount: number; discardedOwnerChannelIds: string[]; deferredCandidateIds: string[] }> {
   // Viewer comments and curated playlist-item text are not creator-controlled.
   // Keep them out of the global claim path until a creator-owned surface
   // corroborates the same code; otherwise a viewer can permanently claim
   // another creator's invite before ownership is known.
-  const unownedCandidates = structuredCandidates.filter(isUnownedSurfaceDiscordCandidate);
-  const claimableCandidates = structuredCandidates.filter(candidate => !isUnownedSurfaceDiscordCandidate(candidate));
+  const deferredCandidates = structuredCandidates.filter(candidate =>
+    isUnownedSurfaceDiscordCandidate(candidate) || !isStaticWebsiteClaimEligible(candidate));
+  const deferredIds = new Set(deferredCandidates.map(candidate => candidate.candidateId));
+  const claimableCandidates = structuredCandidates.filter(candidate => !deferredIds.has(candidate.candidateId));
   const foundCode = discordInviteCodeOf(foundInvite);
   const foundIsUnownedOnly = !!foundCode
-    && unownedCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode)
+    && deferredCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode)
     && !claimableCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode);
   const effectiveFoundInvite = foundIsUnownedOnly ? null : foundInvite;
-  if (unownedCandidates.length) {
+  if (deferredCandidates.length) {
     console.info(JSON.stringify({
       event: 'discord_unowned_surface_candidates_deferred',
       channelId,
-      count: unownedCandidates.length,
-      codes: unownedCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
+      count: deferredCandidates.length,
+      codes: deferredCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
       timestamp: new Date().toISOString(),
     }));
   }
@@ -522,7 +567,7 @@ export async function admitInspectionDiscordCandidates(
   }
   const loserCodes = [...claimSources.keys()].filter(code => !admittedCodes.has(code));
   if (loserCodes.length) await deps.removeLosers(channelId, loserCodes, provisionalIdsForCode(new Set(loserCodes)), provisionalSince);
-  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount, discardedOwnerChannelIds: [...new Set(discardedOwnerChannelIds)] };
+  return { candidates: admission.candidates, discoveredInvite: admission.discoveredInvite, discardedCount: admission.discardedCount, discardedOwnerChannelIds: [...new Set(discardedOwnerChannelIds)], deferredCandidateIds: deferredCandidates.map(candidate => candidate.candidateId).filter(Boolean) };
 }
 /**
  * Duplicate-owner provenance projection (E8/E9 follow-up). A fresh duplicate
@@ -573,26 +618,103 @@ export function nextDiscordDuplicateOwnerChannelId(input: {
 export async function drainOrphanDiscordCandidates(
   channelId: string,
   deps: Pick<DiscordChokeDeps, 'claim'> & {
-    list(channelId: string, limit?: number): Promise<OrphanDiscordCandidateRow[]>;
+    list(channelId: string, limit?: number, offset?: number): Promise<OrphanDiscordCandidateRow[]>;
     removeOrphans(channelId: string, candidateIds: string[]): Promise<number>;
   } = {
     claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
-    list: (targetChannelId, limit) => listOrphanDiscordCandidates(targetChannelId, limit),
+    list: (targetChannelId, limit, offset) => listOrphanDiscordCandidates(targetChannelId, limit, offset),
     removeOrphans: (targetChannelId, candidateIds) => deleteOrphanDiscordCandidates(targetChannelId, candidateIds),
   },
   limit = 5,
+  ownership: { creatorName?: string; creatorWebsiteHosts?: string[] } = {},
 ): Promise<{ candidates: DiscordCandidate[]; removed: number; discardedOwnerChannelIds: string[] }> {
-  const rows = await deps.list(channelId, limit);
-  if (!rows.length) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
-  // Orphan rows are matched by exact candidate id and the same
-  // DISCOVERED/NOT_STARTED predicate that listed them; their discovered_at
-  // predates this execution, so no time watermark applies.
-  const sources = new Map<string, { surface: string | null; url: string | null }>();
-  for (const row of rows) {
-    const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
-    if (code && !sources.has(code)) sources.set(code, { surface: row.sourceSurface, url: row.sourceUrl });
+  // Deferred rows are intentionally kept for later evidence, but they must not
+  // monopolize the oldest-N window forever. Scan bounded pages past them so a
+  // claimable invite saved after a crash still reaches validation.
+  const scanLimit = Math.min(100, Math.max(limit, 25));
+  const maxScanRows = 100;
+  const rows: OrphanDiscordCandidateRow[] = [];
+  const seenCandidateIds = new Set<string>();
+  for (let offset = 0; offset < maxScanRows; offset += scanLimit) {
+    const batch = await deps.list(channelId, scanLimit, offset);
+    if (!batch.length) break;
+    let fresh = 0;
+    for (const row of batch) {
+      if (seenCandidateIds.has(row.candidateId)) continue;
+      seenCandidateIds.add(row.candidateId);
+      rows.push(row);
+      fresh++;
+    }
+    // Stop on a short page, a non-advancing injected source, or the cap.
+    if (batch.length < scanLimit || fresh === 0 || rows.length >= maxScanRows) break;
   }
-  const claims = await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  if (!rows.length) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
+  // Recover each persisted orphan with its original provenance and ownership
+  // before claiming. Old rows written before the ownership guard must not be
+  // re-admitted merely because they were persisted once.
+  const recovered = rows.map(row => {
+    const persistedObservations = Array.isArray(row.observations)
+      ? row.observations.filter((observation): observation is NonNullable<DiscordCandidate['observations']>[number] =>
+        Boolean(observation) && typeof observation === 'object')
+      : [];
+    const observationSurface = persistedObservations.find(observation => observation.sourceSurface)?.sourceSurface;
+    const observationUrl = persistedObservations.find(observation => observation.sourceUrl)?.sourceUrl;
+    // Never invent channel-controlled provenance for an old row. Rows with no
+    // recorded surface stay unprovenanced and are deferred rather than claimed.
+    const sourceSurface = (row.sourceSurface as DiscordCandidate['sourceSurface'] | null)
+      || observationSurface
+      || null;
+    const sourceUrl = row.sourceUrl || observationUrl || undefined;
+    const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
+    const nativeInviteCode = extractDiscordInviteCodeRaw(row.rawLocator)
+      || extractDiscordInviteCodeRaw(row.normalizedLocator)
+      || code
+      || '';
+    const candidate: DiscordCandidate = {
+      candidateId: row.candidateId,
+      canonicalInviteId: code ? canonicalDiscordInviteId(code) : undefined,
+      locatorType: (row.locatorType as DiscordCandidate['locatorType']) || 'NATIVE_INVITE',
+      sourceSurface: sourceSurface || 'CREATOR_WEBSITES',
+      rawLocator: row.rawLocator || row.normalizedLocator,
+      normalizedLocator: row.normalizedLocator,
+      nativeInviteCode,
+      sourceUrl,
+      extractionConfidence: 'EXPLICIT',
+      observations: persistedObservations,
+    };
+    return {
+      row,
+      code,
+      sourceSurface,
+      sourceUrl: sourceUrl || null,
+      hasProvenance: Boolean(sourceSurface),
+      candidate: { ...candidate, ...inferDiscordOwnership(candidate, ownership) },
+    };
+  });
+  // Orphans are deferred (left in place for a later inspection) when their
+  // provenance is missing or when static-website ownership cannot be proved.
+  const skipped = recovered.filter(item =>
+    !item.hasProvenance || (item.code && !isStaticWebsiteClaimEligible(item.candidate)));
+  const skippedIds = new Set(skipped.map(item => item.candidate.candidateId).filter(Boolean));
+  const sources = new Map<string, { surface: string | null; url: string | null }>();
+  const activeIds = new Set<string>();
+  for (const item of recovered) {
+    if (!item.code || skippedIds.has(item.candidate.candidateId)) continue;
+    // Keep the scan window large enough to page past deferred rows, but never
+    // expand the registry batch beyond the caller's limit. Count unique codes,
+    // not rows: duplicate-code orphans must not crowd out distinct invites.
+    if (!sources.has(item.code)) {
+      if (sources.size >= Math.max(1, limit)) break;
+      sources.set(item.code, { surface: item.sourceSurface, url: item.sourceUrl });
+    }
+    activeIds.add(item.candidate.candidateId);
+  }
+  // Deferred rows never touch the registry (and an empty claim would still be
+  // an unnecessary write-path round trip). No-code rows still flow through the
+  // loser cleanup below instead of being stranded.
+  const claims = sources.size
+    ? await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId)
+    : [];
   const admitted = new Set(claims.filter(claim => claim.admitted).map(claim => claim.code));
   // A discarded orphan is still positive evidence that the channel publishes
   // this invite, so retain the foreign owner for dashboard provenance even
@@ -606,33 +728,30 @@ export async function drainOrphanDiscordCandidates(
   const discardedOwnerChannelIds = new Set<string>();
   const loserIds: string[] = [];
   const candidates: DiscordCandidate[] = [];
-  for (const row of rows) {
-    const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
-    if (!code || !admitted.has(code)) {
-      const owner = code ? foreignOwnerByCode.get(code) : undefined;
-      if (owner) discardedOwnerChannelIds.add(owner);
-      if (row.candidateId) loserIds.push(row.candidateId);
+  const returnedCodes = new Set<string>();
+  for (const item of recovered) {
+    const { code, candidate } = item;
+    if (skippedIds.has(candidate.candidateId)) continue;
+    if (!code) {
+      if (candidate.candidateId) loserIds.push(candidate.candidateId);
       continue;
     }
-    // Preserve the original-case invite code for validation (Discord codes are
-    // case-sensitive) and re-derive ownership from the persisted observations.
-    // The registry claim above intentionally uses the lowercase key only.
-    const nativeInviteCode = extractDiscordInviteCodeRaw(row.rawLocator)
-      || extractDiscordInviteCodeRaw(row.normalizedLocator)
-      || code;
-    const recovered: DiscordCandidate = {
-      candidateId: row.candidateId,
-      canonicalInviteId: canonicalDiscordInviteId(code),
-      locatorType: (row.locatorType as DiscordCandidate['locatorType']) || 'NATIVE_INVITE',
-      sourceSurface: (row.sourceSurface as DiscordCandidate['sourceSurface']) || 'CHANNEL_EXTERNAL_LINKS',
-      rawLocator: row.rawLocator || row.normalizedLocator,
-      normalizedLocator: row.normalizedLocator,
-      nativeInviteCode,
-      sourceUrl: row.sourceUrl || undefined,
-      extractionConfidence: 'EXPLICIT',
-      observations: row.observations as DiscordCandidate['observations'],
-    };
-    candidates.push({...recovered,...inferDiscordOwnership(recovered)});
+    // Rows beyond this pass's bounded batch stay in place for the next drain.
+    if (!activeIds.has(candidate.candidateId)) continue;
+    if (!admitted.has(code)) {
+      const owner = foreignOwnerByCode.get(code);
+      if (owner) discardedOwnerChannelIds.add(owner);
+      if (candidate.candidateId) loserIds.push(candidate.candidateId);
+      continue;
+    }
+    // One validation candidate per canonical code; a duplicate-code orphan is
+    // redundant residue once the code has been admitted for this channel.
+    if (returnedCodes.has(code)) {
+      if (candidate.candidateId) loserIds.push(candidate.candidateId);
+      continue;
+    }
+    returnedCodes.add(code);
+    candidates.push(candidate);
   }
   const removed = loserIds.length ? await deps.removeOrphans(channelId, loserIds) : 0;
   return { candidates, removed, discardedOwnerChannelIds: [...discardedOwnerChannelIds] };
@@ -5023,8 +5142,9 @@ export async function inspectAndValidateChannel(
     if(caseCollisions.length){
       console.warn(JSON.stringify({event:'discord_case_collision_detected',channelId:channel.channel_id,collisions:caseCollisions,timestamp:new Date().toISOString()}));
     }
-    const executedCandidateIds=[...new Set(structuredCandidates.map(candidate=>candidate.candidateId).filter(Boolean))];
     let chokeAdmission=await admitInspectionDiscordCandidates(structuredCandidates,inspection.foundInvite,channel.channel_id);
+    const deferredCandidateIds=new Set(chokeAdmission.deferredCandidateIds);
+    const executedCandidateIds=[...new Set(structuredCandidates.map(candidate=>candidate.candidateId).filter(Boolean).filter(candidateId=>!deferredCandidateIds.has(candidateId)))];
     if(chokeAdmission.discardedCount)console.info(JSON.stringify({event:'discord_duplicate_discarded',channelId:channel.channel_id,discardedCount:chokeAdmission.discardedCount,discardedOwnerChannelIds:chokeAdmission.discardedOwnerChannelIds,timestamp:new Date().toISOString()}));
     admittedInspection={...inspection,discordCandidates:chokeAdmission.candidates,foundInvite:chokeAdmission.discoveredInvite};
 
@@ -5048,7 +5168,7 @@ export async function inspectAndValidateChannel(
     // discovery is never permanently stranded. Codes owned by another channel
     // are residue and are removed by exact candidate id; codes still
     // available (or already owned here) join the validation set below.
-    const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id).catch(error=>{
+    const orphanDrain=await drainOrphanDiscordCandidates(channel.channel_id, undefined, undefined, {creatorName:channel.channel_name,creatorWebsiteHosts:creatorWebsiteHostsFromLinks(inspection.observedChannelLinks||[])}).catch(error=>{
       console.warn(JSON.stringify({event:'orphan_candidate_drain_failed',channelId:channel.channel_id,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));
       return {candidates:[] as DiscordCandidate[],removed:0,discardedOwnerChannelIds:[] as string[]};
     });
