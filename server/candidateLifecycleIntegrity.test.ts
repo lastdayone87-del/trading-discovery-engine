@@ -606,7 +606,7 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   const db = readSource('dbCore.ts');
   assert.match(db, /candidate_status='DISCOVERED' AND validation_status='NOT_STARTED' AND selected IS NOT TRUE/);
   assert.match(db, /export async function deleteOrphanDiscordCandidates/);
-  assert.match(db, /ORDER BY discovered_at ASC LIMIT \$2 OFFSET \$3/);
+  assert.match(db, /ORDER BY discovered_at ASC,candidate_id ASC LIMIT \$2 OFFSET \$3/);
   const queue = readSource('queueManager.ts');
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
