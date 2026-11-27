@@ -3,7 +3,7 @@ import test from 'node:test';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
 import { isAllowedChildRedirect, isKnownCommunityDestinationHost, shouldFollowDestination } from './destinationPolicy';
 import { admitInspectionDiscordCandidates } from './queueManager';
-import { isSkippableNavigableAnchorClick, shouldEnqueueRenderedCrossOriginLink } from './browserCommunityFallback';
+import { isSkippableNavigableAnchorClick, planRenderedCrossOriginEnqueues, shouldEnqueueRenderedCrossOriginLink } from './browserCommunityFallback';
 
 function websiteCandidate(code: string, sourceUrl: string) {
   return makeDiscordCandidate({
@@ -197,10 +197,31 @@ test('seed scheme/apex redirects stay first-party in static and rendered policy'
 test('creator first-party redirects may hand off to a separate community domain', () => {
   const seed = new URL('http://www.creator.example');
   const redirectedSeed = new URL('https://creator.example');
-  assert.equal(isAllowedChildRedirect(redirectedSeed, redirectedSeed, new URL('https://community.example/join')), true,
+  assert.equal(isAllowedChildRedirect(seed, redirectedSeed, new URL('https://community.example/join')), true,
     'a creator-authored /join redirect is not an external-page hop');
+  const sharedParentHop = shouldFollowDestination({
+    url: 'https://substack.com/',
+    currentUrl: 'https://docs.n8n.io/integrations/',
+    seedUrl: 'https://alice.substack.com/',
+    anchorText: 'Join the community',
+  });
+  assert.equal(sharedParentHop.eligible, false,
+    'a multi-tenant shared apex is not the tenant creator site');
   assert.equal(isAllowedChildRedirect(new URL('https://creator.example'), new URL('https://docs.n8n.io/integrations/'), new URL('https://unknown.example/community')), false,
     'once off the creator site, unrelated hosts remain blocked');
   assert.equal(isAllowedChildRedirect(new URL('https://creator.example'), new URL('https://docs.n8n.io/integrations/'), new URL('https://www.skool.com/trader')), true,
     'an evidenced community platform remains reachable from a reference page');
+});
+
+test('merged pre-click cross-origin links keep their source document', () => {
+  const url = 'https://unknown.example/community';
+  const plan = planRenderedCrossOriginEnqueues({
+    candidates: [{ url, text: 'Join the community', sourceUrl: 'https://creator.example/' }],
+    currentUrl: 'https://docs.n8n.io/integrations/',
+    seedUrl: 'https://creator.example/',
+    alreadyVisited: new Set(),
+    queued: new Set(),
+    maxEnqueues: 5,
+  });
+  assert.deepEqual(plan.admitted, [url], 'a creator-origin pre-click anchor is not reclassified against the post-click docs page');
 });

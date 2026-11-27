@@ -697,14 +697,21 @@ export async function drainOrphanDiscordCandidates(
     !item.hasProvenance || (item.code && !isStaticWebsiteClaimEligible(item.candidate)));
   const skippedIds = new Set(skipped.map(item => item.candidate.candidateId).filter(Boolean));
   const sources = new Map<string, { surface: string | null; url: string | null }>();
+  const activeIds = new Set<string>();
   for (const item of recovered) {
     if (!item.code || skippedIds.has(item.candidate.candidateId)) continue;
+    // Keep the scan window large enough to page past deferred rows, but never
+    // expand the claim/validation batch beyond the caller's limit.
+    if (activeIds.size >= Math.max(1, limit)) break;
+    activeIds.add(item.candidate.candidateId);
     if (!sources.has(item.code)) sources.set(item.code, { surface: item.sourceSurface, url: item.sourceUrl });
   }
   // Deferred rows never touch the registry (and an empty claim would still be
-  // an unnecessary write-path round trip).
-  if (!sources.size) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
-  const claims = await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
+  // an unnecessary write-path round trip). No-code rows still flow through the
+  // loser cleanup below instead of being stranded.
+  const claims = sources.size
+    ? await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId)
+    : [];
   const admitted = new Set(claims.filter(claim => claim.admitted).map(claim => claim.code));
   // A discarded orphan is still positive evidence that the channel publishes
   // this invite, so retain the foreign owner for dashboard provenance even
@@ -721,8 +728,14 @@ export async function drainOrphanDiscordCandidates(
   for (const item of recovered) {
     const { code, candidate } = item;
     if (skippedIds.has(candidate.candidateId)) continue;
-    if (!code || !admitted.has(code)) {
-      const owner = code ? foreignOwnerByCode.get(code) : undefined;
+    if (!code) {
+      if (candidate.candidateId) loserIds.push(candidate.candidateId);
+      continue;
+    }
+    // Rows beyond this pass's bounded batch stay in place for the next drain.
+    if (!activeIds.has(candidate.candidateId)) continue;
+    if (!admitted.has(code)) {
+      const owner = foreignOwnerByCode.get(code);
       if (owner) discardedOwnerChannelIds.add(owner);
       if (candidate.candidateId) loserIds.push(candidate.candidateId);
       continue;

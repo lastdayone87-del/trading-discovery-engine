@@ -2759,7 +2759,11 @@ export function planRenderedCrossOriginEnqueues(input: {
     // eligible destination.
     const decision = shouldFollowDestination({
       url,
-      currentUrl: input.currentUrl,
+      // Evaluate against the document that produced this anchor. Pre-click
+      // candidates are merged with the post-click snapshot, so using the
+      // post-click page URL here would misclassify a creator-origin link as an
+      // external-page hop after navigation.
+      currentUrl: String(candidate.sourceUrl || input.currentUrl),
       seedUrl: input.seedUrl,
       anchorText: candidate.labels.join(' '),
     });

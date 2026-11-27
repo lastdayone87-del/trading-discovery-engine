@@ -543,6 +543,54 @@ test('E6: deferred orphans cannot monopolize the recovery window', async () => {
   assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode), ['LATERROOM']);
 });
 
+test('E6: no-code orphans are still cleaned up when no claimable codes remain', async () => {
+  let claimCalls = 0;
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async () => { claimCalls += 1; return []; },
+    list: async () => [{
+      candidateId: 'orphan-malformed',
+      rawLocator: 'https://discord.com/',
+      normalizedLocator: 'https://discord.com/',
+      locatorType: 'UNKNOWN',
+      sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+      sourceUrl: 'https://youtube.test/channel/about',
+      observations: [],
+      canonicalCode: null,
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never);
+  assert.equal(claimCalls, 0);
+  assert.deepEqual(removed, [['orphan-malformed']], 'unparseable residue is deleted without a registry claim');
+  assert.equal(result.removed, 1);
+});
+
+test('E6: claimable recovery stays within the caller limit after paging', async () => {
+  const claimableRows = Array.from({ length: 3 }, (_, index) => ({
+    candidateId: `claimable-${index}`,
+    rawLocator: `https://discord.gg/CLAIM${index}`,
+    normalizedLocator: `https://discord.gg/claim${index}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    sourceUrl: 'https://youtube.test/channel/about',
+    observations: [],
+    canonicalCode: `claim${index}`,
+    discoveredAt: `2026-10-18T00:00:0${index}.000Z`,
+  }));
+  const claimed: string[] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async (items: Array<{ code: string }>) => {
+      claimed.push(...items.map(item => item.code));
+      return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanA' }));
+    },
+    list: async () => claimableRows,
+    removeOrphans: async () => 0,
+  } as never, 2);
+  assert.deepEqual(claimed.sort(), ['claim0', 'claim1'], 'only the bounded batch reaches validation');
+  assert.equal(result.candidates.length, 2);
+});
+
 test('E6: drain is a no-op when no orphans exist', async () => {
   let claimCalls = 0;
   const result = await drainOrphanDiscordCandidates('chanA', {

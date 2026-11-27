@@ -25,19 +25,18 @@ import {
  * host, preserving protection against crawling arbitrary outbound links.
  */
 
-/** Host identity used for first-party redirect checks. Scheme, port, a `www.`
- * prefix, and subdomains of the same creator host must not turn an ordinary
- * apex/www or HTTP/HTTPS redirect into a third-party hop. */
+/** Host identity used for first-party redirect checks. Scheme, port, and a
+ * `www.` prefix must not turn an ordinary apex/www or HTTP/HTTPS redirect into
+ * a third-party hop. Parent/subdomain matching is deliberately excluded:
+ * on multi-tenant hosts such as `alice.substack.com`, treating the shared apex
+ * `substack.com` as the creator's own site would let unrelated pages hop. */
 function normalizedSiteHost(url: URL): string {
   return url.hostname.toLowerCase().replace(/^www\./, '');
 }
 export function isSameCreatorSite(first: URL, second: URL): boolean {
   const firstHost = normalizedSiteHost(first);
   const secondHost = normalizedSiteHost(second);
-  if (!firstHost || !secondHost) return false;
-  return firstHost === secondHost
-    || firstHost.endsWith(`.${secondHost}`)
-    || secondHost.endsWith(`.${firstHost}`);
+  return Boolean(firstHost && secondHost && firstHost === secondHost);
 }
 
 /** Redirect-host policy for a child page already admitted by the seed crawl.
