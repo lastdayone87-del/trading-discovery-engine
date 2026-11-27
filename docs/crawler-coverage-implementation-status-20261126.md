@@ -1,8 +1,8 @@
 # Crawler Coverage Remediation — Implementation Status (Phase 0/1)
 
-**Status:** IMPLEMENTATION IN PROGRESS — code/test verification; **not yet deployed**
-**Date:** 2026-11-26
-**Branch:** `feat/crawler-coverage-remediation` (rebased onto production `f0aa55b3`; review baseline was `1bf93568`)
+**Status:** DEPLOYED — PR #707 live on production at `54f93d1f`; follow-up monitoring in progress
+**Date:** 2026-11-27 (updated)
+**Branch:** `main` (PR #707 merged; production deployment 2026-11-27T14:31Z)
 **References:** gap register and remediation plan in the same directory
 
 ---
@@ -143,30 +143,90 @@ and arbitrary app routes are explicitly deferred, not treated as covered.
 | Full 100-site browser V4 | Requires browser infrastructure; YouTube 100 + render 19 + fixtures are the current evidence |
 | Cross-process robots pacing | Crawl-delay is coordinated per crawl/process, not across every worker process; robots enforcement remains canary-gated |
 | True cancellation of timed-out YouTube calls | Innertube has no generic abort surface here; late rejections are contained, but an abandoned request may still finish at the network layer |
-| Production deployment | Not yet; code is on the branch |
+| Production deployment | Complete for PR #707 (`54f93d1f`), deployed 2026-11-27T14:31Z; depth-3 remains deliberately off |
 
 ---
 
 ## 5. Deployment status
 
-Production advanced during implementation to `f0aa55b3` (Gemini route rotation;
-schema 210; crawler files unchanged). The branch was rebased onto it. No
-production code or config was changed by this work yet. `/api/version` will
-report `SOURCE_COMMIT` **after** this branch is deployed; until then the
-deployed image still reports `commitSha:"unknown"`.
+Production runs merge commit `54f93d1f` (PR #707, static ownership guard) as of
+2026-11-27T14:31Z. The image built successfully and the app container was
+replaced; the previous production commit was `dea6b834`.
 
----
+Active production settings:
 
-## 6. Next verification after merge
+- `CRAWLER_MAX_DEPTH=2`, `CRAWLER_QUEUE_CAP=12`, `CRAWLER_PAGE_CAP=12`
+- `CRAWLER_ROBOTS_ENFORCEMENT=true`
+- `youtube_surface_expansion_enabled=true`,
+  `youtube_surface_expansion_basis_points=500` (5%)
+- Depth-3 / 24-page static expansion remains **off**.
 
-1. Run the full suite on the merge commit; triage any remaining failures.
-2. Deploy Phase 0/1 with all new behavior flags off by default.
-3. Verify `/api/version` reports the deployed merge commit after `f0aa55b3`.
-4. Enable YouTube surface canary at 5% (`youtube_surface_expansion_enabled=true`,
-   `youtube_surface_expansion_basis_points=500`) and measure live-new yield.
-5. Enable `CRAWLER_ROBOTS_ENFORCEMENT=true` in canary and verify explicit
-   Disallow/Crawl-delay behavior plus no loss of 403/unreachable sites.
-6. Enable static depth/queue canary (`CRAWLER_MAX_DEPTH=3`,
-   `CRAWLER_QUEUE_CAP=24`, `CRAWLER_PAGE_CAP=24`) and measure page yield/429s.
-7. Do not provision the browser service until the remaining implementation and
-   benchmark are complete and the infrastructure comparison is approved.
+### PR #707 ownership guard
+
+- Static website claims require `CREATOR_OWNED` or a known community/link hub.
+  Viewer comments and curated playlist items are ignored when classifying the
+  provenance, so a docs page plus a viewer comment cannot bypass the guard.
+- External reference pages cannot hop to unrelated external hosts. Apex/www,
+  HTTP/HTTPS, and port redirects stay first-party; a creator-authored `/join`
+  redirect may hand off to a separate community domain, but after the crawl
+  leaves the creator site only same-site or evidenced-community targets are
+  followed.
+- Orphan recovery defers rows without provenance and rows whose static
+  ownership cannot be proved. Deferred rows are paged past with a bounded,
+  deterministic scan; the claim batch is capped by unique codes.
+- Rendered cross-origin planning/clicking receives the original seed context,
+  and merged pre-click candidates are classified against the document that
+  produced them.
+- The deployed deferral event name is
+  `discord_unowned_surface_candidates_deferred`; the transient
+  `discord_unowned_candidates_deferred` rename was never shipped.
+
+### Production false-positive cleanup
+
+After PR #707 was approved, the interim production window was audited again.
+The earlier cleanup removed 15 docs/wiki/reference claims. The final cleanup
+removed **37 false candidate rows**, **37 registry rows**, and cleared
+**16 channels** whose serving or candidate pointer referenced those rows.
+
+- Clear removals included Play Store app pages, Wikipedia, DeepL, PlanetPython,
+  open-webui, Polymer/Inco project docs, Base/Jupiter/Hyperliquid/Titan project
+  invites, Pump.fun/Pastel/Telegram project invites, MyForexFunds, CWallet,
+  PerpTools, mfatraders, and unrelated link-hub/privacy-page invites.
+- Preserved genuine creator evidence, including YinYang Algorithms
+  (`ccEHem37FB`, direct TradingView/YouTube evidence), Whiteboard Crypto
+  (`hvMQp4qcM6`, repeated video descriptions), Alex Morrison (`MYaCsKrDev`,
+  linked Stockminds site), Novig, Tailored Trading (`2U33H3yM4F` direct link;
+  FlowMatrix is linked from the channel), Daily Market School, Quant Trading
+  Pro, Hourglass Trader, FudStop, YoungBuffett, TGFX Academy, and the Donald
+  King Google Form titled "Free Discord Community".
+- The remaining recent static claims were reviewed and are brand-owned,
+  creator-controlled, known-hub, or creator-linked. No docs/wiki/app-store
+  false claims remain in the recent set.
+
+### Initial post-deploy observation
+
+Measured from production PostgreSQL candidate/registry counts and the app
+container logs, from 2026-11-27T14:31Z through 15:00Z:
+
+- 0 new `discord_candidates` rows and 0 new registry claims.
+- 0 new docs/wiki/reference false claims.
+- No `youtube_surface_expansion_failed` events and no fatal/OOM events.
+- Rendered fallback logged a memory-pressure warning at about 2.0 GB, roughly
+  103% of the container's 1.985 GB limit; the process stayed up, but this
+  remains the main capacity constraint.
+- No net-new validated Discord invite was measured in this short window. The
+  guard is deliberately deferring unowned static rows; genuine yield must be
+  measured over a longer window before changing static depth or YouTube
+  canary size.
+
+## 6. Next verification
+
+1. Continue monitoring `discord_unowned_surface_candidates_deferred`, new
+   static claims, and genuine invite yield over a longer production window.
+2. Keep robots enforcement on and static bounds at **2/12/12**.
+3. Keep YouTube surface expansion at **5%** until reliability, quota usage, and
+   new-validated-invite yield justify an increase.
+4. Consider a controlled depth-3 canary only after a clean multi-hour window
+   with no docs/wiki/reference claims and measurable genuine static yield.
+5. A dedicated browser service remains blocked on infrastructure/spending
+   approval; the observed ~2 GB rendered-fallback pressure supports that need.
