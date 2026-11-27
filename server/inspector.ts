@@ -716,16 +716,21 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     return (await respectRobotsDelay(target,decision))?'allow':'budget';
   };
   const childRedirectPermit=async(seedUrl:string,currentChild:string,target:string):Promise<'allow'|'disallow'|'budget'|'hop'>=>{
-    const robots=await robotsPermit(target);
-    if(robots!=='allow')return robots;
+    // Decide the host-policy hop before touching robots.txt, so a target that
+    // will never be contacted does not generate a policy fetch.
     try{
-      const seedOrigin=new URL(seedUrl).origin;
-      const currentOrigin=new URL(currentChild).origin;
-      const targetUrl=new URL(target);
-      const targetOrigin=targetUrl.origin;
-      if(currentOrigin!==seedOrigin&&targetOrigin!==currentOrigin&&targetOrigin!==seedOrigin&&!isKnownCommunityDestinationHost(targetUrl.hostname))return 'hop';
+      const seed=new URL(seedUrl), current=new URL(currentChild), targetUrl=new URL(target);
+      const stripWww=(host:string)=>host.toLowerCase().replace(/^www\./,'');
+      const seedHost=stripWww(seed.hostname), targetHost=stripWww(targetUrl.hostname);
+      const sameCreatorSite=targetHost===seedHost||targetHost.endsWith(`.${seedHost}`)||seedHost.endsWith(`.${targetHost}`);
+      const knownTarget=isKnownCommunityDestinationHost(targetUrl.hostname);
+      if(current.origin===seed.origin){
+        if(targetUrl.origin!==seed.origin&&!sameCreatorSite&&!knownTarget)return 'hop';
+      }else if(targetUrl.origin!==current.origin&&targetUrl.origin!==seed.origin&&!knownTarget){
+        return 'hop';
+      }
     }catch{/* malformed redirect is handled by the transport guard */}
-    return 'allow';
+    return robotsPermit(target);
   };
   let scannedCount=0;const observations:ExternalAcquisitionObservation[]=[];const discovered:DiscordCandidate[]=[];const domainWeightShadows:DomainWeightShadowEvaluation[]=[];const communityIntents:CommunityIntentEvidence[]=[];
   // Shared-visit pre-seeding (v2 L1): terminal-success finals inspected by an

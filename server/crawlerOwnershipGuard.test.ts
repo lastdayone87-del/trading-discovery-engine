@@ -92,6 +92,19 @@ test('third-party pages cannot open unrelated external hosts', () => {
     seedUrl: seed,
   });
   assert.equal(sameExternalOrigin.eligible, true);
+  const redirectedSeed = shouldFollowDestination({
+    url: 'https://members.creator.example/join',
+    currentUrl: 'https://www.creator.example/',
+    seedUrl: 'https://www.creator.example/',
+    anchorText: 'Join the community',
+  });
+  assert.equal(redirectedSeed.eligible, true);
+  const backToCreator = shouldFollowDestination({
+    url: 'https://www.creator.example/community',
+    currentUrl: 'https://docs.n8n.io/integrations/',
+    seedUrl: 'https://www.creator.example/',
+  });
+  assert.equal(backToCreator.eligible, true);
   for (const url of ['https://www.skool.com/trader', 'https://discord.gg/room', 'https://stan.store/trader']) {
     const known = shouldFollowDestination({
       url,

@@ -456,6 +456,12 @@ function isStaticWebsiteClaimEligible(candidate: DiscordCandidate): boolean {
   // turn the unowned code into a claim.
   const controlledSurfaces = new Set(['YOUTUBE_ABOUT', 'CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'RECENT_VIDEO_DESCRIPTIONS']);
   if (observations.some(observation => controlledSurfaces.has(observation.sourceSurface))) return true;
+  // A directly linked social profile is creator-controlled enough to keep
+  // its invite unless ownership is explicitly third-party. Do not let a mixed
+  // website observation use this path.
+  if (candidate.ownershipStatus !== 'THIRD_PARTY'
+    && observations.length > 0
+    && observations.every(observation => observation.sourceSurface === 'SOCIAL_PROFILES')) return true;
   const staticOnly = observations.length > 0
     && observations.every(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
   if (!staticOnly) return false;
@@ -634,7 +640,7 @@ export async function drainOrphanDiscordCandidates(
       candidateId: row.candidateId,
       canonicalInviteId: code ? canonicalDiscordInviteId(code) : undefined,
       locatorType: (row.locatorType as DiscordCandidate['locatorType']) || 'NATIVE_INVITE',
-      sourceSurface: (row.sourceSurface as DiscordCandidate['sourceSurface']) || 'CHANNEL_EXTERNAL_LINKS',
+      sourceSurface: (row.sourceSurface as DiscordCandidate['sourceSurface']) || 'CREATOR_WEBSITES',
       rawLocator: row.rawLocator || row.normalizedLocator,
       normalizedLocator: row.normalizedLocator,
       nativeInviteCode,

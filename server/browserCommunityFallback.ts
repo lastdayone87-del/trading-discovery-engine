@@ -2410,8 +2410,9 @@ export function shouldEnqueueRenderedCrossOriginLink(input: {
 export function countPursuableRenderedOverflow(
   candidates: readonly RenderedCrossOriginCandidate[],
   currentUrl: string,
+  seedUrl?: string,
 ): number {
-  return pursuableRenderedOverflowUrls(candidates, currentUrl).size;
+  return pursuableRenderedOverflowUrls(candidates, currentUrl, seedUrl).size;
 }
 
 /**
@@ -2425,6 +2426,7 @@ export function countPursuableRenderedOverflow(
 export function pursuableRenderedOverflowUrls(
   candidates: readonly RenderedCrossOriginCandidate[],
   currentUrl: string,
+  seedUrl?: string,
 ): Set<string> {
   const urls = new Set<string>();
   for (const candidate of candidates) {
@@ -2440,6 +2442,7 @@ export function pursuableRenderedOverflowUrls(
     if (shouldEnqueueRenderedCrossOriginLink({
       url,
       currentUrl: candidate.sourceUrl || currentUrl,
+      seedUrl,
       anchorText: candidate.text || '',
     })) {
       urls.add(key);
@@ -5741,7 +5744,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // click that replaces the document must not erase the original
                 // page's unclassified destinations, and a destination seen in
                 // both snapshots must not be counted twice.
-                for (const url of pursuableRenderedOverflowUrls(collection.overflowCandidates, currentUrl)) {
+                for (const url of pursuableRenderedOverflowUrls(collection.overflowCandidates, currentUrl, seedUrl)) {
                   crossOriginOverflowEligible.add(url);
                 }
                 // A later snapshot can promote an earlier overflow destination
@@ -5875,6 +5878,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               await enqueueRenderedCrossOriginPass({
                 collect: async () => candidates,
                 currentUrl: page.url(),
+                seedUrl,
                 alreadyVisited: renderedCrossOriginVisitedIdentities(alreadyVisitedSet, terminalSuccessUrls),
                 queued: crossOriginQueued,
                 maxEnqueues: MAX_RENDERED_CROSS_ORIGIN_ENQUEUES - crossOriginQueued.size,
