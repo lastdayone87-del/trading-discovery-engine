@@ -703,7 +703,7 @@ export interface ProfilerFetchOptions {
    * stops the chain before the target is requested; used by robots
    * enforcement so a Disallow rule or exhausted pacing budget cannot be
    * bypassed by an allowed seed redirecting into it. */
-  shouldFollowRedirect?: (targetUrl: string) => Promise<'allow' | 'disallow' | 'budget' | 'hop'>;
+  shouldFollowRedirect?: (targetUrl: string, currentUrl: string) => Promise<'allow' | 'disallow' | 'budget' | 'hop'>;
   /** Called immediately before each guarded fetch, with the URL actually
    * contacted, so pacing can record request-start time rather than permit
    * time. */
@@ -1046,7 +1046,7 @@ export async function fetchProfilerUrl(
         const decision = remainingMs <= 0
           ? 'timeout' as const
           : await Promise.race([
-              options.shouldFollowRedirect(nextUrl),
+              options.shouldFollowRedirect(nextUrl, currentUrl),
               new Promise<'timeout'>(resolve => { gateTimer = setTimeout(() => resolve('timeout'), remainingMs); }),
             ]).finally(() => { if (gateTimer) clearTimeout(gateTimer); });
         if (decision !== 'allow') {

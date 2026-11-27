@@ -47,9 +47,43 @@ test('brand-matched creator websites and known hubs remain eligible', () => {
   assert.equal(isKnownCommunityDestinationHost('stan.store'), true);
 });
 
+test('social-only candidates remain claimable without website evidence', async () => {
+  const social = makeDiscordCandidate({
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'SOCIAL_PROFILES',
+    rawLocator: 'https://discord.gg/SOCIALROOM',
+    normalizedLocator: 'https://discord.gg/SOCIALROOM',
+    nativeInviteCode: 'SOCIALROOM',
+    sourceUrl: 'https://instagram.com/some_creator',
+    extractionConfidence: 'EXPLICIT',
+    observations: [{ sourceSurface: 'SOCIAL_PROFILES', sourceUrl: 'https://instagram.com/some_creator', rawLocator: 'https://discord.gg/SOCIALROOM', extractionConfidence: 'EXPLICIT' }],
+  });
+  const owned = { ...social, ...inferDiscordOwnership(social, { creatorName: 'Some Creator' }) };
+  const claimed: string[] = [];
+  await admitInspectionDiscordCandidates([owned] as never, null, 'chanX', {
+    persist: async () => {},
+    claim: async (items: Array<{ code: string }>) => {
+      claimed.push(...items.map(item => item.code));
+      return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanX' }));
+    },
+    removeLosers: async () => 0,
+    executionNow: async () => new Date().toISOString(),
+  } as never);
+  assert.deepEqual(claimed, ['socialroom']);
+});
+
 test('static candidates without ownership evidence cannot claim the registry', async () => {
   const falseCandidate = websiteCandidate('N8NDOCS', 'https://docs.n8n.io/integrations/');
   const falseOwned = { ...falseCandidate, ...inferDiscordOwnership(falseCandidate, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] }) };
+  const mixedCandidate = websiteCandidate('MIXEDDOCS', 'https://docs.n8n.io/integrations/');
+  const mixed = {
+    ...mixedCandidate,
+    ...inferDiscordOwnership(mixedCandidate, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] }),
+    observations: [
+      { sourceSurface: 'CREATOR_WEBSITES' as const, sourceUrl: 'https://docs.n8n.io/integrations/', rawLocator: 'https://discord.gg/MIXEDDOCS', extractionConfidence: 'EXPLICIT' as const },
+      { sourceSurface: 'YOUTUBE_COMMENTS' as const, sourceUrl: 'https://youtube.com/channel/UC123', rawLocator: 'https://discord.gg/MIXEDDOCS', extractionConfidence: 'EXPLICIT' as const },
+    ],
+  };
   const legitCandidate = websiteCandidate('DMSCLASS', 'https://dailymarketschool.com/demo-lessons');
   const legitOwned = { ...legitCandidate, ...inferDiscordOwnership(legitCandidate, { creatorName: 'Daily Market School', creatorWebsiteHosts: ['dailymarketschool.com'] }) };
   const claimed: string[] = [];
@@ -63,10 +97,11 @@ test('static candidates without ownership evidence cannot claim the registry', a
     removeLosers: async () => 0,
     executionNow: async () => new Date().toISOString(),
   };
-  const result = await admitInspectionDiscordCandidates([falseOwned, legitOwned] as never, null, 'chanX', deps as never);
+  const result = await admitInspectionDiscordCandidates([falseOwned, mixed, legitOwned] as never, null, 'chanX', deps as never);
   assert.deepEqual(claimed, ['dmsclass']);
   assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode), ['DMSCLASS']);
   assert.equal(persisted.includes(falseOwned.candidateId), false);
+  assert.equal(persisted.includes(mixed.candidateId), false);
 });
 
 test('third-party pages cannot open unrelated external hosts', () => {
