@@ -407,8 +407,8 @@ test('processing retry jobs persist click progress for their remaining attempts'
 
 test('E6: orphan drain re-admits claimable orphans and removes foreign-owned residue', async () => {
   const orphans = [
-    { candidateId: 'orphan-free', rawLocator: 'discord.gg/free', normalizedLocator: 'https://discord.gg/free', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://site.example/', observations: [], canonicalCode: 'free', discoveredAt: '2026-10-18T00:00:00.000Z' },
-    { candidateId: 'orphan-taken', rawLocator: 'discord.gg/taken', normalizedLocator: 'https://discord.gg/taken', locatorType: 'NATIVE_INVITE', sourceSurface: 'CREATOR_WEBSITES', sourceUrl: 'https://site.example/', observations: [], canonicalCode: 'taken', discoveredAt: '2026-10-18T00:00:01.000Z' },
+    { candidateId: 'orphan-free', rawLocator: 'discord.gg/free', normalizedLocator: 'https://discord.gg/free', locatorType: 'NATIVE_INVITE', sourceSurface: 'CHANNEL_EXTERNAL_LINKS', sourceUrl: 'https://youtube.test/channel/about', observations: [], canonicalCode: 'free', discoveredAt: '2026-10-18T00:00:00.000Z' },
+    { candidateId: 'orphan-taken', rawLocator: 'discord.gg/taken', normalizedLocator: 'https://discord.gg/taken', locatorType: 'NATIVE_INVITE', sourceSurface: 'CHANNEL_EXTERNAL_LINKS', sourceUrl: 'https://youtube.test/channel/about', observations: [], canonicalCode: 'taken', discoveredAt: '2026-10-18T00:00:01.000Z' },
   ];
   const removed: string[][] = [];
   const claims: string[] = [];
@@ -453,6 +453,53 @@ test('E6: orphan drain preserves the original invite casing and ownership eviden
   assert.equal(result.candidates[0]?.ownershipStatus, 'CREATOR_OWNED');
   assert.deepEqual(removed, []);
   assert.deepEqual(result.discardedOwnerChannelIds, []);
+});
+
+test('E6: orphan drain defers rows without provenance instead of inventing a controlled surface', async () => {
+  let claimCalls = 0;
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async () => { claimCalls += 1; return []; },
+    list: async () => [{
+      candidateId: 'orphan-unprovenanced',
+      rawLocator: 'https://discord.gg/LEGACYROOM',
+      normalizedLocator: 'https://discord.gg/legacyroom',
+      locatorType: 'NATIVE_INVITE',
+      sourceSurface: null,
+      sourceUrl: null,
+      observations: [],
+      canonicalCode: 'legacyroom',
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never, 5, { creatorName: 'Some Creator', creatorWebsiteHosts: ['creator.example'] });
+  assert.equal(claimCalls, 0, 'unprovenanced rows never reach the global registry');
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.discardedOwnerChannelIds, []);
+  assert.deepEqual(removed, [], 'deferred rows stay available for a later inspection with real provenance');
+});
+
+test('E6: orphan drain does not re-claim an old unowned static row', async () => {
+  let claimCalls = 0;
+  const removed: string[][] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async () => { claimCalls += 1; return []; },
+    list: async () => [{
+      candidateId: 'orphan-docs',
+      rawLocator: 'https://discord.gg/N8NDOCS',
+      normalizedLocator: 'https://discord.gg/n8ndocs',
+      locatorType: 'NATIVE_INVITE',
+      sourceSurface: 'CREATOR_WEBSITES',
+      sourceUrl: 'https://docs.n8n.io/integrations/',
+      observations: [],
+      canonicalCode: 'n8ndocs',
+      discoveredAt: '2026-10-18T00:00:00.000Z',
+    }],
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
+  } as never, 5, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] });
+  assert.equal(claimCalls, 0, 'a docs-page orphan cannot claim the registry');
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(removed, []);
 });
 
 test('E6: drain is a no-op when no orphans exist', async () => {

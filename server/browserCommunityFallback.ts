@@ -2225,6 +2225,9 @@ export function sumRenderedPageContextCounts(
 }
 
 export interface RenderedAnchorClickSkipOptions {
+  /** Original crawl seed. Keeps the destination policy from treating an
+   * apex/www or HTTP/HTTPS redirect as an unrelated third-party page. */
+  seedUrl?: string;
   /** True while the bounded cross-origin pass will pursue eligible
    * destinations. Cross-host anchors are then enqueue-owned, not clicked. */
   crossOriginPursued?: boolean;
@@ -2295,6 +2298,7 @@ export function isSkippableNavigableAnchorClick(
     return !shouldEnqueueRenderedCrossOriginLink({
       url: absolute.toString(),
       currentUrl: page.toString(),
+      seedUrl: options.seedUrl,
       anchorText: target.text || '',
     });
   }
@@ -3334,6 +3338,8 @@ export interface RenderedClickLoopInput {
    * retry does not repeatedly select the same DOM-order subset of controls
    * revealed by a previous click. */
   clickOffset?: number;
+  /** Original crawl seed, used by the destination hop guard. */
+  seedUrl?: string;
   /** True while the bounded cross-origin pass will pursue eligible
    * destinations. Cross-host anchors are then enqueue-owned, not clicked. */
   crossOriginPursued?: boolean;
@@ -3495,6 +3501,7 @@ export async function runRenderedClickLoop(input: RenderedClickLoopInput): Promi
           pendingQueuedTargets,
           input.clickOffset,
           {
+            seedUrl: input.seedUrl,
             crossOriginPursued: input.crossOriginPursued,
             queuedDestinations: input.queuedDestinations,
           },
@@ -6024,6 +6031,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             // retain it here before the click planner drops it; otherwise a
             // JS-inserted direct Discord/invite href would be lost entirely.
             retainSkippableAnchorEvidence(controls, page.url(), retain, {
+              seedUrl,
               crossOriginPursued: crossOriginPursuitActive(),
               queuedDestinations: isQueuedDestination,
             });
@@ -6039,6 +6047,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
               limits.clickOffset,
               undefined,
               {
+                seedUrl,
                 crossOriginPursued: crossOriginPursuitActive(),
                 queuedDestinations: isQueuedDestination,
               },
@@ -6063,6 +6072,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
             for (const control of controls) {
               if (control.marker && !clickPlan.toClick.some(target => target.marker === control.marker)
                 && !isSkippableNavigableAnchorClick(control, page.url(), {
+                  seedUrl,
                   crossOriginPursued: crossOriginPursuitActive(),
                   queuedDestinations: isQueuedDestination,
                 })) {
@@ -6146,6 +6156,7 @@ export async function crawlRenderedCommunitySurface(seedUrl: string, budget: Par
                 // a real navigation commits a new document and changes it.
                 documentIdentity: () => page.evaluate(() => performance.timeOrigin),
                 clickOffset: limits.clickOffset,
+                seedUrl,
                 crossOriginPursued: crossOriginPursuitActive(),
                 queuedDestinations: isQueuedDestination,
                 countedSkips: countedControlSkips,

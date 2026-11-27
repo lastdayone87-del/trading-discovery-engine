@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { inferDiscordOwnership, makeDiscordCandidate } from './discordCandidates';
-import { isKnownCommunityDestinationHost, shouldFollowDestination } from './destinationPolicy';
+import { isAllowedChildRedirect, isKnownCommunityDestinationHost, shouldFollowDestination } from './destinationPolicy';
 import { admitInspectionDiscordCandidates } from './queueManager';
+import { isSkippableNavigableAnchorClick, shouldEnqueueRenderedCrossOriginLink } from './browserCommunityFallback';
 
 function websiteCandidate(code: string, sourceUrl: string) {
   return makeDiscordCandidate({
@@ -150,4 +151,56 @@ test('third-party pages cannot open unrelated external hosts', () => {
     });
     assert.equal(known.eligible, true, url);
   }
+});
+
+test('seed scheme/apex redirects stay first-party in static and rendered policy', () => {
+  const seed = 'http://www.creator.example';
+  const redirected = shouldFollowDestination({
+    url: 'https://unknown.example/community',
+    currentUrl: 'https://creator.example/',
+    seedUrl: seed,
+    anchorText: 'Join the community',
+  });
+  assert.equal(redirected.eligible, true);
+  const docsHop = shouldFollowDestination({
+    url: 'https://unknown.example/community',
+    currentUrl: 'https://docs.n8n.io/integrations/',
+    seedUrl: seed,
+    anchorText: 'Join the community',
+  });
+  assert.equal(docsHop.eligible, false);
+  assert.equal(docsHop.reason, 'external-page-hop');
+  assert.equal(shouldEnqueueRenderedCrossOriginLink({
+    url: 'https://unknown.example/community',
+    currentUrl: 'https://creator.example/',
+    seedUrl: seed,
+    anchorText: 'Join the community',
+  }), true);
+  assert.equal(shouldEnqueueRenderedCrossOriginLink({
+    url: 'https://unknown.example/community',
+    currentUrl: 'https://docs.n8n.io/integrations/',
+    seedUrl: seed,
+    anchorText: 'Join the community',
+  }), false);
+  assert.equal(isSkippableNavigableAnchorClick(
+    { href: 'https://unknown.example/community', text: 'Join the community' },
+    'https://creator.example/',
+    { seedUrl: seed, crossOriginPursued: false },
+  ), false);
+  assert.equal(isSkippableNavigableAnchorClick(
+    { href: 'https://unknown.example/community', text: 'Join the community' },
+    'https://docs.n8n.io/integrations/',
+    { seedUrl: seed, crossOriginPursued: false },
+  ), true);
+});
+
+test('creator first-party redirects may hand off to a separate community domain', () => {
+  const seed = new URL('http://www.creator.example');
+  const redirectedSeed = new URL('https://creator.example');
+  assert.equal(isAllowedChildRedirect(redirectedSeed, redirectedSeed, new URL('https://community.example/join')), true,
+    'a creator-authored /join redirect is not an external-page hop');
+  assert.equal(isAllowedChildRedirect(new URL('https://creator.example'), new URL('https://docs.n8n.io/integrations/'), new URL('https://unknown.example/community')), false,
+    'once off the creator site, unrelated hosts remain blocked');
+  assert.equal(isAllowedChildRedirect(new URL('https://creator.example'), new URL('https://docs.n8n.io/integrations/'), new URL('https://www.skool.com/trader')), true,
+    'an evidenced community platform remains reachable from a reference page');
 });

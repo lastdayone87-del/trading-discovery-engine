@@ -25,6 +25,35 @@ import {
  * host, preserving protection against crawling arbitrary outbound links.
  */
 
+/** Host identity used for first-party redirect checks. Scheme, port, a `www.`
+ * prefix, and subdomains of the same creator host must not turn an ordinary
+ * apex/www or HTTP/HTTPS redirect into a third-party hop. */
+function normalizedSiteHost(url: URL): string {
+  return url.hostname.toLowerCase().replace(/^www\./, '');
+}
+export function isSameCreatorSite(first: URL, second: URL): boolean {
+  const firstHost = normalizedSiteHost(first);
+  const secondHost = normalizedSiteHost(second);
+  if (!firstHost || !secondHost) return false;
+  return firstHost === secondHost
+    || firstHost.endsWith(`.${secondHost}`)
+    || secondHost.endsWith(`.${firstHost}`);
+}
+
+/** Redirect-host policy for a child page already admitted by the seed crawl.
+ * While the crawl is still on the creator's own site, the redirect is
+ * creator-authored and may hand off to a separate community domain. After the
+ * crawl leaves that site, only same-site or evidenced-community targets are
+ * allowed, so an external docs/reference page cannot fan out to unknown hosts. */
+export function isAllowedChildRedirect(seed: URL, current: URL, target: URL): boolean {
+  if (isSameCreatorSite(current, seed)) return true;
+  if (isSameCreatorSite(target, seed) || isSameCreatorSite(target, current)) return true;
+  // Off the creator's site, a redirect may only reach a known community
+  // platform. A generic `/community` path on an unrelated host is not enough:
+  // docs/reference pages routinely contain such links.
+  return isKnownCommunityDestinationHost(target.hostname);
+}
+
 const LINK_HUB_HOSTS = [
   'linktr.ee',
   'beacons.ai',
@@ -168,12 +197,16 @@ export function shouldFollowDestination(input: {
   let externalPageHop = false;
   if (input.seedUrl && input.currentUrl && !sameOrigin && !knownHost) {
     try {
-      const seedOrigin = new URL(input.seedUrl).origin;
-      const currentOrigin = new URL(input.currentUrl).origin;
-      const targetOrigin = new URL(input.url).origin;
-      // Returning to the creator's own host is always first-party, even when
-      // the current page is an external reference.
-      externalPageHop = currentOrigin !== seedOrigin && targetOrigin !== seedOrigin;
+      const seed = new URL(input.seedUrl);
+      const current = new URL(input.currentUrl);
+      const target = new URL(input.url);
+      // Apex/www and HTTP/HTTPS redirects are still the creator's site. Treat
+      // same-site subdomains as first-party, and allow returns to the creator
+      // host from an external reference page. Only a target unrelated to both
+      // the seed site and the current site is an external-page hop.
+      externalPageHop = !isSameCreatorSite(current, seed)
+        && !isSameCreatorSite(target, seed)
+        && !isSameCreatorSite(current, target);
     } catch { externalPageHop = false; }
   }
   if (externalPageHop) {

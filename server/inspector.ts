@@ -28,7 +28,7 @@ import {
   MULTILINGUAL_WEAK_COMMUNITY_EVIDENCE,
 } from './multilingualCommunityLexicon';
 import { isAcquisitionLadderEnabled, resolveRenderEscalation, selectSameSiteSitemapSeedCandidates, selectStructuredNavigationCandidates, MAX_LADDER_SITEMAP_SEEDS, MAX_LADDER_PROFILE_RUNS_PER_INSPECTION, ACQUISITION_LADDER_POLICY_VERSION } from './acquisitionLadder';
-import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget, isKnownCommunityDestinationHost } from './destinationPolicy';
+import { shouldFollowDestination, selectDiverseNavigationQueue, createDestinationBudget, isKnownCommunityDestinationHost, isSameCreatorSite, isAllowedChildRedirect } from './destinationPolicy';
 import { RobotsCrawlPolicy, isRobotsCrawlEnforcementEnabled } from './robotsCrawlPolicy';
 import { markRobotsRequestStarted, paceRobotsOrigin } from './robotsPacing';
 import { isCrawlerCanarySelected, mergeNavigationQueue, resolveCrawlerExplorationLimits } from './crawlerExplorationLimits';
@@ -720,17 +720,7 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
     // will never be contacted does not generate a policy fetch.
     try{
       const seed=new URL(seedUrl), current=new URL(currentHop||currentChild), targetUrl=new URL(target);
-      const stripWww=(host:string)=>host.toLowerCase().replace(/^www\./,'');
-      const seedHost=stripWww(seed.hostname), targetHost=stripWww(targetUrl.hostname);
-      const sameCreatorSite=targetHost===seedHost||targetHost.endsWith(`.${seedHost}`)||seedHost.endsWith(`.${targetHost}`);
-      const knownTarget=isKnownCommunityDestinationHost(targetUrl.hostname);
-      const communityTargetText=`${decodeCommunityHost(target)} ${decodeCommunityPath(target)}`;
-      const communityTarget=knownTarget||COMMUNITY_PATH_HINTS.test(communityTargetText)||MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(communityTargetText);
-      if(current.origin===seed.origin){
-        if(targetUrl.origin!==seed.origin&&!sameCreatorSite&&!communityTarget)return 'hop';
-      }else if(targetUrl.origin!==current.origin&&targetUrl.origin!==seed.origin&&!knownTarget){
-        return 'hop';
-      }
+      if(!isAllowedChildRedirect(seed,current,targetUrl))return 'hop';
     }catch{/* malformed redirect is handled by the transport guard */}
     return robotsPermit(target);
   };

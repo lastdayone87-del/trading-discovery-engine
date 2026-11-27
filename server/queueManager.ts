@@ -450,22 +450,25 @@ function isStaticWebsiteClaimEligible(candidate: DiscordCandidate): boolean {
     ? candidate.observations
     : [{ sourceSurface: candidate.sourceSurface, sourceUrl: candidate.sourceUrl }];
   if (candidate.ownershipStatus === 'CREATOR_OWNED') return true;
+  // Viewer comments and curated playlist items are not controlled surfaces.
+  // Ignore them when classifying the candidate's provenance so mixing a docs
+  // page with a viewer comment still applies the static-website guard instead
+  // of falling through a mixed-observation exemption.
+  const unownedSurfaces = new Set(['YOUTUBE_COMMENTS', 'YOUTUBE_PLAYLIST_ITEMS']);
+  const provenance = observations.filter(observation => !unownedSurfaces.has(observation.sourceSurface));
+  if (!provenance.length) return false;
   // A creator-controlled surface is sufficient even when the aggregate
-  // ownership score is uncertain. Viewer comments and curated playlist items
-  // are not controlled surfaces; mixing one with an uncertain website must not
-  // turn the unowned code into a claim.
+  // ownership score is uncertain.
   const controlledSurfaces = new Set(['YOUTUBE_ABOUT', 'CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'RECENT_VIDEO_DESCRIPTIONS']);
-  if (observations.some(observation => controlledSurfaces.has(observation.sourceSurface))) return true;
+  if (provenance.some(observation => controlledSurfaces.has(observation.sourceSurface))) return true;
   // A directly linked social profile is creator-controlled enough to keep
-  // its invite unless ownership is explicitly third-party. Do not let a mixed
-  // website observation use this path.
+  // its invite unless ownership is explicitly third-party. Viewer comments do
+  // not change that classification.
   if (candidate.ownershipStatus !== 'THIRD_PARTY'
-    && observations.length > 0
-    && observations.every(observation => observation.sourceSurface === 'SOCIAL_PROFILES')) return true;
-  const staticOnly = observations.length > 0
-    && observations.every(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
+    && provenance.every(observation => observation.sourceSurface === 'SOCIAL_PROFILES')) return true;
+  const staticOnly = provenance.every(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
   if (!staticOnly) return false;
-  for (const observation of observations) {
+  for (const observation of provenance) {
     try {
       const host = new URL(observation.sourceUrl || '').hostname.toLowerCase().replace(/^www\./, '');
       if (host && isKnownCommunityDestinationHost(host)) return true;
@@ -631,6 +634,18 @@ export async function drainOrphanDiscordCandidates(
   // before claiming. Old rows written before the ownership guard must not be
   // re-admitted merely because they were persisted once.
   const recovered = rows.map(row => {
+    const persistedObservations = Array.isArray(row.observations)
+      ? row.observations.filter((observation): observation is NonNullable<DiscordCandidate['observations']>[number] =>
+        Boolean(observation) && typeof observation === 'object')
+      : [];
+    const observationSurface = persistedObservations.find(observation => observation.sourceSurface)?.sourceSurface;
+    const observationUrl = persistedObservations.find(observation => observation.sourceUrl)?.sourceUrl;
+    // Never invent channel-controlled provenance for an old row. Rows with no
+    // recorded surface stay unprovenanced and are deferred rather than claimed.
+    const sourceSurface = (row.sourceSurface as DiscordCandidate['sourceSurface'] | null)
+      || observationSurface
+      || null;
+    const sourceUrl = row.sourceUrl || observationUrl || undefined;
     const code = discordInviteCodeOf(row.canonicalCode || row.normalizedLocator);
     const nativeInviteCode = extractDiscordInviteCodeRaw(row.rawLocator)
       || extractDiscordInviteCodeRaw(row.normalizedLocator)
@@ -640,24 +655,36 @@ export async function drainOrphanDiscordCandidates(
       candidateId: row.candidateId,
       canonicalInviteId: code ? canonicalDiscordInviteId(code) : undefined,
       locatorType: (row.locatorType as DiscordCandidate['locatorType']) || 'NATIVE_INVITE',
-      sourceSurface: (row.sourceSurface as DiscordCandidate['sourceSurface']) || 'CREATOR_WEBSITES',
+      sourceSurface: sourceSurface || 'CREATOR_WEBSITES',
       rawLocator: row.rawLocator || row.normalizedLocator,
       normalizedLocator: row.normalizedLocator,
       nativeInviteCode,
-      sourceUrl: row.sourceUrl || undefined,
+      sourceUrl,
       extractionConfidence: 'EXPLICIT',
-      observations: row.observations as DiscordCandidate['observations'],
+      observations: persistedObservations,
     };
-    return { row, code, candidate: { ...candidate, ...inferDiscordOwnership(candidate, ownership) } };
+    return {
+      row,
+      code,
+      sourceSurface,
+      sourceUrl: sourceUrl || null,
+      hasProvenance: Boolean(sourceSurface),
+      candidate: { ...candidate, ...inferDiscordOwnership(candidate, ownership) },
+    };
   });
-  const ownershipContext = Boolean(ownership.creatorName || ownership.creatorWebsiteHosts?.length);
-  const skipped = recovered.filter(item => ownershipContext && item.code && !isStaticWebsiteClaimEligible(item.candidate));
+  // Orphans are deferred (left in place for a later inspection) when their
+  // provenance is missing or when static-website ownership cannot be proved.
+  const skipped = recovered.filter(item =>
+    !item.hasProvenance || (item.code && !isStaticWebsiteClaimEligible(item.candidate)));
   const skippedIds = new Set(skipped.map(item => item.candidate.candidateId).filter(Boolean));
   const sources = new Map<string, { surface: string | null; url: string | null }>();
   for (const item of recovered) {
     if (!item.code || skippedIds.has(item.candidate.candidateId)) continue;
-    if (!sources.has(item.code)) sources.set(item.code, { surface: item.row.sourceSurface, url: item.row.sourceUrl });
+    if (!sources.has(item.code)) sources.set(item.code, { surface: item.sourceSurface, url: item.sourceUrl });
   }
+  // Deferred rows never touch the registry (and an empty claim would still be
+  // an unnecessary write-path round trip).
+  if (!sources.size) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
   const claims = await deps.claim([...sources.entries()].map(([code, src]) => ({ code, sourceSurface: src.surface, sourceUrl: src.url })), channelId);
   const admitted = new Set(claims.filter(claim => claim.admitted).map(claim => claim.code));
   // A discarded orphan is still positive evidence that the channel publishes
@@ -674,7 +701,8 @@ export async function drainOrphanDiscordCandidates(
   const candidates: DiscordCandidate[] = [];
   for (const item of recovered) {
     const { code, candidate } = item;
-    if (!code || skippedIds.has(candidate.candidateId) || !admitted.has(code)) {
+    if (skippedIds.has(candidate.candidateId)) continue;
+    if (!code || !admitted.has(code)) {
       const owner = code ? foreignOwnerByCode.get(code) : undefined;
       if (owner) discardedOwnerChannelIds.add(owner);
       if (candidate.candidateId) loserIds.push(candidate.candidateId);
