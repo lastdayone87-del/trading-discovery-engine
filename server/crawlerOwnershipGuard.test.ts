@@ -76,13 +76,14 @@ test('static candidates without ownership evidence cannot claim the registry', a
   const falseCandidate = websiteCandidate('N8NDOCS', 'https://docs.n8n.io/integrations/');
   const falseOwned = { ...falseCandidate, ...inferDiscordOwnership(falseCandidate, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] }) };
   const mixedCandidate = websiteCandidate('MIXEDDOCS', 'https://docs.n8n.io/integrations/');
+  const mixedObservations = [
+    { sourceSurface: 'CREATOR_WEBSITES' as const, sourceUrl: 'https://docs.n8n.io/integrations/', rawLocator: 'https://discord.gg/MIXEDDOCS', extractionConfidence: 'EXPLICIT' as const },
+    { sourceSurface: 'YOUTUBE_COMMENTS' as const, sourceUrl: 'https://youtube.com/channel/UC123', rawLocator: 'https://discord.gg/MIXEDDOCS', extractionConfidence: 'EXPLICIT' as const },
+  ];
+  const mixedBase = { ...mixedCandidate, observations: mixedObservations };
   const mixed = {
-    ...mixedCandidate,
-    ...inferDiscordOwnership(mixedCandidate, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] }),
-    observations: [
-      { sourceSurface: 'CREATOR_WEBSITES' as const, sourceUrl: 'https://docs.n8n.io/integrations/', rawLocator: 'https://discord.gg/MIXEDDOCS', extractionConfidence: 'EXPLICIT' as const },
-      { sourceSurface: 'YOUTUBE_COMMENTS' as const, sourceUrl: 'https://youtube.com/channel/UC123', rawLocator: 'https://discord.gg/MIXEDDOCS', extractionConfidence: 'EXPLICIT' as const },
-    ],
+    ...mixedBase,
+    ...inferDiscordOwnership(mixedBase, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] }),
   };
   const legitCandidate = websiteCandidate('DMSCLASS', 'https://dailymarketschool.com/demo-lessons');
   const legitOwned = { ...legitCandidate, ...inferDiscordOwnership(legitCandidate, { creatorName: 'Daily Market School', creatorWebsiteHosts: ['dailymarketschool.com'] }) };

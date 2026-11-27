@@ -724,8 +724,10 @@ export async function crawlExternalLinks(links:string[],logDetails:string[]=[],d
       const seedHost=stripWww(seed.hostname), targetHost=stripWww(targetUrl.hostname);
       const sameCreatorSite=targetHost===seedHost||targetHost.endsWith(`.${seedHost}`)||seedHost.endsWith(`.${targetHost}`);
       const knownTarget=isKnownCommunityDestinationHost(targetUrl.hostname);
+      const communityTargetText=`${decodeCommunityHost(target)} ${decodeCommunityPath(target)}`;
+      const communityTarget=knownTarget||COMMUNITY_PATH_HINTS.test(communityTargetText)||MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(communityTargetText);
       if(current.origin===seed.origin){
-        if(targetUrl.origin!==seed.origin&&!sameCreatorSite&&!knownTarget)return 'hop';
+        if(targetUrl.origin!==seed.origin&&!sameCreatorSite&&!communityTarget)return 'hop';
       }else if(targetUrl.origin!==current.origin&&targetUrl.origin!==seed.origin&&!knownTarget){
         return 'hop';
       }
