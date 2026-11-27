@@ -203,6 +203,7 @@ import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIR
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, detectDiscordInviteCaseCollisions, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, isUnownedSurfaceDiscordCandidate, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
+import { isKnownCommunityDestinationHost } from './destinationPolicy';
 import {
   candidatesFromYouTubeSnapshot,
   collectYouTubeSurfaceSnapshot,
@@ -434,6 +435,33 @@ export interface DiscordChokeDeps {
    * the deletion watermark shares the clock that wrote `discovered_at`. */
   executionNow(): Promise<string>;
 }
+/** Static website candidates need creator ownership evidence before they can
+ * claim the global registry. A candidate found only on a third-party docs,
+ * wiki, market-reference or aggregator page is not attributed to the creator
+ * merely because that page mentions Discord. Exact creator hosts and known
+ * community/link-hub platforms qualify; unknown subdomains of a linked site
+ * do not. */
+function isStaticWebsiteClaimEligible(candidate: DiscordCandidate): boolean {
+  // Legacy/test callers may not have run ownership inference yet. Preserve the
+  // historical fail-open behavior for those; production inspections always
+  // carry an explicit status before the choke point.
+  if (candidate.ownershipStatus === undefined) return true;
+  const observations = candidate.observations?.length
+    ? candidate.observations
+    : [{ sourceSurface: candidate.sourceSurface, sourceUrl: candidate.sourceUrl }];
+  const staticOnly = observations.length > 0
+    && observations.every(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
+  if (!staticOnly) return true;
+  if (candidate.ownershipStatus === 'CREATOR_OWNED') return true;
+  for (const observation of observations) {
+    try {
+      const host = new URL(observation.sourceUrl || '').hostname.toLowerCase().replace(/^www\./, '');
+      if (host && isKnownCommunityDestinationHost(host)) return true;
+    } catch { /* malformed provenance is not ownership */ }
+  }
+  return false;
+}
+
 export async function admitInspectionDiscordCandidates(
   structuredCandidates: DiscordCandidate[],
   foundInvite: string | null | undefined,
@@ -449,19 +477,21 @@ export async function admitInspectionDiscordCandidates(
   // Keep them out of the global claim path until a creator-owned surface
   // corroborates the same code; otherwise a viewer can permanently claim
   // another creator's invite before ownership is known.
-  const unownedCandidates = structuredCandidates.filter(isUnownedSurfaceDiscordCandidate);
-  const claimableCandidates = structuredCandidates.filter(candidate => !isUnownedSurfaceDiscordCandidate(candidate));
+  const deferredCandidates = structuredCandidates.filter(candidate =>
+    isUnownedSurfaceDiscordCandidate(candidate) || !isStaticWebsiteClaimEligible(candidate));
+  const deferredIds = new Set(deferredCandidates.map(candidate => candidate.candidateId));
+  const claimableCandidates = structuredCandidates.filter(candidate => !deferredIds.has(candidate.candidateId));
   const foundCode = discordInviteCodeOf(foundInvite);
   const foundIsUnownedOnly = !!foundCode
-    && unownedCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode)
+    && deferredCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode)
     && !claimableCandidates.some(candidate => discordInviteCodeOf(candidate.nativeInviteCode) === foundCode);
   const effectiveFoundInvite = foundIsUnownedOnly ? null : foundInvite;
-  if (unownedCandidates.length) {
+  if (deferredCandidates.length) {
     console.info(JSON.stringify({
-      event: 'discord_unowned_surface_candidates_deferred',
+      event: 'discord_unowned_candidates_deferred',
       channelId,
-      count: unownedCandidates.length,
-      codes: unownedCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
+      count: deferredCandidates.length,
+      codes: deferredCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
       timestamp: new Date().toISOString(),
     }));
   }

@@ -32,6 +32,7 @@ const LINK_HUB_HOSTS = [
   'solo.to',
   'campsite.bio',
   'lnk.bio',
+  'stan.store',
 ];
 
 /**
@@ -77,6 +78,7 @@ export type DestinationReason =
   | 'structured-nomination'
   | 'community-evidence'
   | 'no-community-evidence'
+  | 'external-page-hop'
   | 'admission-rejected';
 
 export interface DestinationDecision {
@@ -113,6 +115,12 @@ function hasStrongCommunityEvidence(text: string): boolean {
 export function shouldFollowDestination(input: {
   url: string;
   currentUrl?: string;
+  /** Original admitted creator seed. When the current page is already on a
+   * third-party host, unknown outbound hosts are not followed: only its own
+   * pages, known community/shortener hosts, and terminal Discord links stay
+   * eligible. This prevents docs/wiki pages from cascading into unrelated
+   * communities. */
+  seedUrl?: string;
   anchorText?: string;
   baseScore?: number;
   structuredNominated?: boolean;
@@ -157,6 +165,17 @@ export function shouldFollowDestination(input: {
     || MULTILINGUAL_HOST_COMMUNITY_EVIDENCE.test(hostEvidence)
     || MULTILINGUAL_URL_COMMUNITY_EVIDENCE.test(pathEvidence);
   const weakEvidence = WEAK_COMMUNITY_EVIDENCE.test(text);
+  let externalPageHop = false;
+  if (input.seedUrl && input.currentUrl && !sameOrigin && !knownHost) {
+    try {
+      const seedOrigin = new URL(input.seedUrl).origin;
+      const currentOrigin = new URL(input.currentUrl).origin;
+      externalPageHop = currentOrigin !== seedOrigin;
+    } catch { externalPageHop = false; }
+  }
+  if (externalPageHop) {
+    return { eligible: false, score: 0, reason: 'external-page-hop' };
+  }
   const eligible = sameOrigin
     || Boolean(input.structuredNominated)
     || knownHost

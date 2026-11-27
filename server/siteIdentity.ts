@@ -34,6 +34,7 @@ const PATH_TENANT_HOSTS = [
   'campsite.bio',
   'lnk.bio',
   'patreon.com',
+  'stan.store',
 ] as const;
 
 export const SITE_IDENTITY_POLICY_VERSION = 'site-identity-v1';

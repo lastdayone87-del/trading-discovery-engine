@@ -92,6 +92,7 @@ const SOCIAL_HOSTS = new Set([
 const LINK_HUB_HOSTS = new Set([
   'linktr.ee', 'www.linktr.ee', 'beacons.ai', 'www.beacons.ai', 'bio.link', 'www.bio.link',
   'solo.to', 'www.solo.to', 'campsite.bio', 'www.campsite.bio', 'lnk.bio', 'www.lnk.bio',
+  'stan.store', 'www.stan.store',
 ]);
 const COMMUNITY_PLATFORM_HOSTS = new Set([
   'skool.com', 'www.skool.com', 'whop.com', 'www.whop.com', 'circle.so', 'www.circle.so',
