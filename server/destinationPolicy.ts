@@ -1,4 +1,5 @@
 import { assessCrawlAdmission, isKnownBrokerOrExchangeHost } from './communitySurfacePolicy';
+import { isNonTradingReferenceOrApplicationUrl } from './acquisitionRelevance';
 import {
   decodeCommunityHost,
   decodeCommunityPath,
@@ -45,6 +46,7 @@ export function isSameCreatorSite(first: URL, second: URL): boolean {
  * crawl leaves that site, only same-site or evidenced-community targets are
  * allowed, so an external docs/reference page cannot fan out to unknown hosts. */
 export function isAllowedChildRedirect(seed: URL, current: URL, target: URL): boolean {
+  if (isNonTradingReferenceOrApplicationUrl(target.toString())) return false;
   if (isSameCreatorSite(current, seed)) return true;
   if (isSameCreatorSite(target, seed) || isSameCreatorSite(target, current)) return true;
   // Off the creator's site, a redirect may only reach a known community
@@ -107,6 +109,7 @@ export type DestinationReason =
   | 'community-evidence'
   | 'no-community-evidence'
   | 'external-page-hop'
+  | 'reference-host'
   | 'admission-rejected';
 
 export interface DestinationDecision {
@@ -174,6 +177,11 @@ export function shouldFollowDestination(input: {
     }
   }
 
+  // Obvious reference/application hosts are never community destinations.
+  // Same-origin navigation inside a creator's own site remains allowed.
+  if (!sameOrigin && isNonTradingReferenceOrApplicationUrl(input.url)) {
+    return { eligible: false, score: 0, reason: 'reference-host' };
+  }
   const baseScore = Math.max(0, Number(input.baseScore) || 0);
   // Use the destination pathname, never its query string: a tracking parameter
   // such as `?campaign=signal` is not evidence that an unrelated host is a

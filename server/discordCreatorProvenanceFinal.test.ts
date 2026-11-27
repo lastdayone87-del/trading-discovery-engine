@@ -55,6 +55,34 @@ test('canonical domain corroborates but never decides ownership alone',()=>{
   assert.ok(corroborated.ownershipReasons?.includes('CREATOR_BRAND_DOMAIN_MATCH'));
 });
 
+test('repeated pages on an exact creator-linked website corroborate ownership',()=>{
+  const pages=['https://www.flowmatrix-nt8.com/','https://www.flowmatrix-nt8.com/pages/products/signalbuilder','https://www.flowmatrix-nt8.com/pages/flowmatrix-suite','https://www.flowmatrix-nt8.com/pages/products/deepwatch'];
+  const c=makeDiscordCandidate({
+    locatorType:'NATIVE_INVITE',sourceSurface:'CREATOR_WEBSITES',rawLocator:'https://discord.com/invite/2NABMnGKdH',normalizedLocator:'https://discord.gg/2nabmngkdh',nativeInviteCode:'2NABMnGKdH',sourceUrl:pages[1],extractionConfidence:'EXPLICIT',
+    observations:pages.map(url=>({sourceSurface:'CREATOR_WEBSITES' as const,sourceUrl:url,sourcePageUrl:url,rawLocator:'https://discord.com/invite/2NABMnGKdH',extractionConfidence:'EXPLICIT' as const})),
+  });
+  const ownership=inferDiscordOwnership(c,{creatorName:'Tailored Trading',creatorWebsiteHosts:['flowmatrix-nt8.com']});
+  assert.equal(ownership.ownershipStatus,'CREATOR_OWNED');
+  assert.ok(ownership.ownershipReasons?.includes('REPEATED_CREATOR_WEBSITE_PAGES'));
+});
+
+test('docs subdomain pages never qualify as a repeated creator website',()=>{
+  const pages=['https://docs.n8n.io/integrations/','https://docs.n8n.io/credentials/','https://docs.n8n.io/workflows/'];
+  const c=makeDiscordCandidate({
+    locatorType:'NATIVE_INVITE',sourceSurface:'CREATOR_WEBSITES',rawLocator:'https://discord.gg/n8ndocs',normalizedLocator:'https://discord.gg/n8ndocs',nativeInviteCode:'N8NDOCS',sourceUrl:pages[0],extractionConfidence:'EXPLICIT',
+    observations:pages.map(url=>({sourceSurface:'CREATOR_WEBSITES' as const,sourceUrl:url,sourcePageUrl:url,rawLocator:'https://discord.gg/n8ndocs',extractionConfidence:'EXPLICIT' as const})),
+  });
+  const ownership=inferDiscordOwnership(c,{creatorName:'iOSCoding',creatorWebsiteHosts:['n8n.io']});
+  assert.equal(ownership.ownershipStatus,'UNCERTAIN');
+  assert.ok(!ownership.ownershipReasons?.includes('REPEATED_CREATOR_WEBSITE_PAGES'));
+});
+
+test('affiliate links do not become creator-canonical website hosts',()=>{
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://myforexfunds.com/?wpam_id=64562']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://inklyn.app/@apollo']),[]);
+  assert.deepEqual(creatorWebsiteHostsFromLinks(['https://flowmatrix-nt8.com/pages/pricing?utm_source=youtube']),['flowmatrix-nt8.com']);
+});
+
 test('third-party linked site without corroboration stays out of creator-owned',()=>{
   // A creator linking an ordinary third-party tools site must not promote
   // that site's Discord to creator-owned on the link alone.

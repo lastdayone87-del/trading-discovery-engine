@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyUrlRelevance } from './acquisitionRelevance';
+import { classifyUrlRelevance, isNonTradingReferenceOrApplicationUrl } from './acquisitionRelevance';
 
 describe('acquisition relevance tiering (fail-open, recall-safe)', () => {
   it('fails open on missing/errored input', () => {
@@ -152,5 +152,33 @@ describe('acquisition relevance tiering (fail-open, recall-safe)', () => {
     // Invalid/asset handled by admission boundary, not relevance BLOCK.
     const invalid = classifyUrlRelevance({ url: 'https://g/', source: 'VIDEO_1_DESCRIPTION', contextMatches: false });
     assert.equal(invalid.tier, 'ELIGIBLE');
+  });
+});
+
+describe('reference/application host policy', () => {
+  it('flags obvious non-community reference and application hosts', () => {
+    for (const url of [
+      'https://docs.n8n.io/integrations/',
+      'https://es.wikipedia.org/wiki/Portal:Comunidad',
+      'https://play.google.com/store/apps/details?id=com.example',
+      'https://chromewebstore.google.com/detail/x',
+      'https://github.com/UnionKeyHQ/firmware',
+      'https://rentry.co/what',
+    ]) {
+      assert.equal(isNonTradingReferenceOrApplicationUrl(url), true, url);
+    }
+  });
+
+  it('keeps legitimate creator, affiliate, broker, prop-firm and form URLs eligible', () => {
+    for (const url of [
+      'https://myforexfunds.com/contact-us/',
+      'https://apextraderfunding.com/member/aff/go/test',
+      'https://tradeify.co/post/best-trading-discord-servers',
+      'https://flowmatrix-nt8.com/pages/pricing',
+      'https://support.novig.com/en/articles/16075495',
+      'https://docs.google.com/forms/d/e/example/viewform',
+    ]) {
+      assert.equal(isNonTradingReferenceOrApplicationUrl(url), false, url);
+    }
   });
 });

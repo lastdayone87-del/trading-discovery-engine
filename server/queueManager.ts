@@ -37,6 +37,7 @@ import {
   appendDiscordCheckAttempts,
   persistDiscordCandidates,
   claimDiscordInvites,
+  releaseDiscordInviteClaim,
   deleteDiscordCandidates,
   getDbStatementNow,
   listOrphanDiscordCandidates,
@@ -203,7 +204,7 @@ import {COMMUNITY_ACQUISITION_CAPACITY_UNAVAILABLE, COMMUNITY_ACQUISITION_REQUIR
 import { classifyProviderRunOutcome, type ProviderRunOutcome } from './providerCapacityDiagnostics';
 import { discordCandidateCompositeRank } from './discordOwnershipSelection';
 import { admitDiscordCandidates, buildLegacyDiscordCandidate, canonicalDiscordInviteId, detectDiscordInviteCaseCollisions, discordInviteCodeOf, extractDiscordInviteCodeRaw, inferDiscordOwnership, isUnownedSurfaceDiscordCandidate, mergeDiscordCandidates, type DiscordCandidate } from './discordCandidates';
-import { isKnownCommunityDestinationHost } from './destinationPolicy';
+import { isNonTradingReferenceOrApplicationUrl } from './acquisitionRelevance';
 import {
   candidatesFromYouTubeSnapshot,
   collectYouTubeSurfaceSnapshot,
@@ -435,46 +436,26 @@ export interface DiscordChokeDeps {
    * the deletion watermark shares the clock that wrote `discovered_at`. */
   executionNow(): Promise<string>;
 }
-/** Static website candidates need creator ownership evidence before they can
- * claim the global registry. A candidate found only on a third-party docs,
- * wiki, market-reference or aggregator page is not attributed to the creator
- * merely because that page mentions Discord. Exact creator hosts and known
- * community/link-hub platforms qualify; unknown subdomains of a linked site
- * do not. */
-function isStaticWebsiteClaimEligible(candidate: DiscordCandidate): boolean {
-  // Legacy/test callers may not have run ownership inference yet. Preserve the
-  // historical fail-open behavior for those; production inspections always
-  // carry an explicit status before the choke point.
-  if (candidate.ownershipStatus === undefined) return true;
+/** Keep the provenance protections that still matter: viewer comments and
+ * curated playlist items are not creator-controlled, and a static candidate
+ * whose only website provenance is an obvious docs/wiki/app-store host is not a
+ * trading community source. Ownership is a ranking/attribution signal, not a
+ * blanket admission requirement: legitimate creator, affiliate, broker,
+ * prop-firm and partner websites proceed to Discord relevance validation. */
+function isReferenceOnlyStaticCandidate(candidate: DiscordCandidate): boolean {
   const observations = candidate.observations?.length
     ? candidate.observations
     : [{ sourceSurface: candidate.sourceSurface, sourceUrl: candidate.sourceUrl }];
-  if (candidate.ownershipStatus === 'CREATOR_OWNED') return true;
-  // Viewer comments and curated playlist items are not controlled surfaces.
-  // Ignore them when classifying the candidate's provenance so mixing a docs
-  // page with a viewer comment still applies the static-website guard instead
-  // of falling through a mixed-observation exemption.
+  const controlledSurfaces = new Set(['YOUTUBE_ABOUT', 'CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'RECENT_VIDEO_DESCRIPTIONS']);
+  if (observations.some(observation => controlledSurfaces.has(observation.sourceSurface))) return false;
   const unownedSurfaces = new Set(['YOUTUBE_COMMENTS', 'YOUTUBE_PLAYLIST_ITEMS']);
   const provenance = observations.filter(observation => !unownedSurfaces.has(observation.sourceSurface));
-  if (!provenance.length) return false;
-  // A creator-controlled surface is sufficient even when the aggregate
-  // ownership score is uncertain.
-  const controlledSurfaces = new Set(['YOUTUBE_ABOUT', 'CHANNEL_EXTERNAL_LINKS', 'PINNED_COMMENT', 'RECENT_VIDEO_DESCRIPTIONS']);
-  if (provenance.some(observation => controlledSurfaces.has(observation.sourceSurface))) return true;
-  // A directly linked social profile is creator-controlled enough to keep
-  // its invite unless ownership is explicitly third-party. Viewer comments do
-  // not change that classification.
-  if (candidate.ownershipStatus !== 'THIRD_PARTY'
-    && provenance.every(observation => observation.sourceSurface === 'SOCIAL_PROFILES')) return true;
-  const staticOnly = provenance.every(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
-  if (!staticOnly) return false;
-  for (const observation of provenance) {
-    try {
-      const host = new URL(observation.sourceUrl || '').hostname.toLowerCase().replace(/^www\./, '');
-      if (host && isKnownCommunityDestinationHost(host)) return true;
-    } catch { /* malformed provenance is not ownership */ }
-  }
-  return false;
+  if (!provenance.length) return true;
+  const websites = provenance.filter(observation => observation.sourceSurface === 'CREATOR_WEBSITES');
+  if (!websites.length || websites.length !== provenance.length) return false;
+  return websites.every(observation => observation.sourceUrl
+    ? isNonTradingReferenceOrApplicationUrl(observation.sourceUrl)
+    : false);
 }
 
 export async function admitInspectionDiscordCandidates(
@@ -493,7 +474,7 @@ export async function admitInspectionDiscordCandidates(
   // corroborates the same code; otherwise a viewer can permanently claim
   // another creator's invite before ownership is known.
   const deferredCandidates = structuredCandidates.filter(candidate =>
-    isUnownedSurfaceDiscordCandidate(candidate) || !isStaticWebsiteClaimEligible(candidate));
+    isUnownedSurfaceDiscordCandidate(candidate) || isReferenceOnlyStaticCandidate(candidate));
   const deferredIds = new Set(deferredCandidates.map(candidate => candidate.candidateId));
   const claimableCandidates = structuredCandidates.filter(candidate => !deferredIds.has(candidate.candidateId));
   const foundCode = discordInviteCodeOf(foundInvite);
@@ -691,10 +672,11 @@ export async function drainOrphanDiscordCandidates(
       candidate: { ...candidate, ...inferDiscordOwnership(candidate, ownership) },
     };
   });
-  // Orphans are deferred (left in place for a later inspection) when their
-  // provenance is missing or when static-website ownership cannot be proved.
+  // Orphans are deferred (left in place for a later inspection) only when
+  // their provenance is missing or their only evidence is an unowned viewer
+  // surface / obvious reference host.
   const skipped = recovered.filter(item =>
-    !item.hasProvenance || (item.code && !isStaticWebsiteClaimEligible(item.candidate)));
+    !item.hasProvenance || (item.code && (isUnownedSurfaceDiscordCandidate(item.candidate) || isReferenceOnlyStaticCandidate(item.candidate))));
   const skippedIds = new Set(skipped.map(item => item.candidate.candidateId).filter(Boolean));
   const sources = new Map<string, { surface: string | null; url: string | null }>();
   const activeIds = new Set<string>();
@@ -5008,9 +4990,19 @@ export async function inspectAndValidateChannel(
       } catch { /* a settings read must never block the inspection */ }
       if (youtubeExpansionEnabled && isYouTubeSurfaceCanarySelected(channel.channel_id, youtubeCanaryBasisPoints)) {
         try {
+          const expansionStartedAt = Date.now();
           const client = await createYouTubeSurfaceClient();
           const snapshot = await collectYouTubeSurfaceSnapshot(channel.channel_id, client);
           const youtubeCandidates = candidatesFromYouTubeSnapshot(snapshot, channel.channel_id);
+          console.info(JSON.stringify({
+            event: 'youtube_surface_expansion_inspected',
+            channelId: channel.channel_id,
+            basisPoints: youtubeCanaryBasisPoints,
+            candidates: youtubeCandidates.length,
+            codes: youtubeCandidates.map(candidate => candidate.nativeInviteCode).filter(Boolean),
+            durationMs: Date.now() - expansionStartedAt,
+            timestamp: new Date().toISOString(),
+          }));
           if (youtubeCandidates.length) {
             inspection = mergeYouTubeSurfaceCandidates(inspection, youtubeCandidates, {
               creatorName: channel.channel_name,
@@ -5237,6 +5229,7 @@ export async function inspectAndValidateChannel(
       // invite is a fallback, not a reason to suppress a stronger later invite.
       let selected:Awaited<ReturnType<typeof validateDiscordInvite>>|null=null,selectedCandidate= candidates[0],selectedRank=-1;
       const terminalInvalid:Array<{validation:Awaited<ReturnType<typeof validateDiscordInvite>>;candidate:typeof selectedCandidate}>=[];
+      const rejectedRegistryCodes:string[]=[];
       let currentCandidateNonTrading=false;
       for(const candidate of candidates){
         if(!candidate.nativeInviteCode)continue;
@@ -5261,10 +5254,22 @@ export async function inspectAndValidateChannel(
           priorProviderFailureObservations
         });
         await appendDiscordCheckAttempts(channel.channel_id,validation.candidateInviteUrl,validation.status,validation.attempts,{candidateId:candidate.candidateId,rawLocator:candidate.rawLocator,locatorType:candidate.locatorType,resolvedLocator:validation.candidateInviteUrl,sourceSurface:candidate.sourceSurface,sourceUrl:candidate.sourceUrl});
-        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push({validation,candidate});continue;}
-        if(validation.operationalOutcome==='SUCCEEDED'&&validation.status==='NON_TRADING'&&isSameSelectedDiscordCandidate(channel,candidate))currentCandidateNonTrading=true;
+        if(validation.operationalOutcome==='CONFIRMED_INVALID'){terminalInvalid.push({validation,candidate});rejectedRegistryCodes.push(discordInviteCodeOf(candidate.nativeInviteCode)||'');continue;}
+        if(validation.operationalOutcome==='SUCCEEDED'&&validation.status==='NON_TRADING'){
+          rejectedRegistryCodes.push(discordInviteCodeOf(candidate.nativeInviteCode)||'');
+          if(isSameSelectedDiscordCandidate(channel,candidate))currentCandidateNonTrading=true;
+        }
         const rank=discordCandidateCompositeRank(candidate,validation);
         if(rank>selectedRank){selected=validation;selectedCandidate=candidate;selectedRank=rank;}
+      }
+      // Registry dedupe is provisional until Discord-native relevance is known.
+      // Release a first-seen claim when this inspection proves the invite is
+      // non-trading/dead/invalid; source relationships remain recorded.
+      for(const code of new Set(rejectedRegistryCodes.filter(Boolean))){
+        try{
+          const released=await releaseDiscordInviteClaim(code,channel.channel_id);
+          if(released)console.info(JSON.stringify({event:'discord_invite_claim_released',channelId:channel.channel_id,code,reason:'validated_non_trading_or_invalid',timestamp:new Date().toISOString()}));
+        }catch(error){console.warn(JSON.stringify({event:'discord_invite_claim_release_failed',channelId:channel.channel_id,code,error:error instanceof Error?error.message:String(error),timestamp:new Date().toISOString()}));}
       }
       if(!selected&&terminalInvalid.length===candidates.filter(candidate=>candidate.nativeInviteCode).length){selected=terminalInvalid[0].validation;selectedCandidate=terminalInvalid[0].candidate;}
       if(!selected)throw new Error('No resolvable native Discord candidate was available for validation');

@@ -50,6 +50,8 @@ export const ALLOWED_MANIFEST_ENV_KEYS = new Set([
   'RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT',
   'BROWSER_RUNTIME_CONCURRENCY',
   'RENDERED_FALLBACK_MAX_WAIT_MS',
+  'CRAWLEE_MEMORY_MBYTES',
+  'NODE_OPTIONS',
 ]);
 
 export type ConfigCheckSource = 'environment' | 'code' | 'secret';

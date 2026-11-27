@@ -33,6 +33,39 @@ import { assessCrawlAdmission } from './communitySurfacePolicy';
 import { decodeCommunityHost, decodeCommunityPath, MULTILINGUAL_HOST_COMMUNITY_EVIDENCE, MULTILINGUAL_STRONG_COMMUNITY_EVIDENCE } from './multilingualCommunityLexicon';
 import { canonicalSiteIdentity } from './siteIdentity';
 
+const REFERENCE_OR_APPLICATION_HOSTS = new Set([
+  'play.google.com',
+  'apps.apple.com',
+  'chromewebstore.google.com',
+  'addons.mozilla.org',
+  'github.com',
+  'gitlab.com',
+  'rentry.co',
+  'wikipedia.org',
+  'wikimedia.org',
+]);
+const REFERENCE_SUBDOMAIN_LABELS = new Set(['docs', 'wiki']);
+
+/** Obvious non-community reference/application destinations. These are never
+ * useful crawl roots or Discord sources for a trading creator. The match is
+ * structural (docs/wiki subdomains and known app/reference hosts), not an
+ * arbitrary domain blocklist; legitimate business, broker, prop-firm and
+ * affiliate sites remain eligible. */
+export function isNonTradingReferenceOrApplicationUrl(raw: string): boolean {
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { return false; }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  if (!host) return false;
+  // Google Forms are creator/business evidence, unlike Google Docs.
+  if (host === 'docs.google.com') return !parsed.pathname.startsWith('/forms/');
+  if (REFERENCE_OR_APPLICATION_HOSTS.has(host)) return true;
+  if (host === 'wikipedia.org' || host.endsWith('.wikipedia.org')
+    || host === 'wikimedia.org' || host.endsWith('.wikimedia.org')) return true;
+  const firstLabel = host.split('.')[0];
+  return REFERENCE_SUBDOMAIN_LABELS.has(firstLabel);
+}
+
+
 export type RelevanceTier = 'BLOCK' | 'DEMOTE' | 'ELIGIBLE';
 
 export const RELEVANCE_POLICY_VERSION = 'acquisition-relevance-v1';

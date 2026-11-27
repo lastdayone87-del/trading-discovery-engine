@@ -18,7 +18,9 @@
     "RENDERED_ADMISSION_EMERGENCY_PER_HOUR": "72",
     "RENDERED_ADMISSION_DISCOVERY_FLOOR_PCT": "35",
     "BROWSER_RUNTIME_CONCURRENCY": "2",
-    "RENDERED_FALLBACK_MAX_WAIT_MS": "90000"
+    "RENDERED_FALLBACK_MAX_WAIT_MS": "90000",
+    "CRAWLEE_MEMORY_MBYTES": "3072",
+    "NODE_OPTIONS": "--max-old-space-size=3072"
   },
   "secretGroups": [
     { "kind": "youtube", "minimum": 58 },

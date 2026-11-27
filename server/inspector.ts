@@ -409,12 +409,30 @@ export function communityNavigationScore(href:string,label:string):number {
  * excluded (a link proves reference, never ownership), and a leading www.
  * is stripped so aliases match consistently on both comparison sides.
  */
+const AFFILIATE_WEBSITE_QUERY_KEY = /^(?:wpam(?:_id)?|aff(?:iliate)?(?:_id)?|ref(?:erral)?|partner(?:_id)?|promo(?:code)?|coupon|cpa|clickid|subid|irclickid)$/i;
+const LINK_HUB_PROFILE_PATH = /^\/@[^/]+\/?$/;
+/** A referral/affiliate link proves a business relationship, not ownership of
+ * the destination site. Link-in-bio profile URLs are likewise references to a
+ * shared platform profile, not the creator's canonical website. Exclude both
+ * from creator-canonical host derivation so an affiliate/broker page cannot
+ * become CREATOR_OWNED from the link alone. */
+function isNonCanonicalCreatorWebsiteLink(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (LINK_HUB_PROFILE_PATH.test(parsed.pathname)) return true;
+    for (const key of parsed.searchParams.keys()) {
+      if (AFFILIATE_WEBSITE_QUERY_KEY.test(key)) return true;
+    }
+    return false;
+  } catch { return true; }
+}
 export function creatorWebsiteHostsFromLinks(links: Array<string | null | undefined>): string[] {
   const hosts = new Set<string>();
   for (const link of links) {
     if (!link || typeof link !== 'string') continue;
     const normalized = normalizeExternalUrl(link);
     if (!normalized || normalized.kind !== 'WEBSITE') continue;
+    if (isNonCanonicalCreatorWebsiteLink(normalized.url)) continue;
     let host = '';
     try { host = new URL(normalized.url).hostname.toLowerCase().replace(/^www\./, ''); } catch { continue; }
     if (!host.includes('.')) continue;

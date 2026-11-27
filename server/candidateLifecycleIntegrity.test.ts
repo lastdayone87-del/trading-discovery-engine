@@ -612,6 +612,8 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   assert.match(db, /ORDER BY discovered_at ASC,candidate_id ASC LIMIT \$2 OFFSET \$3/);
   const queue = readSource('queueManager.ts');
   assert.match(queue, /event: 'discord_unowned_surface_candidates_deferred'/);
+  assert.match(queue, /releaseDiscordInviteClaim\(code,channel\.channel_id\)/);
+  assert.match(db, /INSERT INTO discord_invite_sources/);
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
   const claimIndex = queue.indexOf('await markSiteInspectionsClaimed(channel.channel_id,executedCandidateIds).catch');

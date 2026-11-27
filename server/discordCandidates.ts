@@ -259,7 +259,7 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
 
   const creatorName=String(input.creatorName||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const creatorParts=creatorIdentityParts(creatorName);
-  const partnerSignals=/affiliate|referral|sponsor|sponsored|partner|broker|course|product|parrain|refer\b|promo|discount/;
+  const partnerSignals=/affiliate|referral|sponsor|sponsored|partner|broker|parrain|refer\b|promo|discount/;
   const provenanceText=observations.map(observation=>[
     observation.sourceUrl,
     observation.sourcePageUrl,
@@ -270,9 +270,27 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
   if(partnerSignals.test(provenanceText)){score-=80;reasons.push('PARTNER_OR_AFFILIATE_SURFACE');}
 
   const candidateHosts=new Set(observations.map(observation=>observation.sourcePageUrl||observation.sourceUrl||'').filter(Boolean));
+  // Count distinct pages per host. Repeated invite evidence across multiple
+  // pages of the exact creator-linked host is materially stronger than a bare
+  // link (which may only reference a third-party docs/tool/broker site), but
+  // subdomains such as docs.n8n.io remain a separate host and do not qualify.
+  const pagesByHost=new Map<string,Set<string>>();
+  for(const candidateUrl of candidateHosts){
+    try{
+      const parsed=new URL(candidateUrl);
+      const host=parsed.hostname.toLowerCase().replace(/^www\./,'');
+      parsed.search='';parsed.hash='';
+      const pages=pagesByHost.get(host)||new Set<string>();
+      pages.add(parsed.toString());
+      pagesByHost.set(host,pages);
+    }catch{/* non-URL provenance (e.g. YouTube surfaces) does not count */}
+  }
   for(const candidateUrl of candidateHosts){
     try{
       const parsed=new URL(candidateUrl),host=parsed.hostname.toLowerCase();
+      const normalizedHost=host.replace(/^www\./,'');
+      const exactLinkedHost=input.creatorWebsiteHosts?.some(candidateHost=>normalizedHost===candidateHost.replace(/^www\./,''))||false;
+      const subdomainLinkedHost=input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))||false;
       // A canonical-domain match corroborates ownership but can never decide it
       // alone: a channel link proves reference, not ownership (a linked broker,
       // tool, docs or sponsor page is a third-party surface). +30 keeps a
@@ -280,7 +298,13 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
       // cross-surface (+15) corroboration is also present. No break here
       // (unlike the branches below): brand/social identity may still corroborate
       // the same host. Awarded at most once.
-      if(!reasons.includes('CREATOR_CANONICAL_DOMAIN')&&input.creatorWebsiteHosts?.some(candidateHost=>host===candidateHost||host.endsWith(`.${candidateHost}`))){score+=30;reasons.push('CREATOR_CANONICAL_DOMAIN');}
+      if(!reasons.includes('CREATOR_CANONICAL_DOMAIN')&&subdomainLinkedHost){score+=30;reasons.push('CREATOR_CANONICAL_DOMAIN');}
+      // Exact creator-linked host + invite evidence on multiple distinct pages
+      // is a genuine creator-site signal. A single page stays at 70/UNCERTAIN
+      // (the linked-site-alone rule), and a docs/tool subdomain never matches.
+      if(exactLinkedHost&&(pagesByHost.get(normalizedHost)?.size||0)>=2&&!reasons.includes('REPEATED_CREATOR_WEBSITE_PAGES')){
+        score+=10;reasons.push('REPEATED_CREATOR_WEBSITE_PAGES');
+      }
       if(creatorName){
         const compact=creatorName.replace(/\s+/g,''),hostCompact=host.replace(/[^a-z0-9]/g,'');
         // A brand-matching creator website was already intended as strong

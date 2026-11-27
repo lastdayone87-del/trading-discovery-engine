@@ -315,7 +315,30 @@ export async function claimDiscordInvites(items:Array<{code:string;sourceSurface
     `SELECT canonical_code,first_channel_id FROM discord_invite_registry WHERE canonical_code=ANY($1::text[])`,
     [unique])).rows;
   const owners=new Map(existing.map((row:any)=>[String(row.canonical_code),String(row.first_channel_id)]));
+  // Global dedupe keeps one registry row, but every creator/affiliate/business
+  // that published the same invite keeps a durable source relationship. This
+  // runs for winners and losers alike; a loser's candidate row is still
+  // removed, so no duplicate validation is created.
+  await db.query(
+    `INSERT INTO discord_invite_sources(canonical_code,channel_id,source_surface,source_url,first_seen_at,last_seen_at)
+     SELECT code,$2,surface,LEFT(url,2048),now(),now()
+     FROM unnest($1::text[],$3::text[],$4::text[]) AS u(code,surface,url)
+     ON CONFLICT(canonical_code,channel_id,source_surface,source_url)
+     DO UPDATE SET last_seen_at=now()`,
+    [unique,channelId,unique.map(code=>seen.get(code)!.surface||''),unique.map(code=>seen.get(code)!.url||'')]);
   return unique.map(code=>({code,admitted:won.has(code)||owners.get(code)===channelId,firstChannelId:won.has(code)?channelId:(owners.get(code)||null)}));
+}
+/** Releases the provisional first-seen registry claim after validation proves
+ * the invite is non-trading, dead, or invalid. Source relationships remain in
+ * discord_invite_sources, and another channel/source may claim the canonical
+ * code on its next inspection. Only the first claimant can release it. */
+export async function releaseDiscordInviteClaim(canonicalCode:string,channelId:string):Promise<boolean>{
+  if(!canonicalCode||!channelId)return false;
+  const db=await getDb();
+  const result=await db.query(
+    `DELETE FROM discord_invite_registry WHERE canonical_code=$1 AND first_channel_id=$2`,
+    [canonicalCode,channelId]);
+  return (result.rowCount||0)>0;
 }
 /** Removes this channel's candidate rows for the given canonical codes.
  * Used after a lost global claim so a duplicate discovery leaves no residue:
