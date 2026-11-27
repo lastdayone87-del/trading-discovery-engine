@@ -394,6 +394,7 @@ export async function releaseDiscordInviteClaim(canonicalCode:string,channelId:s
            AND lower(split_part(regexp_replace(regexp_replace(COALESCE(a.resolved_locator,a.invite_locator), '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1))=$1
            AND a.checked_at > $3::timestamptz
            AND a.semantic_status IN ('ACTIVE','ACTIVE_LOW_VOLUME')
+           AND a.operational_outcome='SUCCEEDED'
        ))`,
     [canonicalCode,channelId,rejectedCheckedAt||null]);
   return (result.rowCount||0)>0;

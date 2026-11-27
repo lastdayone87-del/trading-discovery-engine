@@ -66,6 +66,15 @@ test('affiliate links do not become creator-canonical website hosts',()=>{
     'ordinary campaign ref values do not erase a creator-owned host');
 });
 
+test('product and course paths are content types, not partner evidence',()=>{
+  const product=candidate('CREATOR_WEBSITES','https://creator.example/products/indicator');
+  const productOwnership=inferDiscordOwnership(product,{creatorName:'Atlas Trading',creatorWebsiteHosts:['creator.example']});
+  assert.equal(productOwnership.ownershipStatus,'UNCERTAIN');
+  assert.ok(!productOwnership.ownershipReasons?.includes('PARTNER_OR_AFFILIATE_SURFACE'));
+  const partner=candidate('CREATOR_WEBSITES','https://creator.example/broker-partner');
+  assert.equal(inferDiscordOwnership(partner,{creatorName:'Atlas Trading',creatorWebsiteHosts:['creator.example']}).ownershipStatus,'THIRD_PARTY');
+});
+
 test('third-party linked site without corroboration stays out of creator-owned',()=>{
   // A creator linking an ordinary third-party tools site must not promote
   // that site's Discord to creator-owned on the link alone.

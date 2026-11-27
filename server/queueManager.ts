@@ -5306,9 +5306,9 @@ export async function inspectAndValidateChannel(
         if(!previous||(item.checkedAt||'')>(previous.checkedAt||''))rejectedByCode.set(item.code,item);
       }
       for(const {code,checkedAt} of rejectedByCode.values()){
-        // A currently successful same-code serving selection is stronger than
-        // a stale rejection from an overlapping inspection.
-        if(channel.discord_invite&&discordInviteCodeOf(channel.discord_invite)===code&&channel.discord_validation_status==='SUCCEEDED')continue;
+        // The timestamp-aware release below already protects a newer
+        // successful overlapping validation; a previous scan's serving
+        // projection must not block a newer rejection from releasing.
         try{
           const released=await releaseDiscordInviteClaim(code,channel.channel_id,checkedAt);
           if(released)console.info(JSON.stringify({event:'discord_invite_claim_released',channelId:channel.channel_id,code,reason:'validated_non_trading_or_invalid',timestamp:new Date().toISOString()}));

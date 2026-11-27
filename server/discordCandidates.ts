@@ -259,6 +259,9 @@ export function inferDiscordOwnership(candidate:DiscordCandidate,input:{creatorN
 
   const creatorName=String(input.creatorName||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const creatorParts=creatorIdentityParts(creatorName);
+  // `course`/`product` are content types, not relationship evidence: a
+  // creator's own product/course page often carries the community invite.
+  // Explicit affiliate/referral/sponsor/broker tokens still trigger the penalty.
   const partnerSignals=/affiliate|referral|referrer|sponsor|sponsored|partner|broker|parrain|refer\b|promo|discount/;
   const provenanceText=observations.map(observation=>[
     observation.sourceUrl,

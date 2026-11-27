@@ -164,6 +164,7 @@ describe('reference/application host policy', () => {
       'https://chromewebstore.google.com/detail/x',
       'https://github.com/UnionKeyHQ/firmware',
       'https://github.com./UnionKeyHQ/firmware',
+      'https://github.com../UnionKeyHQ/firmware',
       'https://gist.github.com/example',
       'https://itunes.apple.com/us/app/example/id1',
       'https://apps.microsoft.com/detail/example',

@@ -55,7 +55,7 @@ export function isNonTradingReferenceOrApplicationUrl(raw: string): boolean {
   try { parsed = new URL(raw); } catch { return false; }
   // DNS is case-insensitive and a trailing dot is the same host. Normalize
   // both before exact/suffix/label checks so escaped spellings cannot bypass.
-  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '');
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '').replace(/\.+$/, '');
   if (!host) return false;
   // Google Forms are creator/business evidence, unlike Google Docs.
   if (host === 'docs.google.com') return !parsed.pathname.startsWith('/forms/');
