@@ -566,9 +566,9 @@ test('E6: no-code orphans are still cleaned up when no claimable codes remain', 
   assert.equal(result.removed, 1);
 });
 
-test('E6: claimable recovery stays within the caller limit after paging', async () => {
-  const claimableRows = Array.from({ length: 3 }, (_, index) => ({
-    candidateId: `claimable-${index}`,
+test('E6: claimable recovery is capped by unique code, not duplicate rows', async () => {
+  const claimableRows = [0, 0, 1, 2].map((index, rowIndex) => ({
+    candidateId: `claimable-${index}-${rowIndex}`,
     rawLocator: `https://discord.gg/CLAIM${index}`,
     normalizedLocator: `https://discord.gg/claim${index}`,
     locatorType: 'NATIVE_INVITE',
@@ -579,16 +579,19 @@ test('E6: claimable recovery stays within the caller limit after paging', async 
     discoveredAt: `2026-10-18T00:00:0${index}.000Z`,
   }));
   const claimed: string[] = [];
+  const removed: string[][] = [];
   const result = await drainOrphanDiscordCandidates('chanA', {
     claim: async (items: Array<{ code: string }>) => {
       claimed.push(...items.map(item => item.code));
       return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanA' }));
     },
     list: async () => claimableRows,
-    removeOrphans: async () => 0,
+    removeOrphans: async (_channelId: string, ids: string[]) => { removed.push(ids); return ids.length; },
   } as never, 2);
-  assert.deepEqual(claimed.sort(), ['claim0', 'claim1'], 'only the bounded batch reaches validation');
+  assert.deepEqual(claimed.sort(), ['claim0', 'claim1'], 'the cap counts unique codes, so a duplicate does not crowd out claim1');
   assert.equal(result.candidates.length, 2);
+  assert.deepEqual(removed, [['claimable-0-1']], 'the duplicate-code row is removed after the code is admitted');
+  assert.equal(result.removed, 1);
 });
 
 test('E6: drain is a no-op when no orphans exist', async () => {

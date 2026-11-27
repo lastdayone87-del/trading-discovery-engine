@@ -701,10 +701,13 @@ export async function drainOrphanDiscordCandidates(
   for (const item of recovered) {
     if (!item.code || skippedIds.has(item.candidate.candidateId)) continue;
     // Keep the scan window large enough to page past deferred rows, but never
-    // expand the claim/validation batch beyond the caller's limit.
-    if (activeIds.size >= Math.max(1, limit)) break;
+    // expand the registry batch beyond the caller's limit. Count unique codes,
+    // not rows: duplicate-code orphans must not crowd out distinct invites.
+    if (!sources.has(item.code)) {
+      if (sources.size >= Math.max(1, limit)) break;
+      sources.set(item.code, { surface: item.sourceSurface, url: item.sourceUrl });
+    }
     activeIds.add(item.candidate.candidateId);
-    if (!sources.has(item.code)) sources.set(item.code, { surface: item.sourceSurface, url: item.sourceUrl });
   }
   // Deferred rows never touch the registry (and an empty claim would still be
   // an unnecessary write-path round trip). No-code rows still flow through the
@@ -725,6 +728,7 @@ export async function drainOrphanDiscordCandidates(
   const discardedOwnerChannelIds = new Set<string>();
   const loserIds: string[] = [];
   const candidates: DiscordCandidate[] = [];
+  const returnedCodes = new Set<string>();
   for (const item of recovered) {
     const { code, candidate } = item;
     if (skippedIds.has(candidate.candidateId)) continue;
@@ -740,6 +744,13 @@ export async function drainOrphanDiscordCandidates(
       if (candidate.candidateId) loserIds.push(candidate.candidateId);
       continue;
     }
+    // One validation candidate per canonical code; a duplicate-code orphan is
+    // redundant residue once the code has been admitted for this channel.
+    if (returnedCodes.has(code)) {
+      if (candidate.candidateId) loserIds.push(candidate.candidateId);
+      continue;
+    }
+    returnedCodes.add(code);
     candidates.push(candidate);
   }
   const removed = loserIds.length ? await deps.removeOrphans(channelId, loserIds) : 0;
