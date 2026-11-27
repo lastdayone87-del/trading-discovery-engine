@@ -377,12 +377,12 @@ export interface OrphanDiscordCandidateRow{candidateId:string;rawLocator:string;
  * the row exists while no validation attempt ever ran. These are invisible to
  * every discovery report today; the drain path (E6) re-admits them through the
  * normal global claim so a discovery cannot be permanently stranded. */
-export async function listOrphanDiscordCandidates(channelId:string,limit=5):Promise<OrphanDiscordCandidateRow[]>{
+export async function listOrphanDiscordCandidates(channelId:string,limit=5,offset=0):Promise<OrphanDiscordCandidateRow[]>{
   if(!channelId)return[];
   const db=await getDb();
   const res=await db.query(
-    `SELECT candidate_id,raw_locator,normalized_locator,locator_type,source_surface,source_url,source_observations,discovered_at,lower(split_part(regexp_replace(regexp_replace(normalized_locator, '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1)) AS canonical_code FROM discord_candidates WHERE channel_id=$1 AND candidate_status='DISCOVERED' AND validation_status='NOT_STARTED' AND selected IS NOT TRUE ORDER BY discovered_at ASC LIMIT $2`,
-    [channelId,Math.min(Math.max(limit,1),25)]);
+    `SELECT candidate_id,raw_locator,normalized_locator,locator_type,source_surface,source_url,source_observations,discovered_at,lower(split_part(regexp_replace(regexp_replace(normalized_locator, '[?#].*$', ''), '^(https?://)?(discord\.gg|discord\.com/invite|discord\.app/invite|discordapp\.com/invite|discord\.(me|io)|dsc\.gg)/+', ''), '/', 1)) AS canonical_code FROM discord_candidates WHERE channel_id=$1 AND candidate_status='DISCOVERED' AND validation_status='NOT_STARTED' AND selected IS NOT TRUE ORDER BY discovered_at ASC LIMIT $2 OFFSET $3`,
+    [channelId,Math.min(Math.max(limit,1),100),Math.max(0,Math.trunc(offset)||0)]);
   return res.rows.map(row=>({candidateId:row.candidate_id,rawLocator:row.raw_locator,normalizedLocator:row.normalized_locator,locatorType:row.locator_type||'UNKNOWN',sourceSurface:row.source_surface||null,sourceUrl:row.source_url||null,observations:Array.isArray(row.source_observations)?row.source_observations:[],canonicalCode:row.canonical_code||null,discoveredAt:new Date(row.discovered_at).toISOString()}));
 }
 /** Removes orphan rows (same predicate as listOrphanDiscordCandidates) by exact

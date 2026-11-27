@@ -618,17 +618,36 @@ export function nextDiscordDuplicateOwnerChannelId(input: {
 export async function drainOrphanDiscordCandidates(
   channelId: string,
   deps: Pick<DiscordChokeDeps, 'claim'> & {
-    list(channelId: string, limit?: number): Promise<OrphanDiscordCandidateRow[]>;
+    list(channelId: string, limit?: number, offset?: number): Promise<OrphanDiscordCandidateRow[]>;
     removeOrphans(channelId: string, candidateIds: string[]): Promise<number>;
   } = {
     claim: (items, targetChannelId) => claimDiscordInvites(items, targetChannelId),
-    list: (targetChannelId, limit) => listOrphanDiscordCandidates(targetChannelId, limit),
+    list: (targetChannelId, limit, offset) => listOrphanDiscordCandidates(targetChannelId, limit, offset),
     removeOrphans: (targetChannelId, candidateIds) => deleteOrphanDiscordCandidates(targetChannelId, candidateIds),
   },
   limit = 5,
   ownership: { creatorName?: string; creatorWebsiteHosts?: string[] } = {},
 ): Promise<{ candidates: DiscordCandidate[]; removed: number; discardedOwnerChannelIds: string[] }> {
-  const rows = await deps.list(channelId, limit);
+  // Deferred rows are intentionally kept for later evidence, but they must not
+  // monopolize the oldest-N window forever. Scan bounded pages past them so a
+  // claimable invite saved after a crash still reaches validation.
+  const scanLimit = Math.min(100, Math.max(limit, 25));
+  const maxScanRows = 100;
+  const rows: OrphanDiscordCandidateRow[] = [];
+  const seenCandidateIds = new Set<string>();
+  for (let offset = 0; offset < maxScanRows; offset += scanLimit) {
+    const batch = await deps.list(channelId, scanLimit, offset);
+    if (!batch.length) break;
+    let fresh = 0;
+    for (const row of batch) {
+      if (seenCandidateIds.has(row.candidateId)) continue;
+      seenCandidateIds.add(row.candidateId);
+      rows.push(row);
+      fresh++;
+    }
+    // Stop on a short page, a non-advancing injected source, or the cap.
+    if (batch.length < scanLimit || fresh === 0 || rows.length >= maxScanRows) break;
+  }
   if (!rows.length) return { candidates: [], removed: 0, discardedOwnerChannelIds: [] };
   // Recover each persisted orphan with its original provenance and ownership
   // before claiming. Old rows written before the ownership guard must not be

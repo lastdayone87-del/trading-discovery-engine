@@ -502,6 +502,47 @@ test('E6: orphan drain does not re-claim an old unowned static row', async () =>
   assert.deepEqual(removed, []);
 });
 
+test('E6: deferred orphans cannot monopolize the recovery window', async () => {
+  const deferredRows = Array.from({ length: 25 }, (_, index) => ({
+    candidateId: `deferred-${index}`,
+    rawLocator: `https://discord.gg/DEFER${String(index).padStart(2, '0')}`,
+    normalizedLocator: `https://discord.gg/defer${String(index).padStart(2, '0')}`,
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CREATOR_WEBSITES',
+    sourceUrl: 'https://docs.n8n.io/integrations/',
+    observations: [],
+    canonicalCode: `defer${String(index).padStart(2, '0')}`,
+    discoveredAt: `2026-10-18T00:00:${String(index).padStart(2, '0')}.000Z`,
+  }));
+  const laterRow = {
+    candidateId: 'later-claimable',
+    rawLocator: 'https://discord.gg/LATERROOM',
+    normalizedLocator: 'https://discord.gg/laterroom',
+    locatorType: 'NATIVE_INVITE',
+    sourceSurface: 'CHANNEL_EXTERNAL_LINKS',
+    sourceUrl: 'https://youtube.test/channel/about',
+    observations: [],
+    canonicalCode: 'laterroom',
+    discoveredAt: '2026-10-18T00:01:00.000Z',
+  };
+  const offsets: number[] = [];
+  const claims: string[] = [];
+  const result = await drainOrphanDiscordCandidates('chanA', {
+    claim: async (items: Array<{ code: string }>) => {
+      claims.push(...items.map(item => item.code));
+      return items.map(item => ({ code: item.code, admitted: true, firstChannelId: 'chanA' }));
+    },
+    list: async (_channelId: string, _limit?: number, offset = 0) => {
+      offsets.push(offset);
+      return offset === 0 ? deferredRows : offset === 25 ? [laterRow] : [];
+    },
+    removeOrphans: async () => 0,
+  } as never, 5, { creatorName: 'iOSCoding', creatorWebsiteHosts: ['n8n.io'] });
+  assert.deepEqual(offsets, [0, 25], 'the drain pages past the deferred window');
+  assert.deepEqual(claims, ['laterroom'], 'a later claimable orphan still reaches the registry');
+  assert.deepEqual(result.candidates.map(candidate => candidate.nativeInviteCode), ['LATERROOM']);
+});
+
 test('E6: drain is a no-op when no orphans exist', async () => {
   let claimCalls = 0;
   const result = await drainOrphanDiscordCandidates('chanA', {
@@ -517,6 +558,7 @@ test('E6 (contract): orphan predicate and drain wiring match the DB semantics', 
   const db = readSource('dbCore.ts');
   assert.match(db, /candidate_status='DISCOVERED' AND validation_status='NOT_STARTED' AND selected IS NOT TRUE/);
   assert.match(db, /export async function deleteOrphanDiscordCandidates/);
+  assert.match(db, /ORDER BY discovered_at ASC LIMIT \$2 OFFSET \$3/);
   const queue = readSource('queueManager.ts');
   // Drain runs after the admission claim so orphan rows can never be deleted
   // while the same execution still owns their codes.
